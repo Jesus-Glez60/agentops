@@ -10,5 +10,13 @@ name = "agentops_mcp"
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 agentops-graph = { path = "../agentops-graph" }
 agentops-scanner = { path = "../agentops-scanner" }
+agentops-docgen = { path = "../agentops-docgen" }
+agentops-notes = { path = "../agentops-notes" }
+agentops-agents-md = { path = "../agentops-agents-md" }
+
+[dev-dependencies]
+tempfile = "3"

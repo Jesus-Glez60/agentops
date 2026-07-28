@@ -59,6 +59,13 @@ enum Command {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Run the stdio MCP server. AccessMode gates which tools are registered
+    /// at all — Advisor mode's tools/list never includes scan_repo/add_note/
+    /// generate_docs, not just a prompt asking the model to avoid them.
+    Serve {
+        #[arg(long, value_enum, default_value_t = AccessMode::Advisor)]
+        access_mode: AccessMode,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -67,6 +74,15 @@ enum AccessMode {
     Advisor,
     /// Full agent access, including code creation/modification.
     Full,
+}
+
+impl From<AccessMode> for agentops_mcp::AccessMode {
+    fn from(mode: AccessMode) -> Self {
+        match mode {
+            AccessMode::Advisor => agentops_mcp::AccessMode::Advisor,
+            AccessMode::Full => agentops_mcp::AccessMode::Full,
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -89,6 +105,7 @@ fn main() -> Result<()> {
         Command::Docgen { path } => docgen(&path),
         Command::Note { path, kind, affects, title, text } => note(&path, kind, affects.as_deref(), &title, &text),
         Command::Status { path } => status(&path),
+        Command::Serve { access_mode } => agentops_mcp::run_stdio(access_mode.into()),
     }
 }
 

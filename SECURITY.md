@@ -76,13 +76,26 @@ A public disclosure policy will be published alongside the first open-source rel
   `ureq`'s TLS stack) use this permissive-but-non-standard license. Allowed
   explicitly in `deny.toml`.
 
+## Controls in place (Phase 1, continued)
+
+- **`AccessMode::Advisor` structural enforcement (`agentops-mcp`)** — implemented, not
+  just a plan item anymore. `Advisor` mode's `tools/list` response genuinely never
+  includes `scan_repo`/`add_note`/`generate_docs` (the tool definitions aren't in the
+  list the server builds — a client has no way to discover them exist). `call_tool`
+  also re-checks the mode defensively at the dispatch layer, so even a
+  hand-constructed `tools/call` naming a write tool directly is refused with a normal
+  tool-result error, not executed. Verified against the real hand-rolled JSON-RPC/
+  stdio server (not just unit tests): `tools/list` in `Advisor` mode returns exactly
+  `["status", "list_gotchas", "repo_map"]`; `Full` mode adds `scan_repo`/`add_note`/
+  `generate_docs`. This is the "an AI agent that structurally cannot" guarantee the
+  plan called for, as opposed to a system-prompt suggestion.
+
 ## Not yet implemented (tracked against the plan)
 
 - Per-tenant/org isolation for `GraphStore` and docbrain-store queries (Phase 2/3).
-- `AccessMode::Advisor` structural enforcement (write-capable MCP tools genuinely not
-  registered, not just refused at call time) — Phase 1 scope, not yet built in this
-  skeleton.
 - GitHub repo-access credential custody (per-repo SSH keypairs encrypted at rest,
   GitHub App as the preferred path) — Phase 3.
+- The `agentops-api` REST server (same core, same `AccessMode` enforcement, but no
+  HTTP surface exists yet — only the stdio MCP server is implemented).
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.
