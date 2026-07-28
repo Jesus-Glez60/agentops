@@ -66,6 +66,13 @@ enum Command {
         #[arg(long, value_enum, default_value_t = AccessMode::Advisor)]
         access_mode: AccessMode,
     },
+    /// Run the REST API server (same tool logic and AccessMode enforcement as `serve`).
+    ServeApi {
+        #[arg(long, value_enum, default_value_t = AccessMode::Advisor)]
+        access_mode: AccessMode,
+        #[arg(long, default_value = "127.0.0.1:8420")]
+        addr: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -95,7 +102,8 @@ fn graph_db_path(repo: &Path) -> PathBuf {
     repo.join(".context").join("graph.db")
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
@@ -106,6 +114,7 @@ fn main() -> Result<()> {
         Command::Note { path, kind, affects, title, text } => note(&path, kind, affects.as_deref(), &title, &text),
         Command::Status { path } => status(&path),
         Command::Serve { access_mode } => agentops_mcp::run_stdio(access_mode.into()),
+        Command::ServeApi { access_mode, addr } => agentops_api::run(&addr, access_mode.into()).await,
     }
 }
 

@@ -20,10 +20,15 @@ dependencies = [
 name = "agentops-api"
 version = "0.1.0"
 dependencies = [
- "agentops-graph",
+ "agentops-mcp",
  "anyhow",
  "axum",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -31,6 +36,7 @@ name = "agentops-cli"
 version = "0.1.0"
 dependencies = [
  "agentops-agents-md",
+ "agentops-api",
  "agentops-docgen",
  "agentops-graph",
  "agentops-manifest",

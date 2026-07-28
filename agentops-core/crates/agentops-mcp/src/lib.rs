@@ -13,7 +13,8 @@ mod protocol;
 mod server;
 mod tools;
 
-pub use tools::AccessMode;
+pub use protocol::{CallToolResult, ContentBlock, ToolDefinition};
+pub use tools::{call_tool, list_tools, AccessMode};
 
 use std::io::{BufRead, Write};
 

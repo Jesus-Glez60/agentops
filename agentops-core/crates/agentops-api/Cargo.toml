@@ -11,4 +11,11 @@ name = "agentops_api"
 anyhow.workspace = true
 axum.workspace = true
 tokio.workspace = true
-agentops-graph = { path = "../agentops-graph" }
+serde.workspace = true
+serde_json.workspace = true
+agentops-mcp = { path = "../agentops-mcp" }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

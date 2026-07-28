@@ -89,13 +89,21 @@ A public disclosure policy will be published alongside the first open-source rel
   `["status", "list_gotchas", "repo_map"]`; `Full` mode adds `scan_repo`/`add_note`/
   `generate_docs`. This is the "an AI agent that structurally cannot" guarantee the
   plan called for, as opposed to a system-prompt suggestion.
+- **`agentops-api` (implemented)** — the REST transport reuses `agentops-mcp`'s
+  `list_tools`/`call_tool` directly (one implementation of each tool, two
+  transports), so the same `AccessMode` guarantee holds over HTTP: `GET /tools` in
+  Advisor mode omits the write tools, and `POST /tools/scan_repo` in Advisor mode
+  returns `403 Forbidden` before any repo-scanning code runs — verified against a
+  live server with `curl`, not just in-process tests. The server has no
+  authentication of its own yet (see "Not yet implemented" — this binds to
+  `127.0.0.1` by default and is not intended to be exposed beyond localhost as-is).
 
 ## Not yet implemented (tracked against the plan)
 
 - Per-tenant/org isolation for `GraphStore` and docbrain-store queries (Phase 2/3).
+- Real authn/authz on `agentops-api` (API key or mTLS) — currently unauthenticated;
+  fine for localhost-only Phase 1 use, not for the hosted heavy tier (Phase 3).
 - GitHub repo-access credential custody (per-repo SSH keypairs encrypted at rest,
   GitHub App as the preferred path) — Phase 3.
-- The `agentops-api` REST server (same core, same `AccessMode` enforcement, but no
-  HTTP surface exists yet — only the stdio MCP server is implemented).
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.

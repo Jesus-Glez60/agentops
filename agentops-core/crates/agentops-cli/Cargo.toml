@@ -24,3 +24,4 @@ agentops-manifest = { path = "../agentops-manifest" }
 agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }
 agentops-agents-md = { path = "../agentops-agents-md" }
 agentops-mcp = { path = "../agentops-mcp" }
+agentops-api = { path = "../agentops-api" }
