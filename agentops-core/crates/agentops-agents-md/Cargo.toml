@@ -9,3 +9,6 @@ name = "agentops_agents_md"
 
 [dependencies]
 anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

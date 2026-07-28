@@ -10,3 +10,4 @@ name = "agentops_security"
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+regex.workspace = true

@@ -1,0 +1,6 @@
+# Forces tree-sitter-language-pack to statically compile only the grammars
+# agentops-scanner actually supports, at BUILD time, instead of relying on its
+# default `download` feature (disabled in the workspace Cargo.toml) which would
+# otherwise fetch grammar binaries over the network at RUNTIME. See SECURITY.md.
+[env]
+TSLP_LANGUAGES = "python,javascript,typescript,go"

@@ -27,14 +27,28 @@ A public disclosure policy will be published alongside the first open-source rel
   gain a *runtime* HTTP/networking dependency. Enforced mechanically via `deny.toml`'s
   `[[bans.deny]]` list (`reqwest`, `hyper-tls`, `native-tls`, `openssl`) — run
   `cargo deny check` in CI on every PR.
-  - **Known, understood exception**: `tree-sitter-language-pack` (used by
-    `agentops-scanner` for AST extraction) pulls in `ureq` as a **build-dependency**
-    only, to fetch/compile tree-sitter grammar sources at `cargo build` time. This
-    means *building* `agentops-scanner` from source requires network access, but the
-    compiled binary makes zero network calls when actually scanning a repository.
-    `ureq` is intentionally not in the deny list — banning it would break the build —
-    but this distinction (build-time vs. runtime egress) is exactly why the invariant
-    is scoped to runtime dependencies, not "no networking crate anywhere in the tree."
+  - **Known, understood exception, verified empirically (not assumed from docs)**:
+    `tree-sitter-language-pack` (used by `agentops-scanner` for AST extraction) has a
+    *default* `download` feature that auto-fetches precompiled grammar binaries over
+    the network at **runtime** on first use — left enabled, this would be a real
+    runtime-egress violation. It's disabled in the workspace `Cargo.toml`
+    (`default-features = false`). Instead, `.cargo/config.toml` sets `TSLP_LANGUAGES`
+    to our 4 supported languages, which makes the crate's build script fetch grammar
+    *source* and compile each into a `.dylib`/`.so` under the build output directory —
+    at `cargo build` time, via `ureq` as a genuine build-dependency (confirmed via
+    `cargo tree -e normal,build -i ureq`, which shows it only under
+    `[build-dependencies]`) — then load it via `libloading` (the `dynamic-loading`
+    feature, kept enabled) from that same local path at runtime. Net effect: building
+    `agentops-scanner` from source requires network access; the compiled binary makes
+    zero network calls when actually scanning a repository. This was verified against
+    a throwaway probe crate (build the dependency graph, inspect the generated
+    `registry_generated.rs`, confirm `get_parser()` actually returns a working parser)
+    rather than trusted from the crate's documentation, which turned out to describe
+    the default (`download`-enabled) behavior, not this project's configuration.
+    `ureq` is intentionally not in the `deny.toml` ban list — banning it would break
+    the build — but this distinction (build-time vs. runtime egress) is exactly why
+    the invariant is scoped to runtime dependencies, not "no networking crate anywhere
+    in the tree."
 - **Injection-aware output formatting** (planned, not yet implemented in the Phase 1
   skeleton) — raw repository content in generated docs will be wrapped with an
   explicit delimiter and framing note distinguishing "repository content" from
