@@ -49,15 +49,21 @@ A public disclosure policy will be published alongside the first open-source rel
     the build — but this distinction (build-time vs. runtime egress) is exactly why
     the invariant is scoped to runtime dependencies, not "no networking crate anywhere
     in the tree."
-- **Injection-aware output formatting** (planned, not yet implemented in the Phase 1
-  skeleton) — raw repository content in generated docs will be wrapped with an
-  explicit delimiter and framing note distinguishing "repository content" from
-  "instructions," since comments/READMEs in a scanned repo are untrusted input to
-  whatever agent reads our output next.
-- **Pinned Ruler version** (planned) — `agentops-ruler-bridge` will invoke a specific,
-  checksum-verified version of `@intellectronica/ruler`, not a live `npx` resolution
-  of whatever's currently published, given the precedent of supply-chain attacks
-  against agentic tooling via malicious npm postinstall scripts.
+- **Injection-aware output formatting** (`agentops-security::wrap_repo_content`,
+  implemented but not yet wired into `agentops-docgen`'s output) — raw repository
+  content in generated docs will be wrapped with an explicit delimiter and framing
+  note distinguishing "repository content" from "instructions," since comments/
+  READMEs in a scanned repo are untrusted input to whatever agent reads our output
+  next.
+- **Pinned Ruler version** (`agentops-ruler-bridge::RULER_VERSION`, implemented) —
+  `apply()` always invokes `@intellectronica/ruler@0.3.44` explicitly, never
+  `@latest` or an unversioned `npx @intellectronica/ruler`, given the precedent of
+  supply-chain attacks against agentic tooling via malicious npm postinstall
+  scripts. **Residual limitation, stated plainly**: this pins the *version string*
+  only — it relies on the npm registry's own tarball-integrity check, not an
+  additional locally-vendored checksum/lockfile independent of npm. Bumping
+  `RULER_VERSION` is a deliberate code change (reviewed like any other dependency
+  bump), not something that happens silently.
 
 ## Known, tracked exceptions
 

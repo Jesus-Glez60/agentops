@@ -30,6 +30,12 @@ enum Command {
         dry_run: bool,
         #[arg(long, value_enum, default_value_t = AccessMode::Advisor)]
         access_mode: AccessMode,
+        /// Skip Ruler-based prompt-pack distribution entirely (no Node required).
+        #[arg(long)]
+        no_ruler: bool,
+        /// Comma-separated Ruler agent identifiers (e.g. claude,cursor). Empty = all.
+        #[arg(long, value_delimiter = ',', default_value = "claude")]
+        agents: Vec<String>,
     },
     /// Generate an onboarding/engineering doc from an already-scanned repo.
     Docgen {
@@ -77,14 +83,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Install { path, dry_run, access_mode } => install(&path, dry_run, access_mode),
+        Command::Install { path, dry_run, access_mode, no_ruler, agents } => {
+            install(&path, dry_run, access_mode, no_ruler, &agents)
+        }
         Command::Docgen { path } => docgen(&path),
         Command::Note { path, kind, affects, title, text } => note(&path, kind, affects.as_deref(), &title, &text),
         Command::Status { path } => status(&path),
     }
 }
 
-fn install(path: &Path, dry_run: bool, access_mode: AccessMode) -> Result<()> {
+fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, agents: &[String]) -> Result<()> {
     let repo_name = path
         .canonicalize()
         .ok()
@@ -147,7 +155,7 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode) -> Result<()> {
     }
 
     let opts = agentops_agents_md::GenerateOptions {
-        claude_code_installed: false,
+        claude_code_installed: !no_ruler && agents.iter().any(|a| a == "claude"),
         repo_map_path: Some("repo-map.md".to_string()),
     };
     let agents_md = agentops_agents_md::generate(path, &opts);
@@ -163,6 +171,22 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode) -> Result<()> {
         db_path.display()
     );
     println!("Wrote {}", path.join("AGENTS.md").display());
+
+    if no_ruler {
+        println!("Skipping Ruler prompt-pack distribution (--no-ruler).");
+    } else {
+        println!("Distributing prompt pack via Ruler {}...", agentops_ruler_bridge::RULER_VERSION);
+        agentops_ruler_bridge::build_ruler_dir(path, &agents_md).context("building .ruler/ directory")?;
+        let agent_refs: Vec<&str> = agents.iter().map(|s| s.as_str()).collect();
+        match agentops_ruler_bridge::apply(path, &agent_refs, false) {
+            Ok(output) => print!("{output}"),
+            Err(e) => println!(
+                "WARNING: Ruler prompt distribution failed, continuing without it ({e}). \
+                 Scan results and AGENTS.md above are still valid — rerun with --no-ruler to skip this step."
+            ),
+        }
+    }
+
     println!("Run `agentops docgen --path {}` to generate the onboarding doc.", path.display());
 
     Ok(())
