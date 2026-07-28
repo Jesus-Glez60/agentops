@@ -98,6 +98,10 @@ enum Command {
         org: Option<String>,
         #[arg(long)]
         db: Option<PathBuf>,
+        /// Skip the interactive ask-user fallback (discovery-order step 3) —
+        /// just report what neither the registry nor GitHub search found.
+        #[arg(long)]
+        no_interactive: bool,
     },
 }
 
@@ -143,7 +147,9 @@ async fn main() -> Result<()> {
         Command::ServeApi { access_mode, addr } => agentops_api::run(&addr, access_mode.into()).await,
         Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(default_docbrain_db_path)),
         Command::DocbrainServeApi { addr, db } => docbrain_api::run(&addr, &db.unwrap_or_else(default_docbrain_db_path)).await,
-        Command::SyncDocs { path, org, db } => sync_docs(&path, org.as_deref(), &db.unwrap_or_else(default_docbrain_db_path)),
+        Command::SyncDocs { path, org, db, no_interactive } => {
+            sync_docs(&path, org.as_deref(), &db.unwrap_or_else(default_docbrain_db_path), no_interactive)
+        }
     }
 }
 
@@ -252,9 +258,12 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, 
     Ok(())
 }
 
-fn sync_docs(path: &Path, org: Option<&str>, db_path: &Path) -> Result<()> {
+/// Docbrain-3's full 3-step discovery order: (1) registry metadata, (2)
+/// GitHub search, (3) ask the user — implemented here rather than in
+/// docbrain-ingest since step 3 is inherently an interactive CLI concern.
+fn sync_docs(path: &Path, org: Option<&str>, db_path: &Path, no_interactive: bool) -> Result<()> {
     use docbrain_graph::{DocbrainStore, TenantContext, Visibility};
-    use docbrain_ingest::{classify_dependency, discover};
+    use docbrain_ingest::{classify_dependency, discover, search_github};
     use std::collections::BTreeSet;
 
     let report = agentops_scanner::scan_repo(path).context("scanning repo for dependencies")?;
@@ -275,9 +284,13 @@ fn sync_docs(path: &Path, org: Option<&str>, db_path: &Path) -> Result<()> {
         Some(id) => TenantContext::org(id),
         None => TenantContext::public(),
     };
+    let visibility = match &tenant {
+        TenantContext::Org(id) => Visibility::Private(id.clone()),
+        TenantContext::Public => Visibility::Public,
+    };
     let store = DocbrainStore::open(db_path).context("opening docbrain store")?;
 
-    let (mut already_known, mut discovered, mut not_found) = (0u32, 0u32, Vec::new());
+    let (mut already_known, mut discovered, mut asked, mut unresolved) = (0u32, 0u32, 0u32, Vec::new());
 
     for (ecosystem, name) in &candidates {
         if store.get_library(&tenant, name)?.is_some() {
@@ -285,24 +298,70 @@ fn sync_docs(path: &Path, org: Option<&str>, db_path: &Path) -> Result<()> {
             continue;
         }
 
-        match discover(*ecosystem, name)? {
-            Some(found) => {
-                let visibility = match &tenant {
-                    TenantContext::Org(id) => Visibility::Private(id.clone()),
-                    TenantContext::Public => Visibility::Public,
-                };
-                store.add_library(&tenant, name, name, found.repo_url.as_deref(), found.docs_url.as_deref(), visibility)?;
-                println!("  discovered: {name} -> {}", found.docs_url.as_deref().unwrap_or(found.repo_url.as_deref().unwrap_or("(no URL published)")));
-                discovered += 1;
+        // Step 1: registry metadata. A network/parse error here is a soft
+        // fail (warn, keep going) — one flaky lookup shouldn't abort a batch.
+        let step1 = match discover(*ecosystem, name) {
+            Ok(found) => found,
+            Err(e) => {
+                println!("  warning: registry lookup for {name} failed ({e}), trying GitHub search next");
+                None
             }
-            None => not_found.push(name.clone()),
+        };
+
+        if let Some(found) = step1 {
+            store.add_library(&tenant, name, name, found.repo_url.as_deref(), found.docs_url.as_deref(), visibility.clone())?;
+            println!("  discovered (registry): {name} -> {}", found.docs_url.as_deref().unwrap_or(found.repo_url.as_deref().unwrap_or("(no URL published)")));
+            discovered += 1;
+            continue;
         }
+
+        // Step 2: GitHub search fallback. Same soft-fail treatment — a
+        // rate-limited search is not the same as "ask the user," so it's
+        // reported distinctly rather than silently falling through.
+        let step2 = match search_github(name) {
+            Ok(found) => found,
+            Err(e) => {
+                println!("  warning: GitHub search for {name} unavailable ({e})");
+                None
+            }
+        };
+
+        if let Some(found) = step2 {
+            store.add_library(&tenant, name, name, found.repo_url.as_deref(), found.docs_url.as_deref(), visibility.clone())?;
+            println!("  discovered (GitHub search): {name} -> {}", found.docs_url.as_deref().unwrap_or(found.repo_url.as_deref().unwrap_or("(no URL published)")));
+            discovered += 1;
+            continue;
+        }
+
+        // Step 3: ask the user, interactively, right now — rather than just
+        // printing a list to act on later. `interact_text()` requires a real
+        // TTY (dialoguer reads raw terminal input, not just redirected
+        // stdin); in a non-interactive context (CI, piped input, this
+        // sandbox) it errors, and `.unwrap_or_default()` treats that the
+        // same as "left blank" — a safe no-op, not a crash. Verified this
+        // degrades gracefully via piped stdin; a real terminal session is
+        // dialoguer's normal, well-established use case.
+        if !no_interactive {
+            let prompt = format!("'{name}' not found via registry or GitHub search. Enter a docs URL (blank to skip)");
+            let answer: String = dialoguer::Input::new().with_prompt(prompt).allow_empty(true).interact_text().unwrap_or_default();
+            if !answer.trim().is_empty() {
+                store.add_library(&tenant, name, name, None, Some(answer.trim()), visibility.clone())?;
+                println!("  registered (user-provided): {name} -> {}", answer.trim());
+                asked += 1;
+                continue;
+            }
+        }
+
+        unresolved.push(name.clone());
     }
 
-    println!("{already_known} already known, {discovered} newly discovered, {} not found on registry.", not_found.len());
-    if !not_found.is_empty() {
-        println!("Not found via registry lookup (discovery-order step 1) — try a web search or provide a docs URL manually next:");
-        for name in &not_found {
+    println!(
+        "{already_known} already known, {discovered} discovered (registry/GitHub), {asked} registered from user input, {} unresolved.",
+        unresolved.len()
+    );
+    if !unresolved.is_empty() {
+        println!("Not found via any discovery step, and not provided manually:");
+        for name in &unresolved {
             println!("  - {name}");
         }
     }

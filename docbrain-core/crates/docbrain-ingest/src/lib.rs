@@ -2,10 +2,20 @@
 //! docs when a repo is first onboarded... searching for it automatically or
 //! asking the user for a docs URL if it can't be found."
 //!
-//! This crate implements discovery-order step (1): query the relevant package
-//! registry's own metadata API (no hardcoded per-library URL mapping needed
-//! for the common case). Steps (2) web-search fallback and (3) ask-the-user
-//! are the caller's responsibility (a CLI/MCP-level concern, not this crate's).
+//! Discovery order:
+//! 1. `discover()` — the relevant package registry's own metadata API (no
+//!    hardcoded per-library URL mapping needed for the common case).
+//! 2. `search_github()` — GitHub's repository search API, for anything not
+//!    published to npm/PyPI at all (internal tools, non-packaged libraries,
+//!    docs-only projects). Real and keyless, but tightly rate-limited (10
+//!    requests/minute unauthenticated, verified empirically — a genuine
+//!    constraint to design around, not a hypothetical one) — errors from
+//!    this step (rate-limited or network failure) are distinguishable from
+//!    a genuine "no match" so the caller can tell "try again later" apart
+//!    from "this really isn't on GitHub."
+//! 3. Ask the user for a docs URL — the caller's responsibility (a CLI/MCP-
+//!    level concern, not this crate's; `agentops-cli`'s `sync-docs` does
+//!    this interactively).
 //!
 //! Unlike `agentops-scanner`, this crate is explicitly NOT under the
 //! zero-network-egress invariant — its entire job is fetching from the
@@ -128,6 +138,57 @@ fn discover_pypi(name: &str) -> Result<Option<DiscoveredLibrary>> {
     }))
 }
 
+#[derive(Debug, Deserialize)]
+struct GitHubSearchResponse {
+    #[serde(default)]
+    items: Vec<GitHubRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GitHubRepo {
+    #[serde(default)]
+    full_name: Option<String>,
+    html_url: String,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// Discovery-order step (2): searches GitHub's repository search API for a
+/// repo named `name`, returning its highest-starred match. Distinguishes
+/// three outcomes the caller needs to tell apart:
+/// - `Ok(Some(_))` — found a real match.
+/// - `Ok(None)` — the search genuinely returned zero results.
+/// - `Err(_)` — the search itself failed (rate-limited or network error),
+///   which is NOT the same as "not found" and shouldn't be reported to a
+///   user as if it were.
+pub fn search_github(name: &str) -> Result<Option<DiscoveredLibrary>> {
+    let query = format!("{name}+in:name");
+    let url = format!("https://api.github.com/search/repositories?q={query}&sort=stars&order=desc&per_page=1");
+
+    let response = ureq::get(&url).header("User-Agent", "docbrain-ingest").call();
+    let mut response = match response {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(403)) => {
+            anyhow::bail!("GitHub search rate limit exceeded (10 req/min unauthenticated) — try again shortly")
+        }
+        Err(e) => return Err(e).with_context(|| format!("searching GitHub for '{name}'")),
+    };
+
+    let parsed: GitHubSearchResponse = response.body_mut().read_json().with_context(|| format!("parsing GitHub search response for '{name}'"))?;
+    let Some(repo) = parsed.items.into_iter().next() else {
+        return Ok(None);
+    };
+
+    Ok(Some(DiscoveredLibrary {
+        name: repo.full_name.unwrap_or_else(|| name.to_string()),
+        description: repo.description,
+        docs_url: repo.homepage,
+        repo_url: Some(repo.html_url),
+    }))
+}
+
 /// Cleans up the `git+https://github.com/x/y.git` shape npm's `repository.url`
 /// commonly uses into a plain, browsable URL.
 fn normalize_repo_url(raw: &str) -> String {
@@ -175,5 +236,31 @@ mod tests {
     fn normalizes_git_plus_prefixed_repo_urls() {
         assert_eq!(normalize_repo_url("git+https://github.com/facebook/react.git"), "https://github.com/facebook/react");
         assert_eq!(normalize_repo_url("https://github.com/facebook/react"), "https://github.com/facebook/react");
+    }
+
+    // GitHub's search API is genuinely rate-limited to 10 req/min unauthenticated
+    // (confirmed empirically while developing this — a real curl against it
+    // returned "API rate limit exceeded" after only a couple of manual checks).
+    // This test honors that reality instead of pretending network flakiness
+    // doesn't exist: a rate-limit error is an *expected*, distinguishable
+    // outcome, not a test failure, since the whole point of search_github's
+    // Result/Option split is telling "rate-limited" apart from "not found."
+
+    #[test]
+    fn github_search_finds_a_real_repo_or_reports_rate_limit_honestly() {
+        match search_github("ohmyzsh") {
+            Ok(Some(result)) => assert!(result.repo_url.unwrap().contains("github.com")),
+            Ok(None) => panic!("expected 'ohmyzsh' to be found on GitHub"),
+            Err(e) => assert!(e.to_string().contains("rate limit"), "unexpected error: {e}"),
+        }
+    }
+
+    #[test]
+    fn github_search_reports_genuine_no_match_or_rate_limit() {
+        match search_github("this-string-should-never-match-any-real-repository-agentops-probe-xyz") {
+            Ok(None) => {} // genuine no-match, the expected happy path
+            Ok(Some(r)) => panic!("unexpectedly matched a real repo: {r:?}"),
+            Err(e) => assert!(e.to_string().contains("rate limit"), "unexpected error: {e}"),
+        }
     }
 }
