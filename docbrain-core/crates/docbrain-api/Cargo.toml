@@ -1,0 +1,13 @@
+[package]
+name = "docbrain-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "docbrain_api"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+docbrain-graph = { path = "../docbrain-graph" }

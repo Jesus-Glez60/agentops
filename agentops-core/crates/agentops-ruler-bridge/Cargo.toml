@@ -1,0 +1,12 @@
+[package]
+name = "agentops-ruler-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_ruler_bridge"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true

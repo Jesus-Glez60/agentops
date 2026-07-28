@@ -1,0 +1,14 @@
+[package]
+name = "agentops-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_mcp"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+agentops-graph = { path = "../agentops-graph" }
+agentops-scanner = { path = "../agentops-scanner" }

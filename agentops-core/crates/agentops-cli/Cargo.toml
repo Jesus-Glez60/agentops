@@ -1,0 +1,25 @@
+[package]
+name = "agentops-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentops"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+dialoguer.workspace = true
+indicatif.workspace = true
+tokio.workspace = true
+
+agentops-scanner = { path = "../agentops-scanner" }
+agentops-graph = { path = "../agentops-graph" }
+agentops-docgen = { path = "../agentops-docgen" }
+agentops-notes = { path = "../agentops-notes" }
+agentops-security = { path = "../agentops-security" }
+agentops-manifest = { path = "../agentops-manifest" }
+agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }
+agentops-agents-md = { path = "../agentops-agents-md" }

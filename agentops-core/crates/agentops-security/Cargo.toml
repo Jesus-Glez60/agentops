@@ -1,0 +1,12 @@
+[package]
+name = "agentops-security"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_security"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true

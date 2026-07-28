@@ -1,0 +1,12 @@
+[package]
+name = "docbrain-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "docbrain_graph"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true

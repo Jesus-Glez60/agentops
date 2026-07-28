@@ -1,0 +1,13 @@
+[package]
+name = "agentops-notes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_notes"
+
+[dependencies]
+anyhow.workspace = true
+agentops-graph = { path = "../agentops-graph" }
+serde.workspace = true
