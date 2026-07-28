@@ -25,3 +25,6 @@ agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }
 agentops-agents-md = { path = "../agentops-agents-md" }
 agentops-mcp = { path = "../agentops-mcp" }
 agentops-api = { path = "../agentops-api" }
+docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
+docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
+docbrain-api = { path = "../../../docbrain-core/crates/docbrain-api" }

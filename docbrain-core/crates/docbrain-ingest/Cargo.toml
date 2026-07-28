@@ -10,3 +10,6 @@ name = "docbrain_ingest"
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "3", features = ["json"] }

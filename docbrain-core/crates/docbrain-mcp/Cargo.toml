@@ -10,4 +10,7 @@ name = "docbrain_mcp"
 [dependencies]
 anyhow.workspace = true
 tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 docbrain-graph = { path = "../docbrain-graph" }
+docbrain-ingest = { path = "../docbrain-ingest" }

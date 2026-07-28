@@ -73,6 +73,18 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:8420")]
         addr: String,
     },
+    /// Run the docbrain stdio MCP server (library docs/changelogs, Docbrain-1..4).
+    DocbrainServe {
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
+    /// Run the docbrain REST API server.
+    DocbrainServeApi {
+        #[arg(long, default_value = "127.0.0.1:8421")]
+        addr: String,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -115,7 +127,14 @@ async fn main() -> Result<()> {
         Command::Status { path } => status(&path),
         Command::Serve { access_mode } => agentops_mcp::run_stdio(access_mode.into()),
         Command::ServeApi { access_mode, addr } => agentops_api::run(&addr, access_mode.into()).await,
+        Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(default_docbrain_db_path)),
+        Command::DocbrainServeApi { addr, db } => docbrain_api::run(&addr, &db.unwrap_or_else(default_docbrain_db_path)).await,
     }
+}
+
+fn default_docbrain_db_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".agentops").join("docbrain.db")
 }
 
 fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, agents: &[String]) -> Result<()> {

@@ -10,4 +10,13 @@ name = "docbrain_api"
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 docbrain-graph = { path = "../docbrain-graph" }
+docbrain-mcp = { path = "../docbrain-mcp" }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
