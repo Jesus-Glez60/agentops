@@ -97,6 +97,15 @@ A public disclosure policy will be published alongside the first open-source rel
   live server with `curl`, not just in-process tests. The server has no
   authentication of its own yet (see "Not yet implemented" — this binds to
   `127.0.0.1` by default and is not intended to be exposed beyond localhost as-is).
+- **`docbrain-api`'s CORS policy is deliberately permissive** (`CorsLayer::permissive()`,
+  any origin) so the local dashboard (`apps/web`, a separate origin during
+  development) can call it directly from the browser. This is coherent with
+  "no auth yet, localhost-only" above — permissive CORS on an unauthenticated,
+  localhost-bound server doesn't add new exposure beyond what already existed,
+  but it must be tightened (scoped to the dashboard's actual origin) before this
+  server is ever bound beyond `127.0.0.1` or gains real authentication, since
+  permissive CORS on an *authenticated* endpoint would let any web page make
+  credentialed requests on a logged-in user's behalf.
 
 ## Not yet implemented (tracked against the plan)
 

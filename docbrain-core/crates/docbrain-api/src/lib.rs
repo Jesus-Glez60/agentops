@@ -9,12 +9,14 @@
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use axum::extract::{Path as AxumPath, State};
+use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use docbrain_graph::DocbrainStore;
+use docbrain_graph::{DocbrainStore, TenantContext};
+use serde::Deserialize;
 use serde_json::{json, Value};
+use tower_http::cors::CorsLayer;
 
 #[derive(Clone)]
 struct AppState {
@@ -27,7 +29,13 @@ pub fn build_router(store: DocbrainStore) -> Router {
         .route("/health", get(health))
         .route("/tools", get(list_tools_handler))
         .route("/tools/{name}", post(call_tool_handler))
+        .route("/libraries", get(list_libraries_json))
         .with_state(state)
+        // Permissive CORS: this server has no auth of its own yet (see
+        // SECURITY.md), and the dashboard is a separate origin (Next.js dev
+        // server) during local development — fine for localhost-only Phase 2
+        // use, revisit before this is ever bound beyond 127.0.0.1.
+        .layer(CorsLayer::permissive())
 }
 
 pub async fn run(addr: &str, db_path: &Path) -> anyhow::Result<()> {
@@ -45,6 +53,28 @@ async fn health() -> &'static str {
 
 async fn list_tools_handler() -> Json<Value> {
     Json(json!({ "tools": docbrain_mcp::list_tools() }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LibrariesQuery {
+    org: Option<String>,
+}
+
+/// Structured JSON for the dashboard's library browser — the `tools/*`
+/// endpoints return MCP-shaped text content (right for an agent, awkward for
+/// a UI to render as a table), so this is a small, genuinely-REST endpoint
+/// alongside them rather than asking the frontend to parse tool-result text.
+async fn list_libraries_json(State(state): State<AppState>, Query(q): Query<LibrariesQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match q.org {
+        Some(org) => TenantContext::org(org),
+        None => TenantContext::public(),
+    };
+
+    let store = state.store.lock().unwrap();
+    match store.list_libraries(&tenant) {
+        Ok(libs) => (StatusCode::OK, Json(json!({ "libraries": libs }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
 }
 
 async fn call_tool_handler(
@@ -82,6 +112,27 @@ mod tests {
         let app = build_router(store);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn libraries_json_endpoint_returns_structured_data_scoped_by_org() {
+        let store = DocbrainStore::open_in_memory().unwrap();
+        store.add_library(&TenantContext::public(), "react", "React", None, Some("https://react.dev"), Visibility::Public).unwrap();
+        store
+            .add_library(&TenantContext::org("acme"), "acme-sdk", "Acme SDK", None, None, Visibility::Private("acme".into()))
+            .unwrap();
+
+        let app = build_router(store);
+        let resp = app.clone().oneshot(Request::builder().uri("/libraries").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let libs = body["libraries"].as_array().unwrap();
+        assert_eq!(libs.len(), 1, "public caller should only see the public library");
+        assert_eq!(libs[0]["slug"], "react");
+
+        let resp = app.oneshot(Request::builder().uri("/libraries?org=acme").body(Body::empty()).unwrap()).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["libraries"].as_array().unwrap().len(), 2, "acme should see public + its own private library");
     }
 
     #[tokio::test]

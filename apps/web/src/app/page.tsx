@@ -4,6 +4,7 @@ const screens = [
   { href: "/repos", title: "Repo overview", desc: "Connected repos, last-scanned time, health status." },
   { href: "/graph", title: "Neuron / graph browser", desc: "Symbols, dependencies, and gotcha nodes wired into the code graph." },
   { href: "/docs", title: "Onboarding docs viewer", desc: "Rendered agentops-docgen output." },
+  { href: "/libraries", title: "Docbrain library browser", desc: "Ingested libraries, versions, and visibility — live from docbrain-api." },
 ];
 
 export default function Home() {
