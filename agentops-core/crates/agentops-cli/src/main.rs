@@ -85,6 +85,20 @@ enum Command {
         #[arg(long)]
         db: Option<PathBuf>,
     },
+    /// Docbrain-3: scan a repo's dependencies and auto-discover docs for any
+    /// that aren't already known to docbrain, via the registry (npm/PyPI).
+    /// Reports anything the registry doesn't have, for the web-search/
+    /// ask-the-user fallback steps.
+    SyncDocs {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Register newly-discovered libraries as private to this org instead
+        /// of public.
+        #[arg(long)]
+        org: Option<String>,
+        #[arg(long)]
+        db: Option<PathBuf>,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -129,6 +143,7 @@ async fn main() -> Result<()> {
         Command::ServeApi { access_mode, addr } => agentops_api::run(&addr, access_mode.into()).await,
         Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(default_docbrain_db_path)),
         Command::DocbrainServeApi { addr, db } => docbrain_api::run(&addr, &db.unwrap_or_else(default_docbrain_db_path)).await,
+        Command::SyncDocs { path, org, db } => sync_docs(&path, org.as_deref(), &db.unwrap_or_else(default_docbrain_db_path)),
     }
 }
 
@@ -233,6 +248,64 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, 
     }
 
     println!("Run `agentops docgen --path {}` to generate the onboarding doc.", path.display());
+
+    Ok(())
+}
+
+fn sync_docs(path: &Path, org: Option<&str>, db_path: &Path) -> Result<()> {
+    use docbrain_graph::{DocbrainStore, TenantContext, Visibility};
+    use docbrain_ingest::{classify_dependency, discover};
+    use std::collections::BTreeSet;
+
+    let report = agentops_scanner::scan_repo(path).context("scanning repo for dependencies")?;
+
+    let mut candidates: BTreeSet<(docbrain_ingest::Ecosystem, String)> = BTreeSet::new();
+    for file in &report.files {
+        let language = file.language.tree_sitter_name();
+        for dep in &file.deps {
+            if let Some(pair) = classify_dependency(language, dep) {
+                candidates.insert(pair);
+            }
+        }
+    }
+
+    println!("Found {} distinct third-party dependencies across {} files.", candidates.len(), report.files.len());
+
+    let tenant = match org {
+        Some(id) => TenantContext::org(id),
+        None => TenantContext::public(),
+    };
+    let store = DocbrainStore::open(db_path).context("opening docbrain store")?;
+
+    let (mut already_known, mut discovered, mut not_found) = (0u32, 0u32, Vec::new());
+
+    for (ecosystem, name) in &candidates {
+        if store.get_library(&tenant, name)?.is_some() {
+            already_known += 1;
+            continue;
+        }
+
+        match discover(*ecosystem, name)? {
+            Some(found) => {
+                let visibility = match &tenant {
+                    TenantContext::Org(id) => Visibility::Private(id.clone()),
+                    TenantContext::Public => Visibility::Public,
+                };
+                store.add_library(&tenant, name, name, found.repo_url.as_deref(), found.docs_url.as_deref(), visibility)?;
+                println!("  discovered: {name} -> {}", found.docs_url.as_deref().unwrap_or(found.repo_url.as_deref().unwrap_or("(no URL published)")));
+                discovered += 1;
+            }
+            None => not_found.push(name.clone()),
+        }
+    }
+
+    println!("{already_known} already known, {discovered} newly discovered, {} not found on registry.", not_found.len());
+    if !not_found.is_empty() {
+        println!("Not found via registry lookup (discovery-order step 1) — try a web search or provide a docs URL manually next:");
+        for name in &not_found {
+            println!("  - {name}");
+        }
+    }
 
     Ok(())
 }

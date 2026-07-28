@@ -50,6 +50,7 @@ dependencies = [
  "dialoguer",
  "docbrain-api",
  "docbrain-graph",
+ "docbrain-ingest",
  "docbrain-mcp",
  "indicatif",
  "tokio",

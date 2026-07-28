@@ -11,10 +11,13 @@
 //! zero-network-egress invariant — its entire job is fetching from the
 //! network. `ureq` is a genuine, intentional runtime dependency here.
 
+mod classify;
+pub use classify::classify_dependency;
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Ecosystem {
     Npm,
     PyPi,
