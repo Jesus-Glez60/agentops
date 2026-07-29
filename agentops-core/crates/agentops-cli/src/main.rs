@@ -103,6 +103,21 @@ enum Command {
         #[arg(long)]
         no_interactive: bool,
     },
+    /// Generate a new API key for agentops-api/docbrain-api's optional
+    /// AGENTOPS_API_KEY_HASH/DOCBRAIN_API_KEY_HASH auth. Prints the raw key
+    /// once (hand it to the caller who'll use it) and the hash (what you
+    /// actually configure on the server) — closes the "no CLI tooling for
+    /// this yet" gap noted in SECURITY.md.
+    ApiKey {
+        #[command(subcommand)]
+        action: ApiKeyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApiKeyAction {
+    /// Generate a fresh API key and its hash.
+    Generate,
 }
 
 #[derive(Clone, Copy, ValueEnum, Debug)]
@@ -147,6 +162,7 @@ async fn main() -> Result<()> {
         Command::ServeApi { access_mode, addr } => agentops_api::run(&addr, access_mode.into()).await,
         Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(default_docbrain_db_path)),
         Command::DocbrainServeApi { addr, db } => docbrain_api::run(&addr, &db.unwrap_or_else(default_docbrain_db_path)).await,
+        Command::ApiKey { action: ApiKeyAction::Generate } => api_key_generate(),
         Command::SyncDocs { path, org, db, no_interactive } => {
             sync_docs(&path, org.as_deref(), &db.unwrap_or_else(default_docbrain_db_path), no_interactive)
         }
@@ -441,6 +457,16 @@ fn status(path: &Path) -> Result<()> {
     println!("  symbols:   {}", store.nodes_by_kind(NodeKind::Symbol)?.len());
     println!("  gotchas:   {}", store.nodes_by_kind(NodeKind::Gotcha)?.len());
     println!("  decisions: {}", store.nodes_by_kind(NodeKind::Decision)?.len());
+    Ok(())
+}
+
+fn api_key_generate() -> Result<()> {
+    let (raw, hash) = agentops_security::api_key::generate_api_key()?;
+    println!("Raw key (give this to whoever authenticates with it — shown once, not stored anywhere):");
+    println!("  {raw}");
+    println!();
+    println!("Hash (configure this on the server — AGENTOPS_API_KEY_HASH or DOCBRAIN_API_KEY_HASH):");
+    println!("  {hash}");
     Ok(())
 }
 

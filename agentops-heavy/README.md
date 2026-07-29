@@ -12,9 +12,10 @@ Per the plan's phased rollout, this is the differentiated, revenue-line part
 of the product: persistent, scalable graph storage (Postgres, eventually
 Qdrant for embeddings) behind the same `GraphStore` trait the light tier
 (`agentops-graph`'s `SqliteGraphStore`) already implements, plus the Docker
-packaging to run it, license-key gating, and hosted repo access via SSH
-deploy keys (GitHub App install flow, the plan's recommended primary path,
-is still future work — see `agentops-repo-access`'s crate docs).
+packaging to run it, license-key gating, and hosted repo access — both the
+SSH-deploy-key path and the GitHub App client code now exist (the GitHub
+App itself isn't registered on github.com yet, so that path is
+code-complete but operationally unverified — see `agentops-github-app`).
 
 ## Structure
 
@@ -25,7 +26,9 @@ agentops-heavy/
   crates/
     agentops-graph-pg/           # PostgresGraphStore — same GraphStore trait as the light tier
     agentops-license/            # offline license-key verification, gates heavy-tier activation
-    agentops-repo-access/        # per-repo SSH deploy-key custody, clone/fetch over pinned SSH
+    agentops-repo-access/        # per-repo SSH deploy-key custody + connection store
+    agentops-github-app/         # GitHub App JWT signing + installation-token exchange
+    agentops-heavy-api/          # REST server: repo-connection flow, wraps the crates above
   docker/
     docker-compose.yml           # Postgres + Qdrant, parameterized via .env (never committed)
     postgres-init/                # idempotent schema migrations, run on first container start
@@ -61,26 +64,44 @@ to a real secrets manager if it's still sitting there.
 - `cargo run -p agentops-license --example verify_license -- <key>` — sanity-check
   a key against the embedded production public key.
 
-## Hosted repo access (SSH deploy keys)
+## Hosted repo access
 
-`agentops-repo-access` generates a dedicated Ed25519 keypair per connected
-repo (never shared across repos — a compromised key should only expose one
-repo), encrypts the private key with OpenSSH's own bcrypt-pbkdf+AES-256-CTR
-before it's ever returned from `generate_deploy_keypair`, and only decrypts
-it into a `0600` temp file for the duration of one clone/fetch subprocess
-(`UnlockedKey`, zeroed and deleted on `Drop`, including on panic unwind).
+Two credential paths, one connection store, one REST API — see
+`SECURITY.md` for the full verification detail on each.
 
-- `generate_deploy_keypair(comment, passphrase)` — returns the public key
-  (paste into GitHub's repo → Settings → Deploy Keys) and the encrypted
-  private key (what gets persisted).
-- `UnlockedKey::unlock(encrypted_key, passphrase)` → `clone_repo`/`fetch_repo`
-  — pin the SSH host key against `GITHUB_KNOWN_HOSTS` (fetched live from
-  `https://api.github.com/meta`, not hand-typed) rather than trust-on-first-use,
-  which would accept a MITM's key just as readily as GitHub's real one.
-- `passphrase` is a library parameter, not something this crate sources
-  itself — in production it must come from a real secrets manager (KMS/Vault),
-  per-tenant, not a hardcoded value or a plain database column.
-- **Not yet built**: the GitHub App install flow (recommended as the primary
-  path since it avoids private-key custody on our side entirely), the
-  dashboard's repo-connection UI, and where the per-tenant passphrase/wrapping
-  key actually lives in a deployed instance. Tracked in `SECURITY.md`.
+**SSH deploy keys** (`agentops-repo-access`) — a dedicated Ed25519 keypair
+per connected repo, encrypted with OpenSSH's own bcrypt-pbkdf+AES-256-CTR
+before it's ever returned from `generate_deploy_keypair_for_repo`, decrypted
+only into a `0600` temp file for the duration of one clone/fetch subprocess
+(`UnlockedKey`, zeroed and deleted on `Drop`, including panic unwind). The
+passphrase is derived per-repo by `secrets::SecretsProvider` — the shipped
+`EnvSecretsProvider` is real and correct for one self-hosted deployment;
+a KMS/Vault-backed implementation is still needed before any real paying
+customer's key is generated (this is the one item worth treating as a hard
+blocker, not a nice-to-have — see `SECURITY.md`).
+
+**GitHub App** (`agentops-github-app`) — the plan's recommended *primary*
+path, since GitHub holds the credential and an org admin can revoke access
+from GitHub's own UI instead of us custodying a private key at all.
+`generate_app_jwt`/`get_installation_token` implement the auth flow;
+`install_url(app_slug)` builds the install link. No App is registered on
+github.com yet, so this path is code-complete but hasn't been exercised
+against GitHub's real API.
+
+**Connection store + API** (`agentops-repo-access::store`,
+`agentops-heavy-api`) — SQLite, tenant-scoped at the primary-key level
+(`(tenant, id)`, not an app-level filter). `agentops-heavy-api` exposes
+`POST /repos/connect`, `GET /repos`, `POST /repos/{id}/verify`, and
+`GET /repos/github-app/install-url`, behind the same API-key middleware as
+`agentops-api`/`docbrain-api`. Run it via
+`cargo run -p agentops-heavy-api --bin agentops-heavy-api`
+(env: `AGENTOPS_SECRETS_MASTER_KEY` required, `AGENTOPS_HEAVY_API_ADDR`/
+`AGENTOPS_HEAVY_API_DB`/`AGENTOPS_HEAVY_API_KEY_HASH`/
+`AGENTOPS_GITHUB_APP_SLUG` optional). The dashboard page at
+`apps/web/src/app/repos/connect` drives it — both the SSH flow and the
+GitHub App install link.
+
+**Still open**: the dashboard has no callback handling for a completed
+GitHub App install (recording which installation ID belongs to which
+tenant), and neither path is wired to an actual repo sync/ingestion
+pipeline yet — this is credential custody, not clone-and-index.

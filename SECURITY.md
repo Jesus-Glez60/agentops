@@ -121,34 +121,66 @@ A public disclosure policy will be published alongside the first open-source rel
   session), but it should still be tightened to the dashboard's actual origin
   before this server is ever bound beyond `127.0.0.1`, as defense in depth.
 
-## Not yet implemented (tracked against the plan)
-
-- Per-tenant/org isolation for `GraphStore` and docbrain-store queries (Phase 2/3).
-- Key *distribution/rotation* tooling for the API-key auth that did ship (see
-  above) — today `agentops-security::api_key::generate_api_key` is a library
-  call an operator runs manually; there's no CLI command, storage, or rotation
-  workflow yet. Fine for a single hosted deployment managing its own env vars,
-  not sufficient for multi-tenant self-serve key issuance (Phase 3).
-- **`agentops-heavy/crates/agentops-repo-access` (implemented, SSH-deploy-key
-  path only)** — per-repo Ed25519 keypairs, generated and encrypted (OpenSSH's
-  own bcrypt-pbkdf+AES-256-CTR) before ever leaving `generate_deploy_keypair`;
-  decrypted only into a `0600` temp file for the lifetime of one clone/fetch
-  subprocess, zeroed and deleted on `Drop` (including panic unwind). SSH host
-  key pinned against `GITHUB_KNOWN_HOSTS`, fetched live from
-  `https://api.github.com/meta` rather than hand-typed, and verified live
-  against the real `github.com` SSH endpoint (host-key verification passed
-  end to end) — not trust-on-first-use, which would accept a MITM's key
-  just as readily as GitHub's real one. Round-tripped through the system's
-  real `ssh-keygen` as an independent oracle to confirm the OpenSSH encoding
-  is genuinely correct, not just self-consistent with our own decoder.
-  **Still open**: the GitHub App install flow (the plan's *recommended
-  primary* path — avoids private-key custody on our side entirely; SSH
-  deploy keys are the documented fallback/self-hosted path), the dashboard's
-  repo-connection UI, and — the important operational gap — where the
-  per-tenant passphrase/wrapping key actually lives in a deployed instance.
-  `agentops-repo-access` takes the passphrase as a plain parameter and is
-  deliberately agnostic about its source; today nothing sources it from a
-  real secrets manager (KMS/Vault), which is a prerequisite before any real
-  customer's deploy key is ever generated for real, not just a nice-to-have.
+- **API-key CLI tooling (implemented)** — `agentops api-key generate` (in
+  `agentops-cli`) wraps `agentops_security::api_key::generate_api_key`,
+  printing the raw key once and the hash to configure. Closes the "manual
+  library call only" gap noted in an earlier revision of this doc. Still not
+  sufficient for multi-tenant self-serve key issuance/rotation at scale —
+  that's a hosted-dashboard feature, not a CLI one, and isn't built.
+- **`agentops-heavy/crates/agentops-repo-access` (implemented, both repo-access
+  paths now have code)**:
+  - *SSH deploy keys* — per-repo Ed25519 keypairs, encrypted (OpenSSH's own
+    bcrypt-pbkdf+AES-256-CTR) before ever leaving `generate_deploy_keypair`;
+    decrypted only into a `0600` temp file for the lifetime of one clone/fetch
+    subprocess, zeroed and deleted on `Drop` (including panic unwind). SSH
+    host key pinned against `GITHUB_KNOWN_HOSTS`, fetched live from
+    `https://api.github.com/meta` rather than hand-typed, and verified live
+    against the real `github.com` SSH endpoint (host-key verification passed
+    end to end) — not trust-on-first-use. Round-tripped through the system's
+    real `ssh-keygen` as an independent oracle to confirm the OpenSSH
+    encoding is genuinely correct.
+  - *Passphrase sourcing* — no longer a bare caller-supplied parameter.
+    `secrets::SecretsProvider` is now the policy boundary; every passphrase
+    is derived via `HMAC-SHA256(master_key, tenant || repo_id)`, scoped so a
+    derivation for one repo doesn't help with any other repo. The shipped
+    `EnvSecretsProvider` is real and tested — genuinely correct for a single
+    self-hosted deployment — but the master key sits in that deployment's
+    process env, so it is **not sufficient for a multi-tenant hosted
+    product**: a KMS/Vault-backed `SecretsProvider` implementation, where the
+    master key never leaves a hardware/cloud boundary, is still the real
+    prerequisite before any actual paying customer's deploy key is generated.
+    That implementation isn't written.
+  - *GitHub App (`agentops-github-app`, implemented)* — the plan's
+    *recommended primary* path (avoids private-key custody on our side
+    entirely; SSH deploy keys are the documented fallback/self-hosted path).
+    RS256 App-JWT signing and installation-token exchange are implemented.
+    JWT signing verified two independent ways against a real generated RSA
+    keypair (`jsonwebtoken`'s own decode, and a from-scratch signature check
+    via the `rsa` crate's PKCS1v15 verifier). The installation-token HTTP
+    exchange is verified against a real HTTP transaction (`wiremock`)
+    matching GitHub's documented shape — **not against GitHub's live API**,
+    since no App has actually been registered on github.com yet. That
+    registration is a manual, external step only a human can do; until it
+    happens, this path is code-complete but operationally unverified.
+  - *Connection storage + API (`store.rs`, `agentops-heavy-api`, implemented)*
+    — SQLite store scoped by `(tenant, id)` at the schema's primary-key level
+    (composite key, not an app-level filter someone could forget), same
+    pattern as `docbrain-graph`'s `TenantContext`. `agentops-heavy-api`
+    wires it to a REST surface (`POST /repos/connect`, `GET /repos`,
+    `POST /repos/{id}/verify`, `GET /repos/github-app/install-url`) behind
+    the same API-key middleware as `agentops-api`/`docbrain-api`. Response
+    DTOs are hand-built, never a direct serialize of the store row, so the
+    encrypted private key can't leak into a response even by future
+    accident — verified by an explicit test asserting no response body ever
+    contains key material, plus a live end-to-end curl run (connect → list
+    → verify against a real refused connection, correctly recorded as
+    `failed` with the actual git/ssh error text) and a real dashboard page
+    (`apps/web/src/app/repos/connect`) exercised against a running instance.
+  - **Still open**: the dashboard has no GitHub-App-installation *callback*
+    handling (recording which installation ID belongs to which tenant once
+    someone completes the install flow) — today the dashboard can only send
+    someone to the install URL, not react to their coming back. Real repo
+    sync/ingestion using either credential type (this is credential
+    *custody*, not a clone-and-index pipeline) is separate, unbuilt work.
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.
