@@ -129,7 +129,26 @@ A public disclosure policy will be published alongside the first open-source rel
   call an operator runs manually; there's no CLI command, storage, or rotation
   workflow yet. Fine for a single hosted deployment managing its own env vars,
   not sufficient for multi-tenant self-serve key issuance (Phase 3).
-- GitHub repo-access credential custody (per-repo SSH keypairs encrypted at rest,
-  GitHub App as the preferred path) — Phase 3.
+- **`agentops-heavy/crates/agentops-repo-access` (implemented, SSH-deploy-key
+  path only)** — per-repo Ed25519 keypairs, generated and encrypted (OpenSSH's
+  own bcrypt-pbkdf+AES-256-CTR) before ever leaving `generate_deploy_keypair`;
+  decrypted only into a `0600` temp file for the lifetime of one clone/fetch
+  subprocess, zeroed and deleted on `Drop` (including panic unwind). SSH host
+  key pinned against `GITHUB_KNOWN_HOSTS`, fetched live from
+  `https://api.github.com/meta` rather than hand-typed, and verified live
+  against the real `github.com` SSH endpoint (host-key verification passed
+  end to end) — not trust-on-first-use, which would accept a MITM's key
+  just as readily as GitHub's real one. Round-tripped through the system's
+  real `ssh-keygen` as an independent oracle to confirm the OpenSSH encoding
+  is genuinely correct, not just self-consistent with our own decoder.
+  **Still open**: the GitHub App install flow (the plan's *recommended
+  primary* path — avoids private-key custody on our side entirely; SSH
+  deploy keys are the documented fallback/self-hosted path), the dashboard's
+  repo-connection UI, and — the important operational gap — where the
+  per-tenant passphrase/wrapping key actually lives in a deployed instance.
+  `agentops-repo-access` takes the passphrase as a plain parameter and is
+  deliberately agnostic about its source; today nothing sources it from a
+  real secrets manager (KMS/Vault), which is a prerequisite before any real
+  customer's deploy key is ever generated for real, not just a nice-to-have.
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.

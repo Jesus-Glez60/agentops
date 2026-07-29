@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/agentops-graph-pg",
     "crates/agentops-license",
+    "crates/agentops-repo-access",
 ]
 
 [workspace.package]
@@ -23,6 +24,8 @@ deadpool-postgres = "0.14"
 ed25519-dalek = { version = "3.0", features = ["rand_core"] }
 base64 = "0.22"
 rand = "0.10"
+ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "rand_core", "getrandom"] }
+zeroize = "1"
 
 # The light-tier GraphStore trait these crates implement against — a
 # cross-workspace path dependency (Cargo supports this fine; it does NOT
