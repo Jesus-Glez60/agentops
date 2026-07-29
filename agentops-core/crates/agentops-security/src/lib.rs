@@ -10,6 +10,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+pub mod api_key;
+
 /// One redaction rule: a name (used in the `[REDACTED:<rule>]` marker) and pattern.
 struct Rule {
     name: &'static str,

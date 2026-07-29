@@ -94,24 +94,41 @@ A public disclosure policy will be published alongside the first open-source rel
   transports), so the same `AccessMode` guarantee holds over HTTP: `GET /tools` in
   Advisor mode omits the write tools, and `POST /tools/scan_repo` in Advisor mode
   returns `403 Forbidden` before any repo-scanning code runs — verified against a
-  live server with `curl`, not just in-process tests. The server has no
-  authentication of its own yet (see "Not yet implemented" — this binds to
-  `127.0.0.1` by default and is not intended to be exposed beyond localhost as-is).
+  live server with `curl`, not just in-process tests.
+- **API-key authentication (`agentops-security::api_key`, implemented)** — opt-in,
+  applied identically to `agentops-api` and `docbrain-api` via an axum
+  `middleware::from_fn_with_state` layer. Keys are 32 random bytes from the OS
+  CSRNG (`getrandom`), shown to the operator once at generation time; only a
+  SHA-256 hash is ever configured on the server (`AGENTOPS_API_KEY_HASH` /
+  `DOCBRAIN_API_KEY_HASH`), so a compromised server config doesn't hand over a
+  usable key. Verification compares hashes via `subtle::ConstantTimeEq`, not
+  `==`, so response timing can't be used to guess a key byte-by-byte. `/health`
+  is exempt (so uptime checks/load balancers work without a key); every other
+  route returns `401 Unauthorized` on a missing or wrong `Authorization: Bearer
+  <key>` header once a hash is configured. Auth is opt-in rather than
+  mandatory-by-default: if no hash is configured, the server runs
+  unauthenticated exactly as before, which remains fine for the CLI's
+  localhost-only `serve-api`/`docbrain-serve-api` workflows (Phase 1) but MUST
+  be turned on before either server is ever bound beyond `127.0.0.1` (Phase 3
+  hosted heavy tier).
 - **`docbrain-api`'s CORS policy is deliberately permissive** (`CorsLayer::permissive()`,
   any origin) so the local dashboard (`apps/web`, a separate origin during
-  development) can call it directly from the browser. This is coherent with
-  "no auth yet, localhost-only" above — permissive CORS on an unauthenticated,
-  localhost-bound server doesn't add new exposure beyond what already existed,
-  but it must be tightened (scoped to the dashboard's actual origin) before this
-  server is ever bound beyond `127.0.0.1` or gains real authentication, since
-  permissive CORS on an *authenticated* endpoint would let any web page make
-  credentialed requests on a logged-in user's behalf.
+  development) can call it directly from the browser. This is now a real gap
+  worth naming precisely rather than the "no auth yet" framing used before
+  API-key auth shipped: permissive CORS plus `Authorization`-header auth is
+  still safe (browsers don't attach an `Authorization` header cross-origin
+  automatically the way they do cookies, so another site can't ride a logged-in
+  session), but it should still be tightened to the dashboard's actual origin
+  before this server is ever bound beyond `127.0.0.1`, as defense in depth.
 
 ## Not yet implemented (tracked against the plan)
 
 - Per-tenant/org isolation for `GraphStore` and docbrain-store queries (Phase 2/3).
-- Real authn/authz on `agentops-api` (API key or mTLS) — currently unauthenticated;
-  fine for localhost-only Phase 1 use, not for the hosted heavy tier (Phase 3).
+- Key *distribution/rotation* tooling for the API-key auth that did ship (see
+  above) — today `agentops-security::api_key::generate_api_key` is a library
+  call an operator runs manually; there's no CLI command, storage, or rotation
+  workflow yet. Fine for a single hosted deployment managing its own env vars,
+  not sufficient for multi-tenant self-serve key issuance (Phase 3).
 - GitHub repo-access credential custody (per-repo SSH keypairs encrypted at rest,
   GitHub App as the preferred path) — Phase 3.
 - Independent security review of the redaction gate and zero-egress invariant, before

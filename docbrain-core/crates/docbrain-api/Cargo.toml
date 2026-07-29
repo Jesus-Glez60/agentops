@@ -16,6 +16,7 @@ serde_json.workspace = true
 docbrain-graph = { path = "../docbrain-graph" }
 docbrain-mcp = { path = "../docbrain-mcp" }
 tower-http = { version = "0.7.0", features = ["cors"] }
+agentops-security = { path = "../../../agentops-core/crates/agentops-security" }
 
 [dev-dependencies]
 tempfile = "3"

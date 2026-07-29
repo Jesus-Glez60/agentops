@@ -11,3 +11,6 @@ name = "agentops_security"
 anyhow.workspace = true
 serde.workspace = true
 regex.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+subtle.workspace = true
