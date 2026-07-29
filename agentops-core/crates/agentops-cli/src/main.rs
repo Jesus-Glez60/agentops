@@ -209,31 +209,50 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, 
     let db_path = graph_db_path(path);
     let store = SqliteGraphStore::open(&db_path).context("opening graph store")?;
 
+    // upsert_node (not add_node) keyed on (repo, kind, path, name): rescanning
+    // an unchanged file/symbol reuses its existing node id rather than
+    // inserting a duplicate copy every time `install` runs — a naive
+    // add_node here would both bloat the store and, once anything embeds
+    // node content for semantic search, bloat and skew retrieval with
+    // near-duplicate points. Preserving ids across a rescan also means any
+    // gotcha/decision edge pointing at a symbol survives the rescan instead
+    // of dangling.
+    let mut kept_file_ids = Vec::with_capacity(report.files.len());
+    let mut kept_symbol_ids = Vec::new();
     let mut symbol_count = 0;
     for file in &report.files {
         let path_str = file.path.to_string_lossy().to_string();
-        store.add_node(NewNode {
-            kind: NodeKind::File,
-            repo: repo_name.clone(),
-            path: Some(path_str.clone()),
-            name: None,
-            start_line: None,
-            end_line: None,
-            content: None,
-        })?;
+        let file_id = agentops_graph::upsert_node(
+            &store,
+            NewNode { kind: NodeKind::File, repo: repo_name.clone(), path: Some(path_str.clone()), name: None, start_line: None, end_line: None, content: None },
+        )?;
+        kept_file_ids.push(file_id);
 
         for symbol in &file.symbols {
-            store.add_node(NewNode {
-                kind: NodeKind::Symbol,
-                repo: repo_name.clone(),
-                path: Some(path_str.clone()),
-                name: Some(symbol.name.clone()),
-                start_line: Some(symbol.start_line as i64),
-                end_line: Some(symbol.end_line as i64),
-                content: Some(symbol.source.clone()),
-            })?;
+            let symbol_id = agentops_graph::upsert_node(
+                &store,
+                NewNode {
+                    kind: NodeKind::Symbol,
+                    repo: repo_name.clone(),
+                    path: Some(path_str.clone()),
+                    name: Some(symbol.name.clone()),
+                    start_line: Some(symbol.start_line as i64),
+                    end_line: Some(symbol.end_line as i64),
+                    content: Some(symbol.source.clone()),
+                },
+            )?;
+            kept_symbol_ids.push(symbol_id);
             symbol_count += 1;
         }
+    }
+
+    // Anything left over from a prior scan that this scan didn't touch is
+    // stale — a deleted file, a renamed/removed symbol — so it's pruned
+    // rather than left to accumulate forever.
+    let pruned_files = agentops_graph::prune_stale_nodes(&store, &repo_name, NodeKind::File, &kept_file_ids)?;
+    let pruned_symbols = agentops_graph::prune_stale_nodes(&store, &repo_name, NodeKind::Symbol, &kept_symbol_ids)?;
+    if pruned_files > 0 || pruned_symbols > 0 {
+        println!("Pruned {pruned_files} stale file node(s) and {pruned_symbols} stale symbol node(s) from prior scans.");
     }
 
     let opts = agentops_agents_md::GenerateOptions {

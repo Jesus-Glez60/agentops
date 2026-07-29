@@ -116,6 +116,62 @@ pub trait GraphStore {
     fn edges_to(&self, dst_id: i64) -> Result<Vec<Edge>>;
     fn all_nodes(&self) -> Result<Vec<Node>>;
     fn all_edges(&self) -> Result<Vec<Edge>>;
+
+    /// Finds a node by its natural key — `(repo, kind, path, name)` — rather
+    /// than its id. The primitive `upsert_node`/rescanning is built on: a
+    /// rescan needs to recognize "this is the same file/symbol as last
+    /// time," not just insert blindly.
+    fn find_node(&self, repo: &str, kind: NodeKind, path: Option<&str>, name: Option<&str>) -> Result<Option<Node>>;
+
+    /// Updates an existing node's line range and content in place —
+    /// deliberately id-preserving, so any edge pointing at this node (e.g. a
+    /// gotcha's `Affects` edge) stays valid across a rescan instead of
+    /// dangling.
+    fn update_node(&self, id: i64, start_line: Option<i64>, end_line: Option<i64>, content: Option<String>) -> Result<()>;
+
+    /// Deletes the given nodes and any edges touching them (as either
+    /// endpoint) — used to prune nodes from a prior scan that no longer
+    /// exist in the current one (a removed file, a renamed/deleted symbol).
+    fn delete_nodes(&self, ids: &[i64]) -> Result<()>;
+}
+
+/// Inserts `node`, or — if a node with the same `(repo, kind, path, name)`
+/// already exists — updates that node's content/line-range in place and
+/// returns its existing id. This is what rescanning a repo should call
+/// instead of `add_node` directly: a naive `add_node` on every scan
+/// duplicates every file/symbol node once per rescan (each rescan adds a
+/// fresh copy without removing the stale one), which both bloats the store
+/// and — for anything embedding node content for semantic search — bloats
+/// and skews retrieval with near-duplicate near-identical points. Built on
+/// the trait's primitives so every `GraphStore` implementation gets this
+/// behavior for free, rather than each one re-implementing upsert logic.
+pub fn upsert_node(store: &dyn GraphStore, node: NewNode) -> Result<i64> {
+    match store.find_node(&node.repo, node.kind, node.path.as_deref(), node.name.as_deref())? {
+        Some(existing) => {
+            store.update_node(existing.id, node.start_line, node.end_line, node.content)?;
+            Ok(existing.id)
+        }
+        None => store.add_node(node),
+    }
+}
+
+/// Deletes every node of `kind` in `repo` whose id is not in `keep_ids` —
+/// call this after upserting a scan's files/symbols with the full set of
+/// ids that scan touched, to prune whatever's left over from a prior scan
+/// (a file that was deleted, a symbol that was renamed or removed).
+/// Returns how many nodes were pruned.
+pub fn prune_stale_nodes(store: &dyn GraphStore, repo: &str, kind: NodeKind, keep_ids: &[i64]) -> Result<usize> {
+    let stale: Vec<i64> = store
+        .nodes_by_kind(kind)?
+        .into_iter()
+        .filter(|n| n.repo == repo && !keep_ids.contains(&n.id))
+        .map(|n| n.id)
+        .collect();
+    let count = stale.len();
+    if !stale.is_empty() {
+        store.delete_nodes(&stale)?;
+    }
+    Ok(count)
 }
 
 /// Embedded, single-file graph store backed by SQLite — the light-tier `GraphStore`.
@@ -262,6 +318,39 @@ impl GraphStore for SqliteGraphStore {
         let rows = stmt.query_map([], Self::row_to_edge)?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
+
+    fn find_node(&self, repo: &str, kind: NodeKind, path: Option<&str>, name: Option<&str>) -> Result<Option<Node>> {
+        // `IS` (not `=`) so a NULL path/name matches NULL rather than never
+        // matching at all, per SQL's usual NULL-comparison semantics.
+        let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE repo = ?1 AND kind = ?2 AND path IS ?3 AND name IS ?4")?;
+        let mut rows = stmt.query_map(rusqlite::params![repo, kind.as_str(), path, name], Self::row_to_node)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    fn update_node(&self, id: i64, start_line: Option<i64>, end_line: Option<i64>, content: Option<String>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE nodes SET start_line = ?1, end_line = ?2, content = ?3 WHERE id = ?4",
+            rusqlite::params![start_line, end_line, content, id],
+        )?;
+        Ok(())
+    }
+
+    fn delete_nodes(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        // Two separate IN-clauses (src_id, dst_id) each need their own copy
+        // of the bound params — reusing `params` once wouldn't cover both.
+        let doubled_params: Vec<&dyn rusqlite::ToSql> = params.iter().copied().chain(params.iter().copied()).collect();
+        self.conn.execute(
+            &format!("DELETE FROM edges WHERE src_id IN ({placeholders}) OR dst_id IN ({placeholders})"),
+            doubled_params.as_slice(),
+        )?;
+        self.conn.execute(&format!("DELETE FROM nodes WHERE id IN ({placeholders})"), params.as_slice())?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -351,5 +440,77 @@ mod tests {
         let store = SqliteGraphStore::open(&db_path).unwrap();
         let files = store.nodes_by_kind(NodeKind::File).unwrap();
         assert_eq!(files.len(), 1);
+    }
+
+    fn symbol_node(repo: &str, path: &str, name: &str, content: &str) -> NewNode {
+        NewNode { kind: NodeKind::Symbol, repo: repo.into(), path: Some(path.into()), name: Some(name.into()), start_line: Some(1), end_line: Some(2), content: Some(content.into()) }
+    }
+
+    #[test]
+    fn upserting_the_same_symbol_twice_updates_in_place_instead_of_duplicating() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id1 = upsert_node(&store, symbol_node("demo", "src/lib.rs", "do_thing", "fn do_thing() { 1 }")).unwrap();
+        let id2 = upsert_node(&store, symbol_node("demo", "src/lib.rs", "do_thing", "fn do_thing() { 2 }")).unwrap();
+
+        assert_eq!(id1, id2, "rescanning the same symbol must reuse its id, not create a new one");
+        let symbols = store.nodes_by_kind(NodeKind::Symbol).unwrap();
+        assert_eq!(symbols.len(), 1, "must not duplicate the node on a second upsert");
+        assert!(symbols[0].content.as_deref().unwrap().contains('2'), "content must be updated to the latest scan");
+    }
+
+    #[test]
+    fn upsert_preserves_id_so_existing_gotcha_edges_survive_a_rescan() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let symbol_id = upsert_node(&store, symbol_node("demo", "src/auth.rs", "verify_token", "fn verify_token() {}")).unwrap();
+        let gotcha_id = store
+            .add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some("g".into()), start_line: None, end_line: None, content: Some("gotcha text".into()) })
+            .unwrap();
+        store.add_edge(gotcha_id, symbol_id, EdgeRelation::Affects).unwrap();
+
+        // Simulate a rescan of the same, unchanged symbol.
+        let rescanned_id = upsert_node(&store, symbol_node("demo", "src/auth.rs", "verify_token", "fn verify_token() {}")).unwrap();
+        assert_eq!(rescanned_id, symbol_id);
+
+        let incoming = store.edges_to(symbol_id).unwrap();
+        assert_eq!(incoming.len(), 1, "the gotcha's edge must still resolve after a rescan");
+        assert_eq!(incoming[0].src_id, gotcha_id);
+    }
+
+    #[test]
+    fn prune_stale_nodes_removes_symbols_missing_from_the_latest_scan() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let kept_id = upsert_node(&store, symbol_node("demo", "src/lib.rs", "kept_fn", "..")).unwrap();
+        let removed_id = upsert_node(&store, symbol_node("demo", "src/lib.rs", "removed_fn", "..")).unwrap();
+
+        // This scan only found `kept_fn` — `removed_fn` must have been deleted from the source.
+        let pruned = prune_stale_nodes(&store, "demo", NodeKind::Symbol, &[kept_id]).unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(store.get_node(kept_id).unwrap().is_some());
+        assert!(store.get_node(removed_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn prune_stale_nodes_also_removes_edges_touching_the_pruned_node() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let symbol_id = upsert_node(&store, symbol_node("demo", "src/lib.rs", "removed_fn", "..")).unwrap();
+        let gotcha_id = store
+            .add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some("g".into()), start_line: None, end_line: None, content: Some("text".into()) })
+            .unwrap();
+        store.add_edge(gotcha_id, symbol_id, EdgeRelation::Affects).unwrap();
+
+        prune_stale_nodes(&store, "demo", NodeKind::Symbol, &[]).unwrap();
+
+        assert!(store.edges_to(symbol_id).unwrap().is_empty(), "dangling edge to a pruned node must be cleaned up too");
+    }
+
+    #[test]
+    fn prune_stale_nodes_never_touches_a_different_repo() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let other_repo_id = upsert_node(&store, symbol_node("other-repo", "src/lib.rs", "fn_a", "..")).unwrap();
+
+        prune_stale_nodes(&store, "demo", NodeKind::Symbol, &[]).unwrap();
+
+        assert!(store.get_node(other_repo_id).unwrap().is_some(), "pruning one repo must never delete another repo's nodes");
     }
 }

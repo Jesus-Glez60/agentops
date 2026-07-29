@@ -160,6 +160,43 @@ impl GraphStore for PostgresGraphStore {
             rows.iter().map(Self::row_to_edge).collect()
         })
     }
+
+    fn find_node(&self, repo: &str, kind: NodeKind, path: Option<&str>, name: Option<&str>) -> Result<Option<Node>> {
+        self.runtime.block_on(async {
+            let client = self.pool.get().await?;
+            // `IS NOT DISTINCT FROM` (not `=`) so a NULL path/name matches
+            // NULL rather than never matching at all.
+            let row = client
+                .query_opt(
+                    "SELECT * FROM nodes WHERE repo = $1 AND kind = $2 AND path IS NOT DISTINCT FROM $3 AND name IS NOT DISTINCT FROM $4",
+                    &[&repo, &kind.as_str(), &path, &name],
+                )
+                .await?;
+            row.map(|r| Self::row_to_node(&r)).transpose()
+        })
+    }
+
+    fn update_node(&self, id: i64, start_line: Option<i64>, end_line: Option<i64>, content: Option<String>) -> Result<()> {
+        self.runtime.block_on(async {
+            let client = self.pool.get().await?;
+            client
+                .execute("UPDATE nodes SET start_line = $1, end_line = $2, content = $3 WHERE id = $4", &[&start_line, &end_line, &content, &id])
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    fn delete_nodes(&self, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.runtime.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("DELETE FROM edges WHERE src_id = ANY($1) OR dst_id = ANY($1)", &[&ids]).await?;
+            client.execute("DELETE FROM nodes WHERE id = ANY($1)", &[&ids]).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -258,5 +295,70 @@ mod tests {
     fn connect_fails_fast_on_a_bad_url_instead_of_deferring_the_error() {
         let result = PostgresGraphStore::connect("postgres://nope:nope@127.0.0.1:1/nonexistent");
         assert!(result.is_err());
+    }
+
+    fn symbol_node(repo: &str, path: &str, name: &str, content: &str) -> NewNode {
+        NewNode { kind: NodeKind::Symbol, repo: repo.into(), path: Some(path.into()), name: Some(name.into()), start_line: Some(1), end_line: Some(2), content: Some(content.into()) }
+    }
+
+    #[test]
+    fn upserting_the_same_symbol_twice_updates_in_place_instead_of_duplicating() {
+        let Some(store) = test_store() else { return };
+        let repo = "test-upsert-no-duplicate";
+        cleanup(&store, repo);
+
+        let id1 = agentops_graph::upsert_node(&store, symbol_node(repo, "src/lib.rs", "do_thing", "v1")).unwrap();
+        let id2 = agentops_graph::upsert_node(&store, symbol_node(repo, "src/lib.rs", "do_thing", "v2")).unwrap();
+
+        assert_eq!(id1, id2, "rescanning the same symbol must reuse its id, not create a new one");
+        let symbols: Vec<_> = store.nodes_by_kind(NodeKind::Symbol).unwrap().into_iter().filter(|n| n.repo == repo).collect();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].content.as_deref(), Some("v2"));
+
+        cleanup(&store, repo);
+    }
+
+    #[test]
+    fn upsert_preserves_id_so_existing_gotcha_edges_survive_a_rescan() {
+        let Some(store) = test_store() else { return };
+        let repo = "test-upsert-preserves-edges";
+        cleanup(&store, repo);
+
+        let symbol_id = agentops_graph::upsert_node(&store, symbol_node(repo, "src/auth.rs", "verify_token", "v1")).unwrap();
+        let gotcha_id = store
+            .add_node(NewNode { kind: NodeKind::Gotcha, repo: repo.into(), path: None, name: Some("g".into()), start_line: None, end_line: None, content: Some("text".into()) })
+            .unwrap();
+        store.add_edge(gotcha_id, symbol_id, EdgeRelation::Affects).unwrap();
+
+        let rescanned_id = agentops_graph::upsert_node(&store, symbol_node(repo, "src/auth.rs", "verify_token", "v1")).unwrap();
+        assert_eq!(rescanned_id, symbol_id);
+
+        let incoming = store.edges_to(symbol_id).unwrap();
+        assert_eq!(incoming.len(), 1, "the gotcha's edge must still resolve after a rescan");
+
+        cleanup(&store, repo);
+    }
+
+    #[test]
+    fn prune_stale_nodes_removes_symbols_missing_from_the_latest_scan_and_their_edges() {
+        let Some(store) = test_store() else { return };
+        let repo = "test-prune-stale";
+        cleanup(&store, repo);
+
+        let kept_id = agentops_graph::upsert_node(&store, symbol_node(repo, "src/lib.rs", "kept_fn", "..")).unwrap();
+        let removed_id = agentops_graph::upsert_node(&store, symbol_node(repo, "src/lib.rs", "removed_fn", "..")).unwrap();
+        let gotcha_id = store
+            .add_node(NewNode { kind: NodeKind::Gotcha, repo: repo.into(), path: None, name: Some("g".into()), start_line: None, end_line: None, content: Some("text".into()) })
+            .unwrap();
+        store.add_edge(gotcha_id, removed_id, EdgeRelation::Affects).unwrap();
+
+        let pruned = agentops_graph::prune_stale_nodes(&store, repo, NodeKind::Symbol, &[kept_id]).unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(store.get_node(kept_id).unwrap().is_some());
+        assert!(store.get_node(removed_id).unwrap().is_none());
+        assert!(store.edges_to(removed_id).unwrap().is_empty());
+
+        cleanup(&store, repo);
     }
 }
