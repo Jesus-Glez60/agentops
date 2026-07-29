@@ -2,8 +2,9 @@
 //! by edges (depends_on, documents, affects).
 //!
 //! `SqliteGraphStore` is the light-tier implementation (single file, no server).
-//! A `Neo4jGraphStore` implementing the same `GraphStore` trait is heavy-tier,
-//! future work (see the plan's §"The neuron model").
+//! `agentops-graph-pg` (in `agentops-heavy/`, commercially licensed) implements
+//! the same `GraphStore` trait against Postgres for the heavy tier — see the
+//! plan's §"The neuron model".
 
 use std::path::Path;
 
@@ -20,7 +21,10 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    fn as_str(&self) -> &'static str {
+    /// The string this `NodeKind` is stored as — `pub` so other `GraphStore`
+    /// implementations (e.g. `agentops-graph-pg`) can reuse the exact same
+    /// mapping instead of re-deriving it.
+    pub fn as_str(&self) -> &'static str {
         match self {
             NodeKind::Symbol => "symbol",
             NodeKind::File => "file",
@@ -29,7 +33,7 @@ impl NodeKind {
         }
     }
 
-    fn from_str(s: &str) -> Result<Self> {
+    pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "symbol" => Ok(NodeKind::Symbol),
             "file" => Ok(NodeKind::File),
@@ -48,7 +52,7 @@ pub enum EdgeRelation {
 }
 
 impl EdgeRelation {
-    fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &'static str {
         match self {
             EdgeRelation::DependsOn => "depends_on",
             EdgeRelation::Documents => "documents",
@@ -56,7 +60,7 @@ impl EdgeRelation {
         }
     }
 
-    fn from_str(s: &str) -> Result<Self> {
+    pub fn from_str(s: &str) -> Result<Self> {
         match s {
             "depends_on" => Ok(EdgeRelation::DependsOn),
             "documents" => Ok(EdgeRelation::Documents),
@@ -102,7 +106,7 @@ pub struct Edge {
 }
 
 /// Storage backend for the neuron graph. `SqliteGraphStore` is the light-tier
-/// implementation; a Neo4j-backed implementation is heavy-tier future work.
+/// implementation; `agentops-graph-pg` (Postgres-backed) is the heavy tier.
 pub trait GraphStore {
     fn add_node(&self, node: NewNode) -> Result<i64>;
     fn add_edge(&self, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64>;
