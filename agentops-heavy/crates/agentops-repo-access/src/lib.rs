@@ -26,6 +26,10 @@ use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use zeroize::Zeroize;
 
+pub mod secrets;
+pub mod store;
+use secrets::SecretsProvider;
+
 /// A freshly generated per-repo deploy keypair.
 pub struct DeployKeypair {
     /// Safe to display/copy — paste this into GitHub's Deploy Keys UI for
@@ -58,6 +62,21 @@ pub fn generate_deploy_keypair(comment: &str, passphrase: &[u8]) -> Result<Deplo
         encrypted.to_openssh(LineEnding::LF).context("encoding encrypted private key")?.to_string();
 
     Ok(DeployKeypair { public_key_openssh, encrypted_private_key_openssh })
+}
+
+/// The entry point callers should actually use: derives the passphrase from
+/// `secrets` (scoped to `tenant`/`repo_id`) instead of asking the caller to
+/// come up with one, so a caller can't accidentally reuse a passphrase
+/// across repos or hardcode one. `generate_deploy_keypair` stays available
+/// below it for callers (and tests) that already have a passphrase from
+/// elsewhere, but this is the path connection-management code should call.
+pub fn generate_deploy_keypair_for_repo(
+    secrets: &dyn SecretsProvider,
+    tenant: &str,
+    repo_id: &str,
+) -> Result<DeployKeypair> {
+    let passphrase = secrets.repo_passphrase(tenant, repo_id)?;
+    generate_deploy_keypair(&format!("agentops:{tenant}/{repo_id}"), &passphrase)
 }
 
 /// An OpenSSH private key decrypted and written to a `0600` temp file for
@@ -95,6 +114,21 @@ impl UnlockedKey {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Re-derives the same passphrase `generate_deploy_keypair_for_repo`
+    /// used (via `secrets`, scoped to the same `tenant`/`repo_id`) and
+    /// unlocks with it — the read-side counterpart to that function, so
+    /// connection-management code never has to plumb a raw passphrase
+    /// through itself.
+    pub fn unlock_for_repo(
+        secrets: &dyn SecretsProvider,
+        tenant: &str,
+        repo_id: &str,
+        encrypted_private_key_openssh: &str,
+    ) -> Result<Self> {
+        let passphrase = secrets.repo_passphrase(tenant, repo_id)?;
+        Self::unlock(encrypted_private_key_openssh, &passphrase)
+    }
 }
 
 impl Drop for UnlockedKey {
@@ -128,7 +162,7 @@ fn write_private_key_file(path: &Path, contents: &[u8]) -> Result<()> {
     std::fs::write(path, contents).context("writing temp key file")
 }
 
-fn random_suffix() -> String {
+pub(crate) fn random_suffix() -> String {
     let mut bytes = [0u8; 16];
     getrandom_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -224,6 +258,22 @@ mod tests {
         let derived_fields: Vec<&str> = derived_public_key.split_whitespace().take(2).collect();
         let ours_fields: Vec<&str> = keypair.public_key_openssh.split_whitespace().take(2).collect();
         assert_eq!(derived_fields, ours_fields);
+    }
+
+    #[test]
+    fn generate_and_unlock_for_repo_round_trips_via_the_secrets_provider() {
+        let provider = secrets::EnvSecretsProvider::from_hex(&"cd".repeat(32)).unwrap();
+        let keypair = generate_deploy_keypair_for_repo(&provider, "acme", "repo-1").unwrap();
+        let unlocked = UnlockedKey::unlock_for_repo(&provider, "acme", "repo-1", &keypair.encrypted_private_key_openssh).unwrap();
+        assert!(unlocked.path().exists());
+    }
+
+    #[test]
+    fn unlock_for_repo_fails_for_the_wrong_repo_id() {
+        let provider = secrets::EnvSecretsProvider::from_hex(&"cd".repeat(32)).unwrap();
+        let keypair = generate_deploy_keypair_for_repo(&provider, "acme", "repo-1").unwrap();
+        let err = UnlockedKey::unlock_for_repo(&provider, "acme", "repo-2", &keypair.encrypted_private_key_openssh).unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("decrypt"));
     }
 
     #[test]

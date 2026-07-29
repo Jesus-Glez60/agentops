@@ -4,6 +4,8 @@ members = [
     "crates/agentops-graph-pg",
     "crates/agentops-license",
     "crates/agentops-repo-access",
+    "crates/agentops-github-app",
+    "crates/agentops-heavy-api",
 ]
 
 [workspace.package]
@@ -26,6 +28,19 @@ base64 = "0.22"
 rand = "0.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "rand_core", "getrandom"] }
 zeroize = "1"
+hmac = "0.13"
+sha2 = "0.11"
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+tower-http = { version = "0.6", features = ["cors"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rsa = "0.9"
+wiremock = "0.6"
+
+# Cross-workspace path dependencies into the open-core light tier.
+agentops-security = { path = "../agentops-core/crates/agentops-security" }
 
 # The light-tier GraphStore trait these crates implement against — a
 # cross-workspace path dependency (Cargo supports this fine; it does NOT

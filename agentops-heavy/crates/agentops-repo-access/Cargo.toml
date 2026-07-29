@@ -11,6 +11,10 @@ name = "agentops_repo_access"
 anyhow.workspace = true
 ssh-key.workspace = true
 zeroize.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
