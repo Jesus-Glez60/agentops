@@ -16,7 +16,7 @@ export default function Home() {
             agentops dashboard
           </h1>
           <p className="mt-2 text-zinc-600 dark:text-zinc-400">
-            Phase 1 skeleton — read-only client over agentops-api.
+            The neuron graph, onboarding docs, and library index — live from agentops-api and docbrain-api.
           </p>
         </div>
         <nav className="flex flex-col gap-4">

@@ -21,6 +21,7 @@ name = "agentops-api"
 version = "0.1.0"
 dependencies = [
  "agentops-graph",
+ "agentops-manifest",
  "agentops-mcp",
  "agentops-security",
  "anyhow",
@@ -85,6 +86,7 @@ dependencies = [
  "anyhow",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

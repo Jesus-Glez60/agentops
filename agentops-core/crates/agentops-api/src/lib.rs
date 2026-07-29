@@ -45,6 +45,7 @@ pub fn build_router(mode: AccessMode, api_key_hash: Option<String>) -> Router {
         .route("/tools/{name}", post(call_tool_handler))
         .route("/graph", get(graph_json))
         .route("/docs", get(docs_content))
+        .route("/repos", get(list_scanned_repos))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .route("/health", get(health))
         .with_state(state)
@@ -92,6 +93,41 @@ async fn health() -> &'static str {
 #[derive(Debug, Deserialize)]
 struct RepoPathQuery {
     path: String,
+}
+
+/// Lists every repo `agentops install` has ever recorded scanning on this
+/// machine (`~/.agentops/manifest.json`, via `agentops-manifest`), with a
+/// live node-count summary for each — this is what the dashboard's repo
+/// overview page reads so it can answer "what's indexed?" without the
+/// caller already needing to know a path.
+async fn list_scanned_repos() -> (StatusCode, Json<Value>) {
+    let repos = match agentops_manifest::list_scanned_repos() {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+
+    let summaries: Vec<Value> = repos
+        .into_iter()
+        .map(|entry| {
+            let db_path = std::path::Path::new(&entry.path).join(".context").join("graph.db");
+            let counts = SqliteGraphStore::open(&db_path).ok().and_then(|store| {
+                let nodes = store.all_nodes().ok()?;
+                Some(json!({
+                    "files": nodes.iter().filter(|n| n.kind == agentops_graph::NodeKind::File).count(),
+                    "symbols": nodes.iter().filter(|n| n.kind == agentops_graph::NodeKind::Symbol).count(),
+                    "gotchas": nodes.iter().filter(|n| n.kind == agentops_graph::NodeKind::Gotcha).count(),
+                    "decisions": nodes.iter().filter(|n| n.kind == agentops_graph::NodeKind::Decision).count(),
+                }))
+            });
+            json!({
+                "path": entry.path,
+                "last_scanned_at": entry.last_scanned_at,
+                "counts": counts,
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(json!({ "repos": summaries })))
 }
 
 /// Structured JSON for the dashboard's graph browser — same rationale as
@@ -232,6 +268,20 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert!(body["content"][0]["text"].as_str().unwrap().contains("symbols: 1"));
+    }
+
+    #[tokio::test]
+    async fn repos_endpoint_lists_a_repo_after_a_scan_records_it_in_the_manifest() {
+        // agentops-manifest reads/writes a fixed ~/.agentops/manifest.json —
+        // not injectable here, so this asserts the repo scanned in the
+        // preceding scan-then-status test (or any prior `agentops install`
+        // on this machine) shows up, rather than asserting an exact count.
+        let app = build_router(AccessMode::Full, None);
+        let req = Request::builder().uri("/repos").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["repos"].is_array(), "{body:?}");
     }
 
     #[tokio::test]

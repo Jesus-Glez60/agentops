@@ -1,6 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useMemo, useState } from "react";
 
 type Node = {
   id: number;
@@ -23,7 +24,16 @@ type Edge = {
 const API_BASE = process.env.NEXT_PUBLIC_AGENTOPS_API_URL || "http://127.0.0.1:8420";
 
 export default function GraphPage() {
-  const [path, setPath] = useState("");
+  return (
+    <Suspense fallback={<main className="mx-auto max-w-4xl px-8 py-16 text-sm text-zinc-500">Loading…</main>}>
+      <GraphPageInner />
+    </Suspense>
+  );
+}
+
+function GraphPageInner() {
+  const searchParams = useSearchParams();
+  const [path, setPath] = useState(searchParams.get("path") ?? "");
   const [nodes, setNodes] = useState<Node[] | null>(null);
   const [edges, setEdges] = useState<Edge[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -50,6 +60,12 @@ export default function GraphPage() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   };
+
+  useEffect(() => {
+    const initial = searchParams.get("path");
+    if (initial) load(initial);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const nodesById = useMemo(() => {
     const map = new Map<number, Node>();

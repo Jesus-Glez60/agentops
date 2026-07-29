@@ -1,11 +1,21 @@
 "use client";
 
-import { useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense, useEffect, useState } from "react";
 
 const API_BASE = process.env.NEXT_PUBLIC_AGENTOPS_API_URL || "http://127.0.0.1:8420";
 
 export default function DocsPage() {
-  const [path, setPath] = useState("");
+  return (
+    <Suspense fallback={<main className="mx-auto max-w-3xl px-8 py-16 text-sm text-zinc-500">Loading…</main>}>
+      <DocsPageInner />
+    </Suspense>
+  );
+}
+
+function DocsPageInner() {
+  const searchParams = useSearchParams();
+  const [path, setPath] = useState(searchParams.get("path") ?? "");
   const [content, setContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -27,6 +37,12 @@ export default function DocsPage() {
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
       .finally(() => setLoading(false));
   };
+
+  useEffect(() => {
+    const initial = searchParams.get("path");
+    if (initial) load(initial);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <main className="mx-auto max-w-3xl px-8 py-16">

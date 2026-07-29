@@ -245,6 +245,10 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, 
 
     ensure_gitignore_entries(path)?;
 
+    if let Err(e) = agentops_manifest::record_scan(path) {
+        println!("WARNING: could not record this scan in ~/.agentops/manifest.json ({e}) — the dashboard's repo overview won't list it, but the scan itself is unaffected.");
+    }
+
     println!(
         "Wrote {} nodes ({} files, {} symbols) to {}",
         report.files.len() + symbol_count,
