@@ -15,6 +15,8 @@ serde.workspace = true
 serde_json.workspace = true
 agentops-mcp = { path = "../agentops-mcp" }
 agentops-security = { path = "../agentops-security" }
+agentops-graph = { path = "../agentops-graph" }
+tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -21,6 +21,9 @@ static GO_BLOCK_IMPORT: LazyLock<Regex> =
 
 static GO_QUOTED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]+)""#).unwrap());
 
+static RUST_USE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([\w:]+)").unwrap());
+static RUST_MOD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;").unwrap());
+
 /// Extracts raw import/dependency targets from `source` as written (not yet
 /// resolved to actual files on disk — resolution against the scanned file set
 /// happens in `ranker::rank_files`, on a best-effort basis).
@@ -55,6 +58,13 @@ pub fn extract_deps(language: Language, source: &str) -> Vec<String> {
             }
             deps
         }
+
+        Language::Rust => {
+            let mut deps: Vec<String> =
+                RUST_USE.captures_iter(source).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect();
+            deps.extend(RUST_MOD.captures_iter(source).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())));
+            deps
+        }
     }
 }
 
@@ -86,5 +96,16 @@ mod tests {
         assert!(deps.contains(&"fmt".to_string()));
         assert!(deps.contains(&"os".to_string()));
         assert!(deps.contains(&"strings".to_string()));
+    }
+
+    #[test]
+    fn extracts_rust_use_and_mod() {
+        let src = "use std::collections::HashMap;\nuse crate::graph::GraphStore;\npub use anyhow::Result;\nmod walker;\npub mod ast_extract;\n";
+        let deps = extract_deps(Language::Rust, src);
+        assert!(deps.contains(&"std::collections::HashMap".to_string()), "found: {deps:?}");
+        assert!(deps.contains(&"crate::graph::GraphStore".to_string()), "found: {deps:?}");
+        assert!(deps.contains(&"anyhow::Result".to_string()), "found: {deps:?}");
+        assert!(deps.contains(&"walker".to_string()), "found: {deps:?}");
+        assert!(deps.contains(&"ast_extract".to_string()), "found: {deps:?}");
     }
 }

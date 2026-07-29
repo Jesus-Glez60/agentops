@@ -16,12 +16,25 @@ fn definition_kinds(lang: Language) -> &'static [&'static str] {
             &["function_declaration", "class_declaration", "method_definition"]
         }
         Language::Go => &["function_declaration", "method_declaration"],
+        // `impl_item` deliberately excluded: its grammar node has no `name`
+        // field (it has `type`/`trait` fields instead), so matching it here
+        // would just produce "<anonymous>" entries. Methods defined inside
+        // an impl block are still found — they're `function_item` nodes,
+        // and `collect_definitions` recurses into every child regardless of
+        // whether the parent node matched.
+        Language::Rust => &["function_item", "struct_item", "enum_item", "trait_item"],
     }
 }
 
 fn kind_label(node_kind: &str) -> &'static str {
     if node_kind.contains("class") {
         "class"
+    } else if node_kind.contains("struct") {
+        "struct"
+    } else if node_kind.contains("enum") {
+        "enum"
+    } else if node_kind.contains("trait") {
+        "trait"
     } else if node_kind.contains("method") {
         "method"
     } else {
@@ -43,7 +56,11 @@ pub fn extract_symbols(language: Language, source: &str) -> (Vec<Symbol>, bool) 
             Language::Python | Language::TypeScript | Language::JavaScript => {
                 (regex_fallback(language, source), false)
             }
-            Language::Go => (Vec::new(), false),
+            // No regex fallback for Go or Rust — same tradeoff already
+            // documented for Go: a failed parse yields zero symbols rather
+            // than a best-effort regex guess, and the chunker treats that as
+            // "no symbols found," falling back to sliding-window chunking.
+            Language::Go | Language::Rust => (Vec::new(), false),
         },
     }
 }
@@ -101,7 +118,7 @@ fn regex_fallback(language: Language, source: &str) -> Vec<Symbol> {
     match language {
         Language::Python => python_regex_fallback(source),
         Language::TypeScript | Language::JavaScript => js_regex_fallback(source),
-        Language::Go => Vec::new(),
+        Language::Go | Language::Rust => Vec::new(),
     }
 }
 
@@ -223,6 +240,23 @@ mod tests {
         assert!(used_ts, "tree-sitter should be available for go");
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"Add"), "found: {names:?}");
+    }
+
+    #[test]
+    fn extracts_rust_function_struct_and_impl_method_via_tree_sitter() {
+        let src = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub struct Widget {\n    name: String,\n}\n\nimpl Widget {\n    pub fn render(&self) -> String {\n        self.name.clone()\n    }\n}\n";
+        let (symbols, used_ts) = extract_symbols(Language::Rust, src);
+        assert!(used_ts, "tree-sitter should be available for rust");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"add"), "found: {names:?}");
+        assert!(names.contains(&"Widget"), "found: {names:?}");
+        // `render` lives inside an `impl` block (not matched directly, since
+        // impl_item has no `name` field) but should still surface, since
+        // collect_definitions recurses into every child regardless.
+        assert!(names.contains(&"render"), "found: {names:?}");
+
+        let widget = symbols.iter().find(|s| s.name == "Widget").unwrap();
+        assert_eq!(widget.kind, "struct");
     }
 
     #[test]

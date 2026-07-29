@@ -8,6 +8,7 @@ pub enum Language {
     TypeScript,
     JavaScript,
     Go,
+    Rust,
 }
 
 impl Language {
@@ -18,6 +19,7 @@ impl Language {
             "ts" | "tsx" => Some(Language::TypeScript),
             "js" | "jsx" | "mjs" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
+            "rs" => Some(Language::Rust),
             _ => None,
         }
     }
@@ -29,6 +31,7 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::JavaScript => "javascript",
             Language::Go => "go",
+            Language::Rust => "rust",
         }
     }
 }

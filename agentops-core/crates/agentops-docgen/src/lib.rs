@@ -69,24 +69,37 @@ pub fn render_onboarding_doc(store: &dyn GraphStore, repo_name: &str, ranked_pat
     if !all_gotchas.is_empty() {
         out.push_str("## Known gotchas\n\n");
         out.push_str("Every recorded workaround/issue, and the exact symbol it affects — an agent working on that symbol should read this first.\n\n");
-        for gotcha in &all_gotchas {
-            let name = gotcha.name.as_deref().unwrap_or("(untitled)");
-            let text = gotcha.content.as_deref().unwrap_or("");
-            out.push_str(&format!("**{name}**\n\n{text}\n\n"));
+        render_notes(&mut out, store, &all_gotchas)?;
+    }
 
-            let edges = store.edges_from(gotcha.id)?;
-            for edge in edges.iter().filter(|e| e.relation == EdgeRelation::Affects) {
-                if let Some(target) = store.get_node(edge.dst_id)? {
-                    let target_name = target.name.as_deref().unwrap_or("<unknown>");
-                    let target_path = target.path.as_deref().unwrap_or("");
-                    out.push_str(&format!("- Affects: `{target_name}` in `{target_path}`\n"));
-                }
-            }
-            out.push('\n');
-        }
+    if !all_decisions.is_empty() {
+        out.push_str("## Decisions\n\n");
+        out.push_str("Every recorded design decision, and the exact symbol it's tied to — the \"why\" behind code that might otherwise look arbitrary.\n\n");
+        render_notes(&mut out, store, &all_decisions)?;
     }
 
     Ok(out)
+}
+
+/// Shared rendering for gotcha and decision nodes — both are just "a note
+/// edge-connected to a symbol," differing only in which section they land in.
+fn render_notes(out: &mut String, store: &dyn GraphStore, notes: &[agentops_graph::Node]) -> anyhow::Result<()> {
+    for note in notes {
+        let name = note.name.as_deref().unwrap_or("(untitled)");
+        let text = note.content.as_deref().unwrap_or("");
+        out.push_str(&format!("**{name}**\n\n{text}\n\n"));
+
+        let edges = store.edges_from(note.id)?;
+        for edge in edges.iter().filter(|e| e.relation == EdgeRelation::Affects) {
+            if let Some(target) = store.get_node(edge.dst_id)? {
+                let target_name = target.name.as_deref().unwrap_or("<unknown>");
+                let target_path = target.path.as_deref().unwrap_or("");
+                out.push_str(&format!("- Affects: `{target_name}` in `{target_path}`\n"));
+            }
+        }
+        out.push('\n');
+    }
+    Ok(())
 }
 
 fn gotchas_affecting(store: &dyn GraphStore, symbol_id: i64) -> anyhow::Result<Vec<agentops_graph::Edge>> {
@@ -163,5 +176,41 @@ mod tests {
         assert!(doc.contains("known gotcha(s) apply"));
         assert!(doc.contains("token-expiry-off-by-one"));
         assert!(doc.contains("Affects: `verify_token` in `src/auth.rs`"));
+    }
+
+    #[test]
+    fn renders_a_decisions_section_alongside_gotchas() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+
+        let symbol_id = store
+            .add_node(NewNode {
+                kind: NodeKind::Symbol,
+                repo: "demo".into(),
+                path: Some("src/keys.rs".into()),
+                name: Some("generate_deploy_keypair_for_repo".into()),
+                start_line: Some(1),
+                end_line: Some(5),
+                content: Some("fn generate_deploy_keypair_for_repo() {}".into()),
+            })
+            .unwrap();
+
+        let decision_id = store
+            .add_node(NewNode {
+                kind: NodeKind::Decision,
+                repo: "demo".into(),
+                path: None,
+                name: Some("passphrase-not-yet-kms-backed".into()),
+                start_line: None,
+                end_line: None,
+                content: Some("EnvSecretsProvider is fine for self-hosted, not for multi-tenant.".into()),
+            })
+            .unwrap();
+        store.add_edge(decision_id, symbol_id, EdgeRelation::Affects).unwrap();
+
+        let doc = render_onboarding_doc(&store, "demo", &[PathBuf::from("src/keys.rs")]).unwrap();
+
+        assert!(doc.contains("## Decisions"));
+        assert!(doc.contains("passphrase-not-yet-kms-backed"));
+        assert!(doc.contains("Affects: `generate_deploy_keypair_for_repo` in `src/keys.rs`"));
     }
 }

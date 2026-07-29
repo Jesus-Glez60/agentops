@@ -26,3 +26,6 @@ apps/web/.env*.local
 *.pem
 *.key
 id_rsa*
+
+# agentops generated scan output
+repo-map.md
