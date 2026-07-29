@@ -29,3 +29,6 @@ id_rsa*
 
 # agentops generated scan output
 repo-map.md
+
+# Downloaded embedding model cache (multi-GB, fastembed's local cache dir)
+.fastembed_cache/

@@ -6,6 +6,7 @@ members = [
     "crates/agentops-repo-access",
     "crates/agentops-github-app",
     "crates/agentops-heavy-api",
+    "crates/agentops-embeddings",
 ]
 
 [workspace.package]
@@ -38,6 +39,8 @@ jsonwebtoken = { version = "11", default-features = false, features = ["use_pem"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rsa = "0.9"
 wiremock = "0.6"
+fastembed = "5"
+qdrant-client = "1.18"
 
 # Cross-workspace path dependencies into the open-core light tier.
 agentops-security = { path = "../agentops-core/crates/agentops-security" }

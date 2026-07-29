@@ -9,10 +9,10 @@ repo root has no visibility into this directory, and vice versa.
 ## What lives here
 
 Per the plan's phased rollout, this is the differentiated, revenue-line part
-of the product: persistent, scalable graph storage (Postgres, eventually
-Qdrant for embeddings) behind the same `GraphStore` trait the light tier
-(`agentops-graph`'s `SqliteGraphStore`) already implements, plus the Docker
-packaging to run it, license-key gating, and hosted repo access — both the
+of the product: persistent, scalable graph storage (Postgres) behind the
+same `GraphStore` trait the light tier (`agentops-graph`'s
+`SqliteGraphStore`) already implements, semantic search over that graph
+(BGE-M3 + Qdrant), license-key gating, and hosted repo access — both the
 SSH-deploy-key path and the GitHub App client code now exist (the GitHub
 App itself isn't registered on github.com yet, so that path is
 code-complete but operationally unverified — see `agentops-github-app`).
@@ -25,6 +25,7 @@ agentops-heavy/
   LICENSE-COMMERCIAL.md
   crates/
     agentops-graph-pg/           # PostgresGraphStore — same GraphStore trait as the light tier
+    agentops-embeddings/         # BGE-M3 + Qdrant semantic search over the graph
     agentops-license/            # offline license-key verification, gates heavy-tier activation
     agentops-repo-access/        # per-repo SSH deploy-key custody + connection store
     agentops-github-app/         # GitHub App JWT signing + installation-token exchange
@@ -33,6 +34,32 @@ agentops-heavy/
     docker-compose.yml           # Postgres + Qdrant, parameterized via .env (never committed)
     postgres-init/                # idempotent schema migrations, run on first container start
 ```
+
+## Semantic search (`agentops-embeddings`)
+
+The structural graph (`agentops-graph`) is precise but exhaustive — `list_gotchas`
+or a symbol lookup returns everything of a kind, and a caller (often an LLM
+agent, paying in context tokens) reads past it to find what's relevant.
+`SemanticIndex` answers "what's actually relevant to this query" directly:
+BGE-M3 dense embeddings (the same model the original codebrain/docbrain
+used), generated locally via ONNX (`fastembed` — no Python runtime, no
+external embedding API, code/docs never leave the process to get embedded),
+indexed into Qdrant.
+
+- `SemanticIndex::connect(qdrant_url, collection)` then `.ensure_collection()`.
+- `.index_graph_store(store, repo)` — embeds every Symbol/Gotcha/Decision
+  node from a `GraphStore` in one pass; re-running after a rescan overwrites
+  stale entries (node ids are reused as Qdrant point ids) instead of
+  duplicating them.
+- `.search(query, top_k, repo)` — real semantic ranking, not keyword
+  matching. Verified live against the real BGE-M3 model and a real Qdrant
+  instance: a query with zero keyword overlap with its target text still
+  ranks the semantically related item first (`cargo test -p agentops-embeddings`
+  with `AGENTOPS_TEST_QDRANT_URL` set — downloads the real ~2GB model on
+  first run, cached after).
+- Run `cargo run --release -p agentops-embeddings --example index_and_query --
+  <graph.db path> <repo name> <query...>` to index a real scanned repo and
+  query it directly from the command line.
 
 ## Running locally
 

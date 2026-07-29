@@ -182,5 +182,25 @@ A public disclosure policy will be published alongside the first open-source rel
     someone to the install URL, not react to their coming back. Real repo
     sync/ingestion using either credential type (this is credential
     *custody*, not a clone-and-index pipeline) is separate, unbuilt work.
+- **`agentops-heavy/crates/agentops-embeddings` (implemented)** — semantic
+  search over the neuron graph, BGE-M3 dense embeddings generated locally
+  via ONNX (`fastembed`) and indexed into Qdrant. Deliberately no Python
+  runtime and no external embedding API — repo content never leaves the
+  process to get embedded, unlike a hosted-embedding-API design would
+  require. This crate is heavy-tier-only and does make real network calls
+  (downloading the ~2GB BGE-M3 model from Hugging Face Hub on first use,
+  then talking to Qdrant) — that's fine under the heavy tier's threat model
+  (it already talks to Postgres/GitHub/etc.) but is explicitly **not**
+  subject to the light-tier scanner's zero-runtime-network-egress
+  invariant; don't assume that invariant extends here. Verified live
+  against a real Qdrant instance and the real downloaded model: a query
+  with zero keyword overlap with its target text still ranks the
+  semantically related item first, both in a synthetic test (SSH-security
+  query vs. an unrelated bread recipe) and against this repo's own real
+  graph (a business-language query — "is it safe to generate a real
+  customer's deploy key today" — correctly surfaced the exact KMS-gap
+  decision node recorded earlier). **Still open**: no MCP tool or REST
+  endpoint exposes this yet — today it's a library + example CLI, not
+  wired into `agentops-mcp`/`agentops-heavy-api`'s tool surface.
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.
