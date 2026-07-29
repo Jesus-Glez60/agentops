@@ -39,3 +39,22 @@ docker compose up -d
 
 Never commit `.env` — it's gitignored at the repo root already
 (`.env` is in the root `.gitignore`'s secrets section).
+
+## License-key gating
+
+`agentops-license` verifies offline, Ed25519-signed license keys — asymmetric,
+not HMAC, so a shipped binary can verify a key without holding any secret
+that would let its holder forge one. Only `PRODUCTION_PUBLIC_KEY` (a public
+key, safe to embed) lives in source; the matching private key is held
+offline, never committed, never shipped — see the note left in the session
+scratchpad the day this was set up for where it currently lives, and move it
+to a real secrets manager if it's still sitting there.
+
+- `agentops_license::verify_production_license(key)` — what a heavy-tier
+  binary calls at startup to gate activation.
+- `cargo run -p agentops-license --example sign_license -- <licensee> [expires_at_unix] [seat_limit]`
+  — issuer-side only, requires `AGENTOPS_LICENSE_PRIVATE_KEY_HEX` set to the
+  offline private key. Never run this with the key inline on a command line
+  (shell history); source it from a file or secrets manager into the env var.
+- `cargo run -p agentops-license --example verify_license -- <key>` — sanity-check
+  a key against the embedded production public key.

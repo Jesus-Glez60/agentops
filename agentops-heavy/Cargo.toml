@@ -20,6 +20,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+base64 = "0.22"
+rand = "0.10"
 
 # The light-tier GraphStore trait these crates implement against — a
 # cross-workspace path dependency (Cargo supports this fine; it does NOT
