@@ -13,7 +13,7 @@ mod ranker;
 mod types;
 mod walker;
 
-pub use ranker::rank_files;
+pub use ranker::{rank_files, resolve_dependency_edges};
 pub use types::{Chunk, ChunkKind, Language, ScannedFile, Symbol};
 
 use std::path::Path;

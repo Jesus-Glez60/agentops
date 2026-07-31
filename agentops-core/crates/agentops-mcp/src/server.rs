@@ -111,4 +111,73 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert!(v.get("error").is_some());
     }
+
+    /// Regression test for a real bug: `scan_repo` used to duplicate its
+    /// own `add_node` loop instead of sharing `agentops_mcp::scan::persist`
+    /// with `agentops-cli`'s `install`, so it never got the upsert/prune
+    /// fix that `install` did — meaning the actual primary way this
+    /// product gets used (an agent calling `scan_repo` via MCP mid-session)
+    /// still silently duplicated every file/symbol node on every rescan.
+    /// Drives the real JSON-RPC dispatch path (not the library directly),
+    /// since that's the boundary where the two implementations diverged.
+    #[test]
+    fn rescanning_via_the_scan_repo_tool_does_not_duplicate_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let scan_req = |id: u64| format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"scan_repo","arguments":{{"path":"{path}"}}}}}}"#);
+
+        handle_message(AccessMode::Full, &scan_req(1)).unwrap();
+        handle_message(AccessMode::Full, &scan_req(2)).unwrap();
+
+        let status_req = format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"status","arguments":{{"path":"{path}"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &status_req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("symbols: 1"), "rescanning twice must not double the symbol count: {text}");
+    }
+
+    #[test]
+    fn get_dependencies_reports_a_real_resolved_dependency_edge() {
+        // resolve_dependency_edges only resolves `./`/`../`-style relative
+        // imports (see ranker.rs) — TypeScript exercises the well-covered
+        // path (the same style the ranker's own tests use), unlike
+        // Python's `from .utils import x`, which this join-based resolver
+        // doesn't handle correctly.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("utils.ts"), "export function helper() {}\n").unwrap();
+        std::fs::write(dir.path().join("main.ts"), "import { helper } from './utils';\n\nexport function run() { helper(); }\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let scan_req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"scan_repo","arguments":{{"path":"{path}"}}}}}}"#);
+        handle_message(AccessMode::Full, &scan_req).unwrap();
+
+        let main_deps_req = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_dependencies","arguments":{{"path":"{path}","file":"main.ts"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &main_deps_req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("utils.ts"), "main.ts should depend on utils.ts: {text}");
+
+        let utils_deps_req = format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"get_dependencies","arguments":{{"path":"{path}","file":"utils.ts"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &utils_deps_req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("main.ts"), "utils.ts should be depended on by main.ts: {text}");
+    }
+
+    #[test]
+    fn get_dependencies_on_an_unknown_file_is_a_tool_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "x = 1\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let scan_req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"scan_repo","arguments":{{"path":"{path}"}}}}}}"#);
+        handle_message(AccessMode::Full, &scan_req).unwrap();
+
+        let deps_req = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_dependencies","arguments":{{"path":"{path}","file":"nope.py"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &deps_req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+    }
 }

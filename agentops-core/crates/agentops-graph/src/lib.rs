@@ -117,8 +117,8 @@ pub struct Edge {
 /// The correct rule for callers: never hold a `&dyn GraphStore` across an
 /// `.await` — do the synchronous graph-reading work in a plain (non-async)
 /// function first, get owned data back, then go async. See
-/// `agentops-embeddings::index_graph_store`/`collect_index_items` for the
-/// pattern this protects against getting wrong again.
+/// `agentops-embeddings::collect_index_items` for the pattern this protects
+/// against getting wrong again.
 pub trait GraphStore {
     fn add_node(&self, node: NewNode) -> Result<i64>;
     fn add_edge(&self, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64>;
@@ -145,6 +145,15 @@ pub trait GraphStore {
     /// endpoint) — used to prune nodes from a prior scan that no longer
     /// exist in the current one (a removed file, a renamed/deleted symbol).
     fn delete_nodes(&self, ids: &[i64]) -> Result<()>;
+
+    /// Deletes every `relation` edge originating from `src_id` — used to
+    /// replace a node's outgoing edges of one kind wholesale on a rescan
+    /// (e.g. a file's `DependsOn` edges: its dependency set can change
+    /// without the file node itself changing id, so re-adding fresh edges
+    /// without first clearing the old ones would accumulate stale/wrong
+    /// ones forever, the same class of bug the node-upsert path already
+    /// guards against).
+    fn delete_edges_from(&self, src_id: i64, relation: EdgeRelation) -> Result<()>;
 }
 
 /// Inserts `node`, or — if a node with the same `(repo, kind, path, name)`
@@ -363,6 +372,11 @@ impl GraphStore for SqliteGraphStore {
         self.conn.execute(&format!("DELETE FROM nodes WHERE id IN ({placeholders})"), params.as_slice())?;
         Ok(())
     }
+
+    fn delete_edges_from(&self, src_id: i64, relation: EdgeRelation) -> Result<()> {
+        self.conn.execute("DELETE FROM edges WHERE src_id = ?1 AND relation = ?2", rusqlite::params![src_id, relation.as_str()])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -524,5 +538,24 @@ mod tests {
         prune_stale_nodes(&store, "demo", NodeKind::Symbol, &[]).unwrap();
 
         assert!(store.get_node(other_repo_id).unwrap().is_some(), "pruning one repo must never delete another repo's nodes");
+    }
+
+    #[test]
+    fn delete_edges_from_removes_only_the_matching_relation_from_that_source() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = upsert_node(&store, symbol_node("demo", "a.rs", "a", "..")).unwrap();
+        let b = upsert_node(&store, symbol_node("demo", "b.rs", "b", "..")).unwrap();
+        let c = upsert_node(&store, symbol_node("demo", "c.rs", "c", "..")).unwrap();
+
+        store.add_edge(a, b, EdgeRelation::DependsOn).unwrap();
+        store.add_edge(a, c, EdgeRelation::Affects).unwrap(); // different relation, same src — must survive
+        store.add_edge(c, a, EdgeRelation::DependsOn).unwrap(); // different src, same relation — must survive
+
+        store.delete_edges_from(a, EdgeRelation::DependsOn).unwrap();
+
+        let remaining_from_a = store.edges_from(a).unwrap();
+        assert_eq!(remaining_from_a.len(), 1);
+        assert_eq!(remaining_from_a[0].relation, EdgeRelation::Affects);
+        assert_eq!(store.edges_from(c).unwrap().len(), 1, "a different source's edges of the same relation must be untouched");
     }
 }

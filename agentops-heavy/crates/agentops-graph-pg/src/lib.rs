@@ -197,6 +197,14 @@ impl GraphStore for PostgresGraphStore {
             Ok::<(), anyhow::Error>(())
         })
     }
+
+    fn delete_edges_from(&self, src_id: i64, relation: EdgeRelation) -> Result<()> {
+        self.runtime.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("DELETE FROM edges WHERE src_id = $1 AND relation = $2", &[&src_id, &relation.as_str()]).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -358,6 +366,30 @@ mod tests {
         assert!(store.get_node(kept_id).unwrap().is_some());
         assert!(store.get_node(removed_id).unwrap().is_none());
         assert!(store.edges_to(removed_id).unwrap().is_empty());
+
+        cleanup(&store, repo);
+    }
+
+    #[test]
+    fn delete_edges_from_removes_only_the_matching_relation_from_that_source() {
+        let Some(store) = test_store() else { return };
+        let repo = "test-delete-edges-from";
+        cleanup(&store, repo);
+
+        let a = agentops_graph::upsert_node(&store, symbol_node(repo, "a.rs", "a", "..")).unwrap();
+        let b = agentops_graph::upsert_node(&store, symbol_node(repo, "b.rs", "b", "..")).unwrap();
+        let c = agentops_graph::upsert_node(&store, symbol_node(repo, "c.rs", "c", "..")).unwrap();
+
+        store.add_edge(a, b, EdgeRelation::DependsOn).unwrap();
+        store.add_edge(a, c, EdgeRelation::Affects).unwrap();
+        store.add_edge(c, a, EdgeRelation::DependsOn).unwrap();
+
+        store.delete_edges_from(a, EdgeRelation::DependsOn).unwrap();
+
+        let remaining_from_a = store.edges_from(a).unwrap();
+        assert_eq!(remaining_from_a.len(), 1);
+        assert_eq!(remaining_from_a[0].relation, EdgeRelation::Affects);
+        assert_eq!(store.edges_from(c).unwrap().len(), 1);
 
         cleanup(&store, repo);
     }

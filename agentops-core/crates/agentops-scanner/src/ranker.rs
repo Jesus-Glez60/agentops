@@ -31,15 +31,8 @@ pub fn rank_files(files: &[ScannedFile]) -> Vec<(PathBuf, f64)> {
         index_of.insert(f.path.clone(), idx);
     }
 
-    for f in files {
-        let src_idx = index_of[&f.path];
-        for dep in &f.deps {
-            if let Some(target) = resolve_relative_dep(&f.path, dep, files) {
-                if let Some(&dst_idx) = index_of.get(&target) {
-                    graph.add_edge(src_idx, dst_idx, ());
-                }
-            }
-        }
+    for (from, to) in resolve_dependency_edges(files) {
+        graph.add_edge(index_of[&from], index_of[&to], ());
     }
 
     let ranks = page_rank(&graph, DAMPING_FACTOR, ITERATIONS);
@@ -51,6 +44,27 @@ pub fn rank_files(files: &[ScannedFile]) -> Vec<(PathBuf, f64)> {
 
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked
+}
+
+/// Resolves every file's raw import strings against the scanned file set,
+/// returning `(from, to)` path pairs for whatever could be resolved. `rank_files`
+/// builds its internal PageRank graph from exactly this; it's `pub` so a
+/// caller (`agentops install`) can persist these as `DependsOn` edges in the
+/// graph store instead of the resolution work happening only in memory and
+/// being thrown away once ranking is done — which is what this crate did
+/// until this function existed, and part of why the light tier's graph had
+/// no dependency-graph query capability at all despite the scanner already
+/// computing exactly that data.
+pub fn resolve_dependency_edges(files: &[ScannedFile]) -> Vec<(PathBuf, PathBuf)> {
+    let mut edges = Vec::new();
+    for f in files {
+        for dep in &f.deps {
+            if let Some(target) = resolve_relative_dep(&f.path, dep, files) {
+                edges.push((f.path.clone(), target));
+            }
+        }
+    }
+    edges
 }
 
 /// Best-effort: resolves `./foo`/`../bar` style relative imports against the
@@ -129,6 +143,15 @@ mod tests {
         let ranked = rank_files(&files);
         let top = &ranked[0].0;
         assert_eq!(top, &PathBuf::from("src/utils.ts"), "ranked: {ranked:?}");
+    }
+
+    #[test]
+    fn resolve_dependency_edges_returns_the_same_edges_rank_files_uses_internally() {
+        let files = vec![file("src/utils.ts", &[]), file("src/a.ts", &["./utils"]), file("src/b.ts", &["react", "./missing"])];
+
+        let edges = resolve_dependency_edges(&files);
+
+        assert_eq!(edges, vec![(PathBuf::from("src/a.ts"), PathBuf::from("src/utils.ts"))], "external and unresolvable deps must not produce an edge");
     }
 
     #[test]

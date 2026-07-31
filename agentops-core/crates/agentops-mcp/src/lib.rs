@@ -10,10 +10,12 @@
 //! test without an external MCP client.
 
 mod protocol;
+mod scan;
 mod server;
 mod tools;
 
 pub use protocol::{CallToolResult, ContentBlock, ToolDefinition};
+pub use scan::{persist as persist_scan, scan_and_persist, ScanPersistSummary};
 pub use tools::{call_tool, list_tools, AccessMode};
 
 use std::io::{BufRead, Write};

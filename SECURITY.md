@@ -95,6 +95,26 @@ A public disclosure policy will be published alongside the first open-source rel
   Advisor mode omits the write tools, and `POST /tools/scan_repo` in Advisor mode
   returns `403 Forbidden` before any repo-scanning code runs — verified against a
   live server with `curl`, not just in-process tests.
+- **Dependency graph (`DependsOn` edges, implemented)** — the scanner already
+  computed a file-to-file dependency graph in memory to power PageRank
+  ranking, then discarded it; `agentops_scanner::resolve_dependency_edges`
+  exposes exactly that resolution as data, and `agentops install`/the
+  `scan_repo` MCP tool now persist it as real `DependsOn` edges, queryable
+  via the new `get_dependencies` tool. Fixing this surfaced a real
+  correctness bug worth documenting: `agentops-mcp`'s `scan_repo` tool had
+  quietly drifted from `agentops-cli`'s `install` command into two separate
+  implementations of "scan and persist" — `install` got upsert/prune
+  support (fixing a duplicate-node-on-rescan bug), but `scan_repo` kept the
+  old `add_node`-only behavior, meaning the actual primary way this product
+  gets used (an agent calling `scan_repo` via MCP mid-session, not a human
+  running the CLI) still silently duplicated every node on every rescan.
+  Consolidated into one shared implementation (`agentops_mcp::scan_and_persist`)
+  both callers use, specifically so this class of drift can't happen again
+  by construction. Covered by a regression test that rescans through the
+  real JSON-RPC dispatch path twice and asserts the symbol count doesn't
+  double — a library-level test wouldn't have caught the original bug,
+  since the divergence was between two call sites, not inside either
+  implementation alone.
 - **API-key authentication (`agentops-security::api_key`, implemented)** — opt-in,
   applied identically to `agentops-api` and `docbrain-api` via an axum
   `middleware::from_fn_with_state` layer. Keys are 32 random bytes from the OS

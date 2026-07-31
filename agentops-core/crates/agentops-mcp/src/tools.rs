@@ -7,7 +7,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{GraphStore, NewNode, NodeKind, SqliteGraphStore};
+use agentops_graph::{EdgeRelation, GraphStore, NodeKind, SqliteGraphStore};
 use agentops_notes::AffectsTarget;
 use serde_json::{json, Value};
 
@@ -26,7 +26,7 @@ fn graph_db_path(repo: &Path) -> PathBuf {
 }
 
 /// Read-only tools — available in both `Advisor` and `Full` mode.
-const READ_ONLY_TOOLS: &[&str] = &["status", "list_gotchas", "repo_map"];
+const READ_ONLY_TOOLS: &[&str] = &["status", "list_gotchas", "repo_map", "get_dependencies"];
 
 /// Write-capable tools — available only in `Full` mode. Every one of these
 /// writes to disk (the graph store, and/or generated files) or otherwise
@@ -65,6 +65,18 @@ pub fn list_tools(mode: AccessMode) -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"],
+            }),
+        },
+        ToolDefinition {
+            name: "get_dependencies",
+            description: "What a file depends on and what depends on it, from the persisted DependsOn graph (relative-import resolution only — external package imports aren't tracked as edges).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "file": { "type": "string", "description": "File path relative to the repo root, as it appears in repo_map/status output." },
+                },
+                "required": ["path", "file"],
             }),
         },
     ];
@@ -129,6 +141,7 @@ pub fn call_tool(mode: AccessMode, name: &str, args: &Value) -> Result<CallToolR
         "status" => tool_status(args),
         "list_gotchas" => tool_list_gotchas(args),
         "repo_map" => tool_repo_map(args),
+        "get_dependencies" => tool_get_dependencies(args),
         "scan_repo" => tool_scan_repo(args),
         "add_note" => tool_add_note(args),
         "generate_docs" => tool_generate_docs(args),
@@ -198,51 +211,67 @@ fn tool_repo_map(args: &Value) -> anyhow::Result<String> {
     agentops_docgen::render_onboarding_doc(&store, repo_name, &ranked)
 }
 
-fn tool_scan_repo(args: &Value) -> anyhow::Result<String> {
+fn tool_get_dependencies(args: &Value) -> anyhow::Result<String> {
     let path = require_path(args)?;
-    let repo_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("repo").to_string();
-
-    let report = agentops_scanner::scan_repo(&path)?;
+    let file = get_str(args, "file").ok_or_else(|| anyhow::anyhow!("missing required 'file' argument"))?;
     let db_path = graph_db_path(&path);
+    if !db_path.exists() {
+        anyhow::bail!("no graph store at {} — call scan_repo first", db_path.display());
+    }
     let store = SqliteGraphStore::open(&db_path)?;
 
-    let mut symbol_count = 0;
-    for file in &report.files {
-        let path_str = file.path.to_string_lossy().to_string();
-        store.add_node(NewNode {
-            kind: NodeKind::File,
-            repo: repo_name.clone(),
-            path: Some(path_str.clone()),
-            name: None,
-            start_line: None,
-            end_line: None,
-            content: None,
-        })?;
-        for symbol in &file.symbols {
-            store.add_node(NewNode {
-                kind: NodeKind::Symbol,
-                repo: repo_name.clone(),
-                path: Some(path_str.clone()),
-                name: Some(symbol.name.clone()),
-                start_line: Some(symbol.start_line as i64),
-                end_line: Some(symbol.end_line as i64),
-                content: Some(symbol.source.clone()),
-            })?;
-            symbol_count += 1;
+    let files = store.nodes_by_kind(NodeKind::File)?;
+    let Some(target) = files.iter().find(|f| f.path.as_deref() == Some(file)) else {
+        anyhow::bail!("no file node found for {file:?} — check it matches repo_map/status output exactly");
+    };
+
+    let mut out = String::new();
+    let depends_on: Vec<_> = store.edges_from(target.id)?.into_iter().filter(|e| e.relation == EdgeRelation::DependsOn).collect();
+    out.push_str("Depends on:\n");
+    if depends_on.is_empty() {
+        out.push_str("  (none resolved — only relative-path imports are tracked as edges)\n");
+    }
+    for edge in depends_on {
+        if let Some(dep) = store.get_node(edge.dst_id)? {
+            out.push_str(&format!("  - {}\n", dep.path.as_deref().unwrap_or("<unknown>")));
         }
     }
+
+    let depended_on_by: Vec<_> = store.edges_to(target.id)?.into_iter().filter(|e| e.relation == EdgeRelation::DependsOn).collect();
+    out.push_str("Depended on by:\n");
+    if depended_on_by.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for edge in depended_on_by {
+        if let Some(dep) = store.get_node(edge.src_id)? {
+            out.push_str(&format!("  - {}\n", dep.path.as_deref().unwrap_or("<unknown>")));
+        }
+    }
+
+    Ok(out)
+}
+
+fn tool_scan_repo(args: &Value) -> anyhow::Result<String> {
+    let path = require_path(args)?;
+    let db_path = graph_db_path(&path);
+
+    let summary = crate::scan::scan_and_persist(&path)?;
 
     let opts = agentops_agents_md::GenerateOptions { claude_code_installed: false, repo_map_path: Some("repo-map.md".to_string()) };
     let agents_md = agentops_agents_md::generate(&path, &opts);
     std::fs::write(path.join("AGENTS.md"), &agents_md)?;
 
-    Ok(format!(
-        "Scanned {} files ({} symbols, {} secrets redacted). Wrote AGENTS.md and {}.",
-        report.files.len(),
-        symbol_count,
-        report.redacted_count,
+    let mut msg = format!(
+        "Scanned {} files ({} symbols, {} dependency edges). Wrote AGENTS.md and {}.",
+        summary.files,
+        summary.symbols,
+        summary.dependency_edges,
         db_path.display()
-    ))
+    );
+    if summary.pruned_files > 0 || summary.pruned_symbols > 0 {
+        msg.push_str(&format!(" Pruned {} stale file(s) and {} stale symbol(s) from prior scans.", summary.pruned_files, summary.pruned_symbols));
+    }
+    Ok(msg)
 }
 
 fn tool_add_note(args: &Value) -> anyhow::Result<String> {

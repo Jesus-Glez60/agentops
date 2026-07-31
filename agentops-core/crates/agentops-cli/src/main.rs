@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{GraphStore, NewNode, NodeKind, SqliteGraphStore};
+use agentops_graph::{GraphStore, NodeKind, SqliteGraphStore};
 use agentops_notes::AffectsTarget;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -175,12 +175,6 @@ fn default_docbrain_db_path() -> PathBuf {
 }
 
 fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, agents: &[String]) -> Result<()> {
-    let repo_name = path
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| path.display().to_string());
-
     println!("Scanning {} (access mode: {access_mode:?})...", path.display());
     let report = agentops_scanner::scan_repo(path).context("scanning repo")?;
 
@@ -207,52 +201,18 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, 
     }
 
     let db_path = graph_db_path(path);
-    let store = SqliteGraphStore::open(&db_path).context("opening graph store")?;
 
-    // upsert_node (not add_node) keyed on (repo, kind, path, name): rescanning
-    // an unchanged file/symbol reuses its existing node id rather than
-    // inserting a duplicate copy every time `install` runs — a naive
-    // add_node here would both bloat the store and, once anything embeds
-    // node content for semantic search, bloat and skew retrieval with
-    // near-duplicate points. Preserving ids across a rescan also means any
-    // gotcha/decision edge pointing at a symbol survives the rescan instead
-    // of dangling.
-    let mut kept_file_ids = Vec::with_capacity(report.files.len());
-    let mut kept_symbol_ids = Vec::new();
-    let mut symbol_count = 0;
-    for file in &report.files {
-        let path_str = file.path.to_string_lossy().to_string();
-        let file_id = agentops_graph::upsert_node(
-            &store,
-            NewNode { kind: NodeKind::File, repo: repo_name.clone(), path: Some(path_str.clone()), name: None, start_line: None, end_line: None, content: None },
-        )?;
-        kept_file_ids.push(file_id);
-
-        for symbol in &file.symbols {
-            let symbol_id = agentops_graph::upsert_node(
-                &store,
-                NewNode {
-                    kind: NodeKind::Symbol,
-                    repo: repo_name.clone(),
-                    path: Some(path_str.clone()),
-                    name: Some(symbol.name.clone()),
-                    start_line: Some(symbol.start_line as i64),
-                    end_line: Some(symbol.end_line as i64),
-                    content: Some(symbol.source.clone()),
-                },
-            )?;
-            kept_symbol_ids.push(symbol_id);
-            symbol_count += 1;
-        }
+    // Persistence itself (upsert, prune, DependsOn edges) is shared with
+    // agentops-mcp's scan_repo tool — the actual primary way an agent scans
+    // a repo mid-session — rather than duplicated here. It used to be
+    // duplicated, and the two copies drifted (see agentops-mcp::scan's doc
+    // comment); one implementation is what keeps that from happening again.
+    let summary = agentops_mcp::persist_scan(path, &report).context("persisting scan to graph store")?;
+    if summary.pruned_files > 0 || summary.pruned_symbols > 0 {
+        println!("Pruned {} stale file node(s) and {} stale symbol node(s) from prior scans.", summary.pruned_files, summary.pruned_symbols);
     }
-
-    // Anything left over from a prior scan that this scan didn't touch is
-    // stale — a deleted file, a renamed/removed symbol — so it's pruned
-    // rather than left to accumulate forever.
-    let pruned_files = agentops_graph::prune_stale_nodes(&store, &repo_name, NodeKind::File, &kept_file_ids)?;
-    let pruned_symbols = agentops_graph::prune_stale_nodes(&store, &repo_name, NodeKind::Symbol, &kept_symbol_ids)?;
-    if pruned_files > 0 || pruned_symbols > 0 {
-        println!("Pruned {pruned_files} stale file node(s) and {pruned_symbols} stale symbol node(s) from prior scans.");
+    if summary.dependency_edges > 0 {
+        println!("Wrote {} DependsOn edge(s).", summary.dependency_edges);
     }
 
     let opts = agentops_agents_md::GenerateOptions {
@@ -268,13 +228,7 @@ fn install(path: &Path, dry_run: bool, access_mode: AccessMode, no_ruler: bool, 
         println!("WARNING: could not record this scan in ~/.agentops/manifest.json ({e}) — the dashboard's repo overview won't list it, but the scan itself is unaffected.");
     }
 
-    println!(
-        "Wrote {} nodes ({} files, {} symbols) to {}",
-        report.files.len() + symbol_count,
-        report.files.len(),
-        symbol_count,
-        db_path.display()
-    );
+    println!("Wrote {} nodes ({} files, {} symbols) to {}", summary.files + summary.symbols, summary.files, summary.symbols, db_path.display());
     println!("Wrote {}", path.join("AGENTS.md").display());
 
     if no_ruler {
