@@ -1,7 +1,10 @@
 //! Semantic search over the neuron graph — BGE-M3 dense embeddings (the same
 //! model the original codebrain/docbrain used), generated locally via ONNX
 //! (`fastembed`, no Python runtime, no external embedding API — code/docs
-//! never leave the process to get embedded), indexed into Qdrant.
+//! never leave the process to get embedded), indexed into Qdrant, with a
+//! second-stage bge-reranker-v2-m3 cross-encoder pass — again, the same
+//! model the original system used (there via `sentence_transformers.CrossEncoder`,
+//! here via `fastembed`'s own `TextRerank`, which ships this exact model).
 //!
 //! **Why this exists**: `agentops-graph`'s structural retrieval (`list_gotchas`,
 //! `repo_map`, exact symbol lookups) is precise but exhaustive — a caller
@@ -9,9 +12,18 @@
 //! relevant. That costs tokens on every call an agent makes. `SemanticIndex`
 //! answers "what's actually relevant to this query" directly, so a RAG step
 //! returns the top-k relevant passages instead of the whole graph.
+//!
+//! **Why two stages, not just embeddings**: a bi-encoder (BGE-M3) embeds the
+//! query and each document independently, so it's fast enough to search a
+//! whole corpus but only approximates relevance. A cross-encoder (the
+//! reranker) sees the query and a candidate document *together* in one
+//! forward pass, which is slower — too slow to run over an entire corpus —
+//! but meaningfully more accurate. The standard pattern, and the one this
+//! follows: use the embedding search to cheaply pull a wide candidate pool,
+//! then spend the expensive cross-encoder pass only on that shortlist.
 
 use anyhow::{Context, Result};
-use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use fastembed::{EmbeddingModel, InitOptions, RerankInitOptions, RerankerModel, TextEmbedding, TextRerank};
 use qdrant_client::qdrant::point_id::PointIdOptions;
 use qdrant_client::qdrant::{
     Condition, CreateCollectionBuilder, Distance, Filter, PointStruct, QueryPointsBuilder, UpsertPointsBuilder, VectorParamsBuilder,
@@ -21,8 +33,19 @@ use qdrant_client::{Payload, Qdrant};
 /// BGE-M3's dense embedding output dimension.
 const VECTOR_SIZE: u64 = 1024;
 
+/// How much wider than the caller's requested `top_k` the first-stage
+/// (embedding) candidate pool is, before reranking narrows it back down.
+/// Reranking a too-small pool defeats the point (the bi-encoder's mistakes
+/// never get a chance to be corrected); rereanking the whole corpus is the
+/// slow thing this two-stage design exists to avoid. 4x is a standard,
+/// reasonable middle ground — not tuned against this specific corpus, but a
+/// documented, deliberate default rather than an arbitrary one.
+const CANDIDATE_POOL_MULTIPLIER: u64 = 4;
+const MIN_CANDIDATE_POOL: u64 = 20;
+
 pub struct SemanticIndex {
     model: TextEmbedding,
+    reranker: TextRerank,
     client: Qdrant,
     collection: String,
 }
@@ -88,15 +111,18 @@ pub fn collect_index_items(store: &dyn agentops_graph::GraphStore, repo: &str) -
 
 impl SemanticIndex {
     /// Connects to Qdrant at `qdrant_url` (gRPC, e.g. `http://localhost:6334`)
-    /// and loads the BGE-M3 ONNX model — downloaded from Hugging Face Hub and
-    /// cached locally on first use. This is a real network dependency, but
-    /// scoped to the heavy tier (which already talks to Postgres/GitHub/etc.)
-    /// — not the light-tier scanner's zero-runtime-network-egress invariant.
+    /// and loads both ONNX models — BGE-M3 (embeddings) and bge-reranker-v2-m3
+    /// (reranking) — downloaded from Hugging Face Hub and cached locally on
+    /// first use. This is a real network dependency, but scoped to the heavy
+    /// tier (which already talks to Postgres/GitHub/etc.) — not the
+    /// light-tier scanner's zero-runtime-network-egress invariant.
     pub fn connect(qdrant_url: &str, collection: &str) -> Result<Self> {
         let model = TextEmbedding::try_new(InitOptions::new(EmbeddingModel::BGEM3).with_show_download_progress(true))
             .context("loading BGE-M3 embedding model")?;
+        let reranker = TextRerank::try_new(RerankInitOptions::new(RerankerModel::BGERerankerV2M3).with_show_download_progress(true))
+            .context("loading bge-reranker-v2-m3 reranking model")?;
         let client = Qdrant::from_url(qdrant_url).build().context("connecting to Qdrant")?;
-        Ok(Self { model, client, collection: collection.to_string() })
+        Ok(Self { model, reranker, client, collection: collection.to_string() })
     }
 
     /// Creates the collection if it doesn't already exist. Safe to call on
@@ -164,9 +190,39 @@ impl SemanticIndex {
         Ok(count)
     }
 
-    /// Returns the `top_k` items most semantically similar to `query`,
-    /// optionally scoped to one repo.
+    /// Returns the `top_k` items most relevant to `query`, optionally scoped
+    /// to one repo — a two-stage search: a wide embedding-based recall pass
+    /// (see `vector_search`) narrowed down by the bge-reranker-v2-m3
+    /// cross-encoder, which is slower but more accurate than embedding
+    /// similarity alone since it scores the query and each candidate
+    /// document together rather than comparing independently-computed
+    /// vectors.
     pub async fn search(&mut self, query: &str, top_k: u64, repo: Option<&str>) -> Result<Vec<SearchHit>> {
+        let candidate_pool = (top_k * CANDIDATE_POOL_MULTIPLIER).max(MIN_CANDIDATE_POOL);
+        let candidates = self.vector_search(query, candidate_pool, repo).await?;
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+
+        let documents: Vec<&str> = candidates.iter().map(|c| c.text.as_str()).collect();
+        let reranked = self.reranker.rerank(query, documents, false, None).context("reranking candidates")?;
+
+        Ok(reranked
+            .into_iter()
+            .take(top_k as usize)
+            .map(|r| {
+                let mut hit = candidates[r.index].clone();
+                hit.score = r.score;
+                hit
+            })
+            .collect())
+    }
+
+    /// The first stage on its own: embedding-based cosine-similarity search
+    /// against Qdrant, unreranked. `search` is almost always what callers
+    /// actually want; this is exposed mainly for testing the recall stage
+    /// in isolation from the (slower) reranking stage.
+    pub async fn vector_search(&mut self, query: &str, top_k: u64, repo: Option<&str>) -> Result<Vec<SearchHit>> {
         let embeddings = self.model.embed(vec![query], None).context("embedding query")?;
         let query_vector = embeddings.into_iter().next().context("no embedding produced for the query")?;
 
@@ -264,5 +320,53 @@ mod tests {
 
         let hits = index.search("token verification", 5, Some("repo-a")).await.unwrap();
         assert!(hits.iter().all(|h| h.repo == "repo-a"), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn search_scores_are_reranker_scores_not_raw_cosine_similarity() {
+        let Some(mut index) = test_index("agentops_test_semantic_rerank") else { return };
+        index.ensure_collection().await.unwrap();
+
+        index
+            .index(&[IndexItem {
+                id: 20,
+                text: "Retry with exponential backoff when the upstream API returns HTTP 429.".into(),
+                repo: "rerank-test".into(),
+                kind: "gotcha".into(),
+                name: Some("rate-limit-backoff".into()),
+                path: None,
+            }])
+            .await
+            .unwrap();
+
+        let vector_hits = index.vector_search("what to do on a 429 response", 1, Some("rerank-test")).await.unwrap();
+        let reranked_hits = index.search("what to do on a 429 response", 1, Some("rerank-test")).await.unwrap();
+
+        assert_eq!(vector_hits.len(), 1);
+        assert_eq!(reranked_hits.len(), 1);
+        // Cosine similarity from vector_search is bounded to roughly [-1, 1];
+        // bge-reranker-v2-m3's cross-encoder score is a raw sigmoid logit
+        // that isn't bounded the same way. If these two ever ended up
+        // numerically identical it would mean reranking silently didn't run
+        // (e.g. a no-op stub), not that the two stages happen to agree.
+        assert_ne!(
+            vector_hits[0].score, reranked_hits[0].score,
+            "search()'s score must come from the reranker, not be a passthrough of vector_search()'s cosine score"
+        );
+    }
+
+    #[tokio::test]
+    async fn vector_search_works_standalone_without_reranking() {
+        let Some(mut index) = test_index("agentops_test_semantic_vector_only") else { return };
+        index.ensure_collection().await.unwrap();
+
+        index
+            .index(&[IndexItem { id: 30, text: "Use constant-time comparison for secrets to avoid timing attacks.".into(), repo: "vs-test".into(), kind: "gotcha".into(), name: Some("timing-safe-compare".into()), path: None }])
+            .await
+            .unwrap();
+
+        let hits = index.vector_search("how do we compare secrets safely", 1, Some("vs-test")).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].name.as_deref(), Some("timing-safe-compare"));
     }
 }

@@ -45,9 +45,14 @@ agent, paying in context tokens) reads past it to find what's relevant.
 BGE-M3 dense embeddings (the same model the original codebrain/docbrain
 used), generated locally via ONNX (`fastembed` — no Python runtime, no
 external embedding API, code/docs never leave the process to get embedded),
-indexed into Qdrant.
+indexed into Qdrant, with a `bge-reranker-v2-m3` cross-encoder second stage
+(same reranker model the original system used, there via
+`sentence_transformers.CrossEncoder`) — a wide embedding-based recall pass
+narrowed down by the more accurate (but too slow to run over a whole
+corpus) cross-encoder pass, the standard two-stage retrieval pattern.
 
-- `SemanticIndex::connect(qdrant_url, collection)` then `.ensure_collection()`.
+- `SemanticIndex::connect(qdrant_url, collection)` then `.ensure_collection()`
+  — loads both ONNX models (embedding + reranker).
 - `collect_index_items(store, repo)` — a plain **synchronous** free function
   reading every Symbol/Gotcha/Decision node out of a `GraphStore` into
   embeddable items. Deliberately separate from the async embedding step
@@ -61,12 +66,20 @@ indexed into Qdrant.
 - `.index_items(items)` — embeds and upserts owned items; re-running after a
   rescan overwrites stale entries (node ids are reused as Qdrant point ids)
   instead of duplicating them.
-- `.search(query, top_k, repo)` — real semantic ranking, not keyword
-  matching. Verified live against the real BGE-M3 model and a real Qdrant
-  instance: a query with zero keyword overlap with its target text still
-  ranks the semantically related item first (`cargo test -p agentops-embeddings`
-  with `AGENTOPS_TEST_QDRANT_URL` set — downloads the real ~2GB model on
-  first run, cached after).
+- `.search(query, top_k, repo)` — the full two-stage pipeline: recall via
+  `vector_search` at a wider candidate count, then rerank down to `top_k`.
+  Returned scores are the reranker's, not raw cosine similarity. Verified
+  live against the real models and a real Qdrant instance: a query with
+  zero keyword overlap with its target text still ranks the semantically
+  related item first, and reranked scores are provably distinct from raw
+  vector-search scores (different scale entirely — proof the second stage
+  actually ran, not a silent passthrough).
+- `.vector_search(query, top_k, repo)` — the first stage alone (embedding
+  similarity, no reranking) — exposed mainly for testing that stage in
+  isolation; `.search()` is what callers should normally use.
+  `cargo test -p agentops-embeddings` with `AGENTOPS_TEST_QDRANT_URL` set
+  runs all of this live — downloads both real models (~2GB embedding +
+  reranker) on first run, cached after.
 - Run `cargo run --release -p agentops-embeddings --example index_and_query --
   <graph.db path> <repo name> <query...>` to index a real scanned repo and
   query it directly from the command line.

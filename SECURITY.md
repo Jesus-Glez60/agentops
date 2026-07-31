@@ -253,5 +253,19 @@ A public disclosure policy will be published alongside the first open-source rel
   MCP client sends — `initialize`, `tools/list`, `semantic_index`, then
   `semantic_search` with a query that shares no words with its target text,
   correctly ranked first.
+  Reranking added: `search()` is now a real two-stage pipeline — a wide
+  embedding-based recall pass (`vector_search`, still available standalone)
+  narrowed down by a `bge-reranker-v2-m3` cross-encoder pass (via
+  `fastembed`'s `TextRerank`, the same model the original codebrain/docbrain
+  used, there via `sentence_transformers.CrossEncoder`). A cross-encoder
+  scores the query and a candidate document together in one forward pass
+  rather than comparing independently-computed vectors, which is why it's
+  slower but more accurate — too slow to run over a whole corpus, which is
+  the actual reason this is two stages and not just a better single model.
+  Verified live that reranking isn't a silent no-op: a query's reranked
+  score is provably not the same number as its raw cosine-similarity score
+  (different scale entirely — cosine is bounded, the cross-encoder's isn't),
+  confirming the second stage genuinely ran and reordered/rescored results
+  rather than passing the first stage through unchanged.
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.
