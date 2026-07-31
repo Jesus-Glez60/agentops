@@ -13,3 +13,5 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3", features = ["json"] }
+scraper = "0.27"
+url = "2"

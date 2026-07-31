@@ -63,10 +63,10 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_five_tools() {
+    fn tools_list_has_nine_tools() {
         let store = DocbrainStore::open_in_memory().unwrap();
         let resp = handle_message(&store, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#).unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
-        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(v["result"]["tools"].as_array().unwrap().len(), 9);
     }
 }

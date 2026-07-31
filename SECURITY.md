@@ -161,6 +161,60 @@ A public disclosure policy will be published alongside the first open-source rel
   session), but it should still be tightened to the dashboard's actual origin
   before this server is ever bound beyond `127.0.0.1`, as defense in depth.
 
+- **Docbrain ingestion engine — `scrape_library`/`sync_changelogs`/
+  `resolve_library`/`ingest_local_files` (implemented)** — this is the piece
+  that actually closes the gap between `discover_library` (which only finds
+  a docs/repo URL) and real, queryable `doc_nodes` content; before this,
+  nothing populated doc content at all. All four join `docbrain-ingest`'s
+  existing zero-trust-of-the-network posture: this crate is explicitly
+  **not** under the zero-egress invariant `agentops-scanner` enforces (its
+  entire job is fetching from the network), so the controls here are about
+  handling untrusted response bodies safely, not about avoiding the network
+  call itself.
+  - `scrape_library` (`docbrain_ingest::scrape_docs`) fetches a docs page via
+    `ureq` and parses it with `scraper`/`html5ever` — a real HTML parser, not
+    a regex-based scraper, so malformed/adversarial markup on a third-party
+    docs site can't corrupt extraction the way ad hoc string scraping could.
+    The shallow-crawl option (`max_pages`) is bounded and same-origin +
+    same-path-prefix only (`same_scope_links`), so a single tool call can
+    never turn into an unbounded spider even against a docs site with
+    thousands of internal links — verified via a live scrape of a real
+    docs.rs page (`docs_page_end_to_end`/`scrape_library_persists_real_content...`
+    tests), not a mocked HTML fixture only.
+  - `sync_changelogs` hits GitHub's public releases API — read-only, no
+    token required, so no credential to leak. `parse_owner_repo` only
+    extracts an `owner/repo` pair from a URL already stored on a library the
+    tenant is authorized to see (`authorized_library_id`'s guarantee) and
+    only ever calls out to GitHub, never an arbitrary caller-supplied host.
+  - `ingest_local_files` reads from the **local filesystem**, not the
+    network — the caller-supplied `paths` are read directly via
+    `std::fs::read_to_string`. This tool is meant for a trusted local caller
+    (an agent or CLI user with legitimate filesystem access on the machine
+    running docbrain-mcp/docbrain-api), the same trust boundary
+    `agentops-scanner` already operates under for repo scanning — it is not
+    exposed with any additional path-traversal restriction beyond normal
+    filesystem permissions, and should not be exposed to an untrusted remote
+    caller without adding one (not a concern yet since `docbrain-api`
+    doesn't expose per-tool argument validation beyond what each tool does
+    internally, and every tool call already requires whatever
+    `DOCBRAIN_API_KEY_HASH` auth is configured).
+  - All four went through the same tenant-scoping discipline as the rest of
+    `docbrain-graph`: every write routes through `authorized_library_id`, so
+    e.g. `scrape_library` can't be pointed at a library the caller can't
+    already see, and `ingest_local_files` registers a *new* library as
+    private to the caller's own org (or public) exactly like
+    `discover_library` already does — no new bypass of Docbrain-4's
+    isolation guarantee was introduced by adding a second way to create a
+    library.
+  - Known scope cut, stated plainly: none of these run as background jobs.
+    A `scrape_library`/`sync_changelogs` call blocks until the fetch (and,
+    for a multi-page scrape, all follow-up fetches) completes — there is no
+    `get_job_status` tool and no job queue. This is fine for a single docs
+    page or a shallow few-page crawl (seconds), not for a large multi-page
+    ingestion running in the background while an agent keeps working; that
+    would need a real async job table (`jobs` in `docbrain-graph` + a
+    background thread/task) and hasn't been built.
+
 - **API-key CLI tooling (implemented)** — `agentops api-key generate` (in
   `agentops-cli`) wraps `agentops_security::api_key::generate_api_key`,
   printing the raw key once and the hash to configure. Closes the "manual

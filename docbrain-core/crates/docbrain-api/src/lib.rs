@@ -169,12 +169,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_has_five_entries() {
+    async fn tools_list_has_nine_entries() {
         let store = DocbrainStore::open_in_memory().unwrap();
         let app = build_router(store, None);
         let resp = app.oneshot(Request::builder().uri("/tools").body(Body::empty()).unwrap()).await.unwrap();
         let body = body_json(resp).await;
-        assert_eq!(body["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 9);
     }
 
     #[tokio::test]

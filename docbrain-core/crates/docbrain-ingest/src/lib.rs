@@ -24,6 +24,12 @@
 mod classify;
 pub use classify::classify_dependency;
 
+mod scrape;
+pub use scrape::{scrape_docs, ScrapedSection};
+
+mod changelog;
+pub use changelog::{sync_github_releases, ChangelogFetchEntry};
+
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
