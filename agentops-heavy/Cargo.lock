@@ -116,6 +116,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentops-heavy-mcp"
+version = "0.1.0"
+dependencies = [
+ "agentops-embeddings",
+ "agentops-graph",
+ "agentops-license",
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "agentops-license"
 version = "0.1.0"
 dependencies = [

@@ -216,8 +216,22 @@ A public disclosure policy will be published alongside the first open-source rel
   to make that mistake hard to reintroduce. Verified with a regression test
   that goes through the real HTTP router (a library-level test wouldn't
   have caught this — the bug only manifests via axum's `Handler` trait
-  bound). **Still open**: no MCP tool exposes this yet for actual agent use
-  in Claude Code — only the REST endpoint (for the dashboard) and the CLI
-  example exist so far.
+  bound).
+  Also now exposed as a real MCP server, `agentops-heavy-mcp`
+  (`semantic_search`/`semantic_index` tools, stdio JSON-RPC, same hand-rolled
+  protocol as `agentops-mcp`) — this is the piece that actually matters for
+  agent use in Claude Code, as opposed to the REST endpoint (dashboard) or
+  the CLI example. No `AccessMode`/advisor-mode split here, unlike
+  `agentops-mcp`: every tool is read/index-only, so there's no write
+  capability to structurally gate — the gate that applies is licensing, and
+  the binary refuses to start at all without a valid one (an MCP server
+  with zero tools isn't useful to hand an agent, so "start degraded" doesn't
+  make sense here the way it does for the REST server, which has other,
+  unrelated routes worth keeping up). Verified for real: signed a real
+  license with the offline production key, ran the actual compiled binary,
+  and drove it over real stdin/stdout with the exact JSON-RPC framing an
+  MCP client sends — `initialize`, `tools/list`, `semantic_index`, then
+  `semantic_search` with a query that shares no words with its target text,
+  correctly ranked first.
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.

@@ -29,7 +29,8 @@ agentops-heavy/
     agentops-license/            # offline license-key verification, gates heavy-tier activation
     agentops-repo-access/        # per-repo SSH deploy-key custody + connection store
     agentops-github-app/         # GitHub App JWT signing + installation-token exchange
-    agentops-heavy-api/          # REST server: repo-connection flow, wraps the crates above
+    agentops-heavy-api/          # REST server: repo-connection flow + /search, wraps the crates above
+    agentops-heavy-mcp/          # stdio MCP server: semantic_search/semantic_index tools for agent use
   docker/
     docker-compose.yml           # Postgres + Qdrant, parameterized via .env (never committed)
     postgres-init/                # idempotent schema migrations, run on first container start
@@ -47,10 +48,19 @@ external embedding API, code/docs never leave the process to get embedded),
 indexed into Qdrant.
 
 - `SemanticIndex::connect(qdrant_url, collection)` then `.ensure_collection()`.
-- `.index_graph_store(store, repo)` — embeds every Symbol/Gotcha/Decision
-  node from a `GraphStore` in one pass; re-running after a rescan overwrites
-  stale entries (node ids are reused as Qdrant point ids) instead of
-  duplicating them.
+- `collect_index_items(store, repo)` — a plain **synchronous** free function
+  reading every Symbol/Gotcha/Decision node out of a `GraphStore` into
+  embeddable items. Deliberately separate from the async embedding step
+  below and deliberately not a method on `SemanticIndex`: `&dyn GraphStore`
+  isn't provably `Sync` (`SqliteGraphStore` wraps a `rusqlite::Connection`,
+  intentionally `!Sync` upstream), so a reference to it can never be held
+  across an `.await` — an async function taking it directly compiles fine
+  in isolation but silently produces a `!Send` future the moment something
+  (like an axum handler) actually requires `Send`. Keeping the two steps
+  structurally separate is what makes that mistake hard to reintroduce.
+- `.index_items(items)` — embeds and upserts owned items; re-running after a
+  rescan overwrites stale entries (node ids are reused as Qdrant point ids)
+  instead of duplicating them.
 - `.search(query, top_k, repo)` — real semantic ranking, not keyword
   matching. Verified live against the real BGE-M3 model and a real Qdrant
   instance: a query with zero keyword overlap with its target text still
@@ -60,6 +70,18 @@ indexed into Qdrant.
 - Run `cargo run --release -p agentops-embeddings --example index_and_query --
   <graph.db path> <repo name> <query...>` to index a real scanned repo and
   query it directly from the command line.
+
+**Where this is actually exposed:**
+- `agentops-heavy-api`: `POST /search/index` / `GET /search` — for the
+  dashboard. Requires `AGENTOPS_QDRANT_URL` and a valid `AGENTOPS_LICENSE_KEY`
+  (semantic search is paid-tier; both routes return `402 Payment Required`
+  otherwise, rather than the server refusing to start).
+- `agentops-heavy-mcp`: `semantic_search`/`semantic_index` tools over stdio
+  JSON-RPC — for actual agent use in Claude Code. Same license requirement,
+  but stricter: this binary refuses to start at all without one, since an
+  MCP server with zero tools isn't useful to hand an agent. Run it with
+  `AGENTOPS_LICENSE_KEY` and `AGENTOPS_QDRANT_URL` set:
+  `cargo run --release -p agentops-heavy-mcp`.
 
 ## Running locally
 
