@@ -115,6 +115,26 @@ A public disclosure policy will be published alongside the first open-source rel
   double — a library-level test wouldn't have caught the original bug,
   since the divergence was between two call sites, not inside either
   implementation alone.
+- **Direct symbol lookup (`get_symbol`/`ast_search`, implemented)** — two
+  read-only MCP tools added alongside `get_dependencies`, both always
+  available in `AccessMode::Advisor` and `Full` (added to `READ_ONLY_TOOLS`).
+  `get_symbol` does an exact-name match against `Symbol` nodes and returns
+  the full stored source; `ast_search` does a case-insensitive substring
+  match on symbol names and returns name+location only, so an agent can
+  narrow down to the right symbol before fetching its full source with
+  `get_symbol`. Known limitation, documented rather than silently absent:
+  neither tool filters by symbol kind (`function` vs `struct` vs ...) —
+  the graph only persists the coarse `NodeKind::Symbol`, not the
+  fine-grained kind, so that filter isn't available yet. Both tools return
+  a tool-level error (not a panic or empty success) when nothing matches.
+  Verified live: rebuilt `agentops-cli`, ran the real compiled binary via
+  actual stdin/stdout JSON-RPC against `agentops-heavy/crates/agentops-license`
+  as a target repo — `scan_repo`, `get_symbol` (exact match, real source
+  returned), `ast_search` (case-insensitive substring, matched 9 real
+  symbols, excluded non-matches), and `get_dependencies` (correctly reported
+  none, since this target repo's imports are Rust `use` paths, not the
+  relative-path style the resolver supports) all behaved correctly over the
+  real protocol, not just in unit tests.
 - **API-key authentication (`agentops-security::api_key`, implemented)** — opt-in,
   applied identically to `agentops-api` and `docbrain-api` via an axum
   `middleware::from_fn_with_state` layer. Keys are 32 random bytes from the OS

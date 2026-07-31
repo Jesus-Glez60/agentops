@@ -26,7 +26,7 @@ fn graph_db_path(repo: &Path) -> PathBuf {
 }
 
 /// Read-only tools — available in both `Advisor` and `Full` mode.
-const READ_ONLY_TOOLS: &[&str] = &["status", "list_gotchas", "repo_map", "get_dependencies"];
+const READ_ONLY_TOOLS: &[&str] = &["status", "list_gotchas", "repo_map", "get_dependencies", "get_symbol", "ast_search"];
 
 /// Write-capable tools — available only in `Full` mode. Every one of these
 /// writes to disk (the graph store, and/or generated files) or otherwise
@@ -77,6 +77,30 @@ pub fn list_tools(mode: AccessMode) -> Vec<ToolDefinition> {
                     "file": { "type": "string", "description": "File path relative to the repo root, as it appears in repo_map/status output." },
                 },
                 "required": ["path", "file"],
+            }),
+        },
+        ToolDefinition {
+            name: "get_symbol",
+            description: "Exact lookup of a symbol by name — its file, line range, and full source. Faster and cheaper than reading a whole file when you already know the name.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "name": { "type": "string" },
+                },
+                "required": ["path", "name"],
+            }),
+        },
+        ToolDefinition {
+            name: "ast_search",
+            description: "Find symbols by a case-insensitive substring match on their name — useful when you don't know the exact name get_symbol would need. Returns each match's name, file, and line range (not full source — call get_symbol for that).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string" },
+                    "query": { "type": "string" },
+                },
+                "required": ["path", "query"],
             }),
         },
     ];
@@ -142,6 +166,8 @@ pub fn call_tool(mode: AccessMode, name: &str, args: &Value) -> Result<CallToolR
         "list_gotchas" => tool_list_gotchas(args),
         "repo_map" => tool_repo_map(args),
         "get_dependencies" => tool_get_dependencies(args),
+        "get_symbol" => tool_get_symbol(args),
+        "ast_search" => tool_ast_search(args),
         "scan_repo" => tool_scan_repo(args),
         "add_note" => tool_add_note(args),
         "generate_docs" => tool_generate_docs(args),
@@ -248,6 +274,64 @@ fn tool_get_dependencies(args: &Value) -> anyhow::Result<String> {
         }
     }
 
+    Ok(out)
+}
+
+fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
+    let path = require_path(args)?;
+    let name = get_str(args, "name").ok_or_else(|| anyhow::anyhow!("missing required 'name' argument"))?;
+    let db_path = graph_db_path(&path);
+    if !db_path.exists() {
+        anyhow::bail!("no graph store at {} — call scan_repo first", db_path.display());
+    }
+    let store = SqliteGraphStore::open(&db_path)?;
+
+    let matches: Vec<_> = store.nodes_by_kind(NodeKind::Symbol)?.into_iter().filter(|n| n.name.as_deref() == Some(name)).collect();
+    if matches.is_empty() {
+        anyhow::bail!("no symbol named {name:?} found — try ast_search if you're not sure of the exact name");
+    }
+
+    let mut out = String::new();
+    for symbol in matches {
+        out.push_str(&format!(
+            "{} ({}:{}-{})\n\n{}\n\n",
+            symbol.name.as_deref().unwrap_or("<unnamed>"),
+            symbol.path.as_deref().unwrap_or("<unknown>"),
+            symbol.start_line.unwrap_or(0),
+            symbol.end_line.unwrap_or(0),
+            symbol.content.as_deref().unwrap_or(""),
+        ));
+    }
+    Ok(out)
+}
+
+fn tool_ast_search(args: &Value) -> anyhow::Result<String> {
+    let path = require_path(args)?;
+    let query = get_str(args, "query").ok_or_else(|| anyhow::anyhow!("missing required 'query' argument"))?;
+    let db_path = graph_db_path(&path);
+    if !db_path.exists() {
+        anyhow::bail!("no graph store at {} — call scan_repo first", db_path.display());
+    }
+    let store = SqliteGraphStore::open(&db_path)?;
+    let query_lower = query.to_lowercase();
+
+    let matches: Vec<_> =
+        store.nodes_by_kind(NodeKind::Symbol)?.into_iter().filter(|n| n.name.as_deref().is_some_and(|name| name.to_lowercase().contains(&query_lower))).collect();
+
+    if matches.is_empty() {
+        return Ok(format!("No symbols matching {query:?}."));
+    }
+
+    let mut out = String::new();
+    for symbol in matches {
+        out.push_str(&format!(
+            "{} — {}:{}-{}\n",
+            symbol.name.as_deref().unwrap_or("<unnamed>"),
+            symbol.path.as_deref().unwrap_or("<unknown>"),
+            symbol.start_line.unwrap_or(0),
+            symbol.end_line.unwrap_or(0),
+        ));
+    }
     Ok(out)
 }
 

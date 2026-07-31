@@ -180,4 +180,73 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["isError"], true);
     }
+
+    #[test]
+    fn get_symbol_returns_the_exact_symbol_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token(t):\n    return t == 'ok'\n\ndef verify_password(p):\n    return len(p) > 8\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let scan_req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"scan_repo","arguments":{{"path":"{path}"}}}}}}"#);
+        handle_message(AccessMode::Full, &scan_req).unwrap();
+
+        let req = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_symbol","arguments":{{"path":"{path}","name":"verify_token"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false, "{v:?}");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("verify_token"), "{text}");
+        assert!(text.contains("auth.py"), "{text}");
+        assert!(text.contains("return t == 'ok'"), "get_symbol should return the full source, not just the location: {text}");
+        assert!(!text.contains("verify_password"), "get_symbol must not return unrelated symbols: {text}");
+    }
+
+    #[test]
+    fn get_symbol_on_an_unknown_name_is_a_tool_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "x = 1\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let scan_req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"scan_repo","arguments":{{"path":"{path}"}}}}}}"#);
+        handle_message(AccessMode::Full, &scan_req).unwrap();
+
+        let req = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"get_symbol","arguments":{{"path":"{path}","name":"does_not_exist"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+    }
+
+    #[test]
+    fn ast_search_finds_symbols_by_case_insensitive_substring() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token(t):\n    return True\n\ndef verify_password(p):\n    return True\n\ndef unrelated():\n    return True\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let scan_req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"scan_repo","arguments":{{"path":"{path}"}}}}}}"#);
+        handle_message(AccessMode::Full, &scan_req).unwrap();
+
+        let req = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"ast_search","arguments":{{"path":"{path}","query":"VERIFY"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false, "{v:?}");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("verify_token"), "{text}");
+        assert!(text.contains("verify_password"), "{text}");
+        assert!(!text.contains("unrelated"), "ast_search must not return non-matching symbols: {text}");
+    }
+
+    #[test]
+    fn ast_search_with_no_matches_returns_a_result_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def foo():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let scan_req = format!(r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"scan_repo","arguments":{{"path":"{path}"}}}}}}"#);
+        handle_message(AccessMode::Full, &scan_req).unwrap();
+
+        let req = format!(r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"ast_search","arguments":{{"path":"{path}","query":"zzz_nothing_matches"}}}}}}"#);
+        let resp = handle_message(AccessMode::Full, &req).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false, "no matches is a valid empty result, not a tool error: {v:?}");
+    }
 }
