@@ -250,10 +250,47 @@ A public disclosure policy will be published alongside the first open-source rel
     `index_docs` are unavailable exactly like `semantic_search`/`semantic_index`
     without one — no separate gate was needed since the whole process is
     already gated.
-  - Not yet exposed over `agentops-heavy-api` (REST) — only the MCP stdio
-    server has these two tools today. `agentops-heavy-api`'s existing
-    `/search/index`/`/search` endpoints are codebrain-only; a docbrain
-    equivalent for the dashboard hasn't been added.
+  - Now also exposed over `agentops-heavy-api` (REST) — `POST /docs/search/index`
+    and `GET /docs/search`, same `402 Payment Required` gate as `/search*`
+    (one shared `search_index: Option<...>` state field, not a second gate
+    to keep in sync). `AppState` gained a `docbrain_db_path` field — unlike
+    `search_index`, this isn't itself a paid-tier gate (opening a local
+    SQLite file needs no license), it's just where docbrain's content lives;
+    defaults to the same `~/.agentops/docbrain.db` the CLI/MCP use,
+    overridable via `DOCBRAIN_DB_PATH`. `/docs/search` intentionally takes
+    no `org`/tenant parameter: Qdrant filters by `repo`(reused to hold the
+    library slug)/`kind`, not tenant, so isolation is enforced at index time
+    instead — `/docs/search/index` only ever reads doc nodes the indexing
+    caller's own tenant could see, so nothing a different tenant couldn't
+    already see makes it into the shared index. Verified live over real
+    HTTP against a real Qdrant instance: indexes a docbrain doc section and
+    confirms `/docs/search` finds it by meaning (no keyword overlap with the
+    query), plus the existing `agentops_embeddings::search_scoped` kind
+    filter is exercised through the actual router, not just the library.
+
+- **Async job tracking for docbrain scraping — `get_job_status` (implemented)** —
+  closes the "everything blocks the caller" gap noted above.
+  `scrape_library`/`sync_changelogs` both gained an optional `background: true`
+  argument; when set, the tool validates the request synchronously (unknown
+  library, missing `docs_url`/`github_repo` all still fail immediately, not
+  as a job that predictably fails later), creates a `jobs` row via
+  `docbrain_graph::DocbrainStore::create_job`, spawns a `std::thread` that
+  opens its **own** `DocbrainStore` connection from the same db file to do
+  the actual work and record the result, and returns the job id immediately.
+  `docbrain_mcp::call_tool`'s signature grew a `db_path: &Path` parameter
+  specifically to make this possible — a background job's thread can't
+  share the calling tool's already-open `DocbrainStore` (SQLite connections
+  aren't `Sync`), so it needs to know where to open its own from; this
+  threads through `docbrain-mcp`'s stdio loop and `docbrain-api`'s
+  `AppState` identically. `Job` rows are scoped by a `tenant_key` string
+  (not `visibility`/`visible_scopes` — a job isn't public/private *content*,
+  it's a private status record belonging to whoever started it), so
+  `get_job_status` returns "no such job" to a different tenant even for a
+  real, existing job id, the same information-hiding posture as every other
+  private resource in this codebase. Verified live: real background scrapes
+  of a real docs.rs page and a real GitHub releases sync, both polled to
+  completion through `get_job_status` over the real MCP dispatch path, plus
+  a dedicated tenant-isolation test on `get_job`/`get_job_status` directly.
 
 - **API-key CLI tooling (implemented)** — `agentops api-key generate` (in
   `agentops-cli`) wraps `agentops_security::api_key::generate_api_key`,

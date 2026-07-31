@@ -40,6 +40,13 @@ pub struct AppState {
     /// `/search*` routes return `402 Payment Required` with a clear message
     /// rather than the server refusing to start at all over a gated feature.
     search_index: Option<Arc<AsyncMutex<SemanticIndex>>>,
+    /// Where to open a `DocbrainStore` from for `/docs/search*` — unlike
+    /// `search_index`, this isn't itself a gate (opening a local SQLite file
+    /// needs no license/Qdrant), it's just where docbrain's content lives.
+    /// The `/docs/search*` routes are still gated by `search_index` being
+    /// `Some`, same as the codebrain `/search*` routes — one shared paid-tier
+    /// gate, not two.
+    docbrain_db_path: std::path::PathBuf,
 }
 
 pub fn build_router(
@@ -48,8 +55,9 @@ pub fn build_router(
     github_app_slug: Option<String>,
     api_key_hash: Option<String>,
     search_index: Option<Arc<AsyncMutex<SemanticIndex>>>,
+    docbrain_db_path: std::path::PathBuf,
 ) -> Router {
-    let state = AppState { store: Arc::new(Mutex::new(store)), secrets, github_app_slug, api_key_hash, search_index };
+    let state = AppState { store: Arc::new(Mutex::new(store)), secrets, github_app_slug, api_key_hash, search_index, docbrain_db_path };
     Router::new()
         .route("/repos/connect", post(connect_repo))
         .route("/repos", get(list_repos))
@@ -57,6 +65,8 @@ pub fn build_router(
         .route("/repos/github-app/install-url", get(github_app_install_url))
         .route("/search/index", post(search_index_handler))
         .route("/search", get(search_query_handler))
+        .route("/docs/search/index", post(docs_search_index_handler))
+        .route("/docs/search", get(docs_search_query_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .route("/health", get(health))
         .with_state(state)
@@ -80,6 +90,14 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Same default `docbrain-cli`/`docbrain-mcp` use — `~/.agentops/docbrain.db`
+/// — so a self-hosted deployment running everything on one machine doesn't
+/// need to set `DOCBRAIN_DB_PATH` explicitly for the common case.
+fn default_docbrain_db_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".agentops").join("docbrain.db")
 }
 
 /// Binds `addr` and serves until the process is killed. Reads
@@ -121,7 +139,9 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
         }
     };
 
-    let app = build_router(store, secrets, github_app_slug, api_key_hash, search_index);
+    let docbrain_db_path = std::env::var("DOCBRAIN_DB_PATH").map(std::path::PathBuf::from).unwrap_or_else(|_| default_docbrain_db_path());
+
+    let app = build_router(store, secrets, github_app_slug, api_key_hash, search_index, docbrain_db_path);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("agentops-heavy-api listening on {addr} (auth: {auth_status})");
     axum::serve(listener, app).await?;
@@ -325,10 +345,88 @@ async fn search_query_handler(State(state): State<AppState>, Query(q): Query<Sea
     }
 }
 
+fn tenant_from_org(org: Option<&str>) -> docbrain_graph::TenantContext {
+    match org {
+        Some(id) => docbrain_graph::TenantContext::org(id.to_string()),
+        None => docbrain_graph::TenantContext::public(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DocsIndexRequest {
+    slug: String,
+    org: Option<String>,
+}
+
+/// Embeds and indexes every doc node docbrain has for `slug` (across all its
+/// scraped versions), so `/docs/search` has something to find — the REST
+/// equivalent of `agentops-heavy-mcp`'s `index_docs` tool, same underlying
+/// `collect_doc_index_items`/shared-collection design (see that crate's doc
+/// comment for why docbrain and codebrain content safely share one Qdrant
+/// collection and one BGE-M3 model instance).
+async fn docs_search_index_handler(State(state): State<AppState>, Json(req): Json<DocsIndexRequest>) -> (StatusCode, Json<Value>) {
+    let Some(search_index) = &state.search_index else { return search_not_licensed() };
+    let tenant = tenant_from_org(req.org.as_deref());
+
+    // Same discipline as search_index_handler: DocbrainStore is opened and
+    // fully done with — including being dropped — before the `.await`
+    // below. DocbrainStore wraps a rusqlite::Connection (!Sync), so a
+    // reference to it must never cross an .await.
+    let items = {
+        let store = match docbrain_graph::DocbrainStore::open(&state.docbrain_db_path) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("opening docbrain store at {}: {e}", state.docbrain_db_path.display()) }))),
+        };
+        match agentops_embeddings::collect_doc_index_items(&store, &tenant, &req.slug) {
+            Ok(items) => items,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+        }
+    };
+
+    let mut index = search_index.lock().await;
+    match index.index_items(&items).await {
+        Ok(count) => (StatusCode::OK, Json(json!({ "indexed": count }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DocsSearchQuery {
+    slug: String,
+    q: String,
+    #[serde(default = "default_top_k")]
+    top_k: u64,
+}
+
+/// Semantic search scoped to docbrain doc content only — `search_scoped`'s
+/// `kind: "doc"` filter is what keeps this from ever surfacing a codebrain
+/// symbol/gotcha/decision result, even from the same shared collection.
+/// No `org`/tenant parameter here: Qdrant filters by `repo`/`kind`, not
+/// tenant, so tenant isolation for docbrain content is enforced at index
+/// time instead — `docs_search_index_handler` only ever reads doc nodes the
+/// indexing caller's own tenant could see in the first place, so nothing a
+/// different tenant couldn't already see gets into the shared index.
+async fn docs_search_query_handler(State(state): State<AppState>, Query(q): Query<DocsSearchQuery>) -> (StatusCode, Json<Value>) {
+    let Some(search_index) = &state.search_index else { return search_not_licensed() };
+
+    let mut index = search_index.lock().await;
+    match index.search_scoped(&q.q, q.top_k, Some(&q.slug), Some("doc")).await {
+        Ok(hits) => {
+            let results: Vec<Value> = hits
+                .into_iter()
+                .map(|h| json!({ "id": h.id, "score": h.score, "slug": h.repo, "topic": h.name, "version": h.path, "text": h.text }))
+                .collect();
+            (StatusCode::OK, Json(json!({ "results": results })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use agentops_graph::GraphStore as _;
+    use std::path::PathBuf;
     use agentops_repo_access::secrets::EnvSecretsProvider;
     use axum::body::Body;
     use axum::http::Request;
@@ -349,7 +447,7 @@ mod tests {
     #[tokio::test]
     async fn health_check_ok() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -357,7 +455,7 @@ mod tests {
     #[tokio::test]
     async fn connect_then_list_round_trips_over_http() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
 
         let connect_req = Request::builder()
             .method("POST")
@@ -386,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn list_never_leaks_across_tenants() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
 
         for (tenant, repo_id, url) in [("acme", "w", "url-a"), ("globex", "g", "url-b")] {
             let req = Request::builder()
@@ -408,7 +506,7 @@ mod tests {
     #[tokio::test]
     async fn verify_against_unreachable_host_marks_connection_failed() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
 
         let connect_req = Request::builder()
             .method("POST")
@@ -433,7 +531,7 @@ mod tests {
     #[tokio::test]
     async fn install_url_404s_when_no_app_is_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -441,7 +539,7 @@ mod tests {
     #[tokio::test]
     async fn install_url_returns_the_configured_slug() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None);
+        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain.db"));
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -452,7 +550,7 @@ mod tests {
     async fn missing_api_key_is_rejected_when_one_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash), None);
+        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain.db"));
         let resp = app.oneshot(Request::builder().uri("/repos?tenant=acme").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -461,7 +559,7 @@ mod tests {
     async fn health_check_bypasses_auth_even_when_a_key_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash), None);
+        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain.db"));
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -469,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn search_returns_402_when_not_licensed_or_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
         let resp = app.oneshot(Request::builder().uri("/search?path=/tmp/x&q=hello").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
     }
@@ -477,7 +575,7 @@ mod tests {
     #[tokio::test]
     async fn search_index_returns_402_when_not_licensed_or_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
         let req = Request::builder()
             .method("POST")
             .uri("/search/index")
@@ -486,6 +584,81 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn docs_search_returns_402_when_not_licensed_or_configured() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
+        let resp = app.oneshot(Request::builder().uri("/docs/search?slug=next&q=hello").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn docs_search_index_returns_402_when_not_licensed_or_configured() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain.db"));
+        let req = Request::builder()
+            .method("POST")
+            .uri("/docs/search/index")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"slug": "next"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    /// Same real-Qdrant/real-BGE-M3 live-test convention as
+    /// `search_index_then_query_finds_the_right_symbol_over_http`, for the
+    /// docbrain side — and specifically checks the kind isolation guarantee:
+    /// indexes both a codebrain symbol and a docbrain doc section with
+    /// deliberately overlapping content, then confirms /docs/search only
+    /// ever returns the doc.
+    #[tokio::test]
+    async fn docs_search_index_then_query_finds_the_right_doc_over_http() {
+        let Ok(qdrant_url) = std::env::var("AGENTOPS_TEST_QDRANT_URL") else { return };
+
+        let dir = tempfile::tempdir().unwrap();
+        let docbrain_db_path = dir.path().join("docbrain.db");
+        {
+            use docbrain_graph::{DocbrainStore, TenantContext, Visibility};
+            let docs_store = DocbrainStore::open(&docbrain_db_path).unwrap();
+            let tenant = TenantContext::public();
+            docs_store.add_library(&tenant, "next", "Next.js", None, Some("https://nextjs.org/docs"), Visibility::Public).unwrap();
+            docs_store
+                .add_doc_node(&tenant, "next", "15.1.3", "App Router caching", "Use the fetch cache option to control revalidation behavior.")
+                .unwrap();
+        }
+
+        let index = SemanticIndex::connect(&qdrant_url, "agentops_heavy_api_docs_test").unwrap();
+        index.ensure_collection().await.unwrap();
+        let search_index = Some(Arc::new(AsyncMutex::new(index)));
+
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, search_index, docbrain_db_path);
+
+        let index_req = Request::builder()
+            .method("POST")
+            .uri("/docs/search/index")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"slug": "next"}).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(index_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["indexed"], 1);
+
+        let search_req = Request::builder()
+            .uri("/docs/search?slug=next&q=how+do+I+control+fetch+revalidation")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(search_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "{body:?}");
+        assert_eq!(results[0]["topic"], "App Router caching");
+        assert_eq!(results[0]["version"], "15.1.3");
     }
 
     /// Exercises the full HTTP round trip (not just the library) against a
@@ -524,7 +697,7 @@ mod tests {
         let search_index = Some(Arc::new(AsyncMutex::new(index)));
 
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, search_index);
+        let app = build_router(store, secrets, None, None, search_index, PathBuf::from("unused-docbrain.db"));
 
         let index_req = Request::builder()
             .method("POST")

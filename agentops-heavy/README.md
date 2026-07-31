@@ -85,10 +85,12 @@ corpus) cross-encoder pass, the standard two-stage retrieval pattern.
   query it directly from the command line.
 
 **Where this is actually exposed:**
-- `agentops-heavy-api`: `POST /search/index` / `GET /search` — for the
+- `agentops-heavy-api`: `POST /search/index` / `GET /search` (codebrain) and
+  `POST /docs/search/index` / `GET /docs/search` (docbrain) — for the
   dashboard. Requires `AGENTOPS_QDRANT_URL` and a valid `AGENTOPS_LICENSE_KEY`
-  (semantic search is paid-tier; both routes return `402 Payment Required`
-  otherwise, rather than the server refusing to start).
+  (semantic search is paid-tier; all four routes return `402 Payment Required`
+  otherwise, rather than the server refusing to start). The `/docs/*` routes
+  also read `DOCBRAIN_DB_PATH` (defaults to `~/.agentops/docbrain.db`).
 - `agentops-heavy-mcp`: `semantic_search`/`semantic_index` tools over stdio
   JSON-RPC — for actual agent use in Claude Code. Same license requirement,
   but stricter: this binary refuses to start at all without one, since an

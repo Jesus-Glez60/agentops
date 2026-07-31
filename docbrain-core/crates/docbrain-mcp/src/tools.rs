@@ -7,7 +7,7 @@
 //! structurally hard to do wrong).
 
 use anyhow::Context;
-use docbrain_graph::{DocbrainStore, TenantContext, Visibility};
+use docbrain_graph::{DocbrainStore, JobStatus, TenantContext, Visibility};
 use docbrain_ingest::{discover, scrape_docs, sync_github_releases, Ecosystem};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -71,13 +71,14 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "scrape_library",
-            description: "Docbrain-1: fetch a library's docs page (registered via discover_library/resolve_library) and persist it as version-scoped doc_nodes. Splits the page into heading-scoped sections. Set max_pages > 1 to also follow same-origin, same-path-prefix links found on the landing page (shallow crawl, bounded).",
+            description: "Docbrain-1: fetch a library's docs page (registered via discover_library/resolve_library) and persist it as version-scoped doc_nodes. Splits the page into heading-scoped sections. Set max_pages > 1 to also follow same-origin, same-path-prefix links found on the landing page (shallow crawl, bounded). Set background: true to run as a background job (recommended for max_pages > 1) — returns a job id immediately; poll get_job_status with it.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "slug": { "type": "string" },
                     "version": { "type": "string", "description": "The exact version this scrape represents, e.g. '15.1.3'." },
                     "max_pages": { "type": "integer", "description": "Defaults to 1 (landing page only)." },
+                    "background": { "type": "boolean", "description": "Defaults to false (blocks until done)." },
                     "org": { "type": "string" },
                 },
                 "required": ["slug", "version"],
@@ -85,11 +86,20 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "sync_changelogs",
-            description: "Fetches a library's GitHub releases and persists consecutive-version changelog entries, with a breaking-change heuristic (explicit 'breaking' mention in the release body, or a major-version bump).",
+            description: "Fetches a library's GitHub releases and persists consecutive-version changelog entries, with a breaking-change heuristic (explicit 'breaking' mention in the release body, or a major-version bump). Set background: true to run as a background job — returns a job id immediately; poll get_job_status with it.",
             input_schema: json!({
                 "type": "object",
-                "properties": { "slug": { "type": "string" }, "org": { "type": "string" } },
+                "properties": { "slug": { "type": "string" }, "background": { "type": "boolean", "description": "Defaults to false (blocks until done)." }, "org": { "type": "string" } },
                 "required": ["slug"],
+            }),
+        },
+        ToolDefinition {
+            name: "get_job_status",
+            description: "Polls the status of a background scrape_library/sync_changelogs job (running/succeeded/failed) plus its result message once done.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "job_id": { "type": "integer" }, "org": { "type": "string" } },
+                "required": ["job_id"],
             }),
         },
         ToolDefinition {
@@ -130,17 +140,24 @@ fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
-pub fn call_tool(store: &DocbrainStore, name: &str, args: &Value) -> Result<CallToolResult, String> {
+/// `db_path` is only used by tools that can run in the background
+/// (`scrape_library`/`sync_changelogs` with `background: true`) — a
+/// background job needs to open its *own* `DocbrainStore` connection inside
+/// the spawned thread (SQLite connections aren't `Sync`, so `store` itself
+/// can't be shared across threads), and doing that requires knowing the
+/// path it was opened from in the first place.
+pub fn call_tool(store: &DocbrainStore, db_path: &Path, name: &str, args: &Value) -> Result<CallToolResult, String> {
     let result = match name {
         "list_libraries" => tool_list_libraries(store, args),
         "get_library" => tool_get_library(store, args),
         "get_docs" => tool_get_docs(store, args),
         "get_changelog" => tool_get_changelog(store, args),
         "discover_library" => tool_discover_library(store, args),
-        "scrape_library" => tool_scrape_library(store, args),
-        "sync_changelogs" => tool_sync_changelogs(store, args),
+        "scrape_library" => tool_scrape_library(store, db_path, args),
+        "sync_changelogs" => tool_sync_changelogs(store, db_path, args),
         "resolve_library" => tool_resolve_library(store, args),
         "ingest_local_files" => tool_ingest_local_files(store, args),
+        "get_job_status" => tool_get_job_status(store, args),
         other => return Err(format!("unknown tool '{other}'")),
     };
 
@@ -232,50 +249,133 @@ fn tool_discover_library(store: &DocbrainStore, args: &Value) -> anyhow::Result<
     }
 }
 
-fn tool_scrape_library(store: &DocbrainStore, args: &Value) -> anyhow::Result<String> {
+fn tool_scrape_library(store: &DocbrainStore, db_path: &Path, args: &Value) -> anyhow::Result<String> {
     let tenant = tenant_from_args(args);
-    let slug = get_str(args, "slug").ok_or_else(|| anyhow::anyhow!("missing required 'slug'"))?;
-    let version = get_str(args, "version").ok_or_else(|| anyhow::anyhow!("missing required 'version'"))?;
+    let slug = get_str(args, "slug").ok_or_else(|| anyhow::anyhow!("missing required 'slug'"))?.to_string();
+    let version = get_str(args, "version").ok_or_else(|| anyhow::anyhow!("missing required 'version'"))?.to_string();
     let max_pages = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
 
+    // Resolved synchronously either way, so an obviously-doomed request
+    // (unknown library, no docs_url) fails immediately instead of only
+    // surfacing as a failed job a caller has to go poll for.
     let library = store
-        .get_library(&tenant, slug)?
+        .get_library(&tenant, &slug)?
         .ok_or_else(|| anyhow::anyhow!("no library '{slug}' visible to this caller — register it first via discover_library or ingest_local_files"))?;
     let docs_url = library
         .docs_url
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("library '{slug}' has no docs_url registered — nothing to scrape"))?;
 
-    let sections = scrape_docs(docs_url, max_pages)?;
-    if sections.is_empty() {
-        anyhow::bail!("scraped '{docs_url}' but found no content (no headings and no body text)");
+    if !background {
+        let sections = scrape_docs(&docs_url, max_pages)?;
+        if sections.is_empty() {
+            anyhow::bail!("scraped '{docs_url}' but found no content (no headings and no body text)");
+        }
+        store.add_doc_snapshot(&tenant, &slug, &version)?;
+        for section in &sections {
+            store.add_doc_node(&tenant, &slug, &version, &section.topic, &section.content)?;
+        }
+        return Ok(format!("Scraped {docs_url} -> {} section(s) persisted as {slug}@{version}.", sections.len()));
     }
 
-    store.add_doc_snapshot(&tenant, slug, version)?;
-    for section in &sections {
-        store.add_doc_node(&tenant, slug, version, &section.topic, &section.content)?;
-    }
+    let job_id = store.create_job(&tenant, "scrape_library", &slug)?;
+    let db_path = db_path.to_path_buf();
+    std::thread::spawn(move || run_scrape_job(db_path, tenant, slug, version, docs_url, max_pages, job_id));
 
-    Ok(format!("Scraped {docs_url} -> {} section(s) persisted as {slug}@{version}.", sections.len()))
+    Ok(format!("Started background scrape job {job_id}. Poll get_job_status with job_id: {job_id}."))
 }
 
-fn tool_sync_changelogs(store: &DocbrainStore, args: &Value) -> anyhow::Result<String> {
-    let tenant = tenant_from_args(args);
-    let slug = get_str(args, "slug").ok_or_else(|| anyhow::anyhow!("missing required 'slug'"))?;
+/// Runs entirely on a spawned thread, with its own `DocbrainStore`
+/// connection opened fresh from `db_path` — `store` from the calling tool
+/// can't be moved in here (`rusqlite::Connection` isn't `Sync`, so it isn't
+/// shared across threads; each thread gets its own connection to the same
+/// file instead, which SQLite supports fine).
+fn run_scrape_job(db_path: std::path::PathBuf, tenant: TenantContext, slug: String, version: String, docs_url: String, max_pages: usize, job_id: i64) {
+    let Ok(worker_store) = DocbrainStore::open(&db_path) else { return };
+    let outcome: anyhow::Result<String> = (|| {
+        let sections = scrape_docs(&docs_url, max_pages)?;
+        if sections.is_empty() {
+            anyhow::bail!("scraped '{docs_url}' but found no content (no headings and no body text)");
+        }
+        worker_store.add_doc_snapshot(&tenant, &slug, &version)?;
+        for section in &sections {
+            worker_store.add_doc_node(&tenant, &slug, &version, &section.topic, &section.content)?;
+        }
+        Ok(format!("Scraped {docs_url} -> {} section(s) persisted as {slug}@{version}.", sections.len()))
+    })();
 
-    let library = store.get_library(&tenant, slug)?.ok_or_else(|| anyhow::anyhow!("no library '{slug}' visible to this caller"))?;
+    match outcome {
+        Ok(msg) => {
+            let _ = worker_store.complete_job(job_id, JobStatus::Succeeded, &msg);
+        }
+        Err(e) => {
+            let _ = worker_store.complete_job(job_id, JobStatus::Failed, &e.to_string());
+        }
+    }
+}
+
+fn tool_sync_changelogs(store: &DocbrainStore, db_path: &Path, args: &Value) -> anyhow::Result<String> {
+    let tenant = tenant_from_args(args);
+    let slug = get_str(args, "slug").ok_or_else(|| anyhow::anyhow!("missing required 'slug'"))?.to_string();
+    let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    let library = store.get_library(&tenant, &slug)?.ok_or_else(|| anyhow::anyhow!("no library '{slug}' visible to this caller"))?;
     let repo = library
         .github_repo
-        .as_deref()
+        .clone()
         .ok_or_else(|| anyhow::anyhow!("library '{slug}' has no github_repo registered — nothing to sync changelogs from"))?;
-    let (owner, name) = parse_owner_repo(repo).ok_or_else(|| anyhow::anyhow!("could not parse owner/repo out of '{repo}'"))?;
+    let (owner, name) = parse_owner_repo(&repo).ok_or_else(|| anyhow::anyhow!("could not parse owner/repo out of '{repo}'"))?;
 
-    let entries = sync_github_releases(&owner, &name)?;
-    for e in &entries {
-        store.add_changelog_entry(&tenant, slug, &e.from_version, &e.to_version, &e.entry, e.breaking)?;
+    if !background {
+        let entries = sync_github_releases(&owner, &name)?;
+        for e in &entries {
+            store.add_changelog_entry(&tenant, &slug, &e.from_version, &e.to_version, &e.entry, e.breaking)?;
+        }
+        return Ok(format!("Synced {} changelog entr{} for {slug} from {owner}/{name}.", entries.len(), if entries.len() == 1 { "y" } else { "ies" }));
     }
 
-    Ok(format!("Synced {} changelog entr{} for {slug} from {owner}/{name}.", entries.len(), if entries.len() == 1 { "y" } else { "ies" }))
+    let job_id = store.create_job(&tenant, "sync_changelogs", &slug)?;
+    let db_path = db_path.to_path_buf();
+    std::thread::spawn(move || run_sync_changelogs_job(db_path, tenant, slug, owner, name, job_id));
+
+    Ok(format!("Started background changelog sync job {job_id}. Poll get_job_status with job_id: {job_id}."))
+}
+
+fn run_sync_changelogs_job(db_path: std::path::PathBuf, tenant: TenantContext, slug: String, owner: String, name: String, job_id: i64) {
+    let Ok(worker_store) = DocbrainStore::open(&db_path) else { return };
+    let outcome: anyhow::Result<String> = (|| {
+        let entries = sync_github_releases(&owner, &name)?;
+        for e in &entries {
+            worker_store.add_changelog_entry(&tenant, &slug, &e.from_version, &e.to_version, &e.entry, e.breaking)?;
+        }
+        Ok(format!("Synced {} changelog entr{} for {slug} from {owner}/{name}.", entries.len(), if entries.len() == 1 { "y" } else { "ies" }))
+    })();
+
+    match outcome {
+        Ok(msg) => {
+            let _ = worker_store.complete_job(job_id, JobStatus::Succeeded, &msg);
+        }
+        Err(e) => {
+            let _ = worker_store.complete_job(job_id, JobStatus::Failed, &e.to_string());
+        }
+    }
+}
+
+fn tool_get_job_status(store: &DocbrainStore, args: &Value) -> anyhow::Result<String> {
+    let tenant = tenant_from_args(args);
+    let job_id = args.get("job_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'job_id'"))?;
+    let job = store.get_job(&tenant, job_id)?.ok_or_else(|| anyhow::anyhow!("no job {job_id} visible to this caller"))?;
+
+    let status_str = match job.status {
+        JobStatus::Running => "running",
+        JobStatus::Succeeded => "succeeded",
+        JobStatus::Failed => "failed",
+    };
+    Ok(match job.message {
+        Some(msg) => format!("job {} [{}] {} — {status_str}\n{msg}", job.id, job.job_type, job.slug),
+        None => format!("job {} [{}] {} — {status_str}", job.id, job.job_type, job.slug),
+    })
 }
 
 /// Pulls `owner/repo` out of a GitHub URL in whatever shape it was stored
@@ -368,8 +468,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn list_tools_has_nine_entries() {
-        assert_eq!(list_tools().len(), 9);
+    fn list_tools_has_ten_entries() {
+        assert_eq!(list_tools().len(), 10);
     }
 
     #[test]
@@ -378,14 +478,14 @@ mod tests {
         let acme = TenantContext::org("acme");
         store.add_library(&acme, "acme-sdk", "Acme SDK", None, None, Visibility::Private("acme".into())).unwrap();
 
-        let result = call_tool(&store, "get_library", &json!({"slug": "acme-sdk", "org": "globex"})).unwrap();
+        let result = call_tool(&store, Path::new("unused.db"), "get_library", &json!({"slug": "acme-sdk", "org": "globex"})).unwrap();
         assert!(result.is_error, "globex must not see acme's private library");
     }
 
     #[test]
     fn discover_library_registers_a_real_npm_package() {
         let store = DocbrainStore::open_in_memory().unwrap();
-        let result = call_tool(&store, "discover_library", &json!({"ecosystem": "npm", "name": "react"})).unwrap();
+        let result = call_tool(&store, Path::new("unused.db"), "discover_library", &json!({"ecosystem": "npm", "name": "react"})).unwrap();
         assert!(!result.is_error, "{:?}", result.content);
         assert!(result.content[0].text.contains("Discovered and registered"));
 
@@ -405,7 +505,7 @@ mod tests {
     fn scrape_library_fails_cleanly_when_library_has_no_docs_url() {
         let store = DocbrainStore::open_in_memory().unwrap();
         store.add_library(&TenantContext::public(), "no-docs", "No Docs", None, None, Visibility::Public).unwrap();
-        let result = call_tool(&store, "scrape_library", &json!({"slug": "no-docs", "version": "1.0"})).unwrap();
+        let result = call_tool(&store, Path::new("unused.db"), "scrape_library", &json!({"slug": "no-docs", "version": "1.0"})).unwrap();
         assert!(result.is_error);
         assert!(result.content[0].text.contains("no docs_url"));
     }
@@ -416,7 +516,7 @@ mod tests {
         store
             .add_library(&TenantContext::public(), "anyhow-rs", "anyhow", None, Some("https://docs.rs/anyhow/latest/anyhow/"), Visibility::Public)
             .unwrap();
-        let result = call_tool(&store, "scrape_library", &json!({"slug": "anyhow-rs", "version": "1.0.0"})).unwrap();
+        let result = call_tool(&store, Path::new("unused.db"), "scrape_library", &json!({"slug": "anyhow-rs", "version": "1.0.0"})).unwrap();
         assert!(!result.is_error, "{:?}", result.content);
 
         let nodes = store.get_doc_nodes(&TenantContext::public(), "anyhow-rs", "1.0.0").unwrap();
@@ -429,7 +529,7 @@ mod tests {
         store
             .add_library(&TenantContext::public(), "requests-py", "requests", Some("https://github.com/psf/requests"), None, Visibility::Public)
             .unwrap();
-        let result = call_tool(&store, "sync_changelogs", &json!({"slug": "requests-py"})).unwrap();
+        let result = call_tool(&store, Path::new("unused.db"), "sync_changelogs", &json!({"slug": "requests-py"})).unwrap();
         assert!(!result.is_error, "{:?}", result.content);
         // requests has enough releases that at least one changelog pair should exist,
         // unless GitHub's API happened to rate-limit this exact test run.
@@ -444,7 +544,7 @@ mod tests {
     fn resolve_library_finds_a_fuzzy_match() {
         let store = DocbrainStore::open_in_memory().unwrap();
         store.add_library(&TenantContext::public(), "next", "Next.js", None, None, Visibility::Public).unwrap();
-        let result = call_tool(&store, "resolve_library", &json!({"name": "nextjs"})).unwrap();
+        let result = call_tool(&store, Path::new("unused.db"), "resolve_library", &json!({"name": "nextjs"})).unwrap();
         assert!(!result.is_error);
         assert!(result.content[0].text.contains("next"), "{:?}", result.content);
     }
@@ -452,7 +552,7 @@ mod tests {
     #[test]
     fn resolve_library_reports_no_match_honestly() {
         let store = DocbrainStore::open_in_memory().unwrap();
-        let result = call_tool(&store, "resolve_library", &json!({"name": "totally-unregistered-thing"})).unwrap();
+        let result = call_tool(&store, Path::new("unused.db"), "resolve_library", &json!({"name": "totally-unregistered-thing"})).unwrap();
         assert!(!result.is_error);
         assert!(result.content[0].text.contains("No registered library"));
     }
@@ -467,6 +567,7 @@ mod tests {
         let store = DocbrainStore::open_in_memory().unwrap();
         let result = call_tool(
             &store,
+            Path::new("unused.db"),
             "ingest_local_files",
             &json!({"slug": "acme-sdk", "name": "Acme SDK", "version": "1.0", "paths": [file_path.to_str().unwrap()], "org": "acme"}),
         )
@@ -493,10 +594,92 @@ mod tests {
         let store = DocbrainStore::open_in_memory().unwrap();
         let result = call_tool(
             &store,
+            Path::new("unused.db"),
             "ingest_local_files",
             &json!({"slug": "ghost", "version": "1.0", "paths": ["/nonexistent/path/does-not-exist.md"]}),
         )
         .unwrap();
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn background_scrape_library_reports_running_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docbrain.db");
+        let store = DocbrainStore::open(&db_path).unwrap();
+        store
+            .add_library(&TenantContext::public(), "anyhow-rs", "anyhow", None, Some("https://docs.rs/anyhow/latest/anyhow/"), Visibility::Public)
+            .unwrap();
+
+        let result = call_tool(&store, &db_path, "scrape_library", &json!({"slug": "anyhow-rs", "version": "1.0.0", "background": true})).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let text = &result.content[0].text;
+        assert!(text.contains("Started background scrape job"), "{text}");
+        let job_id: i64 = text.split_whitespace().last().unwrap().trim_end_matches('.').parse().unwrap();
+
+        // Poll until the background thread finishes — real background work,
+        // not simulated, so this waits on the actual thread rather than
+        // asserting a fixed timing.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status_result = call_tool(&store, &db_path, "get_job_status", &json!({"job_id": job_id})).unwrap();
+            assert!(!status_result.is_error, "{:?}", status_result.content);
+            let status_text = &status_result.content[0].text;
+            if status_text.contains("succeeded") {
+                assert!(status_text.contains("section(s) persisted"), "{status_text}");
+                break;
+            }
+            assert!(!status_text.contains("failed"), "job failed: {status_text}");
+            assert!(std::time::Instant::now() < deadline, "background scrape job did not finish in time: {status_text}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        let nodes = store.get_doc_nodes(&TenantContext::public(), "anyhow-rs", "1.0.0").unwrap();
+        assert!(!nodes.is_empty(), "background job must actually persist scraped content");
+    }
+
+    #[test]
+    fn background_sync_changelogs_reports_running_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docbrain.db");
+        let store = DocbrainStore::open(&db_path).unwrap();
+        store
+            .add_library(&TenantContext::public(), "requests-py", "requests", Some("https://github.com/psf/requests"), None, Visibility::Public)
+            .unwrap();
+
+        let result = call_tool(&store, &db_path, "sync_changelogs", &json!({"slug": "requests-py", "background": true})).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        let text = &result.content[0].text;
+        let job_id: i64 = text.split_whitespace().last().unwrap().trim_end_matches('.').parse().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let status_result = call_tool(&store, &db_path, "get_job_status", &json!({"job_id": job_id})).unwrap();
+            let status_text = &status_result.content[0].text;
+            if status_text.contains("succeeded") || status_text.contains("failed") {
+                // GitHub's API may rate-limit this exact test run — that's
+                // an expected, distinguishable outcome (see docbrain-ingest's
+                // own changelog tests), not a bug in the job machinery.
+                assert!(status_text.contains("succeeded") || status_text.contains("rate limit"), "{status_text}");
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "background sync job did not finish in time: {status_text}");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    #[test]
+    fn get_job_status_is_tenant_scoped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docbrain.db");
+        let store = DocbrainStore::open(&db_path).unwrap();
+        let acme = TenantContext::org("acme");
+        let job_id = store.create_job(&acme, "scrape_library", "acme-internal-sdk").unwrap();
+
+        let result = call_tool(&store, &db_path, "get_job_status", &json!({"job_id": job_id, "org": "globex"})).unwrap();
+        assert!(result.is_error, "globex must not see acme's job");
+
+        let result = call_tool(&store, &db_path, "get_job_status", &json!({"job_id": job_id, "org": "acme"})).unwrap();
+        assert!(!result.is_error);
     }
 }

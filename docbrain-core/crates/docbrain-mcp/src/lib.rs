@@ -28,7 +28,7 @@ pub fn run_stdio(db_path: &Path) -> anyhow::Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        if let Some(response) = server::handle_message(&store, &line) {
+        if let Some(response) = server::handle_message(&store, db_path, &line) {
             writeln!(stdout, "{response}")?;
             stdout.flush()?;
         }

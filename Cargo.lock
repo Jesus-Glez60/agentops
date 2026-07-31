@@ -659,6 +659,7 @@ dependencies = [
  "docbrain-ingest",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
 ]
 

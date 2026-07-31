@@ -6,7 +6,7 @@
 //! threads), so it's wrapped in `Arc<Mutex<_>>` for axum's multi-threaded
 //! handler pool — every handler locks it for the duration of one call.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path as AxumPath, Query, Request, State};
@@ -25,6 +25,12 @@ use agentops_security::api_key::verify_api_key;
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<DocbrainStore>>,
+    /// Needed only by tools that can run in the background
+    /// (`scrape_library`/`sync_changelogs` with `background: true`) — the
+    /// spawned thread opens its own `DocbrainStore` connection from this
+    /// path rather than sharing `store` across threads (SQLite connections
+    /// aren't `Sync`). See `docbrain_mcp::call_tool`'s doc comment.
+    db_path: PathBuf,
     /// SHA-256 hash of the required API key. `None` disables auth — see
     /// `agentops-api`'s identical convention and SECURITY.md.
     api_key_hash: Option<String>,
@@ -32,8 +38,8 @@ struct AppState {
 
 /// `api_key_hash`, if set, requires every request except `/health` to
 /// present a matching `Authorization: Bearer <key>` header.
-pub fn build_router(store: DocbrainStore, api_key_hash: Option<String>) -> Router {
-    let state = AppState { store: Arc::new(Mutex::new(store)), api_key_hash };
+pub fn build_router(store: DocbrainStore, db_path: PathBuf, api_key_hash: Option<String>) -> Router {
+    let state = AppState { store: Arc::new(Mutex::new(store)), db_path, api_key_hash };
     Router::new()
         .route("/tools", get(list_tools_handler))
         .route("/tools/{name}", post(call_tool_handler))
@@ -73,7 +79,7 @@ pub async fn run(addr: &str, db_path: &Path) -> anyhow::Result<()> {
     let store = DocbrainStore::open(db_path)?;
     let api_key_hash = std::env::var("DOCBRAIN_API_KEY_HASH").ok();
     let auth_status = if api_key_hash.is_some() { "API key required" } else { "UNAUTHENTICATED (set DOCBRAIN_API_KEY_HASH to require a key)" };
-    let app = build_router(store, api_key_hash);
+    let app = build_router(store, db_path.to_path_buf(), api_key_hash);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("docbrain-api listening on {addr} (auth: {auth_status})");
     axum::serve(listener, app).await?;
@@ -119,7 +125,7 @@ async fn call_tool_handler(
     let args = body.map(|Json(v)| v).unwrap_or(empty);
 
     let store = state.store.lock().unwrap();
-    match docbrain_mcp::call_tool(&store, &name, &args) {
+    match docbrain_mcp::call_tool(&store, &state.db_path, &name, &args) {
         Ok(result) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())),
         Err(refusal) => (StatusCode::FORBIDDEN, Json(json!({ "error": refusal }))),
     }
@@ -142,7 +148,7 @@ mod tests {
     #[tokio::test]
     async fn health_check_ok() {
         let store = DocbrainStore::open_in_memory().unwrap();
-        let app = build_router(store, None);
+        let app = build_router(store, PathBuf::from("unused.db"), None);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -155,7 +161,7 @@ mod tests {
             .add_library(&TenantContext::org("acme"), "acme-sdk", "Acme SDK", None, None, Visibility::Private("acme".into()))
             .unwrap();
 
-        let app = build_router(store, None);
+        let app = build_router(store, PathBuf::from("unused.db"), None);
         let resp = app.clone().oneshot(Request::builder().uri("/libraries").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -169,12 +175,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_has_nine_entries() {
+    async fn tools_list_has_ten_entries() {
         let store = DocbrainStore::open_in_memory().unwrap();
-        let app = build_router(store, None);
+        let app = build_router(store, PathBuf::from("unused.db"), None);
         let resp = app.oneshot(Request::builder().uri("/tools").body(Body::empty()).unwrap()).await.unwrap();
         let body = body_json(resp).await;
-        assert_eq!(body["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 10);
     }
 
     #[tokio::test]
@@ -184,7 +190,7 @@ mod tests {
             .add_library(&TenantContext::org("acme"), "acme-sdk", "Acme SDK", None, None, Visibility::Private("acme".into()))
             .unwrap();
 
-        let app = build_router(store, None);
+        let app = build_router(store, PathBuf::from("unused.db"), None);
         let req = Request::builder()
             .method("POST")
             .uri("/tools/get_library")
@@ -201,7 +207,7 @@ mod tests {
     async fn health_check_bypasses_auth_even_when_a_key_is_required() {
         let store = DocbrainStore::open_in_memory().unwrap();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, Some(hash));
+        let app = build_router(store, PathBuf::from("unused.db"), Some(hash));
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -210,7 +216,7 @@ mod tests {
     async fn missing_api_key_is_rejected_when_one_is_required() {
         let store = DocbrainStore::open_in_memory().unwrap();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, Some(hash));
+        let app = build_router(store, PathBuf::from("unused.db"), Some(hash));
         let resp = app.oneshot(Request::builder().uri("/tools").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -219,7 +225,7 @@ mod tests {
     async fn correct_api_key_is_accepted() {
         let store = DocbrainStore::open_in_memory().unwrap();
         let (raw, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, Some(hash));
+        let app = build_router(store, PathBuf::from("unused.db"), Some(hash));
         let req = Request::builder()
             .uri("/tools")
             .header("authorization", format!("Bearer {raw}"))

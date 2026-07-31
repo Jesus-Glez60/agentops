@@ -107,6 +107,7 @@ dependencies = [
  "agentops-security",
  "anyhow",
  "axum 0.8.9",
+ "docbrain-graph",
  "http-body-util",
  "serde",
  "serde_json",

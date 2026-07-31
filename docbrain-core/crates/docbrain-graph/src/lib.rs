@@ -42,6 +42,18 @@ impl TenantContext {
             TenantContext::Org(id) => vec!["public".to_string(), format!("private:{id}")],
         }
     }
+
+    /// A stable string key identifying exactly this tenant (not what it can
+    /// *see*, unlike `visible_scopes` — this is who it *is*), used to scope
+    /// `jobs` rows to their owner. Two different orgs must never share a
+    /// job's status even if both happen to have started a job for the same
+    /// library slug.
+    fn key(&self) -> String {
+        match self {
+            TenantContext::Public => "public".to_string(),
+            TenantContext::Org(id) => format!("org:{id}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,6 +95,46 @@ pub struct DocNode {
     pub version: String,
     pub topic: String,
     pub content: String,
+}
+
+/// A background ingestion job (`scrape_library`/`sync_changelogs` run in the
+/// background — see `docbrain-mcp`'s `tool_scrape_library`/`tool_sync_changelogs`).
+/// Scoped to the tenant that started it via `tenant_key`, not via
+/// `visibility`/`visible_scopes` (a job isn't content with a
+/// public/private-to-an-org visibility level — it's a private status record
+/// belonging to whoever kicked it off, full stop).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Job {
+    pub id: i64,
+    pub job_type: String,
+    pub slug: String,
+    pub status: JobStatus,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum JobStatus {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+impl JobStatus {
+    fn as_db_str(&self) -> &'static str {
+        match self {
+            JobStatus::Running => "running",
+            JobStatus::Succeeded => "succeeded",
+            JobStatus::Failed => "failed",
+        }
+    }
+
+    fn from_db_str(s: &str) -> Self {
+        match s {
+            "succeeded" => JobStatus::Succeeded,
+            "failed" => JobStatus::Failed,
+            _ => JobStatus::Running,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,9 +203,64 @@ impl DocbrainStore {
                 content     TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_doc_nodes_lib_ver ON doc_nodes(library_id, version);
+
+            CREATE TABLE IF NOT EXISTS jobs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_key  TEXT NOT NULL,
+                job_type    TEXT NOT NULL,
+                slug        TEXT NOT NULL,
+                status      TEXT NOT NULL DEFAULT 'running',
+                message     TEXT,
+                created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             ",
         )?;
         Ok(())
+    }
+
+    /// Starts a job record in `running` state and returns its id. Called
+    /// synchronously, right before spawning the background thread that does
+    /// the actual work — so a caller polling `get_job` immediately after
+    /// starting a background scrape always finds a real row, never "no such
+    /// job" due to a race with the spawned thread not having inserted yet.
+    pub fn create_job(&self, tenant: &TenantContext, job_type: &str, slug: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO jobs (tenant_key, job_type, slug, status) VALUES (?1, ?2, ?3, 'running')",
+            rusqlite::params![tenant.key(), job_type, slug],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Marks a job done, successfully or not. Takes a plain `i64` id rather
+    /// than a tenant-checked lookup — this is called from inside the
+    /// background thread that owns the job, which already knows its own id;
+    /// tenant scoping is enforced on the *read* side (`get_job`) instead.
+    pub fn complete_job(&self, id: i64, status: JobStatus, message: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE jobs SET status = ?1, message = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            rusqlite::params![status.as_db_str(), message, id],
+        )?;
+        Ok(())
+    }
+
+    /// Looks up a job by id, but only if it belongs to `tenant` — one org
+    /// polling another org's job id (even a guessed/incremented one) gets
+    /// `Ok(None)`, indistinguishable from "no such job," same information-
+    /// hiding posture as `get_library` for private libraries.
+    pub fn get_job(&self, tenant: &TenantContext, id: i64) -> Result<Option<Job>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM jobs WHERE id = ?1 AND tenant_key = ?2")?;
+        let mut rows = stmt.query_map(rusqlite::params![id, tenant.key()], |row| {
+            let status_str: String = row.get("status")?;
+            Ok(Job {
+                id: row.get("id")?,
+                job_type: row.get("job_type")?,
+                slug: row.get("slug")?,
+                status: JobStatus::from_db_str(&status_str),
+                message: row.get("message")?,
+            })
+        })?;
+        Ok(rows.next().transpose()?)
     }
 
     fn row_to_library(row: &rusqlite::Row) -> rusqlite::Result<Library> {
@@ -411,6 +518,34 @@ mod tests {
 
         let all = store.all_doc_nodes(&pub_ctx, "next").unwrap();
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn job_lifecycle_running_then_succeeded() {
+        let store = DocbrainStore::open_in_memory().unwrap();
+        let tenant = TenantContext::public();
+        let id = store.create_job(&tenant, "scrape_library", "next").unwrap();
+
+        let job = store.get_job(&tenant, id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Running);
+        assert_eq!(job.slug, "next");
+
+        store.complete_job(id, JobStatus::Succeeded, "Scraped 3 sections.").unwrap();
+        let job = store.get_job(&tenant, id).unwrap().unwrap();
+        assert_eq!(job.status, JobStatus::Succeeded);
+        assert_eq!(job.message.as_deref(), Some("Scraped 3 sections."));
+    }
+
+    #[test]
+    fn a_job_is_never_visible_to_a_different_tenant() {
+        let store = DocbrainStore::open_in_memory().unwrap();
+        let acme = TenantContext::org("acme");
+        let id = store.create_job(&acme, "scrape_library", "acme-internal-sdk").unwrap();
+
+        let globex = TenantContext::org("globex");
+        assert!(store.get_job(&globex, id).unwrap().is_none());
+        assert!(store.get_job(&TenantContext::public(), id).unwrap().is_none());
+        assert!(store.get_job(&acme, id).unwrap().is_some());
     }
 
     #[test]
