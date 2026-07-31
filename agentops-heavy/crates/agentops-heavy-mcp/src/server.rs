@@ -77,13 +77,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_includes_both_tools() {
+    async fn tools_list_includes_all_four_tools() {
         let Some(mut index) = test_index() else { return };
         let resp = handle_message(&mut index, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#).await.unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         let names: Vec<&str> = v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"semantic_search"));
         assert!(names.contains(&"semantic_index"));
+        assert!(names.contains(&"search_docs"));
+        assert!(names.contains(&"index_docs"));
     }
 
     #[tokio::test]
@@ -121,5 +123,68 @@ mod tests {
         assert_eq!(v["result"]["isError"], false, "{v:?}");
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("rate-limit-backoff"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn index_docs_then_search_docs_over_the_real_mcp_dispatch_path() {
+        let Some(mut index) = test_index() else { return };
+        index.ensure_collection().await.unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docbrain.db");
+        {
+            use docbrain_graph::{DocbrainStore, TenantContext, Visibility};
+            let store = DocbrainStore::open(&db_path).unwrap();
+            let tenant = TenantContext::public();
+            store.add_library(&tenant, "next", "Next.js", None, Some("https://nextjs.org/docs"), Visibility::Public).unwrap();
+            store.add_doc_node(&tenant, "next", "15.1.3", "App Router caching", "Use the fetch cache option to control revalidation behavior.").unwrap();
+        }
+
+        let index_req = json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"index_docs","arguments":{"slug": "next", "db_path": db_path.to_str().unwrap()}}});
+        let resp = handle_message(&mut index, &index_req.to_string()).await.unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false, "{v:?}");
+
+        let search_req = json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_docs","arguments":{"slug": "next", "query": "how do I control fetch revalidation"}}});
+        let resp = handle_message(&mut index, &search_req.to_string()).await.unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false, "{v:?}");
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("App Router caching"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn search_docs_never_returns_a_codebrain_symbol_result() {
+        let Some(mut index) = test_index() else { return };
+        index.ensure_collection().await.unwrap();
+
+        // Index a codebrain symbol with text that would otherwise be a
+        // strong semantic match for the docbrain query below.
+        let dir = tempfile::tempdir().unwrap();
+        {
+            use agentops_graph::GraphStore;
+            let db_path = dir.path().join(".context").join("graph.db");
+            let store = agentops_graph::SqliteGraphStore::open(&db_path).unwrap();
+            store
+                .add_node(agentops_graph::NewNode {
+                    kind: agentops_graph::NodeKind::Symbol,
+                    repo: "kind-isolation-probe".into(),
+                    path: Some("src/cache.rs".into()),
+                    name: Some("fetch cache revalidation".into()),
+                    start_line: None,
+                    end_line: None,
+                    content: Some("fetch cache revalidation control function".into()),
+                })
+                .unwrap();
+        }
+        let items = agentops_embeddings::collect_index_items(
+            &agentops_graph::SqliteGraphStore::open(&dir.path().join(".context").join("graph.db")).unwrap(),
+            "kind-isolation-probe",
+        )
+        .unwrap();
+        index.index_items(&items).await.unwrap();
+
+        let hits = index.search_scoped("fetch cache revalidation control", 5, None, Some("doc")).await.unwrap();
+        assert!(hits.iter().all(|h| h.kind == "doc"), "a symbol leaked into a doc-only query: {hits:?}");
     }
 }

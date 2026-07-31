@@ -4,6 +4,14 @@
 //! starting in some degraded no-tools mode — an MCP server with zero tools
 //! isn't a useful thing to hand an agent), `AGENTOPS_QDRANT_COLLECTION`
 //! (optional, defaults to `agentops_semantic`).
+//!
+//! Exposes four tools total: `semantic_search`/`semantic_index` (codebrain,
+//! over an `agentops-graph` SQLite store) and `search_docs`/`index_docs`
+//! (docbrain, over a `docbrain-graph` SQLite store) — both corpora share one
+//! `SemanticIndex`/Qdrant collection (one BGE-M3 model load, not two) but
+//! are kept from leaking into each other's results via a `kind` filter
+//! (`"symbol"/"gotcha"/"decision"` vs `"doc"`) and a namespaced id space
+//! (see `agentops_embeddings::collect_doc_index_items`'s doc comment).
 
 use agentops_embeddings::SemanticIndex;
 

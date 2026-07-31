@@ -49,6 +49,7 @@ version = "0.1.0"
 dependencies = [
  "agentops-graph",
  "anyhow",
+ "docbrain-graph",
  "fastembed",
  "qdrant-client",
  "serde",
@@ -123,6 +124,7 @@ dependencies = [
  "agentops-graph",
  "agentops-license",
  "anyhow",
+ "docbrain-graph",
  "serde",
  "serde_json",
  "tempfile",
@@ -1101,6 +1103,15 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.3",
+]
+
+[[package]]
+name = "docbrain-graph"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "rusqlite",
+ "serde",
 ]
 
 [[package]]

@@ -15,3 +15,4 @@ tokio.workspace = true
 fastembed.workspace = true
 qdrant-client.workspace = true
 agentops-graph.workspace = true
+docbrain-graph.workspace = true

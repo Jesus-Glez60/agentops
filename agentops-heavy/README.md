@@ -95,6 +95,18 @@ corpus) cross-encoder pass, the standard two-stage retrieval pattern.
   MCP server with zero tools isn't useful to hand an agent. Run it with
   `AGENTOPS_LICENSE_KEY` and `AGENTOPS_QDRANT_URL` set:
   `cargo run --release -p agentops-heavy-mcp`.
+- Same binary also exposes `search_docs`/`index_docs` — the paid-tier
+  semantic layer over docbrain's doc content (populated by
+  `docbrain-mcp`'s `scrape_library`/`ingest_local_files`, both free/light-tier).
+  `collect_doc_index_items` (`agentops-embeddings`) reads `docbrain-graph`'s
+  `DocNode`s and shares the *same* Qdrant collection and BGE-M3 model as the
+  codebrain symbol/gotcha index — avoids loading the ~2GB model twice in one
+  process — kept from cross-contaminating results via a `kind` field
+  (`"doc"` vs `"symbol"/"gotcha"/"decision"`) plus a namespaced point-id
+  space (docbrain ids get the top bit set — `DocNode.id` and `agentops-graph`
+  node id are unrelated autoincrement sequences from two different SQLite
+  files, so without namespacing they could collide and silently overwrite
+  each other's Qdrant point).
 
 ## Running locally
 

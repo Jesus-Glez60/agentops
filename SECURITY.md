@@ -215,6 +215,46 @@ A public disclosure policy will be published alongside the first open-source rel
     would need a real async job table (`jobs` in `docbrain-graph` + a
     background thread/task) and hasn't been built.
 
+- **Semantic search over docbrain content — `search_docs`/`index_docs`
+  (implemented, `agentops-heavy-mcp`)** — the paid-tier semantic layer now
+  covers docbrain, not just codebrain. `agentops_embeddings::collect_doc_index_items`
+  reads real `DocNode`s out of a `DocbrainStore` (a cross-workspace path
+  dependency from `agentops-heavy` into the light-tier `docbrain-graph`
+  crate, same pattern already established for `agentops-graph`) and shares
+  the *same* Qdrant collection and BGE-M3/reranker model instance as the
+  existing codebrain index, rather than standing up a second ~2GB model
+  load in the same process. Two things had to be gotten right for that
+  sharing to be safe, both covered by live tests against a real Qdrant
+  instance:
+  - **Id-space collision.** `DocNode.id` and `agentops-graph` node `id` are
+    independent autoincrement sequences from two unrelated SQLite databases
+    — nothing stops them from producing the same number, and both get cast
+    to `u64` as the Qdrant point id. Without namespacing, indexing a
+    docbrain doc and a codebrain symbol that happened to share an id would
+    silently overwrite one with the other. Fixed by reserving the top bit
+    of the `u64` id space for docbrain items (`DOC_ID_NAMESPACE_BIT`) —
+    real source ids are always non-negative `i64`s, so the two ranges
+    provably never overlap. Covered by a dedicated unit test plus a live
+    round-trip test that indexes both kinds and confirms no data loss.
+  - **Result cross-contamination.** A docbrain query must never surface a
+    codebrain symbol, or vice versa, even when their content is
+    semantically similar (the live test uses a symbol and a doc section
+    that describe literally the same thing on purpose, to make sure a
+    naive shared-corpus search would fail this). Fixed with a `kind` field
+    on every indexed point (`"doc"` vs `"symbol"/"gotcha"/"decision"`) and
+    an optional `kind` filter threaded through `SemanticIndex::search_scoped`/
+    `vector_search_scoped` — `search`/`vector_search` stay as unfiltered
+    convenience wrappers so no existing caller's behavior changed.
+  - Same license gate as the rest of `agentops-heavy-mcp`: this binary
+    refuses to start at all without `AGENTOPS_LICENSE_KEY`, so `search_docs`/
+    `index_docs` are unavailable exactly like `semantic_search`/`semantic_index`
+    without one — no separate gate was needed since the whole process is
+    already gated.
+  - Not yet exposed over `agentops-heavy-api` (REST) — only the MCP stdio
+    server has these two tools today. `agentops-heavy-api`'s existing
+    `/search/index`/`/search` endpoints are codebrain-only; a docbrain
+    equivalent for the dashboard hasn't been added.
+
 - **API-key CLI tooling (implemented)** — `agentops api-key generate` (in
   `agentops-cli`) wraps `agentops_security::api_key::generate_api_key`,
   printing the raw key once and the hash to configure. Closes the "manual

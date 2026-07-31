@@ -50,3 +50,9 @@ agentops-security = { path = "../agentops-core/crates/agentops-security" }
 # cross-workspace path dependency (Cargo supports this fine; it does NOT
 # merge the two workspaces or their license postures).
 agentops-graph = { path = "../agentops-core/crates/agentops-graph" }
+
+# docbrain's light-tier, tenant-scoped doc store — same cross-workspace
+# path-dependency pattern as agentops-graph above, so the paid semantic
+# search tier can index real doc_nodes content without docbrain-core itself
+# taking on any commercial-license or paid-infra dependency.
+docbrain-graph = { path = "../docbrain-core/crates/docbrain-graph" }

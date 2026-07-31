@@ -289,6 +289,25 @@ impl DocbrainStore {
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
+    /// Every doc node across every version of `slug` — unlike `get_doc_nodes`
+    /// (Docbrain-2's exact-version guarantee, for retrieval), this is for
+    /// bulk operations like semantic indexing where "all content this
+    /// library has, regardless of version" is exactly what's wanted.
+    pub fn all_doc_nodes(&self, tenant: &TenantContext, slug: &str) -> Result<Vec<DocNode>> {
+        let library_id = self.authorized_library_id(tenant, slug)?;
+        let mut stmt = self.conn.prepare("SELECT * FROM doc_nodes WHERE library_id = ?1")?;
+        let rows = stmt.query_map([library_id], |row| {
+            Ok(DocNode {
+                id: row.get("id")?,
+                library_id: row.get("library_id")?,
+                version: row.get("version")?,
+                topic: row.get("topic")?,
+                content: row.get("content")?,
+            })
+        })?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
     pub fn list_doc_versions(&self, tenant: &TenantContext, slug: &str) -> Result<Vec<String>> {
         let library_id = self.authorized_library_id(tenant, slug)?;
         let mut stmt = self.conn.prepare("SELECT DISTINCT version FROM doc_snapshots WHERE library_id = ?1 ORDER BY version")?;
@@ -380,6 +399,18 @@ mod tests {
         let v3 = store.get_doc_nodes(&pub_ctx, "next", "15.1.3").unwrap();
         assert_eq!(v3.len(), 1);
         assert_eq!(v3[0].content, "15.1.3 routing docs (patched)");
+    }
+
+    #[test]
+    fn all_doc_nodes_spans_every_version() {
+        let store = DocbrainStore::open_in_memory().unwrap();
+        let pub_ctx = TenantContext::public();
+        store.add_library(&pub_ctx, "next", "Next.js", None, Some("https://nextjs.org/docs"), Visibility::Public).unwrap();
+        store.add_doc_node(&pub_ctx, "next", "15.1.2", "routing", "15.1.2 routing docs").unwrap();
+        store.add_doc_node(&pub_ctx, "next", "15.1.3", "routing", "15.1.3 routing docs (patched)").unwrap();
+
+        let all = store.all_doc_nodes(&pub_ctx, "next").unwrap();
+        assert_eq!(all.len(), 2);
     }
 
     #[test]
