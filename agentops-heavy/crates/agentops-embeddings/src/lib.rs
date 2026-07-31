@@ -52,6 +52,40 @@ pub struct SearchHit {
     pub text: String,
 }
 
+/// Reads every Symbol/Gotcha/Decision node out of `store` into embeddable
+/// `IndexItem`s — File nodes are skipped, since they have no meaningful
+/// text of their own (their symbols already carry that). Deliberately a
+/// plain synchronous function, not a method on `SemanticIndex`: it takes
+/// `&dyn GraphStore`, which isn't provably `Sync` (`SqliteGraphStore` wraps
+/// a `rusqlite::Connection`, intentionally `!Sync` upstream), so a
+/// reference to it must never be held across an `.await` — keeping this
+/// synchronous and separate from `SemanticIndex::index_items` (the actual
+/// async embedding step) is what makes that impossible to get wrong by
+/// accident.
+pub fn collect_index_items(store: &dyn agentops_graph::GraphStore, repo: &str) -> Result<Vec<IndexItem>> {
+    use agentops_graph::NodeKind;
+
+    let mut items = Vec::new();
+    for kind in [NodeKind::Symbol, NodeKind::Gotcha, NodeKind::Decision] {
+        for node in store.nodes_by_kind(kind).context("reading nodes to index")? {
+            let Some(content) = &node.content else { continue };
+            let text = match node.name.as_deref() {
+                Some(name) => format!("{name}\n\n{content}"),
+                None => content.clone(),
+            };
+            items.push(IndexItem {
+                id: node.id as u64,
+                text,
+                repo: repo.to_string(),
+                kind: kind.as_str().to_string(),
+                name: node.name.clone(),
+                path: node.path.clone(),
+            });
+        }
+    }
+    Ok(items)
+}
+
 impl SemanticIndex {
     /// Connects to Qdrant at `qdrant_url` (gRPC, e.g. `http://localhost:6334`)
     /// and loads the BGE-M3 ONNX model — downloaded from Hugging Face Hub and
@@ -111,28 +145,16 @@ impl SemanticIndex {
     /// symbols already carry that). Node ids are reused as Qdrant point
     /// ids, so re-running this after a rescan overwrites stale entries
     /// instead of duplicating them. Returns the number of nodes indexed.
-    pub async fn index_graph_store(&mut self, store: &dyn agentops_graph::GraphStore, repo: &str) -> Result<usize> {
-        use agentops_graph::NodeKind;
-
-        let mut items = Vec::new();
-        for kind in [NodeKind::Symbol, NodeKind::Gotcha, NodeKind::Decision] {
-            for node in store.nodes_by_kind(kind).context("reading nodes to index")? {
-                let Some(content) = &node.content else { continue };
-                let text = match node.name.as_deref() {
-                    Some(name) => format!("{name}\n\n{content}"),
-                    None => content.clone(),
-                };
-                items.push(IndexItem {
-                    id: node.id as u64,
-                    text,
-                    repo: repo.to_string(),
-                    kind: kind.as_str().to_string(),
-                    name: node.name.clone(),
-                    path: node.path.clone(),
-                });
-            }
-        }
-
+    ///
+    /// Deliberately takes owned `items` (via `collect_index_items`, called
+    /// separately by the caller) rather than `&dyn GraphStore` directly:
+    /// `&dyn GraphStore` isn't provably `Sync` (SQLite connections aren't),
+    /// so a reference to it can't cross an `.await` point — an async method
+    /// on this type taking it directly would produce a `!Send` future,
+    /// which silently breaks any caller (like an axum handler) that needs
+    /// this to run on a multi-threaded executor. Splitting the synchronous
+    /// graph read from the async embedding step avoids the trap entirely.
+    pub async fn index_items(&mut self, items: &[IndexItem]) -> Result<usize> {
         let count = items.len();
         // Batch embedding calls rather than one call per item or one giant
         // call for the whole repo.

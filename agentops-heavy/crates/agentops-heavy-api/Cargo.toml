@@ -17,6 +17,9 @@ tower-http.workspace = true
 agentops-security.workspace = true
 agentops-repo-access = { path = "../agentops-repo-access" }
 agentops-github-app = { path = "../agentops-github-app" }
+agentops-embeddings = { path = "../agentops-embeddings" }
+agentops-graph.workspace = true
+agentops-license = { path = "../agentops-license" }
 
 [dev-dependencies]
 tempfile = "3"

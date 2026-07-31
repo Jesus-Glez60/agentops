@@ -3,7 +3,7 @@
 //!   cargo run --release -p agentops-embeddings --example index_and_query -- \
 //!     <path to repo's .context/graph.db> <repo name> <query> [query...]
 
-use agentops_embeddings::SemanticIndex;
+use agentops_embeddings::{collect_index_items, SemanticIndex};
 use agentops_graph::SqliteGraphStore;
 
 #[tokio::main]
@@ -14,10 +14,11 @@ async fn main() -> anyhow::Result<()> {
     let queries: Vec<String> = args.collect();
 
     let store = SqliteGraphStore::open(std::path::Path::new(&db_path))?;
+    let items = collect_index_items(&store, &repo)?;
     let mut index = SemanticIndex::connect("http://localhost:6334", "agentops_demo")?;
     index.ensure_collection().await?;
 
-    let count = index.index_graph_store(&store, &repo).await?;
+    let count = index.index_items(&items).await?;
     println!("Indexed {count} nodes from {db_path}\n");
 
     for query in &queries {

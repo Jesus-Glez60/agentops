@@ -39,6 +39,18 @@ pub fn verify_production_license(key: &str) -> Result<LicenseClaims> {
     verify_license(key, &verifying_key, now_unix)
 }
 
+/// Reads `AGENTOPS_LICENSE_KEY` and verifies it against the embedded
+/// production public key — the standard gate for any paid-tier-only
+/// capability (semantic search today, more later). A feature should check
+/// this once at startup and simply not enable itself if it fails, the same
+/// pattern already used for other optional-but-gated capabilities elsewhere
+/// in the heavy tier (e.g. API-key auth): log clearly, degrade the one
+/// feature, don't crash the whole server over it.
+pub fn require_valid_license_from_env() -> Result<LicenseClaims> {
+    let key = std::env::var("AGENTOPS_LICENSE_KEY").context("AGENTOPS_LICENSE_KEY is not set")?;
+    verify_production_license(&key)
+}
+
 /// The tier a license grants. Kept as an explicit enum (not a free-form
 /// string) so a typo in a hand-issued license can't silently grant an
 /// unintended tier.

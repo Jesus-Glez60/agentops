@@ -19,8 +19,10 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::Mutex as AsyncMutex;
 use tower_http::cors::CorsLayer;
 
+use agentops_embeddings::SemanticIndex;
 use agentops_repo_access::secrets::SecretsProvider;
 use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnection};
 use agentops_security::api_key::verify_api_key;
@@ -34,6 +36,10 @@ pub struct AppState {
     /// a clear message when this is `None` rather than returning a bogus URL.
     github_app_slug: Option<String>,
     api_key_hash: Option<String>,
+    /// `None` when Qdrant isn't configured or no valid license was found —
+    /// `/search*` routes return `402 Payment Required` with a clear message
+    /// rather than the server refusing to start at all over a gated feature.
+    search_index: Option<Arc<AsyncMutex<SemanticIndex>>>,
 }
 
 pub fn build_router(
@@ -41,13 +47,16 @@ pub fn build_router(
     secrets: Arc<dyn SecretsProvider + Send + Sync>,
     github_app_slug: Option<String>,
     api_key_hash: Option<String>,
+    search_index: Option<Arc<AsyncMutex<SemanticIndex>>>,
 ) -> Router {
-    let state = AppState { store: Arc::new(Mutex::new(store)), secrets, github_app_slug, api_key_hash };
+    let state = AppState { store: Arc::new(Mutex::new(store)), secrets, github_app_slug, api_key_hash, search_index };
     Router::new()
         .route("/repos/connect", post(connect_repo))
         .route("/repos", get(list_repos))
         .route("/repos/{id}/verify", post(verify_repo))
         .route("/repos/github-app/install-url", get(github_app_install_url))
+        .route("/search/index", post(search_index_handler))
+        .route("/search", get(search_query_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .route("/health", get(health))
         .with_state(state)
@@ -77,8 +86,13 @@ async fn health() -> &'static str {
 /// `AGENTOPS_SECRETS_MASTER_KEY` (required — see
 /// `agentops_repo_access::secrets::EnvSecretsProvider`),
 /// `AGENTOPS_HEAVY_API_KEY_HASH` (optional — unset means unauthenticated,
-/// matching `agentops-api`/`docbrain-api`'s convention), and
-/// `AGENTOPS_GITHUB_APP_SLUG` (optional).
+/// matching `agentops-api`/`docbrain-api`'s convention), `AGENTOPS_GITHUB_APP_SLUG`
+/// (optional), and `AGENTOPS_QDRANT_URL` + `AGENTOPS_LICENSE_KEY` (both
+/// required together to enable `/search*` — semantic search is a paid-tier
+/// capability, gated on a valid license the same way any other paid feature
+/// should be: check once at startup, degrade the one feature rather than
+/// refusing to start the whole server over it. Loading the BGE-M3 model can
+/// take real time on first run, downloading it if not already cached).
 pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     let store = ConnectionStore::open(db_path)?;
     let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(agentops_repo_access::secrets::EnvSecretsProvider::from_env()?);
@@ -86,7 +100,28 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     let api_key_hash = std::env::var("AGENTOPS_HEAVY_API_KEY_HASH").ok();
     let auth_status = if api_key_hash.is_some() { "API key required" } else { "UNAUTHENTICATED (set AGENTOPS_HEAVY_API_KEY_HASH to require a key)" };
 
-    let app = build_router(store, secrets, github_app_slug, api_key_hash);
+    let search_index = match std::env::var("AGENTOPS_QDRANT_URL") {
+        Ok(qdrant_url) => match agentops_license::require_valid_license_from_env() {
+            Ok(claims) => {
+                println!("Licensed to {:?} (tier: {:?}) — loading BGE-M3 (downloads on first run, cached after)...", claims.licensee, claims.tier);
+                let collection = std::env::var("AGENTOPS_QDRANT_COLLECTION").unwrap_or_else(|_| "agentops_semantic".to_string());
+                let index = SemanticIndex::connect(&qdrant_url, &collection)?;
+                index.ensure_collection().await?;
+                println!("Semantic search ready (collection {collection:?} at {qdrant_url}).");
+                Some(Arc::new(AsyncMutex::new(index)))
+            }
+            Err(e) => {
+                println!("AGENTOPS_QDRANT_URL is set but no valid license was found ({e}) — /search* routes disabled. Semantic search is a paid-tier feature.");
+                None
+            }
+        },
+        Err(_) => {
+            println!("AGENTOPS_QDRANT_URL not set — /search* routes disabled for this deployment.");
+            None
+        }
+    };
+
+    let app = build_router(store, secrets, github_app_slug, api_key_hash, search_index);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("agentops-heavy-api listening on {addr} (auth: {auth_status})");
     axum::serve(listener, app).await?;
@@ -216,9 +251,84 @@ async fn github_app_install_url(State(state): State<AppState>) -> (StatusCode, J
     }
 }
 
+/// `402 Payment Required` — the semantically correct status for "this
+/// endpoint exists, but the deployment isn't licensed for it," distinct
+/// from `404` (doesn't exist) or `401`/`403` (identity/permission problem).
+fn search_not_licensed() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::PAYMENT_REQUIRED,
+        Json(json!({ "error": "semantic search is a paid-tier feature — this deployment has no valid license configured (AGENTOPS_LICENSE_KEY / AGENTOPS_QDRANT_URL)" })),
+    )
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchIndexRequest {
+    path: String,
+}
+
+/// Embeds and indexes every Symbol/Gotcha/Decision node from a scanned
+/// repo's graph store — call this after `agentops install`, before
+/// `/search` will return anything useful for that repo.
+async fn search_index_handler(State(state): State<AppState>, Json(req): Json<SearchIndexRequest>) -> (StatusCode, Json<Value>) {
+    let Some(search_index) = &state.search_index else { return search_not_licensed() };
+
+    // Collecting items is synchronous and fully finishes — including
+    // dropping `store` — before the `.await` below. `&dyn GraphStore` isn't
+    // provably `Sync` (SQLite connections aren't), so it must never be held
+    // across an await; see collect_index_items's doc comment.
+    let items = {
+        let db_path = std::path::Path::new(&req.path).join(".context").join("graph.db");
+        let store = match agentops_graph::SqliteGraphStore::open(&db_path) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("opening graph store at {}: {e}", db_path.display()) }))),
+        };
+        match agentops_embeddings::collect_index_items(&store, &req.path) {
+            Ok(items) => items,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        }
+    };
+
+    let mut index = search_index.lock().await;
+    match index.index_items(&items).await {
+        Ok(count) => (StatusCode::OK, Json(json!({ "indexed": count }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchQuery {
+    path: String,
+    q: String,
+    #[serde(default = "default_top_k")]
+    top_k: u64,
+}
+
+fn default_top_k() -> u64 {
+    5
+}
+
+/// Real semantic search — ranks by meaning, not keyword overlap. Requires
+/// `/search/index` to have been run for `path` at least once first.
+async fn search_query_handler(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> (StatusCode, Json<Value>) {
+    let Some(search_index) = &state.search_index else { return search_not_licensed() };
+
+    let mut index = search_index.lock().await;
+    match index.search(&q.q, q.top_k, Some(&q.path)).await {
+        Ok(hits) => {
+            let results: Vec<Value> = hits
+                .into_iter()
+                .map(|h| json!({ "id": h.id, "score": h.score, "kind": h.kind, "name": h.name, "path": h.path, "text": h.text }))
+                .collect();
+            (StatusCode::OK, Json(json!({ "results": results })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentops_graph::GraphStore as _;
     use agentops_repo_access::secrets::EnvSecretsProvider;
     use axum::body::Body;
     use axum::http::Request;
@@ -239,7 +349,7 @@ mod tests {
     #[tokio::test]
     async fn health_check_ok() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None);
+        let app = build_router(store, secrets, None, None, None);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -247,7 +357,7 @@ mod tests {
     #[tokio::test]
     async fn connect_then_list_round_trips_over_http() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None);
+        let app = build_router(store, secrets, None, None, None);
 
         let connect_req = Request::builder()
             .method("POST")
@@ -276,7 +386,7 @@ mod tests {
     #[tokio::test]
     async fn list_never_leaks_across_tenants() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None);
+        let app = build_router(store, secrets, None, None, None);
 
         for (tenant, repo_id, url) in [("acme", "w", "url-a"), ("globex", "g", "url-b")] {
             let req = Request::builder()
@@ -298,7 +408,7 @@ mod tests {
     #[tokio::test]
     async fn verify_against_unreachable_host_marks_connection_failed() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None);
+        let app = build_router(store, secrets, None, None, None);
 
         let connect_req = Request::builder()
             .method("POST")
@@ -323,7 +433,7 @@ mod tests {
     #[tokio::test]
     async fn install_url_404s_when_no_app_is_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None);
+        let app = build_router(store, secrets, None, None, None);
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -331,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn install_url_returns_the_configured_slug() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None);
+        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None);
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -342,7 +452,7 @@ mod tests {
     async fn missing_api_key_is_rejected_when_one_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash));
+        let app = build_router(store, secrets, None, Some(hash), None);
         let resp = app.oneshot(Request::builder().uri("/repos?tenant=acme").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -351,8 +461,96 @@ mod tests {
     async fn health_check_bypasses_auth_even_when_a_key_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash));
+        let app = build_router(store, secrets, None, Some(hash), None);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
+
+    #[tokio::test]
+    async fn search_returns_402_when_not_licensed_or_configured() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None);
+        let resp = app.oneshot(Request::builder().uri("/search?path=/tmp/x&q=hello").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    #[tokio::test]
+    async fn search_index_returns_402_when_not_licensed_or_configured() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/search/index")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"path": "/tmp/x"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYMENT_REQUIRED);
+    }
+
+    /// Exercises the full HTTP round trip (not just the library) against a
+    /// REAL Qdrant instance and the REAL downloaded BGE-M3 model. Set
+    /// AGENTOPS_TEST_QDRANT_URL to run; skipped otherwise, matching
+    /// agentops-embeddings' own live-test convention. This is specifically
+    /// the regression test for the `!Send` future bug fixed alongside this
+    /// endpoint (a `&dyn GraphStore` held across an `.await`, which only
+    /// ever showed up through axum's Handler bound, not in library-level
+    /// tests) — it must go through the real router and a real, indexed
+    /// repo, or it wouldn't have caught that bug.
+    #[tokio::test]
+    async fn search_index_then_query_finds_the_right_symbol_over_http() {
+        let Ok(qdrant_url) = std::env::var("AGENTOPS_TEST_QDRANT_URL") else { return };
+
+        let dir = tempfile::tempdir().unwrap();
+        let repo_path = dir.path().to_string_lossy().to_string();
+        let db_path = dir.path().join(".context").join("graph.db");
+        {
+            let graph_store = agentops_graph::SqliteGraphStore::open(&db_path).unwrap();
+            graph_store
+                .add_node(agentops_graph::NewNode {
+                    kind: agentops_graph::NodeKind::Gotcha,
+                    repo: repo_path.clone(),
+                    path: None,
+                    name: Some("ssh-host-key-pinning".into()),
+                    start_line: None,
+                    end_line: None,
+                    content: Some("Pin the SSH host key so a man-in-the-middle can't intercept the deploy key handshake.".into()),
+                })
+                .unwrap();
+        }
+
+        let index = SemanticIndex::connect(&qdrant_url, "agentops_heavy_api_test").unwrap();
+        index.ensure_collection().await.unwrap();
+        let search_index = Some(Arc::new(AsyncMutex::new(index)));
+
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, search_index);
+
+        let index_req = Request::builder()
+            .method("POST")
+            .uri("/search/index")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"path": repo_path}).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(index_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["indexed"], 1);
+
+        let search_req = Request::builder()
+            .uri(format!("/search?path={}&q=SSH+connection+security", urlencoding_path(&repo_path)))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(search_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let results = body["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1, "{body:?}");
+        assert_eq!(results[0]["name"], "ssh-host-key-pinning");
+    }
+
+    fn urlencoding_path(s: &str) -> String {
+        s.replace('/', "%2F")
+    }
 }
+

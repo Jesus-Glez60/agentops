@@ -107,6 +107,18 @@ pub struct Edge {
 
 /// Storage backend for the neuron graph. `SqliteGraphStore` is the light-tier
 /// implementation; `agentops-graph-pg` (Postgres-backed) is the heavy tier.
+///
+/// Deliberately no `Send`/`Sync` supertrait bound here: `&dyn GraphStore`
+/// needs `Sync` (not `Send`) to be usable across an `.await` point, but
+/// `SqliteGraphStore` wraps `rusqlite::Connection`, which is intentionally
+/// `!Sync` upstream (a SQLite connection isn't safe for concurrent access
+/// from multiple threads without external synchronization) — adding that
+/// bound here would make `SqliteGraphStore` stop implementing this trait.
+/// The correct rule for callers: never hold a `&dyn GraphStore` across an
+/// `.await` — do the synchronous graph-reading work in a plain (non-async)
+/// function first, get owned data back, then go async. See
+/// `agentops-embeddings::index_graph_store`/`collect_index_items` for the
+/// pattern this protects against getting wrong again.
 pub trait GraphStore {
     fn add_node(&self, node: NewNode) -> Result<i64>;
     fn add_edge(&self, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64>;

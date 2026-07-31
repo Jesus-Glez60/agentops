@@ -98,7 +98,10 @@ dependencies = [
 name = "agentops-heavy-api"
 version = "0.1.0"
 dependencies = [
+ "agentops-embeddings",
  "agentops-github-app",
+ "agentops-graph",
+ "agentops-license",
  "agentops-repo-access",
  "agentops-security",
  "anyhow",

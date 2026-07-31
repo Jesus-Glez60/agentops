@@ -199,8 +199,25 @@ A public disclosure policy will be published alongside the first open-source rel
   query vs. an unrelated bread recipe) and against this repo's own real
   graph (a business-language query — "is it safe to generate a real
   customer's deploy key today" — correctly surfaced the exact KMS-gap
-  decision node recorded earlier). **Still open**: no MCP tool or REST
-  endpoint exposes this yet — today it's a library + example CLI, not
-  wired into `agentops-mcp`/`agentops-heavy-api`'s tool surface.
+  decision node recorded earlier).
+  Now wired to `agentops-heavy-api`'s `POST /search/index` /
+  `GET /search`, gated behind a valid license (`agentops_license::require_valid_license_from_env`,
+  reading `AGENTOPS_LICENSE_KEY`) — semantic search is a paid-tier feature,
+  and a missing/invalid license or unset `AGENTOPS_QDRANT_URL` disables the
+  routes (`402 Payment Required`) rather than the server refusing to start.
+  Fixing the endpoint surfaced a real, subtle bug worth documenting: a
+  handler that opened a `SqliteGraphStore` and then `.await`ed a Qdrant call
+  produced a `!Send` future — `&dyn GraphStore` isn't provably `Sync`
+  (`rusqlite::Connection` is intentionally `!Sync` upstream), and `&T: Send`
+  requires `T: Sync`. The trait itself can't require `Sync` without breaking
+  `SqliteGraphStore`, so the real fix is structural: never hold a
+  `&dyn GraphStore` across an `.await` — `collect_index_items` (sync) and
+  `SemanticIndex::index_items` (async) are deliberately separate functions
+  to make that mistake hard to reintroduce. Verified with a regression test
+  that goes through the real HTTP router (a library-level test wouldn't
+  have caught this — the bug only manifests via axum's `Handler` trait
+  bound). **Still open**: no MCP tool exposes this yet for actual agent use
+  in Claude Code — only the REST endpoint (for the dashboard) and the CLI
+  example exist so far.
 - Independent security review of the redaction gate and zero-egress invariant, before
   any real client codebase touches this tool.
