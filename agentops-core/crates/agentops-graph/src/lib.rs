@@ -18,6 +18,26 @@ pub enum NodeKind {
     File,
     Gotcha,
     Decision,
+    /// An LLM-generated explanation of what a symbol does, connected via
+    /// `EdgeRelation::Documents` (not `Affects` — a `Definition` documents
+    /// code, generated *from* the code itself, which is a different kind of
+    /// claim than a human-authored `Gotcha`/`Decision`). See `agentops-llm`.
+    ///
+    /// NOTE for implementers adding a `NodeKind` variant: this enum's own
+    /// `as_str`/`from_str` are the only truly exhaustive match on `NodeKind`
+    /// in the codebase — everywhere else (agentops-docgen, the `status`
+    /// count in agentops-api/agentops-cli/agentops-mcp, and
+    /// agentops-heavy's agentops-embeddings::collect_index_items, a
+    /// separate commercial workspace) enumerates kinds positively, so a new
+    /// variant is silently invisible there until each is updated by hand.
+    Definition,
+    /// A vault/notes-folder entry that isn't a gotcha or decision (frontmatter
+    /// `type: knowledge`/`type: context`, or untyped) — ingested via
+    /// `agentops-notes::ingest_vault`. Reuses `Gotcha`/`Decision` directly for
+    /// those two frontmatter types, since that's exactly what those kinds
+    /// already mean; this variant is only for the ones that don't map to an
+    /// existing kind.
+    Note,
 }
 
 impl NodeKind {
@@ -30,6 +50,8 @@ impl NodeKind {
             NodeKind::File => "file",
             NodeKind::Gotcha => "gotcha",
             NodeKind::Decision => "decision",
+            NodeKind::Definition => "definition",
+            NodeKind::Note => "note",
         }
     }
 
@@ -39,6 +61,8 @@ impl NodeKind {
             "file" => Ok(NodeKind::File),
             "gotcha" => Ok(NodeKind::Gotcha),
             "decision" => Ok(NodeKind::Decision),
+            "definition" => Ok(NodeKind::Definition),
+            "note" => Ok(NodeKind::Note),
             other => anyhow::bail!("unknown node kind: {other}"),
         }
     }
@@ -103,6 +127,83 @@ pub struct Edge {
     pub src_id: i64,
     pub dst_id: i64,
     pub relation: EdgeRelation,
+}
+
+/// One scan's summary — the persisted, queryable counterpart to
+/// `agentops-mcp`'s `ScanPersistSummary` (which stays synchronous/ephemeral
+/// for callers that just want a printout). `node_id` on
+/// `ScanHistoryEntry` is deliberately NOT a foreign key to `nodes(id)`: a
+/// `removed` entry's node has already been deleted by the time this row is
+/// read back, so a real FK constraint would make removed-node history
+/// unreadable (or block the delete) the moment it's needed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanHistoryRow {
+    pub id: i64,
+    pub repo: String,
+    pub started_at: String,
+    pub finished_at: String,
+    pub git_sha: Option<String>,
+    pub files_added: i64,
+    pub files_changed: i64,
+    pub files_removed: i64,
+    pub symbols_added: i64,
+    pub symbols_changed: i64,
+    pub symbols_removed: i64,
+    pub notes_added: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScanEntryKind {
+    File,
+    Symbol,
+}
+
+impl ScanEntryKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScanEntryKind::File => "file",
+            ScanEntryKind::Symbol => "symbol",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScanChange {
+    Added,
+    Changed,
+    Removed,
+}
+
+impl ScanChange {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScanChange::Added => "added",
+            ScanChange::Changed => "changed",
+            ScanChange::Removed => "removed",
+        }
+    }
+}
+
+/// A single added/changed/removed file or symbol, recorded against a scan —
+/// what `persist()` builds up as it classifies each node during a rescan.
+#[derive(Debug, Clone)]
+pub struct NewScanHistoryEntry {
+    pub node_id: i64,
+    pub kind: ScanEntryKind,
+    pub path: Option<String>,
+    pub name: Option<String>,
+    pub change: ScanChange,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScanHistoryEntry {
+    pub id: i64,
+    pub scan_id: i64,
+    pub node_id: i64,
+    pub kind: String,
+    pub path: Option<String>,
+    pub name: Option<String>,
+    pub change: String,
 }
 
 /// Storage backend for the neuron graph. `SqliteGraphStore` is the light-tier
@@ -180,19 +281,21 @@ pub fn upsert_node(store: &dyn GraphStore, node: NewNode) -> Result<i64> {
 /// call this after upserting a scan's files/symbols with the full set of
 /// ids that scan touched, to prune whatever's left over from a prior scan
 /// (a file that was deleted, a symbol that was renamed or removed).
-/// Returns how many nodes were pruned.
-pub fn prune_stale_nodes(store: &dyn GraphStore, repo: &str, kind: NodeKind, keep_ids: &[i64]) -> Result<usize> {
-    let stale: Vec<i64> = store
+/// Returns the pruned nodes themselves (not just a count) — callers building
+/// a scan-to-scan changelog need to know *which* files/symbols were removed,
+/// not just how many; deleting first and returning identity after would lose
+/// that, so the full `Node` is captured before `delete_nodes` runs.
+pub fn prune_stale_nodes(store: &dyn GraphStore, repo: &str, kind: NodeKind, keep_ids: &[i64]) -> Result<Vec<Node>> {
+    let stale: Vec<Node> = store
         .nodes_by_kind(kind)?
         .into_iter()
         .filter(|n| n.repo == repo && !keep_ids.contains(&n.id))
-        .map(|n| n.id)
         .collect();
-    let count = stale.len();
     if !stale.is_empty() {
-        store.delete_nodes(&stale)?;
+        let ids: Vec<i64> = stale.iter().map(|n| n.id).collect();
+        store.delete_nodes(&ids)?;
     }
-    Ok(count)
+    Ok(stale)
 }
 
 /// Embedded, single-file graph store backed by SQLite — the light-tier `GraphStore`.
@@ -246,6 +349,33 @@ impl SqliteGraphStore {
             );
             CREATE INDEX IF NOT EXISTS idx_edges_src ON edges(src_id);
             CREATE INDEX IF NOT EXISTS idx_edges_dst ON edges(dst_id);
+
+            CREATE TABLE IF NOT EXISTS scan_history (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                repo            TEXT NOT NULL,
+                started_at      TEXT NOT NULL,
+                finished_at     TEXT NOT NULL,
+                git_sha         TEXT,
+                files_added     INTEGER NOT NULL,
+                files_changed   INTEGER NOT NULL,
+                files_removed   INTEGER NOT NULL,
+                symbols_added   INTEGER NOT NULL,
+                symbols_changed INTEGER NOT NULL,
+                symbols_removed INTEGER NOT NULL,
+                notes_added     INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_scan_history_repo ON scan_history(repo);
+
+            CREATE TABLE IF NOT EXISTS scan_history_entries (
+                id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id  INTEGER NOT NULL REFERENCES scan_history(id),
+                node_id  INTEGER NOT NULL,
+                kind     TEXT NOT NULL,
+                path     TEXT,
+                name     TEXT,
+                change   TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_scan_history_entries_scan ON scan_history_entries(scan_id);
             ",
         )?;
         Ok(())
@@ -275,6 +405,110 @@ impl SqliteGraphStore {
             relation: EdgeRelation::from_str(&relation_str)
                 .map_err(|e| rusqlite::Error::InvalidColumnType(0, e.to_string(), rusqlite::types::Type::Text))?,
         })
+    }
+
+    fn row_to_scan_history_row(row: &rusqlite::Row) -> rusqlite::Result<ScanHistoryRow> {
+        Ok(ScanHistoryRow {
+            id: row.get("id")?,
+            repo: row.get("repo")?,
+            started_at: row.get("started_at")?,
+            finished_at: row.get("finished_at")?,
+            git_sha: row.get("git_sha")?,
+            files_added: row.get("files_added")?,
+            files_changed: row.get("files_changed")?,
+            files_removed: row.get("files_removed")?,
+            symbols_added: row.get("symbols_added")?,
+            symbols_changed: row.get("symbols_changed")?,
+            symbols_removed: row.get("symbols_removed")?,
+            notes_added: row.get("notes_added")?,
+        })
+    }
+
+    fn row_to_scan_history_entry(row: &rusqlite::Row) -> rusqlite::Result<ScanHistoryEntry> {
+        Ok(ScanHistoryEntry {
+            id: row.get("id")?,
+            scan_id: row.get("scan_id")?,
+            node_id: row.get("node_id")?,
+            kind: row.get("kind")?,
+            path: row.get("path")?,
+            name: row.get("name")?,
+            change: row.get("change")?,
+        })
+    }
+
+    /// Records one completed scan: a `scan_history` summary row (counts
+    /// derived from `entries`) plus one `scan_history_entries` row per
+    /// added/changed/removed file or symbol. Returns the new scan's id.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_scan(
+        &self,
+        repo: &str,
+        started_at: &str,
+        finished_at: &str,
+        git_sha: Option<&str>,
+        entries: &[NewScanHistoryEntry],
+        notes_added: i64,
+    ) -> Result<i64> {
+        let count = |kind: ScanEntryKind, change: ScanChange| {
+            entries.iter().filter(|e| e.kind == kind && e.change == change).count() as i64
+        };
+        self.conn.execute(
+            "INSERT INTO scan_history (repo, started_at, finished_at, git_sha,
+                files_added, files_changed, files_removed,
+                symbols_added, symbols_changed, symbols_removed, notes_added)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                repo,
+                started_at,
+                finished_at,
+                git_sha,
+                count(ScanEntryKind::File, ScanChange::Added),
+                count(ScanEntryKind::File, ScanChange::Changed),
+                count(ScanEntryKind::File, ScanChange::Removed),
+                count(ScanEntryKind::Symbol, ScanChange::Added),
+                count(ScanEntryKind::Symbol, ScanChange::Changed),
+                count(ScanEntryKind::Symbol, ScanChange::Removed),
+                notes_added,
+            ],
+        )?;
+        let scan_id = self.conn.last_insert_rowid();
+
+        for entry in entries {
+            self.conn.execute(
+                "INSERT INTO scan_history_entries (scan_id, node_id, kind, path, name, change)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![scan_id, entry.node_id, entry.kind.as_str(), entry.path, entry.name, entry.change.as_str()],
+            )?;
+        }
+        Ok(scan_id)
+    }
+
+    /// The most recently recorded scan for `repo`, if any.
+    pub fn latest_scan(&self, repo: &str) -> Result<Option<ScanHistoryRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM scan_history WHERE repo = ?1 ORDER BY id DESC LIMIT 1")?;
+        let mut rows = stmt.query_map([repo], Self::row_to_scan_history_row)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// A specific scan's summary row by id.
+    pub fn get_scan(&self, scan_id: i64) -> Result<Option<ScanHistoryRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM scan_history WHERE id = ?1")?;
+        let mut rows = stmt.query_map([scan_id], Self::row_to_scan_history_row)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    /// Every added/changed/removed file/symbol entry recorded for `scan_id`.
+    pub fn scan_diff(&self, scan_id: i64) -> Result<Vec<ScanHistoryEntry>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM scan_history_entries WHERE scan_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map([scan_id], Self::row_to_scan_history_entry)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    /// Up to `limit` most recent scans for `repo`, most recent first.
+    pub fn list_scans(&self, repo: &str, limit: i64) -> Result<Vec<ScanHistoryRow>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM scan_history WHERE repo = ?1 ORDER BY id DESC LIMIT ?2")?;
+        let rows = stmt.query_map(rusqlite::params![repo, limit], Self::row_to_scan_history_row)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 }
 
@@ -511,7 +745,9 @@ mod tests {
         // This scan only found `kept_fn` — `removed_fn` must have been deleted from the source.
         let pruned = prune_stale_nodes(&store, "demo", NodeKind::Symbol, &[kept_id]).unwrap();
 
-        assert_eq!(pruned, 1);
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].id, removed_id, "the returned identity must be the pruned node, not the kept one");
+        assert_eq!(pruned[0].name.as_deref(), Some("removed_fn"));
         assert!(store.get_node(kept_id).unwrap().is_some());
         assert!(store.get_node(removed_id).unwrap().is_none());
     }
@@ -557,5 +793,66 @@ mod tests {
         assert_eq!(remaining_from_a.len(), 1);
         assert_eq!(remaining_from_a[0].relation, EdgeRelation::Affects);
         assert_eq!(store.edges_from(c).unwrap().len(), 1, "a different source's edges of the same relation must be untouched");
+    }
+
+    #[test]
+    fn record_scan_derives_counts_from_the_entries_it_was_given() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let entries = vec![
+            NewScanHistoryEntry { node_id: 1, kind: ScanEntryKind::File, path: Some("a.rs".into()), name: None, change: ScanChange::Added },
+            NewScanHistoryEntry { node_id: 2, kind: ScanEntryKind::Symbol, path: Some("a.rs".into()), name: Some("f".into()), change: ScanChange::Added },
+            NewScanHistoryEntry { node_id: 3, kind: ScanEntryKind::Symbol, path: Some("b.rs".into()), name: Some("g".into()), change: ScanChange::Changed },
+            NewScanHistoryEntry { node_id: 4, kind: ScanEntryKind::File, path: Some("c.rs".into()), name: None, change: ScanChange::Removed },
+        ];
+        let scan_id = store.record_scan("demo", "2026-08-04T00:00:00Z", "2026-08-04T00:00:01Z", Some("abc123"), &entries, 2).unwrap();
+
+        let row = store.latest_scan("demo").unwrap().expect("scan was just recorded");
+        assert_eq!(row.id, scan_id);
+        assert_eq!(row.git_sha.as_deref(), Some("abc123"));
+        assert_eq!(row.files_added, 1);
+        assert_eq!(row.files_removed, 1);
+        assert_eq!(row.symbols_added, 1);
+        assert_eq!(row.symbols_changed, 1);
+        assert_eq!(row.notes_added, 2);
+
+        let diff = store.scan_diff(scan_id).unwrap();
+        assert_eq!(diff.len(), 4, "scan_diff must return the identity-level entries, not just the summary counts");
+        assert!(diff.iter().any(|e| e.name.as_deref() == Some("g") && e.change == "changed"));
+    }
+
+    #[test]
+    fn scan_diff_survives_the_pruned_nodes_it_describes_being_deleted() {
+        // scan_history_entries.node_id is deliberately not a real FK to
+        // nodes(id) -- a "removed" entry's node is already gone from the
+        // nodes table by the time this is read back.
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let removed_id = upsert_node(&store, symbol_node("demo", "src/lib.rs", "gone_fn", "..")).unwrap();
+        store.delete_nodes(&[removed_id]).unwrap();
+
+        let entries = vec![NewScanHistoryEntry {
+            node_id: removed_id,
+            kind: ScanEntryKind::Symbol,
+            path: Some("src/lib.rs".into()),
+            name: Some("gone_fn".into()),
+            change: ScanChange::Removed,
+        }];
+        let scan_id = store.record_scan("demo", "t0", "t1", None, &entries, 0).unwrap();
+
+        let diff = store.scan_diff(scan_id).unwrap();
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].node_id, removed_id);
+        assert_eq!(diff[0].change, "removed");
+    }
+
+    #[test]
+    fn list_scans_returns_most_recent_first_and_respects_the_limit() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.record_scan("demo", "t0", "t0", None, &[], 0).unwrap();
+        let second = store.record_scan("demo", "t1", "t1", None, &[], 0).unwrap();
+        store.record_scan("other-repo", "t2", "t2", None, &[], 0).unwrap();
+
+        let scans = store.list_scans("demo", 1).unwrap();
+        assert_eq!(scans.len(), 1, "limit must be respected");
+        assert_eq!(scans[0].id, second, "most recent scan for the repo must come first");
     }
 }

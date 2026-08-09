@@ -6,6 +6,9 @@
 use agentops_graph::{EdgeRelation, GraphStore, NewNode, NodeKind};
 use anyhow::Result;
 
+mod vault;
+pub use vault::{connect_many, ingest_vault, match_symbols, walk_vault, IngestSummary, NoteType, SymbolMatcher, VaultNote, WordBoundaryMatcher};
+
 /// What a new gotcha/decision note should attach to, if anything.
 pub enum AffectsTarget<'a> {
     /// A specific node id (fastest, exact — e.g. from a prior `docgen`/`graph`
@@ -50,7 +53,7 @@ fn add_note(
 
     let target_id = match affects {
         AffectsTarget::NodeId(id) => Some(id),
-        AffectsTarget::SymbolName(name) => resolve_symbol_by_name(store, name)?,
+        AffectsTarget::SymbolName(name) => resolve_symbol_by_name(store, repo, name)?,
         AffectsTarget::None => None,
     };
 
@@ -61,9 +64,20 @@ fn add_note(
     Ok(note_id)
 }
 
-fn resolve_symbol_by_name(store: &dyn GraphStore, name: &str) -> Result<Option<i64>> {
+/// Resolves `name` to a symbol id within `repo` only, first match wins on
+/// an ambiguous name within that repo — the documented Phase 1
+/// simplification `AffectsTarget::SymbolName` accepts. Fixed to filter by
+/// `repo` (it previously didn't at all): without this, a same-named symbol
+/// in a *different* repo's data could silently be matched, since
+/// `nodes_by_kind` returns every repo's symbols. Still not fully
+/// disambiguated (no `path` filter) — for a caller that already knows
+/// exactly which symbol it means, prefer `AffectsTarget::NodeId` (or, for
+/// the vault-ingestion/`explain_symbol` paths, `agentops_llm::find_symbol_by_name`
+/// / `match_symbols`, both of which are repo *and* path-aware) instead of
+/// widening this function further.
+fn resolve_symbol_by_name(store: &dyn GraphStore, repo: &str, name: &str) -> Result<Option<i64>> {
     let symbols = store.nodes_by_kind(NodeKind::Symbol)?;
-    Ok(symbols.into_iter().find(|s| s.name.as_deref() == Some(name)).map(|s| s.id))
+    Ok(symbols.into_iter().find(|s| s.repo == repo && s.name.as_deref() == Some(name)).map(|s| s.id))
 }
 
 #[cfg(test)]
@@ -107,6 +121,26 @@ mod tests {
         let gotcha_id = add_gotcha(&store, "demo", "orphan", "no matching symbol", AffectsTarget::SymbolName("nope")).unwrap();
         assert!(store.edges_from(gotcha_id).unwrap().is_empty());
         assert!(store.get_node(gotcha_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn affects_symbol_name_never_matches_a_same_named_symbol_in_a_different_repo() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store
+            .add_node(NewNode {
+                kind: NodeKind::Symbol,
+                repo: "other-repo".into(),
+                path: Some("src/auth.rs".into()),
+                name: Some("verify_token".into()),
+                start_line: Some(1),
+                end_line: Some(5),
+                content: Some("fn verify_token() {}".into()),
+            })
+            .unwrap();
+
+        let gotcha_id = add_gotcha(&store, "demo", "wrong-repo-orphan", "should not connect", AffectsTarget::SymbolName("verify_token")).unwrap();
+
+        assert!(store.edges_from(gotcha_id).unwrap().is_empty(), "a same-named symbol in a different repo must not be matched");
     }
 
     #[test]

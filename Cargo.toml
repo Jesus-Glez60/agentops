@@ -5,6 +5,7 @@ members = [
     "agentops-core/crates/agentops-graph",
     "agentops-core/crates/agentops-docgen",
     "agentops-core/crates/agentops-notes",
+    "agentops-core/crates/agentops-llm",
     "agentops-core/crates/agentops-security",
     "agentops-core/crates/agentops-manifest",
     "agentops-core/crates/agentops-ruler-bridge",

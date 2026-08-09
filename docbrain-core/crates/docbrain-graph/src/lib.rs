@@ -86,6 +86,16 @@ pub struct Library {
     pub github_repo: Option<String>,
     pub docs_url: Option<String>,
     pub visibility: Visibility,
+    /// How many `doc_snapshots` rows this library has -- one per
+    /// scrape/ingest call, not one per version (a library can be
+    /// re-scraped at the same version). Matches the field the user's
+    /// existing production docbrain server's `list_libraries_tool` already
+    /// returns.
+    pub doc_snapshots: i64,
+    pub changelog_versions: i64,
+    /// Distinct versions with at least one doc_snapshot, ascending.
+    pub versions: Vec<String>,
+    pub total_nodes: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,15 +273,39 @@ impl DocbrainStore {
         Ok(rows.next().transpose()?)
     }
 
-    fn row_to_library(row: &rusqlite::Row) -> rusqlite::Result<Library> {
+    /// Aggregate stats for one library -- `doc_snapshots`/`changelog_versions`
+    /// counts, distinct `versions`, and total `doc_nodes` count. Three plain
+    /// `COUNT(*)` queries plus one `DISTINCT` query per library; fine at this
+    /// scale (a handful of libraries per tenant, not thousands) and mirrors
+    /// exactly what the user's real production docbrain server's
+    /// `list_libraries_tool` already returns (verified live against it) --
+    /// this isn't a new metric invented for this UI, it's closing a gap
+    /// versus a system already proven to want these fields.
+    fn stats_for(&self, library_id: i64) -> rusqlite::Result<(i64, i64, Vec<String>, i64)> {
+        let doc_snapshots: i64 = self.conn.query_row("SELECT COUNT(*) FROM doc_snapshots WHERE library_id = ?1", [library_id], |r| r.get(0))?;
+        let changelog_versions: i64 =
+            self.conn.query_row("SELECT COUNT(*) FROM changelog_versions WHERE library_id = ?1", [library_id], |r| r.get(0))?;
+        let total_nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM doc_nodes WHERE library_id = ?1", [library_id], |r| r.get(0))?;
+        let mut stmt = self.conn.prepare("SELECT DISTINCT version FROM doc_snapshots WHERE library_id = ?1 ORDER BY version")?;
+        let versions = stmt.query_map([library_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((doc_snapshots, changelog_versions, versions, total_nodes))
+    }
+
+    fn row_to_library(&self, row: &rusqlite::Row) -> rusqlite::Result<Library> {
         let visibility_str: String = row.get("visibility")?;
+        let id: i64 = row.get("id")?;
+        let (doc_snapshots, changelog_versions, versions, total_nodes) = self.stats_for(id)?;
         Ok(Library {
-            id: row.get("id")?,
+            id,
             slug: row.get("slug")?,
             name: row.get("name")?,
             github_repo: row.get("github_repo")?,
             docs_url: row.get("docs_url")?,
             visibility: Visibility::from_db_string(&visibility_str),
+            doc_snapshots,
+            changelog_versions,
+            versions,
+            total_nodes,
         })
     }
 
@@ -315,7 +349,7 @@ impl DocbrainStore {
         for s in &scopes {
             params.push(s);
         }
-        let mut rows = stmt.query_map(params.as_slice(), Self::row_to_library)?;
+        let mut rows = stmt.query_map(params.as_slice(), |row| self.row_to_library(row))?;
         Ok(rows.next().transpose()?)
     }
 
@@ -328,7 +362,7 @@ impl DocbrainStore {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> = scopes.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        let rows = stmt.query_map(params.as_slice(), Self::row_to_library)?;
+        let rows = stmt.query_map(params.as_slice(), |row| self.row_to_library(row))?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
@@ -452,6 +486,49 @@ mod tests {
 
         assert!(store.get_library(&TenantContext::public(), "react").unwrap().is_some());
         assert!(store.get_library(&TenantContext::org("acme"), "react").unwrap().is_some());
+    }
+
+    #[test]
+    fn library_stats_reflect_real_snapshots_changelog_and_doc_node_counts() {
+        let store = DocbrainStore::open_in_memory().unwrap();
+        let pub_ctx = TenantContext::public();
+        store.add_library(&pub_ctx, "next", "Next.js", None, Some("https://nextjs.org/docs"), Visibility::Public).unwrap();
+
+        // Two snapshots means two doc_snapshots rows even though one of the
+        // versions gets scraped twice below (the count isn't "distinct
+        // versions", it's "how many times has this been scraped") -- see
+        // the field's own doc comment for that distinction.
+        store.add_doc_snapshot(&pub_ctx, "next", "15.1.2").unwrap();
+        store.add_doc_snapshot(&pub_ctx, "next", "15.1.3").unwrap();
+        store.add_doc_snapshot(&pub_ctx, "next", "15.1.3").unwrap();
+        store.add_doc_node(&pub_ctx, "next", "15.1.2", "routing", "content a").unwrap();
+        store.add_doc_node(&pub_ctx, "next", "15.1.3", "routing", "content b").unwrap();
+        store.add_doc_node(&pub_ctx, "next", "15.1.3", "caching", "content c").unwrap();
+        store.add_changelog_entry(&pub_ctx, "next", "15.1.2", "15.1.3", "Fixed a routing regression.", true).unwrap();
+
+        let lib = store.get_library(&pub_ctx, "next").unwrap().unwrap();
+        assert_eq!(lib.doc_snapshots, 3);
+        assert_eq!(lib.changelog_versions, 1);
+        assert_eq!(lib.versions, vec!["15.1.2".to_string(), "15.1.3".to_string()]);
+        assert_eq!(lib.total_nodes, 3);
+
+        // list_libraries computes the same stats per row, not just get_library.
+        let listed = store.list_libraries(&pub_ctx).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].total_nodes, 3);
+    }
+
+    #[test]
+    fn a_library_with_no_scrapes_yet_reports_zeroed_stats_not_an_error() {
+        let store = DocbrainStore::open_in_memory().unwrap();
+        let pub_ctx = TenantContext::public();
+        store.add_library(&pub_ctx, "ghost", "Ghost", None, None, Visibility::Public).unwrap();
+
+        let lib = store.get_library(&pub_ctx, "ghost").unwrap().unwrap();
+        assert_eq!(lib.doc_snapshots, 0);
+        assert_eq!(lib.changelog_versions, 0);
+        assert!(lib.versions.is_empty());
+        assert_eq!(lib.total_nodes, 0);
     }
 
     #[test]

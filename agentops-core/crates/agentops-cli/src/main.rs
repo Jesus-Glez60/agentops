@@ -59,6 +59,56 @@ enum Command {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// What changed in this repo's code/notes across scans. With no other
+    /// flags, shows the most recent scan's full added/changed/removed diff.
+    Changelog {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Show this specific scan's diff instead of the most recent one.
+        #[arg(long)]
+        since: Option<i64>,
+        /// List this many recent scan summaries instead of one scan's full diff.
+        #[arg(long)]
+        limit: Option<i64>,
+    },
+    /// Generate an LLM explanation of a symbol (Anthropic API — requires
+    /// AGENTOPS_ANTHROPIC_API_KEY) and record it as a Definition node
+    /// connected to the symbol. On-demand only, never runs during a scan.
+    Explain {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Symbol name to explain.
+        #[arg(long)]
+        symbol: String,
+        /// File path relative to the repo root, to disambiguate `symbol` if
+        /// the name isn't unique in the repo.
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
+    /// Recursively ingest a markdown notes/vault folder, symbol-matching
+    /// each note into the given repo's graph (Gotcha/Decision/Note nodes,
+    /// Affects-connected to matched symbols). Formalizes what a one-off
+    /// script did by hand: real, repeatable notes ingestion.
+    IngestNotes {
+        /// Repo to attach ingested notes to.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Directory to recursively walk for *.md notes.
+        #[arg(long)]
+        notes: PathBuf,
+        /// Print the note -> symbol match table without writing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Re-rank each note's cheap-matched candidates with one Anthropic
+        /// API call per note (requires AGENTOPS_ANTHROPIC_API_KEY) instead
+        /// of trusting the word-boundary match as-is.
+        #[arg(long)]
+        llm_match: bool,
+        /// Minimum symbol-name length to consider as a match candidate —
+        /// the false-positive guard for short, generic names.
+        #[arg(long, default_value_t = 4)]
+        min_name_len: usize,
+    },
     /// Run the stdio MCP server. AccessMode gates which tools are registered
     /// at all — Advisor mode's tools/list never includes scan_repo/add_note/
     /// generate_docs, not just a prompt asking the model to avoid them.
@@ -158,6 +208,9 @@ async fn main() -> Result<()> {
         Command::Docgen { path } => docgen(&path),
         Command::Note { path, kind, affects, title, text } => note(&path, kind, affects.as_deref(), &title, &text),
         Command::Status { path } => status(&path),
+        Command::Changelog { path, since, limit } => changelog(&path, since, limit),
+        Command::Explain { path, symbol, file } => explain(&path, &symbol, file.as_deref()),
+        Command::IngestNotes { path, notes, dry_run, llm_match, min_name_len } => ingest_notes(&path, &notes, dry_run, llm_match, min_name_len),
         Command::Serve { access_mode } => agentops_mcp::run_stdio(access_mode.into()),
         Command::ServeApi { access_mode, addr } => agentops_api::run(&addr, access_mode.into()).await,
         Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(default_docbrain_db_path)),
@@ -434,6 +487,143 @@ fn status(path: &Path) -> Result<()> {
     println!("  symbols:   {}", store.nodes_by_kind(NodeKind::Symbol)?.len());
     println!("  gotchas:   {}", store.nodes_by_kind(NodeKind::Gotcha)?.len());
     println!("  decisions: {}", store.nodes_by_kind(NodeKind::Decision)?.len());
+    println!("  notes:       {}", store.nodes_by_kind(NodeKind::Note)?.len());
+    println!("  definitions: {}", store.nodes_by_kind(NodeKind::Definition)?.len());
+    Ok(())
+}
+
+fn print_scan_summary(scan: &agentops_graph::ScanHistoryRow) {
+    println!(
+        "Scan #{} ({} -> {}){}",
+        scan.id,
+        scan.started_at,
+        scan.finished_at,
+        scan.git_sha.as_deref().map(|s| format!(" @ {s}")).unwrap_or_default()
+    );
+    println!(
+        "  Files: +{} ~{} -{}   Symbols: +{} ~{} -{}   Notes added: {}",
+        scan.files_added, scan.files_changed, scan.files_removed, scan.symbols_added, scan.symbols_changed, scan.symbols_removed, scan.notes_added
+    );
+}
+
+fn changelog(path: &Path, since: Option<i64>, limit: Option<i64>) -> Result<()> {
+    let db_path = graph_db_path(path);
+    if !db_path.exists() {
+        println!("No graph store found at {}. Run `agentops install --path {}` first.", db_path.display(), path.display());
+        return Ok(());
+    }
+    let store = SqliteGraphStore::open(&db_path)?;
+    let repo_name = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| path.display().to_string());
+
+    // `--limit` with neither `--since` nor a default: list recent scans'
+    // summaries, not one scan's full diff -- useful before drilling in.
+    if since.is_none() {
+        if let Some(limit) = limit {
+            let scans = store.list_scans(&repo_name, limit)?;
+            if scans.is_empty() {
+                println!("No scans recorded yet for this repo.");
+                return Ok(());
+            }
+            for scan in &scans {
+                print_scan_summary(scan);
+            }
+            return Ok(());
+        }
+    }
+
+    let scan_id = match since {
+        Some(id) => id,
+        None => match store.latest_scan(&repo_name)? {
+            Some(latest) => latest.id,
+            None => {
+                println!("No scans recorded yet for this repo.");
+                return Ok(());
+            }
+        },
+    };
+    let Some(scan) = store.get_scan(scan_id)? else {
+        anyhow::bail!("no scan #{scan_id} found for this repo");
+    };
+    print_scan_summary(&scan);
+
+    let entries = store.scan_diff(scan_id)?;
+    if entries.is_empty() {
+        println!("  (no changes)");
+    }
+    for e in &entries {
+        let label = match e.name.as_deref() {
+            Some(name) => match e.path.as_deref() {
+                Some(path) => format!("{name} ({path})"),
+                None => name.to_string(),
+            },
+            None => e.path.as_deref().unwrap_or("<unknown>").to_string(),
+        };
+        println!("  {} {} {}", e.change, e.kind, label);
+    }
+    Ok(())
+}
+
+fn explain(path: &Path, symbol: &str, file: Option<&Path>) -> Result<()> {
+    let db_path = graph_db_path(path);
+    if !db_path.exists() {
+        anyhow::bail!("no graph store at {} — run `agentops install --path {}` first", db_path.display(), path.display());
+    }
+    let store = SqliteGraphStore::open(&db_path)?;
+    let repo_name = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| path.display().to_string());
+
+    let symbol_id = agentops_llm::find_symbol_by_name(&store, &repo_name, symbol, file)?;
+    let config = agentops_llm::AnthropicConfig::from_env()?;
+    let definition_id = agentops_llm::explain_symbol(&store, &config, symbol_id)?;
+    let definition = store.get_node(definition_id)?.context("definition node vanished immediately after being written")?;
+
+    println!("Definition #{definition_id} for {symbol} (symbol #{symbol_id}):\n");
+    println!("{}", definition.content.as_deref().unwrap_or(""));
+    Ok(())
+}
+
+fn ingest_notes(path: &Path, notes_dir: &Path, dry_run: bool, llm_match: bool, min_name_len: usize) -> Result<()> {
+    let db_path = graph_db_path(path);
+    if !db_path.exists() {
+        anyhow::bail!("no graph store at {} — run `agentops install --path {}` first", db_path.display(), path.display());
+    }
+    let store = SqliteGraphStore::open(&db_path)?;
+    let repo_name = path
+        .canonicalize()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| path.display().to_string());
+
+    let notes = agentops_notes::walk_vault(notes_dir)?;
+    println!("Found {} notes under {}", notes.len(), notes_dir.display());
+
+    let cheap_matcher = agentops_notes::WordBoundaryMatcher { min_name_len };
+    let llm_config = if llm_match { Some(agentops_llm::AnthropicConfig::from_env()?) } else { None };
+    let llm_matcher = llm_config.as_ref().map(|config| agentops_llm::LlmAssistedMatcher { config, min_name_len });
+    let matcher: &dyn agentops_notes::SymbolMatcher = match &llm_matcher {
+        Some(m) => m,
+        None => &cheap_matcher,
+    };
+
+    if dry_run {
+        for note in &notes {
+            let matched_ids = matcher.match_symbols(&store, &repo_name, &note.body)?;
+            let names: Vec<String> = matched_ids.iter().filter_map(|&id| store.get_node(id).ok().flatten().and_then(|n| n.name)).collect();
+            println!("[{:?}] {} -> {}", note.note_type.node_kind(), note.title, if names.is_empty() { "(no match)".to_string() } else { names.join(", ") });
+        }
+        println!("\n(dry run — nothing written; drop --dry-run to ingest for real)");
+        return Ok(());
+    }
+
+    let summary = agentops_notes::ingest_vault(&store, &repo_name, &notes, matcher)?;
+    println!("Ingested {} of {} notes, wrote {} Affects edge(s).", summary.notes_written, summary.notes_seen, summary.edges_written);
     Ok(())
 }
 

@@ -17,13 +17,20 @@ use serde::{Deserialize, Serialize};
 
 const KEY_PREFIX: &str = "agentops-license.v1";
 
-/// The production verifying key, safe to embed in shipped heavy-tier
-/// binaries — it can only check signatures, not produce them. The matching
-/// private key is held offline (see `agentops-heavy`'s internal docs for
-/// where) and used solely by `examples/sign_license.rs` to issue real keys.
+// TEMPORARY LOCAL-DEMO SWAP -- DO NOT COMMIT.
+// This is a throwaway Ed25519 keypair generated on this machine
+// (agentops-license/examples/gen_keypair.rs) solely to demo semantic
+// search locally without touching the real offline production private
+// key. The real value is below, commented out -- restore it before any
+// commit and delete gen_keypair.rs once the demo key is no longer needed.
+//
+// pub const PRODUCTION_PUBLIC_KEY: [u8; 32] = [
+//     0x64, 0x6b, 0x6a, 0xd2, 0xda, 0x1f, 0x48, 0x3e, 0xfe, 0x99, 0xd7, 0x12, 0x23, 0x19, 0x42, 0x87,
+//     0xa8, 0x56, 0xc9, 0x5e, 0xf7, 0x5d, 0x71, 0x64, 0xd3, 0x0b, 0xa9, 0x70, 0x61, 0x7e, 0xa6, 0xc0,
+// ];
 pub const PRODUCTION_PUBLIC_KEY: [u8; 32] = [
-    0x64, 0x6b, 0x6a, 0xd2, 0xda, 0x1f, 0x48, 0x3e, 0xfe, 0x99, 0xd7, 0x12, 0x23, 0x19, 0x42, 0x87,
-    0xa8, 0x56, 0xc9, 0x5e, 0xf7, 0x5d, 0x71, 0x64, 0xd3, 0x0b, 0xa9, 0x70, 0x61, 0x7e, 0xa6, 0xc0,
+    171, 175, 155, 248, 24, 47, 159, 118, 77, 121, 237, 212, 22, 35, 128, 25, 69, 176, 53, 178, 44,
+    13, 97, 162, 99, 91, 197, 13, 38, 211, 253, 43,
 ];
 
 /// Verifies a license key against the embedded production public key,

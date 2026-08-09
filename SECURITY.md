@@ -292,6 +292,19 @@ A public disclosure policy will be published alongside the first open-source rel
   completion through `get_job_status` over the real MCP dispatch path, plus
   a dedicated tenant-isolation test on `get_job`/`get_job_status` directly.
 
+- **`Library` stats enrichment — `doc_snapshots`/`changelog_versions`/`versions`/`total_nodes`
+  (implemented)** — added to close a real gap surfaced while building the
+  frontend overhaul's Libraries browser: the user's own production docbrain
+  server's `list_libraries_tool` already returns these fields (checked live
+  against it), agentops's reimplementation didn't. No new tenant-isolation
+  surface: `row_to_library`'s new `stats_for()` sub-queries run against a
+  `library_id` that's only ever reached after `get_library`/`list_libraries`
+  already resolved it through the existing `visibility`-scoped query — a
+  tenant can't get another tenant's library's stats any more than it could
+  already get that library's `name`/`docs_url`, since both paths are gated
+  by the same row. Covered by two new tests, including the honest "never
+  scraped yet" case returning zeroed stats rather than an error.
+
 - **API-key CLI tooling (implemented)** — `agentops api-key generate` (in
   `agentops-cli`) wraps `agentops_security::api_key::generate_api_key`,
   printing the raw key once and the hash to configure. Closes the "manual

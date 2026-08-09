@@ -19,6 +19,7 @@ agentops-scanner = { path = "../agentops-scanner" }
 agentops-graph = { path = "../agentops-graph" }
 agentops-docgen = { path = "../agentops-docgen" }
 agentops-notes = { path = "../agentops-notes" }
+agentops-llm = { path = "../agentops-llm" }
 agentops-security = { path = "../agentops-security" }
 agentops-manifest = { path = "../agentops-manifest" }
 agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }

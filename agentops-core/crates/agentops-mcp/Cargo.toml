@@ -17,6 +17,7 @@ agentops-scanner = { path = "../agentops-scanner" }
 agentops-docgen = { path = "../agentops-docgen" }
 agentops-notes = { path = "../agentops-notes" }
 agentops-agents-md = { path = "../agentops-agents-md" }
+agentops-llm = { path = "../agentops-llm" }
 
 [dev-dependencies]
 tempfile = "3"
