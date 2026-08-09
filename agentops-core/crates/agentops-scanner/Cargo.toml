@@ -1,0 +1,21 @@
+[package]
+name = "agentops-scanner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_scanner"
+
+[dependencies]
+anyhow.workspace = true
+tree-sitter.workspace = true
+tree-sitter-language-pack.workspace = true
+petgraph.workspace = true
+serde.workspace = true
+regex.workspace = true
+walkdir.workspace = true
+agentops-security = { path = "../agentops-security" }
+
+[dev-dependencies]
+tempfile = "3"

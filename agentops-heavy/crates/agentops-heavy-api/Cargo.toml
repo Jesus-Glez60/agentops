@@ -1,0 +1,28 @@
+[package]
+name = "agentops-heavy-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_heavy_api"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tower-http.workspace = true
+agentops-security.workspace = true
+agentops-repo-access = { path = "../agentops-repo-access" }
+agentops-github-app = { path = "../agentops-github-app" }
+agentops-embeddings = { path = "../agentops-embeddings" }
+agentops-graph.workspace = true
+docbrain-graph.workspace = true
+agentops-license = { path = "../agentops-license" }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
