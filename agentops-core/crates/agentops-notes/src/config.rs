@@ -48,6 +48,24 @@ fn read_config(repo_path: &Path) -> NotesConfig {
     std::fs::read_to_string(config_path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
 }
 
+/// Writes `notes_path` into `.agentops/config.json`, creating the file/
+/// directory if needed. Merges via a raw JSON map rather than round-tripping
+/// through the typed `NotesConfig` struct — preserves any keys this crate
+/// doesn't know about (including ones added by a future version) instead of
+/// silently dropping them, which a typed round-trip would do.
+pub fn write_notes_path(repo_path: &Path, notes_path: &str) -> anyhow::Result<()> {
+    let config_dir = repo_path.join(".agentops");
+    std::fs::create_dir_all(&config_dir)?;
+    let config_path = config_dir.join("config.json");
+
+    let mut map: serde_json::Map<String, serde_json::Value> =
+        std::fs::read_to_string(&config_path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    map.insert("notes_path".to_string(), serde_json::Value::String(notes_path.to_string()));
+
+    std::fs::write(&config_path, serde_json::to_string_pretty(&map)?)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -90,5 +108,26 @@ mod tests {
         std::fs::write(dir.path().join(".agentops/config.json"), "not valid json").unwrap();
 
         assert_eq!(resolve_notes_path(dir.path(), None), default_notes_path(dir.path()));
+    }
+
+    #[test]
+    fn write_notes_path_is_picked_up_by_resolve_notes_path() {
+        let dir = tempfile::tempdir().unwrap();
+        write_notes_path(dir.path(), "/external/vault").unwrap();
+        assert_eq!(resolve_notes_path(dir.path(), None), PathBuf::from("/external/vault"));
+    }
+
+    #[test]
+    fn write_notes_path_preserves_unrelated_existing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".agentops")).unwrap();
+        std::fs::write(dir.path().join(".agentops/config.json"), r#"{"some_future_key": "keep-me"}"#).unwrap();
+
+        write_notes_path(dir.path(), "/external/vault").unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join(".agentops/config.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(json["some_future_key"], "keep-me");
+        assert_eq!(json["notes_path"], "/external/vault");
     }
 }

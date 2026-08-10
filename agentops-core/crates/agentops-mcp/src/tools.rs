@@ -120,6 +120,14 @@ fn tool_specs() -> Vec<ToolSpec> {
             input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" } }, "required": ["path", "symbol_id"] }),
             handler: tool_explain_symbol,
         },
+        ToolSpec {
+            name: "init_agents_md",
+            description: "Writes (or refreshes) AGENTS.md for this repo with a resolved NOTES_PATH, and ensures .gitignore excludes generated scan output. Lets an agent bootstrap the write-back protocol for itself over MCP, without needing shell access to the CLI's `install` command.",
+            access: AccessMode::Full,
+            annotations: WRITE_IDEMPOTENT,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "notes_path": { "type": "string" } }, "required": ["path"] }),
+            handler: tool_init_agents_md,
+        },
     ]
 }
 
@@ -230,61 +238,41 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
     let tags: Vec<String> = args.get("tags").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
     let explicit_notes_path = get_str(args, "notes_path").map(PathBuf::from);
 
-    let repo_path = Path::new(path_str);
-    let (store, repo) = repo_context(args)?;
-    let classifier = agentops_notes::HeuristicClassifier;
-    let matcher = agentops_notes::WordBoundaryMatcher::default();
-
     let note_type = match note_type_str {
-        Some("gotcha") => agentops_notes::NoteType::Gotcha,
-        Some("decision") => agentops_notes::NoteType::Decision,
-        Some("knowledge") | None => {
-            if note_type_str.is_none() {
-                use agentops_notes::NoteClassifier;
-                classifier.classify(body)?
-            } else {
-                agentops_notes::NoteType::Knowledge
-            }
-        }
+        Some("gotcha") => Some(agentops_notes::NoteType::Gotcha),
+        Some("decision") => Some(agentops_notes::NoteType::Decision),
+        Some("knowledge") => Some(agentops_notes::NoteType::Knowledge),
+        None => None,
         Some(other) => anyhow::bail!("invalid note_type '{other}', expected gotcha, decision, or knowledge"),
     };
 
-    let notes_dir = agentops_notes::resolve_notes_path(repo_path, explicit_notes_path.as_deref());
-    std::fs::create_dir_all(&notes_dir)?;
-    let slug = title.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect::<String>();
-    let slug = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
-    let file_path = notes_dir.join(format!("{slug}.md"));
-
-    let type_str = match note_type {
+    let result = crate::notes::add_note(Path::new(path_str), title, body, note_type, &tags, explicit_notes_path.as_deref())?;
+    let type_str = match result.note_type {
         agentops_notes::NoteType::Gotcha => "gotcha",
         agentops_notes::NoteType::Decision => "decision",
         agentops_notes::NoteType::Knowledge => "knowledge",
         agentops_notes::NoteType::Context => "context",
     };
-    let tags_yaml = if tags.is_empty() { String::new() } else { format!("tags: [{}]\n", tags.join(", ")) };
-    let content = format!("---\ntitle: \"{title}\"\ntype: {type_str}\n{tags_yaml}---\n\n{body}\n");
-    std::fs::write(&file_path, &content)?;
-
-    let notes = agentops_notes::walk_vault(&notes_dir, &classifier)?;
-    let this_note = notes.into_iter().find(|n| n.title == title).ok_or_else(|| anyhow::anyhow!("wrote note but failed to re-parse it"))?;
-    let summary = agentops_notes::ingest_vault(&store, &repo, std::slice::from_ref(&this_note), &matcher)?;
-
-    Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols).", file_path.display(), summary.edges_written))
+    Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols).", result.file_path.display(), result.edges_written))
 }
 
 fn tool_ingest_notes(args: &Value) -> anyhow::Result<String> {
     let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
-    let repo_path = Path::new(path_str);
     let explicit_notes_path = get_str(args, "notes_path").map(PathBuf::from);
-    let notes_dir = agentops_notes::resolve_notes_path(repo_path, explicit_notes_path.as_deref());
-    let (store, repo) = repo_context(args)?;
 
     let classifier = agentops_notes::HeuristicClassifier;
     let matcher = agentops_notes::WordBoundaryMatcher::default();
-    let notes = agentops_notes::walk_vault(&notes_dir, &classifier)?;
-    let summary = agentops_notes::ingest_vault(&store, &repo, &notes, &matcher)?;
+    let summary = crate::notes::ingest_notes_dir(Path::new(path_str), explicit_notes_path.as_deref(), &classifier, &matcher)?;
 
+    let notes_dir = agentops_notes::resolve_notes_path(Path::new(path_str), explicit_notes_path.as_deref());
     Ok(format!("Ingested {} note(s) from {}, wrote {} edge(s).", summary.notes_written, notes_dir.display(), summary.edges_written))
+}
+
+fn tool_init_agents_md(args: &Value) -> anyhow::Result<String> {
+    let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
+    let notes_path = get_str(args, "notes_path").map(PathBuf::from);
+    let result = crate::init::init_agents_md(Path::new(path_str), notes_path.as_deref())?;
+    Ok(format!("Wrote {} (NOTES_PATH: {})", result.agents_md_path.display(), result.notes_path.display()))
 }
 
 fn tool_explain_symbol(args: &Value) -> anyhow::Result<String> {

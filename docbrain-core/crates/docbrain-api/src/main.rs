@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut addr = "127.0.0.1:8421".to_string();
-    let mut db_path = default_db_path();
+    let mut db_path = docbrain_mcp::default_db_path();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -27,9 +27,4 @@ async fn main() -> anyhow::Result<()> {
     }
 
     docbrain_api::run(&addr, &db_path).await
-}
-
-fn default_db_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentops").join("docbrain.db")
 }

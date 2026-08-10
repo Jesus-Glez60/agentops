@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 
 fn main() -> anyhow::Result<()> {
-    let db_path = parse_db_arg().unwrap_or_else(default_db_path);
+    let db_path = parse_db_arg().unwrap_or_else(docbrain_mcp::default_db_path);
     docbrain_mcp::run_stdio(&db_path)
 }
 
@@ -17,9 +17,4 @@ fn parse_db_arg() -> Option<PathBuf> {
         }
     }
     None
-}
-
-fn default_db_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentops").join("docbrain.db")
 }

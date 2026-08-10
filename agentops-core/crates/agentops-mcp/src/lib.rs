@@ -3,13 +3,17 @@
 //! `scan_and_persist` for the actual scan-persistence use case, shared
 //! identically by the CLI and the MCP `scan_repo` tool.
 
+mod init;
+mod notes;
 mod protocol;
 pub mod scan;
 mod server;
 mod tools;
 
+pub use init::{init_agents_md, InitResult};
+pub use notes::{add_note, ingest_notes_dir, AddNoteResult};
 pub use protocol::{CallToolResult, ContentBlock, ToolAnnotations, ToolDefinition};
-pub use scan::{persist, scan_and_persist, ScanPersistSummary};
+pub use scan::{graph_db_path, persist, repo_name, scan_and_persist, ScanPersistSummary};
 pub use tools::{call_tool, list_tools, AccessMode};
 
 use std::io::{BufRead, Write};

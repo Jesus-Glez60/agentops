@@ -11,22 +11,19 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-dialoguer.workspace = true
-indicatif.workspace = true
 tokio.workspace = true
 
 agentops-scanner = { path = "../agentops-scanner" }
 agentops-graph = { path = "../agentops-graph" }
-agentops-docgen = { path = "../agentops-docgen" }
 agentops-notes = { path = "../agentops-notes" }
 agentops-llm = { path = "../agentops-llm" }
 agentops-security = { path = "../agentops-security" }
-agentops-manifest = { path = "../agentops-manifest" }
-agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }
-agentops-agents-md = { path = "../agentops-agents-md" }
 agentops-mcp = { path = "../agentops-mcp" }
 agentops-api = { path = "../agentops-api" }
-docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
-docbrain-ingest = { path = "../../../docbrain-core/crates/docbrain-ingest" }
 docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
 docbrain-api = { path = "../../../docbrain-core/crates/docbrain-api" }
+
+# Re-added when their features are built: agentops-docgen (docgen command),
+# agentops-manifest (repo registry/forget command), agentops-ruler-bridge +
+# dialoguer/indicatif (prompt-pack distribution, sync-docs' interactive
+# fallback) — see the plan's "deliberately out of scope" note.

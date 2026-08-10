@@ -26,14 +26,19 @@ pub struct ScanPersistSummary {
     pub pruned_symbols: usize,
 }
 
-pub(crate) fn graph_db_path(repo_path: &Path) -> PathBuf {
+/// `pub` (not just `pub(crate)`) so driving adapters outside this crate
+/// (`agentops-cli`'s `status`/`changelog` commands) can open the same store
+/// the same way every other adapter does, instead of reimplementing this
+/// path-joining logic a second time — a duplication risk otherwise.
+pub fn graph_db_path(repo_path: &Path) -> PathBuf {
     repo_path.join(".context").join("graph.db")
 }
 
 /// The repo's identity within the graph store — canonicalized directory
 /// name, falling back to the raw path string if canonicalization fails
-/// (e.g. the path doesn't exist yet in a test).
-pub(crate) fn repo_name(path: &Path) -> String {
+/// (e.g. the path doesn't exist yet in a test). `pub` for the same reason
+/// as `graph_db_path`.
+pub fn repo_name(path: &Path) -> String {
     path.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or_else(|| path.display().to_string())
 }
 
