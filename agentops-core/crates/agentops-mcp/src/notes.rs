@@ -6,10 +6,11 @@
 
 use std::path::{Path, PathBuf};
 
-use agentops_graph::SqliteGraphStore;
+use agentops_embeddings::Embedder;
+use agentops_graph::NodeKind;
 use anyhow::Result;
 
-use crate::scan::{graph_db_path, repo_name};
+use crate::scan::repo_name;
 
 pub struct AddNoteResult {
     pub file_path: PathBuf,
@@ -23,8 +24,15 @@ pub struct AddNoteResult {
 /// caller-supplied `note_type` string) pass `Some(..)`, including
 /// `Some(NoteType::Knowledge)` to skip classification for an explicit
 /// "knowledge" request rather than treating it as ambiguous.
-pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<agentops_notes::NoteType>, tags: &[String], notes_path_override: Option<&Path>) -> Result<AddNoteResult> {
-    let store = SqliteGraphStore::open(&graph_db_path(repo_path))?;
+///
+/// `with_embeddings`: natural-language note text is exactly what dense
+/// embeddings are best at, so this is worth offering here too (not just for
+/// scan's symbols) — the note's own node is looked up via `find_node` right
+/// after ingestion (this function always processes exactly one note, unlike
+/// `ingest_notes_dir`'s bulk path below, so there's always exactly one id to
+/// attach an embedding to).
+pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<agentops_notes::NoteType>, tags: &[String], notes_path_override: Option<&Path>, with_embeddings: bool) -> Result<AddNoteResult> {
+    let store = crate::store::open_store(repo_path)?;
     let repo = repo_name(repo_path);
     let classifier = agentops_notes::HeuristicClassifier;
     let matcher = agentops_notes::WordBoundaryMatcher::default();
@@ -55,7 +63,16 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
 
     let notes = agentops_notes::walk_vault(&notes_dir, &classifier)?;
     let this_note = notes.into_iter().find(|n| n.title == title).ok_or_else(|| anyhow::anyhow!("wrote note but failed to re-parse it"))?;
-    let summary = agentops_notes::ingest_vault(&store, &repo, std::slice::from_ref(&this_note), &matcher)?;
+    let summary = agentops_notes::ingest_vault(store.as_ref(), &repo, std::slice::from_ref(&this_note), &matcher)?;
+
+    if with_embeddings {
+        let node_kind = note_type.node_kind();
+        let vault_path = format!("vault:{}", this_note.source_path.to_string_lossy());
+        if let Some(node) = store.find_node(&repo, node_kind, Some(&vault_path), Some(title), None)? {
+            let embedding = agentops_embeddings::LocalEmbedder.embed(body)?;
+            store.set_embedding(&repo, node.id, &embedding)?;
+        }
+    }
 
     Ok(AddNoteResult { file_path, note_type, edges_written: summary.edges_written })
 }
@@ -66,25 +83,50 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
 /// `agentops-cli`'s `--llm-classify`/`--llm-match` flags) so this one
 /// function serves both the cheap default path and the opt-in richer one,
 /// rather than the two paths diverging into separate implementations.
-pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, classifier: &dyn agentops_notes::NoteClassifier, matcher: &dyn agentops_notes::SymbolMatcher) -> Result<agentops_notes::IngestSummary> {
-    let store = SqliteGraphStore::open(&graph_db_path(repo_path))?;
+///
+/// `with_embeddings`: `agentops_notes::ingest_vault`'s `IngestSummary`
+/// never exposes individual node ids (only counts), so there's no id to
+/// hand `set_embedding` straight out of the bulk `ingest_vault` call the
+/// way `add_note`'s single-note path can. Simpler than diffing "which ones
+/// are actually new": re-embed every gotcha/decision/note node currently in
+/// the repo after ingestion completes, each time this is called with
+/// `with_embeddings: true` — safe to re-run (`set_embedding` replaces), at
+/// the cost of re-embedding unchanged notes on every bulk run.
+pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, classifier: &dyn agentops_notes::NoteClassifier, matcher: &dyn agentops_notes::SymbolMatcher, with_embeddings: bool) -> Result<agentops_notes::IngestSummary> {
+    let store = crate::store::open_store(repo_path)?;
     let repo = repo_name(repo_path);
     let notes_dir = agentops_notes::resolve_notes_path(repo_path, notes_path_override);
     let notes = agentops_notes::walk_vault(&notes_dir, classifier)?;
-    agentops_notes::ingest_vault(&store, &repo, &notes, matcher)
+    let summary = agentops_notes::ingest_vault(store.as_ref(), &repo, &notes, matcher)?;
+
+    if with_embeddings {
+        for kind in [NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note] {
+            for node in store.nodes_by_kind(&repo, kind)? {
+                if let Some(content) = &node.content {
+                    let embedding = agentops_embeddings::LocalEmbedder.embed(content)?;
+                    store.set_embedding(&repo, node.id, &embedding)?;
+                }
+            }
+        }
+    }
+
+    Ok(summary)
 }
 
 #[cfg(test)]
 mod tests {
+    use agentops_graph::{GraphStore, SqliteGraphStore};
+
     use super::*;
+    use crate::scan::graph_db_path;
 
     #[test]
     fn add_note_writes_a_file_and_ingests_it_into_the_graph() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
-        crate::scan::scan_and_persist(dir.path()).unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
 
-        let result = add_note(dir.path(), "Token bug", "verify_token has a known workaround for a bug.", None, &[], None).unwrap();
+        let result = add_note(dir.path(), "Token bug", "verify_token has a known workaround for a bug.", None, &[], None, false).unwrap();
         assert_eq!(result.note_type, agentops_notes::NoteType::Gotcha, "gotcha-shaped body must be auto-classified");
         assert!(result.file_path.exists());
 
@@ -98,9 +140,9 @@ mod tests {
     #[test]
     fn add_note_with_explicit_note_type_skips_classification() {
         let dir = tempfile::tempdir().unwrap();
-        crate::scan::scan_and_persist(dir.path()).unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
 
-        let result = add_note(dir.path(), "Some knowledge", "Plain informational text, nothing gotcha- or decision-shaped.", Some(agentops_notes::NoteType::Knowledge), &[], None).unwrap();
+        let result = add_note(dir.path(), "Some knowledge", "Plain informational text, nothing gotcha- or decision-shaped.", Some(agentops_notes::NoteType::Knowledge), &[], None, false).unwrap();
         assert_eq!(result.note_type, agentops_notes::NoteType::Knowledge);
     }
 
@@ -108,7 +150,7 @@ mod tests {
     fn ingest_notes_dir_picks_up_a_hand_written_note() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
-        crate::scan::scan_and_persist(dir.path()).unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
 
         let notes_dir = dir.path().join(".agentops").join("notes");
         std::fs::create_dir_all(&notes_dir).unwrap();
@@ -116,7 +158,21 @@ mod tests {
 
         let classifier = agentops_notes::HeuristicClassifier;
         let matcher = agentops_notes::WordBoundaryMatcher::default();
-        let summary = ingest_notes_dir(dir.path(), None, &classifier, &matcher).unwrap();
+        let summary = ingest_notes_dir(dir.path(), None, &classifier, &matcher, false).unwrap();
         assert_eq!(summary.notes_written, 1);
+    }
+
+    #[test]
+    fn add_note_with_embeddings_makes_it_findable_via_search_similar() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+
+        add_note(dir.path(), "Timing attack risk", "verify_token has a known issue: a plain equality check, vulnerable to timing attacks.", None, &[], None, true).unwrap();
+
+        let store = SqliteGraphStore::open(&graph_db_path(dir.path())).unwrap();
+        let repo = repo_name(dir.path());
+        let query = agentops_embeddings::LocalEmbedder.embed("comparison is not constant-time, timing side channel").unwrap();
+        let hits = store.search_similar(&repo, &query, 5, Some(NodeKind::Gotcha)).unwrap();
+        assert!(hits.iter().any(|(n, _)| n.name.as_deref() == Some("Timing attack risk")), "found: {hits:?}");
     }
 }

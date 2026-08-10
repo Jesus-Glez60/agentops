@@ -4,13 +4,13 @@
 //! lives here (see `agentops-mcp::{scan, notes, init}` for the shared
 //! use cases this and the MCP tool table both call identically).
 //!
-//! `docgen`, Ruler/prompt-pack distribution, and `sync-docs` are not here
-//! yet — `agentops-docgen`/`agentops-ruler-bridge` are still stubs, and
-//! `sync-docs` is a separate follow-up (see the plan).
+//! Ruler/prompt-pack distribution and `sync-docs` are not here yet —
+//! `agentops-ruler-bridge` is still a stub, and `sync-docs` is a separate
+//! follow-up (see the plan).
 
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{GraphStore, NodeKind, SqliteGraphStore};
+use agentops_graph::{GraphStore, NodeKind};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -34,9 +34,20 @@ enum Command {
         /// Preview what would happen without writing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Embed each new/changed symbol so it's findable via `search`.
+        /// Local, no API cost, but real CPU latency per symbol — off by
+        /// default.
+        #[arg(long)]
+        with_embeddings: bool,
     },
     /// Show what's currently scanned for a repo.
     Status {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Generate an onboarding/engineering doc (repo-map.md) from an
+    /// already-scanned repo's graph.
+    Docgen {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
@@ -62,6 +73,9 @@ enum Command {
         kind: Option<NoteKindArg>,
         #[arg(long, value_delimiter = ',')]
         tags: Vec<String>,
+        /// Embed the note so it's findable via `search`.
+        #[arg(long)]
+        with_embeddings: bool,
         title: String,
         text: String,
     },
@@ -85,6 +99,20 @@ enum Command {
         llm_match: bool,
         #[arg(long, default_value_t = 4)]
         min_name_len: usize,
+        /// Embed every ingested note so it's findable via `search`.
+        #[arg(long)]
+        with_embeddings: bool,
+    },
+    /// Dense-vector search over embedded symbols/gotchas/decisions/notes —
+    /// requires having scanned/added notes with --with-embeddings first.
+    Search {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        #[arg(long, value_enum)]
+        kind: Option<SearchKindArg>,
+        query: String,
     },
     /// Generate an LLM explanation of a symbol (requires
     /// AGENTOPS_ANTHROPIC_API_KEY) and record it as a Definition node.
@@ -157,26 +185,64 @@ enum NoteKindArg {
     Knowledge,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum SearchKindArg {
+    Symbol,
+    File,
+    Gotcha,
+    Decision,
+    Note,
+    Definition,
+}
+
+impl From<SearchKindArg> for NodeKind {
+    fn from(kind: SearchKindArg) -> Self {
+        match kind {
+            SearchKindArg::Symbol => NodeKind::Symbol,
+            SearchKindArg::File => NodeKind::File,
+            SearchKindArg::Gotcha => NodeKind::Gotcha,
+            SearchKindArg::Decision => NodeKind::Decision,
+            SearchKindArg::Note => NodeKind::Note,
+            SearchKindArg::Definition => NodeKind::Definition,
+        }
+    }
+}
+
+/// Deliberately *not* `#[tokio::main]` — every subcommand except
+/// `serve-api`/`docbrain-serve-api` is synchronous, and `PostgresGraphStore`
+/// (an optional `GraphStore` backend, see `agentops-graph-pg`) owns its
+/// *own* internal Tokio runtime and calls `block_on` on it per query. An
+/// ambient runtime wrapping the whole `main` would make every one of those
+/// calls a nested `block_on` — confirmed via live testing against a real
+/// Postgres backend to panic outright ("Cannot start a runtime from within
+/// a runtime"), not a hypothetical concern. The two subcommands that are
+/// genuinely async build their own runtime right where they're used
+/// instead, the same pattern `PostgresGraphStore` itself already relies on.
+fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Install { path, notes_path, dry_run } => install(&path, notes_path.as_deref(), dry_run),
+        Command::Install { path, notes_path, dry_run, with_embeddings } => install(&path, notes_path.as_deref(), dry_run, with_embeddings),
         Command::Status { path } => status(&path),
+        Command::Docgen { path } => docgen(&path),
         Command::Changelog { path, since, limit } => changelog(&path, since, limit),
-        Command::Note { path, kind, tags, title, text } => note(&path, kind, &tags, &title, &text),
-        Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len } => ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len),
+        Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
+        Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
+            ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
+        }
+        Command::Search { path, top_k, kind, query } => search(&path, top_k, kind, &query),
         Command::Explain { path, symbol, file } => explain(&path, &symbol, file.as_deref()),
         Command::Serve { access_mode } => agentops_mcp::run_stdio(access_mode.into()),
-        Command::ServeApi { access_mode, addr } => agentops_api::run(&addr, access_mode.into()).await,
+        Command::ServeApi { access_mode, addr } => tokio::runtime::Runtime::new()?.block_on(agentops_api::run(&addr, access_mode.into())),
         Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(docbrain_mcp::default_db_path)),
-        Command::DocbrainServeApi { addr, db } => docbrain_api::run(&addr, &db.unwrap_or_else(docbrain_mcp::default_db_path)).await,
+        Command::DocbrainServeApi { addr, db } => {
+            tokio::runtime::Runtime::new()?.block_on(docbrain_api::run(&addr, &db.unwrap_or_else(docbrain_mcp::default_db_path)))
+        }
         Command::ApiKey { action: ApiKeyAction::Generate } => api_key_generate(),
     }
 }
 
-fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool) -> Result<()> {
+fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embeddings: bool) -> Result<()> {
     println!("Scanning {}...", path.display());
     let report = agentops_scanner::scan_repo(path).context("scanning repo")?;
     println!("Found {} files. {} secret(s) redacted.", report.files.len(), report.redacted_count);
@@ -186,12 +252,12 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool) -> Result<()> 
 
     if dry_run {
         let ranked = agentops_scanner::rank_files(path, &report.files);
-        println!("--dry-run: would write {} and AGENTS.md", agentops_mcp::graph_db_path(path).display());
+        println!("--dry-run: would write to {} and AGENTS.md", agentops_mcp::describe_backend(path));
         println!("Top-ranked files: {:?}", ranked.iter().take(5.min(ranked.len())).map(|(p, _)| p).collect::<Vec<_>>());
         return Ok(());
     }
 
-    let summary = agentops_mcp::persist(path, &report).context("persisting scan to graph store")?;
+    let summary = agentops_mcp::persist(path, &report, with_embeddings).context("persisting scan to graph store")?;
     if summary.pruned_files > 0 || summary.pruned_symbols > 0 {
         println!("Pruned {} stale file node(s) and {} stale symbol node(s) from prior scans.", summary.pruned_files, summary.pruned_symbols);
     }
@@ -200,7 +266,7 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool) -> Result<()> 
         summary.files,
         summary.symbols,
         summary.dependency_edges,
-        agentops_mcp::graph_db_path(path).display()
+        agentops_mcp::describe_backend(path)
     );
 
     let init_result = agentops_mcp::init_agents_md(path, notes_path).context("writing AGENTS.md")?;
@@ -209,24 +275,35 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool) -> Result<()> 
     Ok(())
 }
 
-fn open_store(path: &Path) -> Result<(SqliteGraphStore, String)> {
-    let db_path = agentops_mcp::graph_db_path(path);
-    if !db_path.exists() {
-        anyhow::bail!("no graph store at {} — run `agentops install --path {}` first", db_path.display(), path.display());
+fn open_store(path: &Path) -> Result<(Box<dyn GraphStore>, String)> {
+    let store = agentops_mcp::open_store(path)?;
+    let repo = agentops_mcp::repo_name(path);
+    // "Has this repo ever been scanned" needs a backend-agnostic check now
+    // that AGENTOPS_DATABASE_URL can select Postgres — a SQLite file's
+    // existence (the old check) is meaningless there, since no such file
+    // is ever created for that backend, which would make every command
+    // using this helper always report "not scanned" under Postgres.
+    if store.latest_scan(&repo)?.is_none() {
+        anyhow::bail!("no scans recorded for this repo yet — run `agentops install --path {}` first", path.display());
     }
-    let store = SqliteGraphStore::open(&db_path)?;
-    Ok((store, agentops_mcp::repo_name(path)))
+    Ok((store, repo))
 }
 
 fn status(path: &Path) -> Result<()> {
     let (store, repo) = open_store(path)?;
-    println!("Graph store: {}", agentops_mcp::graph_db_path(path).display());
+    println!("Graph store: {}", agentops_mcp::describe_backend(path));
     println!("  files:       {}", store.nodes_by_kind(&repo, NodeKind::File)?.len());
     println!("  symbols:     {}", store.nodes_by_kind(&repo, NodeKind::Symbol)?.len());
     println!("  gotchas:     {}", store.nodes_by_kind(&repo, NodeKind::Gotcha)?.len());
     println!("  decisions:   {}", store.nodes_by_kind(&repo, NodeKind::Decision)?.len());
     println!("  notes:       {}", store.nodes_by_kind(&repo, NodeKind::Note)?.len());
     println!("  definitions: {}", store.nodes_by_kind(&repo, NodeKind::Definition)?.len());
+    Ok(())
+}
+
+fn docgen(path: &Path) -> Result<()> {
+    let out_path = agentops_mcp::generate_docs(path)?;
+    println!("Wrote {}", out_path.display());
     Ok(())
 }
 
@@ -285,13 +362,13 @@ fn changelog(path: &Path, since: Option<i64>, limit: Option<usize>) -> Result<()
     Ok(())
 }
 
-fn note(path: &Path, kind: Option<NoteKindArg>, tags: &[String], title: &str, text: &str) -> Result<()> {
+fn note(path: &Path, kind: Option<NoteKindArg>, tags: &[String], with_embeddings: bool, title: &str, text: &str) -> Result<()> {
     let note_type = kind.map(|k| match k {
         NoteKindArg::Gotcha => agentops_notes::NoteType::Gotcha,
         NoteKindArg::Decision => agentops_notes::NoteType::Decision,
         NoteKindArg::Knowledge => agentops_notes::NoteType::Knowledge,
     });
-    let result = agentops_mcp::add_note(path, title, text, note_type, tags, None)?;
+    let result = agentops_mcp::add_note(path, title, text, note_type, tags, None, with_embeddings)?;
     let type_str = match result.note_type {
         agentops_notes::NoteType::Gotcha => "gotcha",
         agentops_notes::NoteType::Decision => "decision",
@@ -302,7 +379,7 @@ fn note(path: &Path, kind: Option<NoteKindArg>, tags: &[String], title: &str, te
     Ok(())
 }
 
-fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classify: bool, llm_match: bool, min_name_len: usize) -> Result<()> {
+fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classify: bool, llm_match: bool, min_name_len: usize, with_embeddings: bool) -> Result<()> {
     let resolved_notes_dir = agentops_notes::resolve_notes_path(path, notes_dir);
 
     let llm_config = if llm_classify || llm_match { Some(agentops_llm::AnthropicConfig::from_env()?) } else { None };
@@ -326,7 +403,7 @@ fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classi
         let notes = agentops_notes::walk_vault(&resolved_notes_dir, classifier)?;
         println!("Found {} note(s) under {}", notes.len(), resolved_notes_dir.display());
         for note in &notes {
-            let matched_ids = matcher.match_symbols(&store, &repo, &note.body)?;
+            let matched_ids = matcher.match_symbols(store.as_ref(), &repo, &note.body)?;
             let names: Vec<String> = matched_ids.iter().filter_map(|&id| store.get_node(&repo, id).ok().flatten().and_then(|n| n.name)).collect();
             println!("[{:?}] {} -> {}", note.note_type, note.title, if names.is_empty() { "(no match)".to_string() } else { names.join(", ") });
         }
@@ -334,16 +411,33 @@ fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classi
         return Ok(());
     }
 
-    let summary = agentops_mcp::ingest_notes_dir(path, notes_dir, classifier, matcher)?;
+    let summary = agentops_mcp::ingest_notes_dir(path, notes_dir, classifier, matcher, with_embeddings)?;
     println!("Ingested {} of {} note(s) from {}, wrote {} edge(s).", summary.notes_written, summary.notes_seen, resolved_notes_dir.display(), summary.edges_written);
+    Ok(())
+}
+
+fn search(path: &Path, top_k: usize, kind: Option<SearchKindArg>, query: &str) -> Result<()> {
+    use agentops_embeddings::Embedder;
+
+    let (store, repo) = open_store(path)?;
+    let embedding = agentops_embeddings::LocalEmbedder.embed(query)?;
+    let hits = store.search_similar(&repo, &embedding, top_k, kind.map(NodeKind::from))?;
+
+    if hits.is_empty() {
+        println!("No matches (nothing embedded yet, or nothing close enough — see install/note/ingest-notes's --with-embeddings flag).");
+        return Ok(());
+    }
+    for (node, distance) in &hits {
+        println!("{:?} {} (distance {distance:.4}){}", node.kind, node.name.as_deref().unwrap_or("(untitled)"), node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default());
+    }
     Ok(())
 }
 
 fn explain(path: &Path, symbol: &str, file: Option<&Path>) -> Result<()> {
     let (store, repo) = open_store(path)?;
-    let symbol_id = agentops_llm::find_symbol_by_name(&store, &repo, symbol, file)?;
+    let symbol_id = agentops_llm::find_symbol_by_name(store.as_ref(), &repo, symbol, file)?;
     let config = agentops_llm::AnthropicConfig::from_env()?;
-    let definition_id = agentops_llm::explain_symbol(&store, &config, &repo, symbol_id)?;
+    let definition_id = agentops_llm::explain_symbol(store.as_ref(), &config, &repo, symbol_id)?;
     let definition = store.get_node(&repo, definition_id)?.context("definition node vanished immediately after being written")?;
 
     println!("Definition #{definition_id} for {symbol} (symbol #{symbol_id}):\n");

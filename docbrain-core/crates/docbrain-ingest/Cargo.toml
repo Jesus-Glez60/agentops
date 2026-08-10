@@ -18,8 +18,8 @@ url = "2"
 sha2.workspace = true
 text-splitter.workspace = true
 tiktoken-rs.workspace = true
-fastembed.workspace = true
 docbrain-graph = { path = "../docbrain-graph" }
+agentops-embeddings = { path = "../../../agentops-core/crates/agentops-embeddings" }
 
 [dev-dependencies]
 tempfile = "3"

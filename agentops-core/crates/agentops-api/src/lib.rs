@@ -5,14 +5,15 @@
 //!
 //! Unlike `docbrain-api`, there's no shared, pre-opened store here: every
 //! `agentops-mcp` tool takes a repo `path` in its own arguments and opens
-//! its own `SqliteGraphStore` per call (a design that supports one server
-//! process serving requests about many different repos, unlike docbrain's
-//! one-store-per-process model) — so `AppState` only needs the fixed
-//! `AccessMode` and optional API-key hash for this process.
+//! its own `GraphStore` per call via `agentops_mcp::open_store` (a design
+//! that supports one server process serving requests about many different
+//! repos, unlike docbrain's one-store-per-process model) — so `AppState`
+//! only needs the fixed `AccessMode` and optional API-key hash for this
+//! process.
 
 use std::path::PathBuf;
 
-use agentops_graph::{GraphStore, NodeKind, SqliteGraphStore};
+use agentops_graph::NodeKind;
 use agentops_mcp::AccessMode;
 use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
@@ -114,24 +115,34 @@ fn parse_kind(s: &str) -> Option<NodeKind> {
 /// MCP-shaped text content (right for an agent, awkward for a UI to render
 /// as a table), so this is a small, genuinely-REST endpoint alongside them,
 /// same reasoning as `docbrain-api`'s `/libraries`.
+///
+/// `agentops_mcp::open_store` blocks its calling thread during I/O when
+/// `AGENTOPS_DATABASE_URL` selects `PostgresGraphStore` (see that store's
+/// doc comment on the sync bridge) — run inside `spawn_blocking` so a slow
+/// Postgres round-trip can't stall this process's async executor. Cheap
+/// for the SQLite default too, just an unneeded (harmless) thread hop.
 async fn list_nodes_json(Query(q): Query<NodesQuery>) -> (StatusCode, Json<Value>) {
-    let repo_path = PathBuf::from(&q.path);
-    let db_path = repo_path.join(".context").join("graph.db");
-    let store = match SqliteGraphStore::open(&db_path) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
-    };
-    let repo = repo_path.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or(q.path.clone());
-
-    let result = match q.kind.as_deref().map(parse_kind) {
+    let kind = match q.kind.as_deref().map(parse_kind) {
         Some(None) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid 'kind'" }))),
-        Some(Some(kind)) => store.nodes_by_kind(&repo, kind),
-        None => store.all_nodes(&repo),
+        Some(Some(kind)) => Some(kind),
+        None => None,
     };
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<agentops_graph::Node>> {
+        let repo_path = PathBuf::from(&q.path);
+        let store = agentops_mcp::open_store(&repo_path)?;
+        let repo = repo_path.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or(q.path.clone());
+        match kind {
+            Some(kind) => store.nodes_by_kind(&repo, kind),
+            None => store.all_nodes(&repo),
+        }
+    })
+    .await;
 
     match result {
-        Ok(nodes) => (StatusCode::OK, Json(json!({ "nodes": nodes }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Ok(Ok(nodes)) => (StatusCode::OK, Json(json!({ "nodes": nodes }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
     }
 }
 

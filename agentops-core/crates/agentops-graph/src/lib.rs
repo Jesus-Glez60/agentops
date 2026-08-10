@@ -32,7 +32,7 @@ pub enum NodeKind {
 }
 
 impl NodeKind {
-    fn as_db_str(&self) -> &'static str {
+    pub fn as_db_str(&self) -> &'static str {
         match self {
             NodeKind::Symbol => "symbol",
             NodeKind::File => "file",
@@ -43,7 +43,7 @@ impl NodeKind {
         }
     }
 
-    fn from_db_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "file" => NodeKind::File,
             "gotcha" => NodeKind::Gotcha,
@@ -67,7 +67,7 @@ pub enum EdgeRelation {
 }
 
 impl EdgeRelation {
-    fn as_db_str(&self) -> &'static str {
+    pub fn as_db_str(&self) -> &'static str {
         match self {
             EdgeRelation::DependsOn => "depends_on",
             EdgeRelation::Documents => "documents",
@@ -75,7 +75,7 @@ impl EdgeRelation {
         }
     }
 
-    fn from_db_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "documents" => EdgeRelation::Documents,
             "affects" => EdgeRelation::Affects,
@@ -138,7 +138,7 @@ pub enum ScanChange {
 }
 
 impl ScanChange {
-    fn as_db_str(&self) -> &'static str {
+    pub fn as_db_str(&self) -> &'static str {
         match self {
             ScanChange::Added => "added",
             ScanChange::Changed => "changed",
@@ -146,7 +146,7 @@ impl ScanChange {
         }
     }
 
-    fn from_db_str(s: &str) -> Self {
+    pub fn from_db_str(s: &str) -> Self {
         match s {
             "changed" => ScanChange::Changed,
             "removed" => ScanChange::Removed,
@@ -223,6 +223,22 @@ pub trait GraphStore {
     fn latest_scan(&self, repo: &str) -> Result<Option<ScanHistory>>;
     fn list_scans(&self, repo: &str) -> Result<Vec<ScanHistory>>;
     fn scan_entries(&self, scan_id: i64) -> Result<Vec<ScanHistoryEntry>>;
+
+    /// Attaches (or replaces) `node_id`'s embedding — a separate step from
+    /// node creation, not a `NewNode` field, so callers that never embed
+    /// (most of `agentops-notes`) never need to know embeddings exist at
+    /// all. Update-safe: a node's content (and thus embedding) can change
+    /// across rescans while its id stays stable, so this must overwrite any
+    /// existing embedding for `node_id`, not just insert-once. Mirrors
+    /// `DocbrainStore::upsert_doc_node`'s "insert node, then a separate
+    /// insert into the vector table" precedent, just as its own method
+    /// rather than folded into `add_node`.
+    fn set_embedding(&self, repo: &str, node_id: i64, embedding: &[f32]) -> Result<()>;
+    /// KNN search — nearest first, `distance` as the score (lower = closer).
+    /// `kind`, if given, restricts results to one `NodeKind` (e.g. only
+    /// `Gotcha`/`Decision` for a "what do we already know" search, vs. only
+    /// `Symbol` for "what code does this").
+    fn search_similar(&self, repo: &str, embedding: &[f32], top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>>;
 }
 
 /// Natural-key upsert: finds an existing node by `(repo, kind, path, name,

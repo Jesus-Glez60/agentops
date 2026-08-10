@@ -7,10 +7,9 @@
 //! behavior instead of re-implementing the embed/KNN/edge-walk/budget
 //! logic a second time.
 
+use agentops_embeddings::Embedder;
 use anyhow::Result;
 use docbrain_graph::{DocNode, DocbrainStore, EdgeRelation, NodeKind};
-
-use crate::embed::Embedder;
 
 /// One node included in a retrieval result, with retrieval-specific
 /// metadata a formatter might want: `distance` for a direct semantic hit,

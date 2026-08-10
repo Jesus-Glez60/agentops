@@ -11,15 +11,14 @@ mod changelog;
 mod chunk;
 mod classify;
 mod discover;
-pub mod embed;
 pub mod retrieve;
 mod scrape;
 
+pub use agentops_embeddings::{Embedder, LocalEmbedder};
 pub use changelog::{ChangelogFetchEntry, ChangelogSync, GitHubReleasesSync};
 pub use chunk::{chunk_and_store, ChunkOutcome, MAX_CHUNK_TOKENS};
 pub use classify::classify_dependency;
 pub use discover::{DiscoveredLibrary, Ecosystem, LibraryDiscovery, RegistryDiscovery};
-pub use embed::{Embedder, LocalEmbedder};
 pub use scrape::{scrape_docs, ScrapedPage};
 
 use anyhow::Result;

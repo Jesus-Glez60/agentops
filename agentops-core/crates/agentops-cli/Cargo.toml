@@ -20,10 +20,12 @@ agentops-llm = { path = "../agentops-llm" }
 agentops-security = { path = "../agentops-security" }
 agentops-mcp = { path = "../agentops-mcp" }
 agentops-api = { path = "../agentops-api" }
+agentops-embeddings = { path = "../agentops-embeddings" }
 docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
 docbrain-api = { path = "../../../docbrain-core/crates/docbrain-api" }
 
-# Re-added when their features are built: agentops-docgen (docgen command),
-# agentops-manifest (repo registry/forget command), agentops-ruler-bridge +
-# dialoguer/indicatif (prompt-pack distribution, sync-docs' interactive
-# fallback) — see the plan's "deliberately out of scope" note.
+# Re-added when their features are built: agentops-manifest (repo
+# registry/forget command), agentops-ruler-bridge + dialoguer/indicatif
+# (prompt-pack distribution, sync-docs' interactive fallback) — see the
+# plan's "deliberately out of scope" note. (`docgen` command goes through
+# agentops-mcp::generate_docs, no direct agentops-docgen dep needed here.)

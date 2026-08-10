@@ -22,6 +22,8 @@ agentops-docgen = { path = "../agentops-docgen" }
 agentops-notes = { path = "../agentops-notes" }
 agentops-agents-md = { path = "../agentops-agents-md" }
 agentops-llm = { path = "../agentops-llm" }
+agentops-embeddings = { path = "../agentops-embeddings" }
+agentops-graph-pg = { path = "../agentops-graph-pg" }
 
 [dev-dependencies]
 tempfile = "3"

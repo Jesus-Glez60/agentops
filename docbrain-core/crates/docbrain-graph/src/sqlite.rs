@@ -12,12 +12,12 @@ use sha2::{Digest, Sha256};
 
 use crate::{ChangelogEntry, DocEdge, DocNode, DocbrainStore, EdgeRelation, Job, JobStatus, Library, NewDocNode, NodeKind, SearchHit, UpsertOutcome};
 
-/// Embedding dimension for docbrain's default model (BGE-small-en-v1.5,
-/// chosen in `docbrain-ingest::embed` for a light local footprint). The
+/// Embedding dimension for docbrain's default model (BGE-small-en-v1.5).
+/// Re-exported from `agentops-embeddings` (the single source of truth,
+/// shared with codebrain's semantic search) rather than defined here — the
 /// `vec0` virtual table's column width is fixed at creation time, so this
-/// has to be a compile-time constant shared between the two crates rather
-/// than inferred from whatever vector happens to be inserted first.
-pub const EMBEDDING_DIM: usize = 384;
+/// has to agree with whatever `LocalEmbedder` actually produces.
+pub use agentops_embeddings::EMBEDDING_DIM;
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 

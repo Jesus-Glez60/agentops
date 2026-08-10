@@ -36,7 +36,8 @@ use anyhow::Result;
 use docbrain_graph::{content_hash, DocbrainStore, EdgeRelation, NewDocNode, NodeKind, UpsertOutcome};
 use text_splitter::{ChunkConfig, MarkdownSplitter};
 
-use crate::embed::Embedder;
+use agentops_embeddings::Embedder;
+
 use crate::scrape::ScrapedPage;
 
 /// Token ceiling per chunk. A concrete bound where `main` had none at all —

@@ -10,11 +10,37 @@
 //! not `=`, for NULL-safe comparison), matching `main`'s original approach.
 
 use std::path::Path;
+use std::sync::Once;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 
+use agentops_embeddings::EMBEDDING_DIM;
+
 use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NewNode, NewScanHistoryEntry, ScanChange, ScanHistory, ScanHistoryEntry};
+
+static INIT_VEC_EXTENSION: Once = Once::new();
+
+/// `sqlite-vec` is loaded via `sqlite3_auto_extension`, which registers it
+/// for every connection opened in this process from that point on — must
+/// run before any `Connection::open*` call, and only once per process.
+/// Same technique `docbrain-graph` already uses for the identical purpose.
+fn ensure_vec_extension_registered() {
+    INIT_VEC_EXTENSION.call_once(|| unsafe {
+        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
+            *const (),
+            unsafe extern "C" fn(*mut rusqlite::ffi::sqlite3, *mut *mut std::ffi::c_char, *const rusqlite::ffi::sqlite3_api_routines) -> std::ffi::c_int,
+        >(sqlite_vec::sqlite3_vec_init as *const ())));
+    });
+}
+
+fn embedding_to_bytes(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn vec_table_migration() -> String {
+    format!("CREATE VIRTUAL TABLE IF NOT EXISTS node_vectors USING vec0(node_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBEDDING_DIM}]);")
+}
 
 const MIGRATIONS: &str = "
     CREATE TABLE IF NOT EXISTS nodes (
@@ -75,11 +101,17 @@ pub struct SqliteGraphStore {
 
 impl SqliteGraphStore {
     pub fn open(path: &Path) -> Result<Self> {
-        Ok(Self { conn: agentops_sqlite_support::open(path, MIGRATIONS)? })
+        ensure_vec_extension_registered();
+        let conn = agentops_sqlite_support::open(path, MIGRATIONS)?;
+        conn.execute_batch(&vec_table_migration()).context("creating node_vectors virtual table")?;
+        Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Ok(Self { conn: agentops_sqlite_support::open_in_memory(MIGRATIONS)? })
+        ensure_vec_extension_registered();
+        let conn = agentops_sqlite_support::open_in_memory(MIGRATIONS)?;
+        conn.execute_batch(&vec_table_migration()).context("creating node_vectors virtual table")?;
+        Ok(Self { conn })
     }
 
     fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<Node> {
@@ -168,6 +200,18 @@ impl GraphStore for SqliteGraphStore {
         let mut params: Vec<&dyn rusqlite::ToSql> = vec![&repo];
         params.extend(ids.iter().map(|id| id as &dyn rusqlite::ToSql));
         self.conn.execute(&sql, params.as_slice())?;
+
+        // A pruned node's embedding (if any) must go with it — otherwise
+        // `node_vectors` accumulates orphan rows forever, and a future
+        // `search_similar` could return a hit for a node_id that no longer
+        // exists in `nodes` at all. `node_vectors` isn't itself repo-scoped
+        // (just `node_id`), but `ids` was already validated against `repo`
+        // by the `DELETE FROM nodes` above, so no cross-repo leak risk here.
+        let vec_placeholders = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
+        let vec_sql = format!("DELETE FROM node_vectors WHERE node_id IN ({vec_placeholders})");
+        let vec_params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        self.conn.execute(&vec_sql, vec_params.as_slice())?;
+
         Ok(())
     }
 
@@ -258,6 +302,51 @@ impl GraphStore for SqliteGraphStore {
             })
         })?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn set_embedding(&self, repo: &str, node_id: i64, embedding: &[f32]) -> Result<()> {
+        anyhow::ensure!(embedding.len() == EMBEDDING_DIM, "embedding has {} dims, expected {EMBEDDING_DIM}", embedding.len());
+        // Confirms node_id is actually in this repo before writing anything
+        // — set_embedding must not let a caller attach a vector to a node
+        // outside its own repo scope just because ids are globally unique.
+        anyhow::ensure!(self.get_node(repo, node_id)?.is_some(), "node #{node_id} not found in repo {repo:?}");
+
+        // vec0's `node_id INTEGER PRIMARY KEY` rejects a second INSERT on an
+        // existing id — unlike docbrain (content-hash dedup means "already
+        // exists" implies "unchanged," so it never re-embeds), a codebrain
+        // symbol's content can genuinely change across rescans while its id
+        // stays stable. Delete-then-insert rather than relying on
+        // `INSERT OR REPLACE`/`ON CONFLICT` support on a virtual table,
+        // which varies by `sqlite-vec` version.
+        self.conn.execute("DELETE FROM node_vectors WHERE node_id = ?1", [node_id])?;
+        self.conn.execute("INSERT INTO node_vectors (node_id, embedding) VALUES (?1, ?2)", rusqlite::params![node_id, embedding_to_bytes(embedding)])?;
+        Ok(())
+    }
+
+    fn search_similar(&self, repo: &str, embedding: &[f32], top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
+        anyhow::ensure!(embedding.len() == EMBEDDING_DIM, "query embedding has {} dims, expected {EMBEDDING_DIM}", embedding.len());
+
+        // Over-fetch then filter by repo/kind in Rust — vec0's own filtering
+        // support varies by version, and this scan is cheap at the node
+        // counts a self-hosted instance actually has. Same technique
+        // `docbrain-graph`'s `search_similar` already uses and documents.
+        let fetch_k = (top_k * 8).max(50) as i64;
+        let mut stmt = self.conn.prepare("SELECT node_id, distance FROM node_vectors WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance")?;
+        let rows = stmt.query_map(rusqlite::params![embedding_to_bytes(embedding), fetch_k], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
+
+        let mut hits = Vec::new();
+        for row in rows {
+            let (node_id, distance) = row?;
+            let Some(node) = self.get_node(repo, node_id)? else { continue };
+            if kind.is_some_and(|k| node.kind != k) {
+                continue;
+            }
+            hits.push((node, distance as f32));
+            if hits.len() >= top_k {
+                break;
+            }
+        }
+        Ok(hits)
     }
 }
 
@@ -393,5 +482,84 @@ mod tests {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         store.record_scan("repo-a", &[]).unwrap();
         assert!(store.latest_scan("repo-b").unwrap().is_none());
+    }
+
+    fn unit_vec(dominant: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; EMBEDDING_DIM];
+        v[dominant] = 1.0;
+        v
+    }
+
+    #[test]
+    fn search_similar_ranks_nearest_first() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let close = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("close"))).unwrap();
+        let far = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("b.rs"), Some("far"))).unwrap();
+        store.set_embedding("repo-a", close, &unit_vec(0)).unwrap();
+        store.set_embedding("repo-a", far, &unit_vec(EMBEDDING_DIM - 1)).unwrap();
+
+        let hits = store.search_similar("repo-a", &unit_vec(0), 2, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0.id, close, "the near vector must rank first: {hits:?}");
+    }
+
+    #[test]
+    fn search_similar_respects_repo_and_kind_scoping() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let symbol = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        let gotcha = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("gotcha"))).unwrap();
+        let other_repo = upsert_node(&store, node("repo-b", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        store.set_embedding("repo-a", symbol, &unit_vec(0)).unwrap();
+        store.set_embedding("repo-a", gotcha, &unit_vec(0)).unwrap();
+        store.set_embedding("repo-b", other_repo, &unit_vec(0)).unwrap();
+
+        let kind_scoped = store.search_similar("repo-a", &unit_vec(0), 10, Some(NodeKind::Symbol)).unwrap();
+        assert_eq!(kind_scoped.len(), 1);
+        assert_eq!(kind_scoped[0].0.id, symbol);
+
+        let repo_scoped = store.search_similar("repo-a", &unit_vec(0), 10, None).unwrap();
+        assert!(repo_scoped.iter().all(|(n, _)| n.repo == "repo-a"), "must never return a different repo's node: {repo_scoped:?}");
+    }
+
+    /// Regression test for the confirmed lifecycle pitfall this audit
+    /// caught: a symbol's content (and thus its embedding) can change
+    /// across rescans while its node_id stays stable. `vec0`'s
+    /// `node_id INTEGER PRIMARY KEY` would reject a naive second INSERT.
+    #[test]
+    fn set_embedding_replaces_rather_than_erroring_on_an_existing_node() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        store.set_embedding("repo-a", id, &unit_vec(0)).unwrap();
+        store.set_embedding("repo-a", id, &unit_vec(1)).unwrap();
+
+        let hits = store.search_similar("repo-a", &unit_vec(1), 1, None).unwrap();
+        assert_eq!(hits.len(), 1, "the replaced embedding must be the only one found, not two accumulated rows: {hits:?}");
+        assert_eq!(hits[0].0.id, id);
+    }
+
+    /// Regression test for the other confirmed lifecycle pitfall: pruning a
+    /// node must also clean up its `node_vectors` row, or a future
+    /// `search_similar` could return a hit for a node_id that no longer
+    /// exists in `nodes` at all.
+    #[test]
+    fn delete_nodes_cleans_up_orphaned_embedding_rows() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let keep = upsert_node(&store, node("repo-a", NodeKind::File, Some("keep.rs"), None)).unwrap();
+        let stale = upsert_node(&store, node("repo-a", NodeKind::File, Some("stale.rs"), None)).unwrap();
+        store.set_embedding("repo-a", keep, &unit_vec(0)).unwrap();
+        store.set_embedding("repo-a", stale, &unit_vec(0)).unwrap();
+
+        prune_stale_nodes(&store, "repo-a", NodeKind::File, &[keep]).unwrap();
+
+        let hits = store.search_similar("repo-a", &unit_vec(0), 10, None).unwrap();
+        assert_eq!(hits.len(), 1, "the pruned node's embedding must be gone too, not orphaned: {hits:?}");
+        assert_eq!(hits[0].0.id, keep);
+    }
+
+    #[test]
+    fn set_embedding_rejects_a_node_outside_the_given_repo() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        assert!(store.set_embedding("repo-b", id, &unit_vec(0)).is_err());
     }
 }

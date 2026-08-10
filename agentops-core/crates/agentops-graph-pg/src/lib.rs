@@ -1,0 +1,521 @@
+//! `PostgresGraphStore`: an optional `GraphStore` adapter for a shared,
+//! multi-repo Postgres database — the "hypothetical future shared/
+//! multi-tenant adapter" `agentops-graph`'s own module doc comment already
+//! named as the reason repo-scoping is required on every trait method.
+//! Part of `agentops-core`, not a paid heavy-tier gate — the same "no
+//! tiering" decision docbrain made for itself, extended to codebrain (see
+//! the plan). Schema: `schema.sql` in this crate's root, a structural
+//! mirror of `SqliteGraphStore`'s current schema, not a port of `main`'s
+//! stale `agentops-heavy` one.
+//!
+//! **Sync bridge**: `GraphStore`'s trait methods are all synchronous
+//! (matching `SqliteGraphStore`'s `rusqlite` calls), but `tokio-postgres`
+//! is inherently async. Rather than making the trait itself async — which
+//! would ripple through every existing caller (`agentops-mcp`,
+//! `agentops-cli`, `agentops-api`, and all their tests) — this store owns a
+//! `tokio::runtime::Runtime` internally and blocks on it per call. A call
+//! therefore blocks its calling thread during I/O; an async caller
+//! (`agentops-api`'s handlers) must wrap calls in `tokio::task::spawn_blocking`
+//! to avoid stalling its executor, and must never call from inside an
+//! already-running Tokio runtime directly (nested `block_on` panics).
+
+use agentops_embeddings::EMBEDDING_DIM;
+use agentops_graph::{Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, Node, NodeKind, ScanChange, ScanHistory, ScanHistoryEntry};
+use anyhow::Result;
+
+const SCHEMA: &str = include_str!("../schema.sql");
+
+pub struct PostgresGraphStore {
+    // Kept alive for the store's whole lifetime, not just at construction —
+    // `deadpool-postgres`'s `Runtime::Tokio1`-mode pool needs an active
+    // Tokio context for background connection recycling the entire time
+    // it's in use. Dropping this right after building the pool would panic
+    // on the first query issued afterward.
+    rt: tokio::runtime::Runtime,
+    pool: deadpool_postgres::Pool,
+}
+
+impl PostgresGraphStore {
+    /// Connects to `database_url` and runs the schema migration (idempotent
+    /// — every statement in `schema.sql` is `IF NOT EXISTS`). No repo-scoped
+    /// file path, unlike `SqliteGraphStore::open`: one Postgres database
+    /// serves every repo, distinguished entirely via the `repo` column.
+    pub fn connect(database_url: &str) -> Result<Self> {
+        let rt = tokio::runtime::Runtime::new()?;
+        let pool = rt.block_on(async {
+            let mut cfg = deadpool_postgres::Config::new();
+            cfg.url = Some(database_url.to_string());
+            let pool = cfg.create_pool(Some(deadpool_postgres::Runtime::Tokio1), tokio_postgres::NoTls)?;
+            let client = pool.get().await?;
+            client.batch_execute(SCHEMA).await?;
+            Ok::<deadpool_postgres::Pool, anyhow::Error>(pool)
+        })?;
+        Ok(Self { rt, pool })
+    }
+}
+
+fn row_to_node(row: &tokio_postgres::Row) -> Node {
+    let kind: String = row.get("kind");
+    Node {
+        id: row.get("id"),
+        kind: NodeKind::from_db_str(&kind),
+        repo: row.get("repo"),
+        path: row.get("path"),
+        name: row.get("name"),
+        container: row.get("container"),
+        start_line: row.get("start_line"),
+        end_line: row.get("end_line"),
+        content: row.get("content"),
+    }
+}
+
+fn row_to_edge(row: &tokio_postgres::Row) -> Edge {
+    let relation: String = row.get("relation");
+    Edge { id: row.get("id"), repo: row.get("repo"), src_id: row.get("src_id"), dst_id: row.get("dst_id"), relation: EdgeRelation::from_db_str(&relation) }
+}
+
+fn row_to_scan_history(row: &tokio_postgres::Row) -> ScanHistory {
+    ScanHistory {
+        id: row.get("id"),
+        repo: row.get("repo"),
+        started_at: row.get("started_at"),
+        files_added: row.get("files_added"),
+        files_changed: row.get("files_changed"),
+        files_removed: row.get("files_removed"),
+        symbols_added: row.get("symbols_added"),
+        symbols_changed: row.get("symbols_changed"),
+        symbols_removed: row.get("symbols_removed"),
+        notes_added: row.get("notes_added"),
+    }
+}
+
+const SCAN_HISTORY_COLUMNS: &str = "id, repo, started_at::text AS started_at, files_added, files_changed, files_removed, symbols_added, symbols_changed, symbols_removed, notes_added";
+
+impl GraphStore for PostgresGraphStore {
+    fn add_node(&self, node: NewNode) -> Result<i64> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client
+                .query_one(
+                    "INSERT INTO nodes (kind, repo, path, name, container, start_line, end_line, content) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+                    &[&node.kind.as_db_str(), &node.repo, &node.path, &node.name, &node.container, &node.start_line, &node.end_line, &node.content],
+                )
+                .await?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn get_node(&self, repo: &str, id: i64) -> Result<Option<Node>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client.query_opt("SELECT * FROM nodes WHERE repo = $1 AND id = $2", &[&repo, &id]).await?;
+            Ok(row.as_ref().map(row_to_node))
+        })
+    }
+
+    fn nodes_by_kind(&self, repo: &str, kind: NodeKind) -> Result<Vec<Node>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM nodes WHERE repo = $1 AND kind = $2", &[&repo, &kind.as_db_str()]).await?;
+            Ok(rows.iter().map(row_to_node).collect())
+        })
+    }
+
+    fn all_nodes(&self, repo: &str) -> Result<Vec<Node>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM nodes WHERE repo = $1", &[&repo]).await?;
+            Ok(rows.iter().map(row_to_node).collect())
+        })
+    }
+
+    fn find_node(&self, repo: &str, kind: NodeKind, path: Option<&str>, name: Option<&str>, container: Option<&str>) -> Result<Option<Node>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client
+                .query_opt(
+                    "SELECT * FROM nodes WHERE repo = $1 AND kind = $2 AND path IS NOT DISTINCT FROM $3 AND name IS NOT DISTINCT FROM $4 AND container IS NOT DISTINCT FROM $5",
+                    &[&repo, &kind.as_db_str(), &path, &name, &container],
+                )
+                .await?;
+            Ok(row.as_ref().map(row_to_node))
+        })
+    }
+
+    fn update_node(&self, repo: &str, id: i64, start_line: Option<i64>, end_line: Option<i64>, content: Option<String>) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("UPDATE nodes SET start_line = $1, end_line = $2, content = $3 WHERE repo = $4 AND id = $5", &[&start_line, &end_line, &content, &repo, &id]).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_nodes(&self, repo: &str, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            // Edges cascade (schema's `ON DELETE CASCADE`), and `embedding`
+            // is a plain column on `nodes` itself — unlike SqliteGraphStore
+            // (a separate `vec0` virtual table it must explicitly clean up
+            // to avoid orphan rows), there's nothing else to delete here.
+            client.execute("DELETE FROM nodes WHERE repo = $1 AND id = ANY($2)", &[&repo, &ids]).await?;
+            Ok(())
+        })
+    }
+
+    fn add_edge(&self, repo: &str, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client.query_one("INSERT INTO edges (repo, src_id, dst_id, relation) VALUES ($1,$2,$3,$4) RETURNING id", &[&repo, &src_id, &dst_id, &relation.as_db_str()]).await?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn edges_from(&self, repo: &str, src_id: i64) -> Result<Vec<Edge>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM edges WHERE repo = $1 AND src_id = $2", &[&repo, &src_id]).await?;
+            Ok(rows.iter().map(row_to_edge).collect())
+        })
+    }
+
+    fn edges_to(&self, repo: &str, dst_id: i64) -> Result<Vec<Edge>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM edges WHERE repo = $1 AND dst_id = $2", &[&repo, &dst_id]).await?;
+            Ok(rows.iter().map(row_to_edge).collect())
+        })
+    }
+
+    fn all_edges(&self, repo: &str) -> Result<Vec<Edge>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM edges WHERE repo = $1", &[&repo]).await?;
+            Ok(rows.iter().map(row_to_edge).collect())
+        })
+    }
+
+    fn delete_edges_from(&self, repo: &str, src_id: i64, relation: EdgeRelation) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("DELETE FROM edges WHERE repo = $1 AND src_id = $2 AND relation = $3", &[&repo, &src_id, &relation.as_db_str()]).await?;
+            Ok(())
+        })
+    }
+
+    fn record_scan(&self, repo: &str, entries: &[NewScanHistoryEntry]) -> Result<i64> {
+        self.rt.block_on(async {
+            let mut client = self.pool.get().await?;
+            let txn = client.transaction().await?;
+
+            let count = |kind: NodeKind, change: ScanChange| entries.iter().filter(|e| e.kind == kind && e.change == change).count() as i64;
+            let files_added = count(NodeKind::File, ScanChange::Added);
+            let files_changed = count(NodeKind::File, ScanChange::Changed);
+            let files_removed = count(NodeKind::File, ScanChange::Removed);
+            let symbols_added = count(NodeKind::Symbol, ScanChange::Added);
+            let symbols_changed = count(NodeKind::Symbol, ScanChange::Changed);
+            let symbols_removed = count(NodeKind::Symbol, ScanChange::Removed);
+            let notes_added = entries.iter().filter(|e| matches!(e.kind, NodeKind::Gotcha | NodeKind::Decision | NodeKind::Note) && e.change == ScanChange::Added).count() as i64;
+
+            let row = txn
+                .query_one(
+                    "INSERT INTO scan_history (repo, files_added, files_changed, files_removed, symbols_added, symbols_changed, symbols_removed, notes_added) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
+                    &[&repo, &files_added, &files_changed, &files_removed, &symbols_added, &symbols_changed, &symbols_removed, &notes_added],
+                )
+                .await?;
+            let scan_id: i64 = row.get(0);
+
+            for entry in entries {
+                txn.execute(
+                    "INSERT INTO scan_history_entries (scan_id, node_id, kind, path, name, change) VALUES ($1,$2,$3,$4,$5,$6)",
+                    &[&scan_id, &entry.node_id, &entry.kind.as_db_str(), &entry.path, &entry.name, &entry.change.as_db_str()],
+                )
+                .await?;
+            }
+
+            txn.commit().await?;
+            Ok(scan_id)
+        })
+    }
+
+    fn latest_scan(&self, repo: &str) -> Result<Option<ScanHistory>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {SCAN_HISTORY_COLUMNS} FROM scan_history WHERE repo = $1 ORDER BY started_at DESC, id DESC LIMIT 1");
+            let row = client.query_opt(&sql, &[&repo]).await?;
+            Ok(row.as_ref().map(row_to_scan_history))
+        })
+    }
+
+    fn list_scans(&self, repo: &str) -> Result<Vec<ScanHistory>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {SCAN_HISTORY_COLUMNS} FROM scan_history WHERE repo = $1 ORDER BY started_at DESC, id DESC");
+            let rows = client.query(&sql, &[&repo]).await?;
+            Ok(rows.iter().map(row_to_scan_history).collect())
+        })
+    }
+
+    fn scan_entries(&self, scan_id: i64) -> Result<Vec<ScanHistoryEntry>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM scan_history_entries WHERE scan_id = $1", &[&scan_id]).await?;
+            Ok(rows
+                .iter()
+                .map(|row| {
+                    let kind: String = row.get("kind");
+                    let change: String = row.get("change");
+                    ScanHistoryEntry {
+                        id: row.get("id"),
+                        scan_id: row.get("scan_id"),
+                        node_id: row.get("node_id"),
+                        kind: NodeKind::from_db_str(&kind),
+                        path: row.get("path"),
+                        name: row.get("name"),
+                        change: ScanChange::from_db_str(&change),
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn set_embedding(&self, repo: &str, node_id: i64, embedding: &[f32]) -> Result<()> {
+        anyhow::ensure!(embedding.len() == EMBEDDING_DIM, "embedding has {} dims, expected {EMBEDDING_DIM}", embedding.len());
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let vector = pgvector::Vector::from(embedding.to_vec());
+            let updated = client.execute("UPDATE nodes SET embedding = $1 WHERE repo = $2 AND id = $3", &[&vector, &repo, &node_id]).await?;
+            anyhow::ensure!(updated == 1, "node #{node_id} not found in repo {repo:?}");
+            Ok(())
+        })
+    }
+
+    fn search_similar(&self, repo: &str, embedding: &[f32], top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
+        anyhow::ensure!(embedding.len() == EMBEDDING_DIM, "query embedding has {} dims, expected {EMBEDDING_DIM}", embedding.len());
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let vector = pgvector::Vector::from(embedding.to_vec());
+            let top_k = top_k as i64;
+
+            let rows = match kind {
+                Some(k) => {
+                    client
+                        .query(
+                            "SELECT *, embedding <=> $1 AS distance FROM nodes WHERE repo = $2 AND kind = $3 AND embedding IS NOT NULL ORDER BY embedding <=> $1 LIMIT $4",
+                            &[&vector, &repo, &k.as_db_str(), &top_k],
+                        )
+                        .await?
+                }
+                None => {
+                    client
+                        .query("SELECT *, embedding <=> $1 AS distance FROM nodes WHERE repo = $2 AND embedding IS NOT NULL ORDER BY embedding <=> $1 LIMIT $3", &[&vector, &repo, &top_k])
+                        .await?
+                }
+            };
+
+            Ok(rows
+                .iter()
+                .map(|row| {
+                    let node = row_to_node(row);
+                    let distance: f64 = row.get("distance");
+                    (node, distance as f32)
+                })
+                .collect())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentops_graph::{prune_stale_nodes, upsert_node};
+
+    /// Live against a real local Postgres — matching this rebuild's
+    /// established discipline of verifying adapters against the real thing,
+    /// not mocks. Reads `AGENTOPS_TEST_DATABASE_URL` if set (CI can point
+    /// this anywhere), otherwise a local `pgvector/pgvector` container.
+    /// Skips (not fails) when nothing is reachable, so this crate's test
+    /// suite doesn't hard-require Docker/Postgres on every machine.
+    fn test_store() -> Option<PostgresGraphStore> {
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        match PostgresGraphStore::connect(&url) {
+            Ok(store) => Some(store),
+            Err(e) => {
+                eprintln!("skipping agentops-graph-pg live test: no Postgres reachable at {url} ({e})");
+                None
+            }
+        }
+    }
+
+    macro_rules! require_store {
+        () => {
+            match test_store() {
+                Some(s) => s,
+                None => return,
+            }
+        };
+    }
+
+    fn node(repo: &str, kind: NodeKind, path: Option<&str>, name: Option<&str>) -> NewNode {
+        NewNode { kind, repo: repo.to_string(), path: path.map(String::from), name: name.map(String::from), container: None, start_line: None, end_line: None, content: None }
+    }
+
+    #[test]
+    fn upsert_inserts_then_updates_in_place_preserving_id() {
+        let store = require_store!();
+        let mut n = node("pg-repo-a", NodeKind::Symbol, Some("a.rs"), Some("foo"));
+        n.content = Some("fn foo() {}".to_string());
+        let id1 = upsert_node(&store, n.clone()).unwrap();
+
+        n.content = Some("fn foo() { changed }".to_string());
+        let id2 = upsert_node(&store, n).unwrap();
+
+        assert_eq!(id1, id2, "re-upserting the same natural key must preserve the node's id");
+        let got = store.get_node("pg-repo-a", id1).unwrap().unwrap();
+        assert_eq!(got.content.as_deref(), Some("fn foo() { changed }"));
+
+        store.delete_nodes("pg-repo-a", &[id1]).unwrap();
+    }
+
+    #[test]
+    fn find_node_null_safe_comparison_does_not_cross_match_different_names() {
+        let store = require_store!();
+        let a = upsert_node(&store, node("pg-repo-b", NodeKind::File, Some("a.rs"), None)).unwrap();
+        let b = upsert_node(&store, node("pg-repo-b", NodeKind::File, Some("b.rs"), None)).unwrap();
+        assert_ne!(a, b);
+
+        let found = store.find_node("pg-repo-b", NodeKind::File, Some("a.rs"), None, None).unwrap();
+        assert_eq!(found.unwrap().path.as_deref(), Some("a.rs"));
+
+        store.delete_nodes("pg-repo-b", &[a, b]).unwrap();
+    }
+
+    #[test]
+    fn nodes_never_leak_across_repos() {
+        let store = require_store!();
+        let a = upsert_node(&store, node("pg-repo-c1", NodeKind::Symbol, Some("a.rs"), Some("foo"))).unwrap();
+        let b = upsert_node(&store, node("pg-repo-c2", NodeKind::Symbol, Some("a.rs"), Some("foo"))).unwrap();
+
+        assert!(store.get_node("pg-repo-c1", b).unwrap().is_none() || a != b);
+        assert_eq!(store.nodes_by_kind("pg-repo-c1", NodeKind::Symbol).unwrap().iter().filter(|n| n.id == a).count(), 1);
+        assert_eq!(store.nodes_by_kind("pg-repo-c1", NodeKind::Symbol).unwrap().iter().filter(|n| n.id == b).count(), 0);
+
+        store.delete_nodes("pg-repo-c1", &[a]).unwrap();
+        store.delete_nodes("pg-repo-c2", &[b]).unwrap();
+    }
+
+    #[test]
+    fn edges_are_repo_scoped() {
+        let store = require_store!();
+        let a = upsert_node(&store, node("pg-repo-d", NodeKind::Symbol, Some("a.rs"), Some("foo"))).unwrap();
+        let b = upsert_node(&store, node("pg-repo-d", NodeKind::Symbol, Some("a.rs"), Some("bar"))).unwrap();
+        store.add_edge("pg-repo-d", a, b, EdgeRelation::DependsOn).unwrap();
+
+        assert_eq!(store.edges_from("pg-repo-d", a).unwrap().len(), 1);
+        assert_eq!(store.edges_from("pg-repo-other", a).unwrap().len(), 0, "a different repo scope must see zero edges even for the same node id");
+
+        store.delete_nodes("pg-repo-d", &[a, b]).unwrap();
+    }
+
+    #[test]
+    fn prune_stale_nodes_removes_only_untouched_nodes_in_scope() {
+        let store = require_store!();
+        let keep = upsert_node(&store, node("pg-repo-e", NodeKind::File, Some("keep.rs"), None)).unwrap();
+        let stale = upsert_node(&store, node("pg-repo-e", NodeKind::File, Some("stale.rs"), None)).unwrap();
+
+        let pruned = prune_stale_nodes(&store, "pg-repo-e", NodeKind::File, &[keep]).unwrap();
+        assert_eq!(pruned.len(), 1);
+        assert_eq!(pruned[0].id, stale);
+        assert!(store.get_node("pg-repo-e", keep).unwrap().is_some());
+        assert!(store.get_node("pg-repo-e", stale).unwrap().is_none());
+
+        store.delete_nodes("pg-repo-e", &[keep]).unwrap();
+    }
+
+    #[test]
+    fn record_scan_derives_aggregate_counts_from_entries() {
+        let store = require_store!();
+        // scan_history has no delete path via the public GraphStore trait
+        // (by design — it's an append-only log), and this test runs
+        // against a real, persistent database rather than a fresh
+        // in-memory one — a fixed repo name would accumulate scan rows
+        // across repeated `cargo test` runs and break the `list_scans`
+        // count below on the second run. A unique repo name per test
+        // process makes this test repeatable regardless of prior runs.
+        let repo = format!("pg-repo-f-{}", std::process::id());
+        let entries = vec![
+            NewScanHistoryEntry { node_id: 1, kind: NodeKind::File, path: Some("a.rs".into()), name: None, change: ScanChange::Added },
+            NewScanHistoryEntry { node_id: 2, kind: NodeKind::Symbol, path: Some("a.rs".into()), name: Some("foo".into()), change: ScanChange::Added },
+        ];
+        let scan_id = store.record_scan(&repo, &entries).unwrap();
+
+        let scan = store.latest_scan(&repo).unwrap().unwrap();
+        assert_eq!(scan.id, scan_id);
+        assert_eq!(scan.files_added, 1);
+        assert_eq!(scan.symbols_added, 1);
+        assert_eq!(store.scan_entries(scan_id).unwrap().len(), 2);
+        assert_eq!(store.list_scans(&repo).unwrap().len(), 1);
+    }
+
+    fn unit_vec(dominant: usize) -> Vec<f32> {
+        let mut v = vec![0.0_f32; EMBEDDING_DIM];
+        v[dominant] = 1.0;
+        v
+    }
+
+    #[test]
+    fn search_similar_ranks_nearest_first_and_respects_repo_kind_scoping() {
+        let store = require_store!();
+        let close = upsert_node(&store, node("pg-repo-g", NodeKind::Symbol, Some("a.rs"), Some("close"))).unwrap();
+        let far = upsert_node(&store, node("pg-repo-g", NodeKind::Symbol, Some("b.rs"), Some("far"))).unwrap();
+        let other_kind = upsert_node(&store, node("pg-repo-g", NodeKind::Gotcha, None, Some("gotcha"))).unwrap();
+        store.set_embedding("pg-repo-g", close, &unit_vec(0)).unwrap();
+        store.set_embedding("pg-repo-g", far, &unit_vec(EMBEDDING_DIM - 1)).unwrap();
+        store.set_embedding("pg-repo-g", other_kind, &unit_vec(0)).unwrap();
+
+        let hits = store.search_similar("pg-repo-g", &unit_vec(0), 2, Some(NodeKind::Symbol)).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].0.id, close, "the near vector must rank first: {hits:?}");
+
+        store.delete_nodes("pg-repo-g", &[close, far, other_kind]).unwrap();
+    }
+
+    #[test]
+    fn set_embedding_replaces_rather_than_duplicating() {
+        let store = require_store!();
+        let id = upsert_node(&store, node("pg-repo-h", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        store.set_embedding("pg-repo-h", id, &unit_vec(0)).unwrap();
+        store.set_embedding("pg-repo-h", id, &unit_vec(1)).unwrap();
+
+        let hits = store.search_similar("pg-repo-h", &unit_vec(1), 1, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.id, id);
+
+        store.delete_nodes("pg-repo-h", &[id]).unwrap();
+    }
+
+    /// Regression test for the exact reasoning `schema.sql` documents:
+    /// unlike `SqliteGraphStore` (a separate `vec0` table that needs
+    /// explicit orphan cleanup), `embedding` lives inline on `nodes` here,
+    /// so a deleted node's embedding disappears for free.
+    #[test]
+    fn deleting_a_node_removes_its_embedding_for_free_via_the_row_itself() {
+        let store = require_store!();
+        let id = upsert_node(&store, node("pg-repo-i", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        store.set_embedding("pg-repo-i", id, &unit_vec(0)).unwrap();
+        store.delete_nodes("pg-repo-i", &[id]).unwrap();
+
+        let hits = store.search_similar("pg-repo-i", &unit_vec(0), 10, None).unwrap();
+        assert!(hits.is_empty(), "found: {hits:?}");
+    }
+
+    #[test]
+    fn set_embedding_rejects_a_node_outside_the_given_repo() {
+        let store = require_store!();
+        let id = upsert_node(&store, node("pg-repo-j", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        assert!(store.set_embedding("pg-repo-other", id, &unit_vec(0)).is_err());
+        store.delete_nodes("pg-repo-j", &[id]).unwrap();
+    }
+}

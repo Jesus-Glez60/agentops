@@ -1,12 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/agentops-graph-pg",
     "crates/agentops-license",
     "crates/agentops-repo-access",
     "crates/agentops-github-app",
     "crates/agentops-heavy-api",
-    "crates/agentops-embeddings",
+    "crates/agentops-heavy-embeddings",
     "crates/agentops-heavy-mcp",
 ]
 

@@ -14,7 +14,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{upsert_node, prune_stale_nodes, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, NodeKind, ScanChange, SqliteGraphStore};
+use agentops_embeddings::Embedder;
+use agentops_graph::{upsert_node, prune_stale_nodes, EdgeRelation, NewNode, NewScanHistoryEntry, NodeKind, ScanChange};
 use agentops_scanner::ScanReport;
 use anyhow::Result;
 
@@ -43,18 +44,27 @@ pub fn repo_name(path: &Path) -> String {
 }
 
 /// Scans `path` (via `agentops_scanner::scan_repo`) and persists it into
-/// `.context/graph.db` under `path`.
-pub fn scan_and_persist(path: &Path) -> Result<ScanPersistSummary> {
+/// `.context/graph.db` under `path`. `with_embeddings` is opt-in — see
+/// `persist`'s doc comment.
+pub fn scan_and_persist(path: &Path, with_embeddings: bool) -> Result<ScanPersistSummary> {
     let report = agentops_scanner::scan_repo(path)?;
-    persist(path, &report)
+    persist(path, &report, with_embeddings)
 }
 
 /// The persistence half on its own, for callers that already have a
 /// `ScanReport` (e.g. because they scanned once already to print a preview)
 /// and don't want to pay for scanning the repo twice.
-pub fn persist(path: &Path, report: &ScanReport) -> Result<ScanPersistSummary> {
+///
+/// `with_embeddings`, deliberately opt-in (matching `explain_symbol`'s
+/// "never run automatically" philosophy — embedding is local/free of API
+/// cost but still real CPU-bound latency per symbol, not something every
+/// scan should pay by default): when true, each new/changed symbol's
+/// content is embedded via `agentops_embeddings::LocalEmbedder` and
+/// attached via `GraphStore::set_embedding` right after its `upsert_node`
+/// call, making it findable via `search_similar`/the `semantic_search` tool.
+pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Result<ScanPersistSummary> {
     let repo = repo_name(path);
-    let store = SqliteGraphStore::open(&graph_db_path(path))?;
+    let store = crate::store::open_store(path)?;
 
     let mut kept_file_ids = Vec::with_capacity(report.files.len());
     let mut kept_symbol_ids = Vec::new();
@@ -69,7 +79,7 @@ pub fn persist(path: &Path, report: &ScanReport) -> Result<ScanPersistSummary> {
         let path_str = file.path.to_string_lossy().to_string();
         let existing_file = store.find_node(&repo, NodeKind::File, Some(&path_str), None, None)?;
         let file_id = upsert_node(
-            &store,
+            store.as_ref(),
             NewNode { kind: NodeKind::File, repo: repo.clone(), path: Some(path_str.clone()), name: None, container: None, start_line: None, end_line: None, content: None },
         )?;
         kept_file_ids.push(file_id);
@@ -82,7 +92,7 @@ pub fn persist(path: &Path, report: &ScanReport) -> Result<ScanPersistSummary> {
         for symbol in &file.symbols {
             let existing_symbol = store.find_node(&repo, NodeKind::Symbol, Some(&path_str), Some(&symbol.name), symbol.container.as_deref())?;
             let symbol_id = upsert_node(
-                &store,
+                store.as_ref(),
                 NewNode {
                     kind: NodeKind::Symbol,
                     repo: repo.clone(),
@@ -105,6 +115,13 @@ pub fn persist(path: &Path, report: &ScanReport) -> Result<ScanPersistSummary> {
             if let Some(change) = change {
                 scan_entries.push(NewScanHistoryEntry { node_id: symbol_id, kind: NodeKind::Symbol, path: Some(path_str.clone()), name: Some(symbol.name.clone()), change });
                 files_with_symbol_changes.insert(file_id);
+
+                // Only new/changed symbols need (re)embedding — an unchanged
+                // symbol's embedding from a prior scan is still accurate.
+                if with_embeddings {
+                    let embedding = agentops_embeddings::LocalEmbedder.embed(&symbol.source)?;
+                    store.set_embedding(&repo, symbol_id, &embedding)?;
+                }
             }
         }
     }
@@ -124,8 +141,8 @@ pub fn persist(path: &Path, report: &ScanReport) -> Result<ScanPersistSummary> {
 
     // Repo-scoped by construction (Module A's `GraphStore`), so this prune
     // can never leak into a different repo's nodes even for a shared store.
-    let pruned_files = prune_stale_nodes(&store, &repo, NodeKind::File, &kept_file_ids)?;
-    let pruned_symbols = prune_stale_nodes(&store, &repo, NodeKind::Symbol, &kept_symbol_ids)?;
+    let pruned_files = prune_stale_nodes(store.as_ref(), &repo, NodeKind::File, &kept_file_ids)?;
+    let pruned_symbols = prune_stale_nodes(store.as_ref(), &repo, NodeKind::Symbol, &kept_symbol_ids)?;
     for f in &pruned_files {
         scan_entries.push(NewScanHistoryEntry { node_id: f.id, kind: NodeKind::File, path: f.path.clone(), name: None, change: ScanChange::Removed });
     }
@@ -153,6 +170,8 @@ pub fn persist(path: &Path, report: &ScanReport) -> Result<ScanPersistSummary> {
 
 #[cfg(test)]
 mod tests {
+    use agentops_graph::{GraphStore, SqliteGraphStore};
+
     use super::*;
 
     fn open_store(repo_dir: &Path) -> SqliteGraphStore {
@@ -164,7 +183,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
 
-        scan_and_persist(dir.path()).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
 
         let store = open_store(dir.path());
         let repo = repo_name(dir.path());
@@ -182,9 +201,9 @@ mod tests {
     fn rescanning_an_unchanged_file_records_nothing_as_changed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
-        scan_and_persist(dir.path()).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
 
-        scan_and_persist(dir.path()).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
 
         let store = open_store(dir.path());
         let repo = repo_name(dir.path());
@@ -202,10 +221,10 @@ mod tests {
     fn rescanning_after_editing_a_symbol_records_it_and_its_file_as_changed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
-        scan_and_persist(dir.path()).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
 
         std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hello'\n").unwrap();
-        scan_and_persist(dir.path()).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
 
         let store = open_store(dir.path());
         let repo = repo_name(dir.path());
@@ -222,10 +241,10 @@ mod tests {
     fn removing_a_file_records_its_symbols_and_the_file_itself_as_removed() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
-        scan_and_persist(dir.path()).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
 
         std::fs::remove_file(dir.path().join("main.py")).unwrap();
-        scan_and_persist(dir.path()).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
 
         let store = open_store(dir.path());
         let repo = repo_name(dir.path());
@@ -247,7 +266,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("lib.rs"), "impl Foo {\n    fn new() -> Self { Foo }\n}\n\nimpl Bar {\n    fn new() -> Self { Bar }\n}\n").unwrap();
 
-        let summary = scan_and_persist(dir.path()).unwrap();
+        let summary = scan_and_persist(dir.path(), false).unwrap();
         assert_eq!(summary.symbols, 2, "both `new` methods must be counted, not collapsed");
 
         let store = open_store(dir.path());
@@ -265,9 +284,9 @@ mod tests {
         std::fs::write(dir.path().join("src/util.ts"), "export function greet() { return 'hi'; }\n").unwrap();
         std::fs::write(dir.path().join("src/app.ts"), "import { greet } from './util';\nexport function main() { return greet(); }\n").unwrap();
 
-        let summary1 = scan_and_persist(dir.path()).unwrap();
+        let summary1 = scan_and_persist(dir.path(), false).unwrap();
         assert_eq!(summary1.dependency_edges, 1);
-        let summary2 = scan_and_persist(dir.path()).unwrap();
+        let summary2 = scan_and_persist(dir.path(), false).unwrap();
         assert_eq!(summary2.dependency_edges, 1, "rescanning identical imports must not accumulate duplicate edges");
 
         let store = open_store(dir.path());
