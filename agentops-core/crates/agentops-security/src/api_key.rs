@@ -1,0 +1,63 @@
+//! API-key generation and constant-time verification. Servers store only a
+//! key's SHA-256 hash (`DOCBRAIN_API_KEY_HASH` etc.), never the raw key —
+//! the raw value is shown to whoever generates it exactly once.
+
+use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
+
+/// Generates a fresh random API key. Returns `(raw, hash)` — hand `raw` to
+/// the caller who'll use it; configure the server with `hash`.
+pub fn generate_api_key() -> Result<(String, String)> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).context("generating random API key bytes")?;
+    let raw = format!("ao_{}", hex_encode(&bytes));
+    let hash = hash_api_key(&raw);
+    Ok((raw, hash))
+}
+
+/// Constant-time check that `raw` hashes to `expected_hash` — timing-safe
+/// so a byte-by-byte comparison can't leak how much of the key was guessed
+/// correctly.
+pub fn verify_api_key(raw: &str, expected_hash: &str) -> Result<()> {
+    let computed = hash_api_key(raw);
+    if bool::from(computed.as_bytes().ct_eq(expected_hash.as_bytes())) {
+        Ok(())
+    } else {
+        anyhow::bail!("invalid API key")
+    }
+}
+
+fn hash_api_key(raw: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    hex_encode(&hasher.finalize())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_freshly_generated_key_verifies_against_its_own_hash() {
+        let (raw, hash) = generate_api_key().unwrap();
+        assert!(verify_api_key(&raw, &hash).is_ok());
+    }
+
+    #[test]
+    fn a_wrong_key_is_rejected() {
+        let (_, hash) = generate_api_key().unwrap();
+        assert!(verify_api_key("not-the-right-key", &hash).is_err());
+    }
+
+    #[test]
+    fn two_generated_keys_are_different() {
+        let (raw1, _) = generate_api_key().unwrap();
+        let (raw2, _) = generate_api_key().unwrap();
+        assert_ne!(raw1, raw2);
+    }
+}

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "agentops-core/crates/agentops-scanner",
     "agentops-core/crates/agentops-graph",
+    "agentops-core/crates/agentops-sqlite-support",
     "agentops-core/crates/agentops-docgen",
     "agentops-core/crates/agentops-notes",
     "agentops-core/crates/agentops-llm",
@@ -56,3 +57,14 @@ walkdir = "2"
 sha2 = "0.11"
 getrandom = "0.4"
 subtle = "2"
+
+# --- docbrain: token-efficient neuron/synapse doc-graph rebuild ---
+text-splitter = { version = "0.32", features = ["markdown", "tiktoken-rs"] }
+tiktoken-rs = "0.12"
+sqlite-vec = "0.1"
+# `hf-hub`/`ort` (fastembed's model-download and runtime-download paths) default to
+# `native-tls`-backed features, which would pull in crates banned workspace-wide
+# (see deny.toml's zero-network-egress invariant). The `-rustls-tls` feature
+# variants resolve without `reqwest`/`native-tls` at all (verified via `cargo
+# tree`), so no ban exception is needed — deny.toml's ban stays unconditional.
+fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }

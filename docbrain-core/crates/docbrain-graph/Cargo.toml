@@ -11,6 +11,9 @@ name = "docbrain_graph"
 anyhow.workspace = true
 serde.workspace = true
 rusqlite.workspace = true
+sqlite-vec.workspace = true
+sha2.workspace = true
+agentops-sqlite-support = { path = "../../../agentops-core/crates/agentops-sqlite-support" }
 
 [dev-dependencies]
 tempfile = "3"

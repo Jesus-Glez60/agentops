@@ -1,6 +1,9 @@
-//! Cross-cutting: secret-redaction gate used by driving adapters and docgen output.
+//! Cross-cutting: secret-redaction gate used by driving adapters and docgen
+//! output, plus API-key generation/verification shared by REST servers
+//! (`docbrain-api`, and `agentops-api` once it's built).
 //!
-//! Scaffolded on feat/full-rework for the vnext rebuild -- see the plan at
-//! ~/.claude/plans/i-m-thinking-that-now-modular-sparrow.md and the vault at
-//! ~/Vaults/agentops-vnext/ for full context. Intentionally empty: Module 1
-//! (day-one bug fixes & housekeeping) is the first real implementation pass.
+//! Only `api_key` is implemented so far — added narrowly to unblock
+//! `docbrain-api`'s auth gate; the secret-redaction gate itself is still
+//! future work (Module 1 of the codebrain-side foundation rebuild).
+
+pub mod api_key;

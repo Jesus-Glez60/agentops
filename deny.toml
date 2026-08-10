@@ -15,6 +15,11 @@ ignore = [
     # Not a vulnerability, just unmaintained — tracked in SECURITY.md, revisit when
     # indicatif drops it or a fork appears.
     "RUSTSEC-2025-0119",
+    # paste (transitive via tokenizers -> fastembed, docbrain's local embedding
+    # model) is unmaintained/archived (RUSTSEC-2024-0436), no safe upgrade
+    # available upstream. Not a vulnerability, just unmaintained — revisit when
+    # tokenizers moves off it or a fork appears.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]
@@ -56,6 +61,13 @@ wildcards = "allow"
 # when actually scanning a repo. ureq is intentionally NOT in this deny list because
 # banning it would break the build; the invariant this section enforces is scoped to
 # crates that would introduce runtime egress.
+#
+# `fastembed` (docbrain's local embedding model) pulls in `hf-hub` and `ort`, both
+# of which *could* drag in `reqwest`/`native-tls` via their default features — the
+# root Cargo.toml deliberately selects their `-rustls-tls` feature variants instead
+# (`hf-hub-rustls-tls`, `ort-download-binaries-rustls-tls`), which resolves without
+# `reqwest` at all (verified via `cargo tree`). So no exception is needed here; this
+# ban stays a hard, unconditional deny for the whole graph, including docbrain.
 deny = [
     { name = "reqwest" },
     { name = "hyper-tls" },
