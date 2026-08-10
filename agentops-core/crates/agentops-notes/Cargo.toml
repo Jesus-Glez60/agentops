@@ -11,6 +11,7 @@ name = "agentops_notes"
 anyhow.workspace = true
 agentops-graph = { path = "../agentops-graph" }
 serde.workspace = true
+serde_json.workspace = true
 walkdir.workspace = true
 serde-saphyr = "1.0"
 regex.workspace = true

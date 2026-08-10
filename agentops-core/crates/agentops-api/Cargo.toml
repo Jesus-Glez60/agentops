@@ -7,6 +7,10 @@ license.workspace = true
 [lib]
 name = "agentops_api"
 
+[[bin]]
+name = "agentops-api"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true

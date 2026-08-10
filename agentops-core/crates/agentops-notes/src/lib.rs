@@ -1,6 +1,12 @@
-//! Use-case layer: markdown vault ingestion. Owns the SymbolMatcher port + WordBoundaryMatcher adapter.
-//!
-//! Scaffolded on feat/full-rework for the vnext rebuild -- see the plan at
-//! ~/.claude/plans/i-m-thinking-that-now-modular-sparrow.md and the vault at
-//! ~/Vaults/agentops-vnext/ for full context. Intentionally empty: Module 1
-//! (day-one bug fixes & housekeeping) is the first real implementation pass.
+//! Use-case layer: markdown notes ingestion (a real vault or an unorganized
+//! folder — see `vault.rs`), the `SymbolMatcher` port + `WordBoundaryMatcher`
+//! adapter, and the `NoteClassifier` port + `HeuristicClassifier` adapter.
+
+mod config;
+mod vault;
+
+pub use config::{default_notes_path, resolve_notes_path};
+pub use vault::{
+    connect_many, heuristic_score, ingest_vault, match_symbols, walk_vault, HeuristicClassifier, IngestSummary, NoteClassifier, NoteType, SymbolMatcher,
+    VaultNote, WordBoundaryMatcher,
+};

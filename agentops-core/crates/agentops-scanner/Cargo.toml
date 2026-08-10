@@ -13,6 +13,7 @@ tree-sitter.workspace = true
 tree-sitter-language-pack.workspace = true
 petgraph.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 regex.workspace = true
 walkdir.workspace = true
 agentops-security = { path = "../agentops-security" }

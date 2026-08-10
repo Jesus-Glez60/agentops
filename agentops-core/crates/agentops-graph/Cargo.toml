@@ -12,6 +12,7 @@ anyhow.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+agentops-sqlite-support = { path = "../agentops-sqlite-support" }
 
 [dev-dependencies]
 tempfile = "3"
