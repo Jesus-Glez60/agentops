@@ -20,9 +20,19 @@ agentops-github-app = { path = "../agentops-github-app" }
 agentops-heavy-embeddings = { path = "../agentops-heavy-embeddings" }
 agentops-graph.workspace = true
 docbrain-graph.workspace = true
-agentops-license = { path = "../agentops-license" }
+agentops-mcp.workspace = true
+agentops-linear.workspace = true
+agentops-llm.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+agentops-accounts.workspace = true
+agentops-integrations.workspace = true
+agentops-integration-modules.workspace = true
+# agentops-license deliberately not a dependency this pass — 1.0 has no
+# payment gate at all (see this crate's module doc comment).
 
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
+wiremock.workspace = true

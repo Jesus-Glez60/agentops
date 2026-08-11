@@ -20,7 +20,7 @@
 //! already-running Tokio runtime directly (nested `block_on` panics).
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, Node, NodeKind, RepoState, ScanChange, ScanHistory, ScanHistoryEntry};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, NewTask, Node, NodeKind, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
 use anyhow::Result;
 
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -100,6 +100,55 @@ fn row_to_repo_state(row: &tokio_postgres::Row) -> RepoState {
 // already established for `started_at`, so `row.get::<_, String>` works
 // without a `chrono`/`time` dependency.
 const EDGES_COLUMNS: &str = "id, repo, src_id, dst_id, relation, weight, updated_at::text AS updated_at";
+
+fn row_to_node_version(row: &tokio_postgres::Row) -> NodeVersion {
+    NodeVersion {
+        id: row.get("id"),
+        node_id: row.get("node_id"),
+        content: row.get("content"),
+        start_line: row.get("start_line"),
+        end_line: row.get("end_line"),
+        valid_from: row.get("valid_from"),
+        valid_until: row.get("valid_until"),
+    }
+}
+
+// Same `::text` cast reasoning as EDGES_COLUMNS — valid_until is nullable,
+// and casting NULL::timestamptz to text stays NULL, so Option<String> reads
+// back correctly either way.
+const NODE_VERSIONS_COLUMNS: &str = "id, node_id, content, start_line, end_line, valid_from::text AS valid_from, valid_until::text AS valid_until";
+
+fn row_to_session_event(row: &tokio_postgres::Row) -> SessionEvent {
+    SessionEvent { id: row.get("id"), repo: row.get("repo"), session_id: row.get("session_id"), tool_name: row.get("tool_name"), description: row.get("description"), created_at: row.get("created_at") }
+}
+
+// Same `::text` cast reasoning as EDGES_COLUMNS.
+const SESSION_EVENTS_COLUMNS: &str = "id, repo, session_id, tool_name, description, created_at::text AS created_at";
+
+fn row_to_task(row: &tokio_postgres::Row) -> Task {
+    let status: String = row.get("status");
+    Task {
+        id: row.get("id"),
+        repo: row.get("repo"),
+        title: row.get("title"),
+        description: row.get("description"),
+        status: TaskStatus::from_db_str(&status),
+        priority: row.get("priority"),
+        assignee: row.get("assignee"),
+        external_source: row.get("external_source"),
+        external_id: row.get("external_id"),
+        session_id: row.get("session_id"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+const TASKS_COLUMNS: &str =
+    "id, repo, title, description, status, priority, assignee, external_source, external_id, session_id, created_at::text AS created_at, updated_at::text AS updated_at";
+
+fn row_to_task_link(row: &tokio_postgres::Row) -> TaskLink {
+    TaskLink { task_id: row.get("task_id"), node_id: row.get("node_id"), relation: row.get("relation") }
+}
 
 fn row_to_scan_history(row: &tokio_postgres::Row) -> ScanHistory {
     ScanHistory {
@@ -205,10 +254,15 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
-    fn reinforce_edge(&self, repo: &str, edge_id: i64) -> Result<()> {
+    fn reinforce_edge(&self, repo: &str, edge_id: i64, bump_confirmed_at: bool) -> Result<()> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            client.execute("UPDATE edges SET weight = LEAST(weight + 0.5, 5.0), updated_at = now() WHERE repo = $1 AND id = $2", &[&repo, &edge_id]).await?;
+            let sql = if bump_confirmed_at {
+                "UPDATE edges SET weight = LEAST(weight + 0.5, 5.0), updated_at = now() WHERE repo = $1 AND id = $2"
+            } else {
+                "UPDATE edges SET weight = LEAST(weight + 0.5, 5.0) WHERE repo = $1 AND id = $2"
+            };
+            client.execute(sql, &[&repo, &edge_id]).await?;
             Ok(())
         })
     }
@@ -369,6 +423,61 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn search_lexical(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let top_k = top_k as i64;
+            let rows = match kind {
+                Some(k) => {
+                    client
+                        .query(
+                            "SELECT *, ts_rank(search_vector, plainto_tsquery('english', $1)) AS rank FROM nodes \
+                             WHERE repo = $2 AND kind = $3 AND search_vector @@ plainto_tsquery('english', $1) \
+                             ORDER BY rank DESC LIMIT $4",
+                            &[&query, &repo, &k.as_db_str(), &top_k],
+                        )
+                        .await?
+                }
+                None => {
+                    client
+                        .query(
+                            "SELECT *, ts_rank(search_vector, plainto_tsquery('english', $1)) AS rank FROM nodes \
+                             WHERE repo = $2 AND search_vector @@ plainto_tsquery('english', $1) \
+                             ORDER BY rank DESC LIMIT $3",
+                            &[&query, &repo, &top_k],
+                        )
+                        .await?
+                }
+            };
+            Ok(rows.iter().map(|row| (row_to_node(row), row.get::<_, f32>("rank"))).collect())
+        })
+    }
+
+    fn search_exact(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let top_k = top_k as i64;
+            let rows = client
+                .query(
+                    "SELECT * FROM nodes WHERE repo = $1 AND ($2::text IS NULL OR kind = $2) AND (LOWER(name) = LOWER($3) OR LOWER(name) LIKE '%' || LOWER($3) || '%') \
+                     ORDER BY CASE WHEN LOWER(name) = LOWER($3) THEN 0 ELSE 1 END, LENGTH(name) LIMIT $4",
+                    &[&repo, &kind.map(|k| k.as_db_str()), &query, &top_k],
+                )
+                .await?;
+            Ok(rows
+                .iter()
+                .map(|row| {
+                    let node = row_to_node(row);
+                    let exact = node.name.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(query));
+                    (node, if exact { 0.0 } else { 1.0 })
+                })
+                .collect())
+        })
+    }
+
     fn refresh_repo_state(&self, repo: &str) -> Result<RepoState> {
         // Ranking uses the exact same `rank_notes_by_weight` free function
         // `SqliteGraphStore` calls — computed in Rust, not in SQL, so the
@@ -406,6 +515,166 @@ impl GraphStore for PostgresGraphStore {
                 .query_opt("SELECT repo, updated_at::text AS updated_at, last_scan_id, top_gotcha_ids, top_decision_ids FROM repo_state WHERE repo = $1", &[&repo])
                 .await?;
             Ok(row.as_ref().map(row_to_repo_state))
+        })
+    }
+
+    fn snapshot_node_version(&self, node_id: i64, content: Option<&str>, start_line: Option<i64>, end_line: Option<i64>) -> Result<()> {
+        self.rt.block_on(async {
+            let mut client = self.pool.get().await?;
+            let txn = client.transaction().await?;
+            txn.execute("UPDATE node_versions SET valid_until = now() WHERE node_id = $1 AND valid_until IS NULL", &[&node_id]).await?;
+            txn.execute(
+                "INSERT INTO node_versions (node_id, content, start_line, end_line, valid_from, valid_until) VALUES ($1, $2, $3, $4, now(), NULL)",
+                &[&node_id, &content, &start_line, &end_line],
+            )
+            .await?;
+            txn.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn close_node_version(&self, node_id: i64) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("UPDATE node_versions SET valid_until = now() WHERE node_id = $1 AND valid_until IS NULL", &[&node_id]).await?;
+            Ok(())
+        })
+    }
+
+    fn node_history(&self, node_id: i64) -> Result<Vec<NodeVersion>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {NODE_VERSIONS_COLUMNS} FROM node_versions WHERE node_id = $1 ORDER BY id DESC");
+            let rows = client.query(&sql, &[&node_id]).await?;
+            Ok(rows.iter().map(row_to_node_version).collect())
+        })
+    }
+
+    fn node_as_of(&self, node_id: i64, timestamp: &str) -> Result<Option<NodeVersion>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!(
+                "SELECT {NODE_VERSIONS_COLUMNS} FROM node_versions \
+                 WHERE node_id = $1 AND valid_from <= $2::timestamptz AND (valid_until IS NULL OR valid_until > $2::timestamptz) \
+                 ORDER BY id DESC LIMIT 1"
+            );
+            let row = client.query_opt(&sql, &[&node_id, &timestamp]).await?;
+            Ok(row.as_ref().map(row_to_node_version))
+        })
+    }
+
+    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str) -> Result<i64> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client
+                .query_one(
+                    "INSERT INTO session_events (repo, session_id, tool_name, description) VALUES ($1, $2, $3, $4) RETURNING id",
+                    &[&repo, &session_id, &tool_name, &description],
+                )
+                .await?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {SESSION_EVENTS_COLUMNS} FROM session_events WHERE repo = $1 AND session_id = $2 ORDER BY id ASC");
+            let rows = client.query(&sql, &[&repo, &session_id]).await?;
+            Ok(rows.iter().map(row_to_session_event).collect())
+        })
+    }
+
+    fn create_task(&self, task: NewTask) -> Result<i64> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let status = task.status.as_db_str();
+            let row = client
+                .query_one(
+                    "INSERT INTO tasks (repo, title, description, status, priority, assignee, external_source, external_id, session_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                    &[&task.repo, &task.title, &task.description, &status, &task.priority, &task.assignee, &task.external_source, &task.external_id, &task.session_id],
+                )
+                .await?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn get_task(&self, id: i64) -> Result<Option<Task>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {TASKS_COLUMNS} FROM tasks WHERE id = $1");
+            let row = client.query_opt(&sql, &[&id]).await?;
+            Ok(row.as_ref().map(row_to_task))
+        })
+    }
+
+    fn list_tasks(&self, repo: &str) -> Result<Vec<Task>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {TASKS_COLUMNS} FROM tasks WHERE repo = $1 ORDER BY id ASC");
+            let rows = client.query(&sql, &[&repo]).await?;
+            Ok(rows.iter().map(row_to_task).collect())
+        })
+    }
+
+    fn update_task_status(&self, id: i64, status: TaskStatus) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let status = status.as_db_str();
+            client.execute("UPDATE tasks SET status = $1, updated_at = now() WHERE id = $2", &[&status, &id]).await?;
+            Ok(())
+        })
+    }
+
+    // Same reasoning as SqliteGraphStore's impl: a manual find-then-branch,
+    // not a generic ON CONFLICT DO UPDATE, so created_at survives a resync.
+    fn upsert_external_task(&self, task: NewTask) -> Result<i64> {
+        anyhow::ensure!(task.external_source.is_some() && task.external_id.is_some(), "upsert_external_task requires both external_source and external_id");
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let existing = client.query_opt("SELECT id FROM tasks WHERE external_source = $1 AND external_id = $2", &[&task.external_source, &task.external_id]).await?;
+
+            match existing {
+                Some(row) => {
+                    let id: i64 = row.get(0);
+                    let status = task.status.as_db_str();
+                    client
+                        .execute(
+                            "UPDATE tasks SET repo = $1, title = $2, description = $3, status = $4, priority = $5, assignee = $6, session_id = $7, updated_at = now() WHERE id = $8",
+                            &[&task.repo, &task.title, &task.description, &status, &task.priority, &task.assignee, &task.session_id, &id],
+                        )
+                        .await?;
+                    Ok(id)
+                }
+                None => {
+                    let status = task.status.as_db_str();
+                    let row = client
+                        .query_one(
+                            "INSERT INTO tasks (repo, title, description, status, priority, assignee, external_source, external_id, session_id) \
+                             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id",
+                            &[&task.repo, &task.title, &task.description, &status, &task.priority, &task.assignee, &task.external_source, &task.external_id, &task.session_id],
+                        )
+                        .await?;
+                    Ok(row.get(0))
+                }
+            }
+        })
+    }
+
+    fn link_task(&self, task_id: i64, node_id: i64, relation: &str) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("INSERT INTO task_links (task_id, node_id, relation) VALUES ($1, $2, $3) ON CONFLICT (task_id, node_id, relation) DO NOTHING", &[&task_id, &node_id, &relation]).await?;
+            Ok(())
+        })
+    }
+
+    fn task_links(&self, task_id: i64) -> Result<Vec<TaskLink>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT task_id, node_id, relation FROM task_links WHERE task_id = $1", &[&task_id]).await?;
+            Ok(rows.iter().map(row_to_task_link).collect())
         })
     }
 }

@@ -236,13 +236,17 @@ pub struct ConnectSummary {
 /// that keeps matching the same symbol across repeated ingestions (e.g.
 /// every rescan) strengthens that relationship over time instead of the
 /// second-and-later ingestions being a true no-op.
-pub fn connect_many(store: &dyn GraphStore, repo: &str, note_id: i64, targets: &[i64], relation: EdgeRelation) -> Result<ConnectSummary> {
+///
+/// `bump_confirmed_at` is forwarded to `reinforce_edge` verbatim — see its
+/// doc comment. Must be `false` for the automatic every-scan rematch and
+/// `true` only for an explicit, human-initiated reinforcement.
+pub fn connect_many(store: &dyn GraphStore, repo: &str, note_id: i64, targets: &[i64], relation: EdgeRelation, bump_confirmed_at: bool) -> Result<ConnectSummary> {
     let existing: HashMap<i64, i64> = store.edges_from(repo, note_id)?.into_iter().filter(|e| e.relation == relation).map(|e| (e.dst_id, e.id)).collect();
     let mut summary = ConnectSummary::default();
     for &target_id in targets {
         match existing.get(&target_id) {
             Some(&edge_id) => {
-                store.reinforce_edge(repo, edge_id)?;
+                store.reinforce_edge(repo, edge_id, bump_confirmed_at)?;
                 summary.reinforced += 1;
             }
             None => {
@@ -295,7 +299,12 @@ pub struct IngestSummary {
 /// a scanned code file's path in the same `nodes` table) and its `name` is
 /// its title, so `upsert_node`'s natural key updates an unchanged note in
 /// place on re-ingestion instead of duplicating it.
-pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], matcher: &dyn SymbolMatcher) -> Result<IngestSummary> {
+///
+/// `bump_confirmed_at` — see `connect_many`'s doc comment. Callers: the
+/// automatic every-scan rematch (`scan::persist`) must pass `false`;
+/// explicit single/import ingestion from `add_note`/`import_notes`
+/// (`agentops-mcp/src/notes.rs`) passes `true`.
+pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], matcher: &dyn SymbolMatcher, bump_confirmed_at: bool) -> Result<IngestSummary> {
     let mut summary = IngestSummary { notes_seen: notes.len(), ..Default::default() };
 
     for note in notes {
@@ -316,7 +325,7 @@ pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], mat
         summary.notes_written += 1;
 
         let targets = matcher.match_symbols(store, repo, &note.body)?;
-        let connected = connect_many(store, repo, note_id, &targets, EdgeRelation::Affects)?;
+        let connected = connect_many(store, repo, note_id, &targets, EdgeRelation::Affects, bump_confirmed_at)?;
         summary.edges_written += connected.added;
         summary.edges_reinforced += connected.reinforced;
     }
@@ -446,8 +455,8 @@ mod tests {
         let note_id = store.add_node(NewNode { kind: NodeKind::Note, repo: "demo".into(), path: None, name: Some("n".into()), container: None, start_line: None, end_line: None, content: Some("x".into()) }).unwrap();
         let target_id = upsert_node(&store, node("demo", "a.rs", "f")).unwrap();
 
-        let first = connect_many(&store, "demo", note_id, &[target_id], EdgeRelation::Affects).unwrap();
-        let second = connect_many(&store, "demo", note_id, &[target_id], EdgeRelation::Affects).unwrap();
+        let first = connect_many(&store, "demo", note_id, &[target_id], EdgeRelation::Affects, true).unwrap();
+        let second = connect_many(&store, "demo", note_id, &[target_id], EdgeRelation::Affects, true).unwrap();
 
         assert_eq!(first, ConnectSummary { added: 1, reinforced: 0 });
         assert_eq!(second, ConnectSummary { added: 0, reinforced: 1 }, "re-connecting the same target must reinforce it, not duplicate or silently no-op");
@@ -472,7 +481,7 @@ mod tests {
         }];
 
         let matcher = WordBoundaryMatcher::default();
-        let summary = ingest_vault(&store, "demo", &notes, &matcher).unwrap();
+        let summary = ingest_vault(&store, "demo", &notes, &matcher, true).unwrap();
 
         assert_eq!(summary.notes_written, 1);
         assert_eq!(summary.edges_written, 1);
@@ -492,8 +501,8 @@ mod tests {
         let notes = vec![VaultNote { title: "n".into(), note_type: NoteType::Knowledge, tags: vec![], status: None, body: "body".into(), source_path: PathBuf::from("knowledge/n.md") }];
         let matcher = WordBoundaryMatcher::default();
 
-        ingest_vault(&store, "demo", &notes, &matcher).unwrap();
-        ingest_vault(&store, "demo", &notes, &matcher).unwrap();
+        ingest_vault(&store, "demo", &notes, &matcher, true).unwrap();
+        ingest_vault(&store, "demo", &notes, &matcher, true).unwrap();
 
         assert_eq!(store.nodes_by_kind("demo", NodeKind::Note).unwrap().len(), 1, "re-ingesting the same vault must not duplicate notes");
     }

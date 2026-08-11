@@ -93,3 +93,75 @@ CREATE TABLE IF NOT EXISTS repo_state (
     top_gotcha_ids   TEXT NOT NULL,
     top_decision_ids TEXT NOT NULL
 );
+
+-- Bi-temporal node versioning (Phase 2, 1.0 roadmap). node_id is
+-- deliberately not a hard FK — history must survive the node's own
+-- eventual pruning, same reasoning as scan_history_entries. TIMESTAMPTZ
+-- matching edges.updated_at's existing convention; read back cast to text
+-- via NODE_VERSIONS_COLUMNS in src/lib.rs, same pattern as EDGES_COLUMNS.
+CREATE TABLE IF NOT EXISTS node_versions (
+    id          BIGSERIAL PRIMARY KEY,
+    node_id     BIGINT NOT NULL,
+    content     TEXT,
+    start_line  BIGINT,
+    end_line    BIGINT,
+    valid_from  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    valid_until TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_node_versions_node ON node_versions(node_id);
+
+-- Cross-tool session correlation (Phase 3, 1.0 roadmap, Module 6). Not
+-- scan-scoped — one row per notable write action, tagged with the
+-- caller-supplied session_id.
+CREATE TABLE IF NOT EXISTS session_events (
+    id          BIGSERIAL PRIMARY KEY,
+    repo        TEXT NOT NULL,
+    session_id  TEXT NOT NULL,
+    tool_name   TEXT NOT NULL,
+    description TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_session_events_repo_session ON session_events(repo, session_id);
+
+-- Hybrid native task manager + Linear sync (Phase 3, 1.0 roadmap, Module
+-- 7). external_source/external_id are both NULL for a native task; the
+-- partial unique index only applies once external_source is set.
+CREATE TABLE IF NOT EXISTS tasks (
+    id              BIGSERIAL PRIMARY KEY,
+    repo            TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    description     TEXT,
+    status          TEXT NOT NULL,
+    priority        TEXT,
+    assignee        TEXT,
+    external_source TEXT,
+    external_id     TEXT,
+    session_id      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_external ON tasks(external_source, external_id) WHERE external_source IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_repo ON tasks(repo);
+
+CREATE TABLE IF NOT EXISTS task_links (
+    task_id  BIGINT NOT NULL,
+    node_id  BIGINT NOT NULL,
+    relation TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_task_links_unique ON task_links(task_id, node_id, relation);
+
+-- Lexical (BM25-equivalent) search signal (Phase 4, 1.0 roadmap) — the
+-- Postgres mirror of SqliteGraphStore's FTS5 approach, same "database keeps
+-- it in sync, not a Rust call site" reasoning: a generated `tsvector`
+-- column plus a GIN index, so `ts_rank`-based lexical search stays current
+-- automatically on every INSERT/UPDATE, with no separate write path (and
+-- unlike SQLite's FTS5, Postgres's STORED GENERATED column handles the
+-- pre-existing-row backfill for free — no separate backfill statement, no
+-- risk of the self-referential-read corruption confirmed against SQLite's
+-- FTS5 backfill, since a generated column is computed per-row by Postgres
+-- itself, not populated by a second statement reading the same table).
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS search_vector tsvector
+    GENERATED ALWAYS AS (to_tsvector('english', coalesce(name, '') || ' ' || coalesce(content, ''))) STORED;
+CREATE INDEX IF NOT EXISTS idx_nodes_search_vector ON nodes USING gin(search_vector);
+
+

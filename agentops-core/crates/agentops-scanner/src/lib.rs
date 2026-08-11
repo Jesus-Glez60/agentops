@@ -17,6 +17,7 @@ mod walker;
 
 pub use ranker::{rank_files, resolve_dependency_edges};
 pub use types::{Chunk, ChunkKind, Language, ScannedFile, Symbol};
+pub use walker::watchable_dirs;
 
 use std::path::Path;
 

@@ -20,6 +20,34 @@ fn definition_kinds(lang: Language) -> &'static [&'static str] {
         // and `collect_definitions` recurses into every child regardless of
         // whether the parent node matched.
         Language::Rust => &["function_item", "struct_item", "enum_item", "trait_item"],
+        // `function_definition` here is a free function or an in-class
+        // member definition — both land on this same node kind in
+        // tree-sitter-cpp's grammar. Its name isn't in a `name` field
+        // (see `cpp_function_name`'s doc comment) but it's still the
+        // right node kind to match on.
+        Language::Cpp => &["class_specifier", "struct_specifier", "function_definition"],
+        Language::CSharp => &["class_declaration", "struct_declaration", "enum_declaration", "method_declaration"],
+    }
+}
+
+/// C++'s `function_definition` node has no `name` field of its own — the
+/// identifier is nested inside its `declarator` field, which for a plain
+/// function is a `function_declarator` (whose own `declarator` field is
+/// the `identifier`/`field_identifier`), or a `pointer_declarator`
+/// wrapping a `function_declarator` for a pointer return type (`int*
+/// foo()`) — confirmed via a standalone tree-sitter-cpp probe, not
+/// guessed: `function_definition.declarator` is one of `function_declarator`
+/// (common case) or `pointer_declarator` (needs one more `declarator`
+/// unwrap), and `function_declarator.declarator` is the actual name node.
+/// Recurses through `declarator` fields until landing on a node kind that
+/// is actually a name (also handles `qualified_identifier` for
+/// `Foo::bar()` out-of-class definitions, and `destructor_name`/
+/// `operator_name` for the two other identifier-shaped leaf kinds this
+/// grammar uses).
+fn cpp_function_name(node: &Node, src: &str) -> Option<String> {
+    match node.kind().as_str() {
+        "identifier" | "field_identifier" | "qualified_identifier" | "destructor_name" | "operator_name" => Some(node_text(src, node).to_string()),
+        _ => node.child_by_field_name("declarator").and_then(|d| cpp_function_name(&d, src)),
     }
 }
 
@@ -61,7 +89,7 @@ fn try_tree_sitter(language: Language, source: &str) -> Option<Vec<Symbol>> {
 
     let kinds = definition_kinds(language);
     let mut symbols = Vec::new();
-    collect_definitions(&root, source, kinds, None, &mut symbols);
+    collect_definitions(language, &root, source, kinds, None, &mut symbols);
     Some(symbols)
 }
 
@@ -81,14 +109,25 @@ fn node_text<'a>(src: &'a str, node: &Node) -> &'a str {
 fn container_scope_field(node_kind: &str) -> Option<&'static str> {
     match node_kind {
         "impl_item" => Some("type"),
-        "trait_item" | "class_declaration" | "class_definition" => Some("name"),
+        "trait_item" | "class_declaration" | "class_definition" | "class_specifier" | "struct_specifier" | "struct_declaration" => Some("name"),
         _ => None,
     }
 }
 
-fn collect_definitions(node: &Node, src: &str, kinds: &[&str], scope: Option<&str>, out: &mut Vec<Symbol>) {
+fn collect_definitions(language: Language, node: &Node, src: &str, kinds: &[&str], scope: Option<&str>, out: &mut Vec<Symbol>) {
     if kinds.contains(&node.kind().as_str()) {
-        let name = node.child_by_field_name("name").map(|n| node_text(src, &n).to_string()).unwrap_or_else(|| "<anonymous>".to_string());
+        // `"function_definition"` is also Python's node kind name for
+        // `def foo():` (which *does* have a real `name` field) — this
+        // must be scoped to C++ specifically, not matched by node-kind
+        // string alone, or Python symbols silently come back
+        // `"<anonymous>"` (a real regression this exact confusion caused
+        // once already, caught immediately by the existing Python test).
+        let name = if language == Language::Cpp && node.kind().as_str() == "function_definition" {
+            cpp_function_name(node, src)
+        } else {
+            node.child_by_field_name("name").map(|n| node_text(src, &n).to_string())
+        }
+        .unwrap_or_else(|| "<anonymous>".to_string());
 
         out.push(Symbol {
             name,
@@ -108,12 +147,12 @@ fn collect_definitions(node: &Node, src: &str, kinds: &[&str], scope: Option<&st
 
     for i in 0..node.child_count() as u32 {
         if let Some(child) = node.child(i) {
-            collect_definitions(&child, src, kinds, child_scope, out);
+            collect_definitions(language, &child, src, kinds, child_scope, out);
         }
     }
 }
 
-// --- Regex fallback, all five languages ---
+// --- Regex fallback, all seven languages ---
 
 static PY_DEF: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^(?P<indent>[ \t]*)(def|class)\s+(?P<name>\w+)").unwrap());
 
@@ -127,12 +166,31 @@ static RUST_DEF: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Deliberately loose — C++ signatures (templates, pointers/references,
+/// namespaces, trailing return types) are one of the hardest things to
+/// match with a regex, and this only ever runs when a real tree-sitter
+/// parse already failed outright. `(?P<fname>...)` matches a free/member
+/// function definition line (`ReturnType name(args) {`); `(?P<tname>...)`
+/// matches `class`/`struct` declarations directly.
+static CPP_DEF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\s*(?:class|struct)\s+(?P<tname>\w+)|^\s*(?:[\w:*&<>,\s]+?)\s+(?P<fname>\w+)\s*\([^;{}]*\)\s*(?:const\s*)?\{").unwrap()
+});
+
+static CSHARP_DEF: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^\s*(?:public|private|protected|internal|static|sealed|abstract|partial|\s)*(?:class|struct|enum)\s+(?P<tname>\w+)|^\s*(?:public|private|protected|internal|static|virtual|override|async|\s)*[\w<>\[\],\s]+?\s+(?P<mname>\w+)\s*\([^;{}]*\)\s*\{",
+    )
+    .unwrap()
+});
+
 fn regex_fallback(language: Language, source: &str) -> Vec<Symbol> {
     match language {
         Language::Python => python_regex_fallback(source),
         Language::TypeScript | Language::JavaScript => js_regex_fallback(source),
         Language::Go => go_regex_fallback(source),
         Language::Rust => rust_regex_fallback(source),
+        Language::Cpp => cpp_regex_fallback(source),
+        Language::CSharp => csharp_regex_fallback(source),
     }
 }
 
@@ -233,6 +291,50 @@ fn rust_regex_fallback(source: &str) -> Vec<Symbol> {
         };
 
         let (end, _) = brace_or_semicolon_end(&lines, i);
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+    }
+
+    symbols
+}
+
+fn cpp_regex_fallback(source: &str) -> Vec<Symbol> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut symbols = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let Some(caps) = CPP_DEF.captures(line) else { continue };
+        let (name, kind) = if let Some(m) = caps.name("tname") {
+            (m.as_str().to_string(), if line.trim_start().starts_with("class") { "class" } else { "struct" })
+        } else if let Some(m) = caps.name("fname") {
+            (m.as_str().to_string(), "function")
+        } else {
+            continue;
+        };
+
+        let (end, _) = brace_depth_end(&lines, i);
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+    }
+
+    symbols
+}
+
+fn csharp_regex_fallback(source: &str) -> Vec<Symbol> {
+    let lines: Vec<&str> = source.lines().collect();
+    let mut symbols = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let Some(caps) = CSHARP_DEF.captures(line) else { continue };
+        let (name, kind) = if let Some(m) = caps.name("tname") {
+            let trimmed = line.trim_start();
+            let kind = if trimmed.contains("class") { "class" } else if trimmed.contains("struct") { "struct" } else { "enum" };
+            (m.as_str().to_string(), kind)
+        } else if let Some(m) = caps.name("mname") {
+            (m.as_str().to_string(), "method")
+        } else {
+            continue;
+        };
+
+        let (end, _) = brace_depth_end(&lines, i);
         symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
     }
 
@@ -409,5 +511,58 @@ mod tests {
 
         let unit = symbols.iter().find(|s| s.name == "Unit").unwrap();
         assert_eq!(unit.source, "struct Unit;", "a body-less struct must terminate at its semicolon, not run to end of file");
+    }
+
+    #[test]
+    fn extracts_cpp_class_struct_and_member_function_via_tree_sitter() {
+        let src = "class Foo {\npublic:\n  int bar(int x) { return x; }\n};\n\nint baz(int y) {\n  return y;\n}\n\nstruct Point {\n  int x;\n};\n";
+        let (symbols, used_ts) = extract_symbols(Language::Cpp, src);
+        assert!(used_ts, "tree-sitter should be available for cpp");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "found: {names:?}");
+        assert!(names.contains(&"bar"), "found: {names:?}");
+        assert!(names.contains(&"baz"), "found: {names:?}");
+        assert!(names.contains(&"Point"), "found: {names:?}");
+        assert!(!names.contains(&"<anonymous>"), "no C++ definition here should come back unnamed: {names:?}");
+
+        let bar = symbols.iter().find(|s| s.name == "bar").unwrap();
+        assert_eq!(bar.container.as_deref(), Some("Foo"), "a member function must be qualified by its enclosing class: {symbols:?}");
+
+        let baz = symbols.iter().find(|s| s.name == "baz").unwrap();
+        assert_eq!(baz.container, None, "a free function has no enclosing container");
+    }
+
+    #[test]
+    fn extracts_csharp_class_struct_enum_and_method_via_tree_sitter() {
+        let src = "public class Foo {\n  public int Bar(int x) {\n    return x;\n  }\n}\n\nstruct Point {\n  public int X;\n}\n\nenum Color {\n  Red,\n  Green,\n}\n";
+        let (symbols, used_ts) = extract_symbols(Language::CSharp, src);
+        assert!(used_ts, "tree-sitter should be available for csharp");
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "found: {names:?}");
+        assert!(names.contains(&"Bar"), "found: {names:?}");
+        assert!(names.contains(&"Point"), "found: {names:?}");
+        assert!(names.contains(&"Color"), "found: {names:?}");
+
+        let bar = symbols.iter().find(|s| s.name == "Bar").unwrap();
+        assert_eq!(bar.container.as_deref(), Some("Foo"), "a method must be qualified by its enclosing class: {symbols:?}");
+    }
+
+    #[test]
+    fn cpp_regex_fallback_finds_class_struct_and_function() {
+        let src = "class Foo {\n  int bar() { return 1; }\n};\n\nint baz(int y) {\n  return y;\n}\n\nstruct Point {\n  int x;\n};\n";
+        let symbols = cpp_regex_fallback(src);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "found: {names:?}");
+        assert!(names.contains(&"baz"), "found: {names:?}");
+        assert!(names.contains(&"Point"), "found: {names:?}");
+    }
+
+    #[test]
+    fn csharp_regex_fallback_finds_class_and_method() {
+        let src = "public class Foo {\n  public int Bar(int x) {\n    return x;\n  }\n}\n";
+        let symbols = csharp_regex_fallback(src);
+        let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&"Foo"), "found: {names:?}");
+        assert!(names.contains(&"Bar"), "found: {names:?}");
     }
 }

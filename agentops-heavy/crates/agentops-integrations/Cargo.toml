@@ -1,0 +1,19 @@
+[package]
+name = "agentops-integrations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_integrations"
+
+[dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
+aes-gcm.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+agentops-repo-access = { path = "../agentops-repo-access" }
+
+[dev-dependencies]
+tempfile = "3"

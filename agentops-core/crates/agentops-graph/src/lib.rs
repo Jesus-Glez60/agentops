@@ -280,6 +280,117 @@ pub struct RepoState {
     pub top_decision_ids: Vec<i64>,
 }
 
+/// One version of a node's content over time — bi-temporal history.
+/// `node_id` is deliberately not a hard FK, same reasoning as
+/// `NewScanHistoryEntry`: history must survive the node's own eventual
+/// pruning. `valid_until: None` means this is the currently-open version.
+#[derive(Debug, Clone)]
+pub struct NodeVersion {
+    pub id: i64,
+    pub node_id: i64,
+    pub content: Option<String>,
+    pub start_line: Option<i64>,
+    pub end_line: Option<i64>,
+    pub valid_from: String,
+    pub valid_until: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TaskStatus {
+    Todo,
+    InProgress,
+    InReview,
+    Done,
+    Cancelled,
+}
+
+impl TaskStatus {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            TaskStatus::Todo => "todo",
+            TaskStatus::InProgress => "in_progress",
+            TaskStatus::InReview => "in_review",
+            TaskStatus::Done => "done",
+            TaskStatus::Cancelled => "cancelled",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "in_progress" => TaskStatus::InProgress,
+            "in_review" => TaskStatus::InReview,
+            "done" => TaskStatus::Done,
+            "cancelled" => TaskStatus::Cancelled,
+            _ => TaskStatus::Todo,
+        }
+    }
+}
+
+/// Module 7 (1.0 roadmap): AgentOps's own native task state, not just an
+/// activity tag — see `~/Vaults/agentops-vnext/decisions/hybrid-task-manager-linear.md`.
+/// `external_source`/`external_id` are both `None` for a native task;
+/// `Some("linear")`/`Some(<issue id>)` for one pulled from Linear —
+/// `(external_source, external_id)` is the natural key a Linear-sync upsert
+/// keys on. `session_id` is Module 6's correlation id: once set, every
+/// `session_events` row under it is transitively this task's own activity
+/// feed via `get_task_activity`.
+#[derive(Debug, Clone)]
+pub struct NewTask {
+    pub repo: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: TaskStatus,
+    pub priority: Option<String>,
+    pub assignee: Option<String>,
+    pub external_source: Option<String>,
+    pub external_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Task {
+    pub id: i64,
+    pub repo: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub status: TaskStatus,
+    pub priority: Option<String>,
+    pub assignee: Option<String>,
+    pub external_source: Option<String>,
+    pub external_id: Option<String>,
+    pub session_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Links a task to the symbol/file/gotcha/decision it touches —
+/// `(task_id, node_id, relation)` is a natural key: re-linking the same
+/// pair is a no-op, not a duplicate row.
+#[derive(Debug, Clone)]
+pub struct TaskLink {
+    pub task_id: i64,
+    pub node_id: i64,
+    pub relation: String,
+}
+
+/// One notable write action tagged with a caller-supplied `session_id` —
+/// Module 6's cross-tool session correlation. Not scan-scoped (unlike
+/// `ScanHistoryEntry`, which only exists inside one `scan_repo` call): any
+/// write tool (`scan_repo`, `add_note`, `ingest_notes`, `explain_symbol`)
+/// records one row per call when the caller passes the same `session_id`
+/// across calls, regardless of tool or repo-write-type, so `get_session`
+/// can return one correlated feed spanning multiple MCP/REST clients
+/// working the same session.
+#[derive(Debug, Clone)]
+pub struct SessionEvent {
+    pub id: i64,
+    pub repo: String,
+    pub session_id: String,
+    pub tool_name: String,
+    pub description: String,
+    pub created_at: String,
+}
+
 /// The codebase graph port. One adapter today (`SqliteGraphStore`); the
 /// trait boundary is what lets a future adapter (Postgres-backed, shared
 /// across repos) exist without touching any use-case or MCP-handler code.
@@ -303,11 +414,23 @@ pub trait GraphStore {
     fn edges_to(&self, repo: &str, dst_id: i64) -> Result<Vec<Edge>>;
     fn all_edges(&self, repo: &str) -> Result<Vec<Edge>>;
     fn delete_edges_from(&self, repo: &str, src_id: i64, relation: EdgeRelation) -> Result<()>;
-    /// Bumps `edge_id`'s weight (capped) and its `updated_at` to now —
-    /// called instead of `add_edge` when `connect_many` finds the target
-    /// edge already exists, so repeat matches strengthen a relationship
-    /// instead of being silently skipped.
-    fn reinforce_edge(&self, repo: &str, edge_id: i64) -> Result<()>;
+    /// Bumps `edge_id`'s weight (capped), always. Bumps `updated_at` to now
+    /// only when `bump_confirmed_at` is true — called instead of `add_edge`
+    /// when `connect_many` finds the target edge already exists, so repeat
+    /// matches strengthen a relationship instead of being silently skipped.
+    ///
+    /// `bump_confirmed_at` must be `false` for the automatic every-scan
+    /// note re-match (Module B, `agentops_notes::ingest_vault` called from
+    /// `scan::persist`) and `true` only for an explicit, human-initiated
+    /// reinforcement (re-adding the same note via `add_note`). Otherwise
+    /// `updated_at` would be refreshed to "now" on every single rescan
+    /// regardless of whether the target symbol's content actually changed
+    /// — a real bug caught while wiring up bi-temporal staleness surfacing
+    /// (`tool_get_symbol`): the automatic rematch made every gotcha look
+    /// freshly confirmed immediately after any edit, permanently defeating
+    /// the "has this symbol changed since the note was last confirmed
+    /// relevant" comparison against `node_history`.
+    fn reinforce_edge(&self, repo: &str, edge_id: i64, bump_confirmed_at: bool) -> Result<()>;
 
     fn record_scan(&self, repo: &str, entries: &[NewScanHistoryEntry]) -> Result<i64>;
     fn latest_scan(&self, repo: &str) -> Result<Option<ScanHistory>>;
@@ -342,6 +465,71 @@ pub trait GraphStore {
     /// — a real, expected state for a repo scanned before this feature
     /// existed, not an error.
     fn get_repo_state(&self, repo: &str) -> Result<Option<RepoState>>;
+
+    /// Records `node_id`'s content as of now: closes whatever version was
+    /// previously open for it (if any — a no-op for a brand-new node's
+    /// first version) and opens a new one with `content`/`start_line`/
+    /// `end_line`. Called from `persist()` for every `Added`/`Changed`
+    /// symbol, right alongside the existing `scan_history_entries` write —
+    /// same trigger, same `added`/`changed` classification, no new
+    /// comparison logic. Always pass the *new*, post-upsert values, not the
+    /// old ones: the old content is already durably captured in whatever
+    /// version this call closes out.
+    fn snapshot_node_version(&self, node_id: i64, content: Option<&str>, start_line: Option<i64>, end_line: Option<i64>) -> Result<()>;
+    /// Closes `node_id`'s currently-open version with no replacement —
+    /// called on `Removed` symbols, so `node_history` accurately shows "the
+    /// last known content was valid until removal," not "still open
+    /// forever" for a node that no longer exists.
+    fn close_node_version(&self, node_id: i64) -> Result<()>;
+    /// Every version of `node_id`, most recent first.
+    fn node_history(&self, node_id: i64) -> Result<Vec<NodeVersion>>;
+    /// The version that was valid at `timestamp` (`valid_from <= timestamp`
+    /// and (`valid_until IS NULL` or `valid_until > timestamp`)) — `None` if
+    /// `node_id` has no version history at all (e.g. scanned before this
+    /// feature existed).
+    fn node_as_of(&self, node_id: i64, timestamp: &str) -> Result<Option<NodeVersion>>;
+
+    /// Records one `SessionEvent` row — see its doc comment. `repo`-scoped
+    /// like everything else in this trait, but note `session_events` (unlike
+    /// `session_id` returns) is queried by `(repo, session_id)` together:
+    /// a session_id is only meaningful within one repo's activity feed.
+    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str) -> Result<i64>;
+    /// Every event recorded under `session_id` in `repo`, oldest first —
+    /// the correlated feed `get_session` renders.
+    fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>>;
+
+    /// Creates a native task. For a Linear-sourced task, prefer
+    /// `upsert_external_task` instead, which is idempotent on
+    /// `(external_source, external_id)` — this always inserts a new row.
+    fn create_task(&self, task: NewTask) -> Result<i64>;
+    fn get_task(&self, id: i64) -> Result<Option<Task>>;
+    fn list_tasks(&self, repo: &str) -> Result<Vec<Task>>;
+    fn update_task_status(&self, id: i64, status: TaskStatus) -> Result<()>;
+    /// Inserts a task keyed on `(external_source, external_id)`, or updates
+    /// the existing row in place if that pair already exists — the
+    /// Linear-sync pull path calling this repeatedly must never duplicate
+    /// an already-synced issue.
+    fn upsert_external_task(&self, task: NewTask) -> Result<i64>;
+    /// Idempotent: re-linking the same `(task_id, node_id, relation)` is a
+    /// no-op, not a duplicate row.
+    fn link_task(&self, task_id: i64, node_id: i64, relation: &str) -> Result<()>;
+    fn task_links(&self, task_id: i64) -> Result<Vec<TaskLink>>;
+
+    /// BM25-ranked full-text search over `name`/`content` (SQLite FTS5 /
+    /// Postgres `tsvector`, adapter-specific). Kept automatically in sync
+    /// with `nodes` at the database level (triggers), not by any Rust
+    /// call site — see each adapter's migration for why. The returned
+    /// score is **adapter-internal and ordering-only**: SQLite's `bm25()`
+    /// is lower-is-better, Postgres's `ts_rank` is higher-is-better: do not
+    /// compare scores across adapters or against `search_similar`'s cosine
+    /// distance — the result `Vec` is already sorted best-first, which is
+    /// the only thing `agentops-retrieval`'s fusion actually relies on.
+    fn search_lexical(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>>;
+    /// Cheap exact/substring name match, case-insensitive — an exact
+    /// `name` match ranks first, then substring matches shortest-name
+    /// first. Same "best-first, don't compare the score across sources"
+    /// contract as `search_lexical`.
+    fn search_exact(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>>;
 }
 
 /// Ranks every `kind` node (`Gotcha`/`Decision`) in `repo` by the sum of

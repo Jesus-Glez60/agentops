@@ -17,10 +17,12 @@ agentops-scanner = { path = "../agentops-scanner" }
 agentops-graph = { path = "../agentops-graph" }
 agentops-notes = { path = "../agentops-notes" }
 agentops-llm = { path = "../agentops-llm" }
+agentops-linear = { path = "../agentops-linear" }
 agentops-security = { path = "../agentops-security" }
 agentops-mcp = { path = "../agentops-mcp" }
 agentops-api = { path = "../agentops-api" }
 agentops-embeddings = { path = "../agentops-embeddings" }
+agentops-retrieval = { path = "../agentops-retrieval" }
 agentops-manifest = { path = "../agentops-manifest" }
 agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }
 docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }

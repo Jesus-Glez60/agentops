@@ -6,8 +6,10 @@ members = [
     "agentops-core/crates/agentops-sqlite-support",
     "agentops-core/crates/agentops-embeddings",
     "agentops-core/crates/agentops-docgen",
+    "agentops-core/crates/agentops-retrieval",
     "agentops-core/crates/agentops-notes",
     "agentops-core/crates/agentops-llm",
+    "agentops-core/crates/agentops-linear",
     "agentops-core/crates/agentops-security",
     "agentops-core/crates/agentops-manifest",
     "agentops-core/crates/agentops-ruler-bridge",
@@ -57,6 +59,7 @@ indicatif = "0.17"
 axum = "0.8"
 regex = "1"
 walkdir = "2"
+notify-debouncer-full = "0.7"
 sha2 = "0.11"
 getrandom = "0.4"
 subtle = "2"

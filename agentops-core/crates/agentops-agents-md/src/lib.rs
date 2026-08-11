@@ -125,6 +125,7 @@ pub fn generate(root: &Path, opts: &GenerateOptions) -> String {
 
     out.push_str("## Commit / PR guidelines\n\n");
     out.push_str("No project-specific convention detected yet — follow the existing commit history's style.\n\n");
+    out.push_str("Do not include a `Co-Authored-By` trailer (or similar AI-attribution trailer) in commit messages.\n\n");
 
     out.push_str("## Deployment\n\n");
     out.push_str("No deployment process detected yet.\n\n");
@@ -206,5 +207,16 @@ mod tests {
         let with = generate(dir.path(), &opts);
         assert!(with.contains("NOTES_PATH: /repo/.agentops/notes"));
         assert!(with.contains("add_note"));
+    }
+
+    /// Phase 6b, Extension 3 (corrected design): AgentOps doesn't create
+    /// git commits itself, so trailer hygiene has to be an instruction the
+    /// coding agent reading this file follows — not a git-rewrite step
+    /// AgentOps would have to own.
+    #[test]
+    fn commit_guidelines_instruct_against_a_co_authored_by_trailer() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = generate(dir.path(), &GenerateOptions::default());
+        assert!(content.contains("Co-Authored-By"), "must instruct coding agents not to add this trailer");
     }
 }

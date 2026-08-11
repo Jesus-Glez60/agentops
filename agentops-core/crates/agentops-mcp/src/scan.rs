@@ -116,6 +116,13 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
                 scan_entries.push(NewScanHistoryEntry { node_id: symbol_id, kind: NodeKind::Symbol, path: Some(path_str.clone()), name: Some(symbol.name.clone()), change });
                 files_with_symbol_changes.insert(file_id);
 
+                // Bi-temporal history: records the symbol's *new* content as
+                // of now, closing whatever version was previously open (a
+                // no-op for a brand-new symbol's first version). Always the
+                // new value, never the old one — see
+                // GraphStore::snapshot_node_version's doc comment for why.
+                store.snapshot_node_version(symbol_id, Some(&symbol.source), Some(symbol.start_line as i64), Some(symbol.end_line as i64))?;
+
                 // Only new/changed symbols need (re)embedding — an unchanged
                 // symbol's embedding from a prior scan is still accurate.
                 if with_embeddings {
@@ -148,6 +155,11 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
     }
     for s in &pruned_symbols {
         scan_entries.push(NewScanHistoryEntry { node_id: s.id, kind: NodeKind::Symbol, path: s.path.clone(), name: s.name.clone(), change: ScanChange::Removed });
+        // node_versions has no hard FK to nodes (by design — history must
+        // survive pruning), so closing after delete_nodes already ran is
+        // fine; this just marks "the last known content was valid until
+        // removal" rather than leaving the version open forever.
+        store.close_node_version(s.id)?;
     }
 
     // DependsOn edges are fully replaced per touched file each scan, not diffed.
@@ -179,7 +191,11 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
         let classifier = agentops_notes::HeuristicClassifier;
         let matcher = agentops_notes::WordBoundaryMatcher::default();
         let notes = agentops_notes::walk_vault(&notes_dir, &classifier)?;
-        agentops_notes::ingest_vault(store.as_ref(), &repo, &notes, &matcher)?;
+        // `bump_confirmed_at: false` — this is a blind keyword rematch, not
+        // a human reconfirming the note is still accurate, so it must not
+        // reset the staleness clock `tool_get_symbol` compares against
+        // `node_history` (see `GraphStore::reinforce_edge`'s doc comment).
+        agentops_notes::ingest_vault(store.as_ref(), &repo, &notes, &matcher, false)?;
     }
 
     // Module C: refresh the repo-state snapshot now that both this scan and
@@ -257,6 +273,57 @@ mod tests {
         let entries = store.scan_entries(scan.id).unwrap();
         assert!(entries.iter().any(|e| e.kind == NodeKind::Symbol && e.change == ScanChange::Changed));
         assert!(entries.iter().any(|e| e.kind == NodeKind::File && e.change == ScanChange::Changed));
+    }
+
+    /// Phase 2 (1.0 roadmap): persist() must build real bi-temporal history
+    /// across rescans, not just today's scan_history_entries diff summary —
+    /// this is what makes node_as_of/node_history answer "what did this
+    /// symbol look like before" rather than only "did it change."
+    #[test]
+    fn rescanning_after_editing_a_symbol_builds_real_version_history() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let symbol_id = store.nodes_by_kind(&repo, NodeKind::Symbol).unwrap().into_iter().find(|n| n.name.as_deref() == Some("greet")).unwrap().id;
+
+        let first_history = store.node_history(symbol_id).unwrap();
+        assert_eq!(first_history.len(), 1, "the first scan must open exactly one version");
+        assert!(first_history[0].content.as_deref().unwrap().contains("'hi'"));
+        assert!(first_history[0].valid_until.is_none(), "the only version so far must still be open");
+
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hello'\n").unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
+
+        let history = store.node_history(symbol_id).unwrap();
+        assert_eq!(history.len(), 2, "editing must open a second version, not overwrite the first");
+        assert!(history[0].content.as_deref().unwrap().contains("'hello'"), "most recent first: {history:?}");
+        assert!(history[0].valid_until.is_none());
+        assert!(history[1].content.as_deref().unwrap().contains("'hi'"), "the old content must survive as closed history: {history:?}");
+        assert!(history[1].valid_until.is_some(), "the old version must now be closed");
+    }
+
+    /// A removed symbol's history must survive its own deletion — this is
+    /// exactly why node_id is deliberately not a hard FK to nodes(id).
+    #[test]
+    fn removing_a_symbol_closes_its_version_history_without_deleting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let symbol_id = store.nodes_by_kind(&repo, NodeKind::Symbol).unwrap().into_iter().find(|n| n.name.as_deref() == Some("greet")).unwrap().id;
+
+        std::fs::remove_file(dir.path().join("main.py")).unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
+
+        assert!(store.get_node(&repo, symbol_id).unwrap().is_none(), "the node itself is really gone");
+        let history = store.node_history(symbol_id).unwrap();
+        assert_eq!(history.len(), 1, "history must survive the node's own deletion");
+        assert!(history[0].valid_until.is_some(), "must be closed, not left open forever for a node that no longer exists");
     }
 
     #[test]

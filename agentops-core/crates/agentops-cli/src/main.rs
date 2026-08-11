@@ -131,6 +131,11 @@ enum Command {
         top_k: usize,
         #[arg(long, value_enum)]
         kind: Option<SearchKindArg>,
+        /// Fuse in lexical (keyword/BM25) and exact-name-match signals —
+        /// unlike plain dense search, finds a node even if it was never
+        /// embedded (--with-embeddings left off).
+        #[arg(long)]
+        hybrid: bool,
         query: String,
     },
     /// Generate an LLM explanation of a symbol (requires
@@ -144,6 +149,15 @@ enum Command {
         /// qualifier, to disambiguate `symbol` if it isn't unique.
         #[arg(long)]
         file: Option<PathBuf>,
+    },
+    /// Watches a repo and automatically re-scans it on file changes — the
+    /// repo must have already been scanned once (`agentops install`
+    /// first). Runs until interrupted (Ctrl+C).
+    Watch {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        with_embeddings: bool,
     },
     /// Run the stdio MCP server.
     Serve {
@@ -187,6 +201,110 @@ enum Command {
         #[command(subcommand)]
         action: ApiKeyAction,
     },
+    /// Manage native tasks (Module 7's hybrid task manager) — see
+    /// `sync-linear` for two-way Linear sync.
+    Task {
+        #[command(subcommand)]
+        action: TaskAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskAction {
+    /// Creates a native task owned by this repo's graph.
+    Create {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        description: Option<String>,
+        #[arg(long)]
+        priority: Option<String>,
+        #[arg(long)]
+        assignee: Option<String>,
+        /// Correlates future scan/note/explain calls sharing this id into
+        /// this task's `activity` view.
+        #[arg(long)]
+        session_id: Option<String>,
+        title: String,
+    },
+    /// Lists every task recorded for a repo.
+    List {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
+    /// Moves a task to a new status.
+    UpdateStatus {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        id: i64,
+        #[arg(value_enum)]
+        status: TaskStatusArg,
+    },
+    /// Shortcut for `update-status <id> done`.
+    Close {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        id: i64,
+    },
+    /// The task's built-in final-audit view: every activity correlated
+    /// under its session_id, oldest first.
+    Activity {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        id: i64,
+    },
+    /// Generates technical/non-technical/client-friendly summaries of a
+    /// task's recorded activity (requires AGENTOPS_ANTHROPIC_API_KEY).
+    /// Posts the technical + non-technical summaries as Linear comments if
+    /// the task is Linear-synced (requires AGENTOPS_LINEAR_API_KEY); prints
+    /// all three either way — client-friendly has no auto-post destination
+    /// yet.
+    Summarize {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        id: i64,
+    },
+    /// Pulls issues from Linear into this repo's tasks (idempotent — safe
+    /// to run repeatedly). Requires AGENTOPS_LINEAR_API_KEY. Poll-based:
+    /// there's no webhook infrastructure to push updates automatically yet,
+    /// so re-run this periodically to pick up changes made in Linear.
+    SyncLinear {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+        /// After pulling, also push this task's current local status back
+        /// to its Linear issue (errors if it isn't Linear-synced).
+        #[arg(long)]
+        push: Option<i64>,
+        /// Target this exact Linear workflow state name instead of
+        /// inferring one from the task's TaskStatus — for teams with custom
+        /// states (e.g. "Testing") beyond the generic 5. Only used with
+        /// `--push`.
+        #[arg(long)]
+        status_name: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum, Debug)]
+enum TaskStatusArg {
+    Todo,
+    InProgress,
+    InReview,
+    Done,
+    Cancelled,
+}
+
+impl From<TaskStatusArg> for agentops_graph::TaskStatus {
+    fn from(status: TaskStatusArg) -> Self {
+        match status {
+            TaskStatusArg::Todo => agentops_graph::TaskStatus::Todo,
+            TaskStatusArg::InProgress => agentops_graph::TaskStatus::InProgress,
+            TaskStatusArg::InReview => agentops_graph::TaskStatus::InReview,
+            TaskStatusArg::Done => agentops_graph::TaskStatus::Done,
+            TaskStatusArg::Cancelled => agentops_graph::TaskStatus::Cancelled,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -265,8 +383,12 @@ fn main() -> Result<()> {
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
         }
-        Command::Search { path, top_k, kind, query } => search(&path, top_k, kind, &query),
+        Command::Search { path, top_k, kind, hybrid, query } => search(&path, top_k, kind, hybrid, &query),
         Command::Explain { path, symbol, file } => explain(&path, &symbol, file.as_deref()),
+        Command::Watch { path, with_embeddings } => {
+            open_store(&path).context("repo must be scanned at least once (run `agentops install` first) before watching it")?;
+            agentops_mcp::watch_and_rescan(&path, with_embeddings)
+        }
         Command::Serve { access_mode } => agentops_mcp::run_stdio(access_mode.into()),
         Command::ServeApi { access_mode, addr } => tokio::runtime::Runtime::new()?.block_on(agentops_api::run(&addr, access_mode.into())),
         Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(docbrain_mcp::default_db_path)),
@@ -275,6 +397,15 @@ fn main() -> Result<()> {
         }
         Command::SyncDocs { path, db, no_interactive } => sync_docs(&path, db.as_deref(), no_interactive),
         Command::ApiKey { action: ApiKeyAction::Generate } => api_key_generate(),
+        Command::Task { action } => match action {
+            TaskAction::Create { path, description, priority, assignee, session_id, title } => task_create(&path, &title, description.as_deref(), priority.as_deref(), assignee.as_deref(), session_id.as_deref()),
+            TaskAction::List { path } => task_list(&path),
+            TaskAction::UpdateStatus { path, id, status } => task_update_status(&path, id, status.into()),
+            TaskAction::Close { path, id } => task_update_status(&path, id, agentops_graph::TaskStatus::Done),
+            TaskAction::Activity { path, id } => task_activity(&path, id),
+            TaskAction::Summarize { path, id } => task_summarize(&path, id),
+            TaskAction::SyncLinear { path, limit, push, status_name } => task_sync_linear(&path, limit, push, status_name.as_deref()),
+        },
     }
 }
 
@@ -463,6 +594,117 @@ fn changelog(path: &Path, since: Option<i64>, limit: Option<usize>) -> Result<()
     Ok(())
 }
 
+fn task_create(path: &Path, title: &str, description: Option<&str>, priority: Option<&str>, assignee: Option<&str>, session_id: Option<&str>) -> Result<()> {
+    let (store, repo) = open_store(path)?;
+    let id = store.create_task(agentops_graph::NewTask {
+        repo,
+        title: title.to_string(),
+        description: description.map(String::from),
+        status: agentops_graph::TaskStatus::Todo,
+        priority: priority.map(String::from),
+        assignee: assignee.map(String::from),
+        external_source: None,
+        external_id: None,
+        session_id: session_id.map(String::from),
+    })?;
+    println!("Created task {id}: {title}");
+    Ok(())
+}
+
+fn task_list(path: &Path) -> Result<()> {
+    let (store, repo) = open_store(path)?;
+    let tasks = store.list_tasks(&repo)?;
+    if tasks.is_empty() {
+        println!("No tasks recorded.");
+        return Ok(());
+    }
+    for t in &tasks {
+        println!("[{}] task {}: {}{}", t.status.as_db_str(), t.id, t.title, t.external_source.as_deref().map(|s| format!(" (synced from {s})")).unwrap_or_default());
+    }
+    Ok(())
+}
+
+fn task_update_status(path: &Path, id: i64, status: agentops_graph::TaskStatus) -> Result<()> {
+    let (store, _repo) = open_store(path)?;
+    store.update_task_status(id, status)?;
+    println!("Task {id} moved to {}", status.as_db_str());
+    Ok(())
+}
+
+fn task_activity(path: &Path, id: i64) -> Result<()> {
+    let (store, repo) = open_store(path)?;
+    let task = store.get_task(id)?.ok_or_else(|| anyhow::anyhow!("task {id} not found"))?;
+    let Some(session_id) = &task.session_id else {
+        println!("Task {id} ({}) has no session_id — nothing to correlate.", task.title);
+        return Ok(());
+    };
+    let events = store.session_events(&repo, session_id)?;
+    if events.is_empty() {
+        println!("Task {id} ({}) has session_id '{session_id}' but no activity recorded under it yet.", task.title);
+        return Ok(());
+    }
+    for e in &events {
+        println!("[{}] {}: {}", e.created_at, e.tool_name, e.description);
+    }
+    Ok(())
+}
+
+fn task_summarize(path: &Path, id: i64) -> Result<()> {
+    let (store, repo) = open_store(path)?;
+    let task = store.get_task(id)?.ok_or_else(|| anyhow::anyhow!("task {id} not found"))?;
+    let Some(session_id) = &task.session_id else {
+        anyhow::bail!("task {id} ({}) has no session_id — nothing to summarize", task.title);
+    };
+    let events = store.session_events(&repo, session_id)?;
+    if events.is_empty() {
+        anyhow::bail!("task {id} ({}) has session_id '{session_id}' but no activity recorded under it yet", task.title);
+    }
+
+    let config = agentops_llm::AnthropicConfig::from_env()?;
+    let summaries = agentops_llm::summarize_task_activity(&config, &task.title, &events)?;
+
+    println!("Technical:\n{}\n", summaries.technical);
+    println!("Non-technical:\n{}\n", summaries.non_technical);
+    println!("Client-friendly:\n{}\n", summaries.client_friendly);
+
+    if task.external_source.as_deref() == Some("linear") {
+        if let Some(external_id) = &task.external_id {
+            match agentops_linear::LinearConfig::from_env() {
+                Ok(linear_config) => {
+                    agentops_linear::post_comment(&linear_config, external_id, &format!("**Technical summary**\n\n{}", summaries.technical))?;
+                    agentops_linear::post_comment(&linear_config, external_id, &format!("**Non-technical summary**\n\n{}", summaries.non_technical))?;
+                    println!("Posted technical + non-technical summaries as comments on {external_id}.");
+                }
+                Err(e) => println!("Skipping Linear comment post ({e:#})."),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn task_sync_linear(path: &Path, limit: u32, push: Option<i64>, status_name: Option<&str>) -> Result<()> {
+    let (store, repo) = open_store(path)?;
+    let config = agentops_linear::LinearConfig::from_env()?;
+
+    // Push *before* pulling — a real bug caught live-testing this against
+    // the AgentOps testing Linear project: pulling first calls
+    // `upsert_external_task`, which overwrites the very local status
+    // change `--push` was about to send, so the push would silently send
+    // whatever Linear already had (a no-op) instead of the local change.
+    // Pushing first means the local change reaches Linear before anything
+    // local gets overwritten; the pull that follows then correctly reflects
+    // it back, along with everything else that changed upstream.
+    if let Some(task_id) = push {
+        agentops_linear::sync_push(store.as_ref(), &config, task_id, status_name)?;
+        println!("Pushed task {task_id}'s status to Linear.");
+    }
+
+    let synced = agentops_linear::pull_issues(store.as_ref(), &config, &repo, limit)?;
+    println!("Pulled {synced} issue(s) from Linear.");
+    Ok(())
+}
+
 fn note(path: &Path, kind: Option<NoteKindArg>, tags: &[String], with_embeddings: bool, title: &str, text: &str) -> Result<()> {
     let note_type = kind.map(|k| match k {
         NoteKindArg::Gotcha => agentops_notes::NoteType::Gotcha,
@@ -517,12 +759,27 @@ fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classi
     Ok(())
 }
 
-fn search(path: &Path, top_k: usize, kind: Option<SearchKindArg>, query: &str) -> Result<()> {
+fn search(path: &Path, top_k: usize, kind: Option<SearchKindArg>, hybrid: bool, query: &str) -> Result<()> {
     use agentops_embeddings::Embedder;
 
     let (store, repo) = open_store(path)?;
+    let kind = kind.map(NodeKind::from);
+
+    if hybrid {
+        let hits = agentops_retrieval::search_hybrid(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, query, top_k, kind)?;
+        if hits.is_empty() {
+            println!("No matches.");
+            return Ok(());
+        }
+        for h in &hits {
+            let signals = [h.dense_rank.map(|_| "dense"), h.lexical_rank.map(|_| "lexical"), h.exact_rank.map(|_| "exact")].into_iter().flatten().collect::<Vec<_>>().join("+");
+            println!("{:?} {} (score {:.4}, signals: {signals}){}", h.node.kind, h.node.name.as_deref().unwrap_or("(untitled)"), h.fused_score, h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default());
+        }
+        return Ok(());
+    }
+
     let embedding = agentops_embeddings::LocalEmbedder.embed(query)?;
-    let hits = store.search_similar(&repo, &embedding, top_k, kind.map(NodeKind::from))?;
+    let hits = store.search_similar(&repo, &embedding, top_k, kind)?;
 
     if hits.is_empty() {
         println!("No matches (nothing embedded yet, or nothing close enough — see install/note/ingest-notes's --with-embeddings flag).");
@@ -547,130 +804,54 @@ fn explain(path: &Path, symbol: &str, file: Option<&Path>) -> Result<()> {
 }
 
 /// Docbrain's full 3-step discovery order: (1) registry metadata, (2)
-/// GitHub search, (3) ask the user — implemented here rather than in
-/// docbrain-ingest since step 3 is inherently an interactive CLI concern.
-/// Single-tenant this pass (`docbrain-graph` dropped `TenantContext`), so
-/// no `--org` flag or visibility plumbing.
+/// GitHub search — both run via the shared `agentops_mcp::sync_docs` (also
+/// used by the Linear webhook auto-kickoff dispatch path, which has no
+/// terminal to prompt against) — then (3) ask the user, implemented here
+/// since step 3 is inherently an interactive CLI concern. Single-tenant
+/// this pass (`docbrain-graph` dropped `TenantContext`), so no `--org` flag
+/// or visibility plumbing.
 fn sync_docs(path: &Path, db: Option<&Path>, no_interactive: bool) -> Result<()> {
-    use docbrain_ingest::{classify_dependency, RegistryDiscovery};
-    use std::collections::BTreeSet;
+    let shared = agentops_mcp::sync_docs(path, db).context("running shared registry/GitHub discovery")?;
 
-    let report = agentops_scanner::scan_repo(path).context("scanning repo for dependencies")?;
+    println!("{} already known, {} discovered (registry/GitHub), {} unresolved after automatic discovery.", shared.already_known, shared.discovered, shared.unresolved.len());
 
-    let mut candidates: BTreeSet<(docbrain_ingest::Ecosystem, String)> = BTreeSet::new();
-    for file in &report.files {
-        let language = file.language.tree_sitter_name();
-        for dep in &file.deps {
-            if let Some(pair) = classify_dependency(language, dep) {
-                candidates.insert(pair);
+    let mut asked = 0u32;
+    let mut still_unresolved = Vec::new();
+    if !shared.unresolved.is_empty() {
+        let store = docbrain_graph::SqliteDocbrainStore::open(&db.map(Path::to_path_buf).unwrap_or_else(docbrain_mcp::default_db_path)).context("opening docbrain store")?;
+        for name in &shared.unresolved {
+            // Step 3: ask the user, interactively, right now — rather than
+            // just printing a list to act on later. `interact_text()`
+            // requires a real TTY (dialoguer reads raw terminal input, not
+            // just redirected stdin); in a non-interactive context (CI,
+            // piped input) it errors, and `.unwrap_or_default()` treats
+            // that the same as "left blank" — a safe no-op, not a crash.
+            if !no_interactive {
+                let prompt = format!("'{name}' not found via registry or GitHub search. Enter a docs URL (blank to skip)");
+                let answer: String = dialoguer::Input::new().with_prompt(prompt).allow_empty(true).interact_text().unwrap_or_default();
+                if !answer.trim().is_empty() {
+                    use docbrain_graph::DocbrainStore;
+                    store.add_library(name, name, None, Some(answer.trim()))?;
+                    println!("  registered (user-provided): {name} -> {}", answer.trim());
+                    asked += 1;
+                    continue;
+                }
             }
+            still_unresolved.push(name.clone());
         }
     }
 
-    println!("Found {} distinct third-party dependencies across {} files.", candidates.len(), report.files.len());
-
-    let store = docbrain_graph::SqliteDocbrainStore::open(&db.map(Path::to_path_buf).unwrap_or_else(docbrain_mcp::default_db_path)).context("opening docbrain store")?;
-    let summary = sync_candidates(&store, &RegistryDiscovery, &candidates, no_interactive)?;
-
-    println!(
-        "{} already known, {} discovered (registry/GitHub), {} registered from user input, {} unresolved.",
-        summary.already_known,
-        summary.discovered,
-        summary.asked,
-        summary.unresolved.len()
-    );
-    if !summary.unresolved.is_empty() {
+    if asked > 0 {
+        println!("{asked} registered from user input.");
+    }
+    if !still_unresolved.is_empty() {
         println!("Not found via any discovery step, and not provided manually:");
-        for name in &summary.unresolved {
+        for name in &still_unresolved {
             println!("  - {name}");
         }
     }
 
     Ok(())
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-struct SyncSummary {
-    already_known: u32,
-    discovered: u32,
-    asked: u32,
-    unresolved: Vec<String>,
-}
-
-/// Docbrain's full 3-step discovery order: (1) registry metadata, (2)
-/// GitHub search, (3) ask the user. Takes `&dyn LibraryDiscovery` so this
-/// core loop is unit-testable against a fake, without hitting the real
-/// npm/PyPI/GitHub network — mirroring how `docbrain-ingest`'s own tests
-/// already fake `Embedder`/`LibraryDiscovery`.
-fn sync_candidates(
-    store: &dyn docbrain_graph::DocbrainStore,
-    discovery: &dyn docbrain_ingest::LibraryDiscovery,
-    candidates: &std::collections::BTreeSet<(docbrain_ingest::Ecosystem, String)>,
-    no_interactive: bool,
-) -> Result<SyncSummary> {
-    let mut summary = SyncSummary::default();
-
-    for (ecosystem, name) in candidates {
-        if store.get_library(name)?.is_some() {
-            summary.already_known += 1;
-            continue;
-        }
-
-        // Step 1: registry metadata. A network/parse error here is a soft
-        // fail (warn, keep going) — one flaky lookup shouldn't abort a batch.
-        let step1 = match discovery.discover(*ecosystem, name) {
-            Ok(found) => found,
-            Err(e) => {
-                println!("  warning: registry lookup for {name} failed ({e}), trying GitHub search next");
-                None
-            }
-        };
-
-        if let Some(found) = step1 {
-            store.add_library(name, name, found.repo_url.as_deref(), found.docs_url.as_deref())?;
-            println!("  discovered (registry): {name} -> {}", found.docs_url.as_deref().unwrap_or(found.repo_url.as_deref().unwrap_or("(no URL published)")));
-            summary.discovered += 1;
-            continue;
-        }
-
-        // Step 2: GitHub search fallback. Same soft-fail treatment — a
-        // rate-limited search is not the same as "ask the user," so it's
-        // reported distinctly rather than silently falling through.
-        let step2 = match discovery.search_github(name) {
-            Ok(found) => found,
-            Err(e) => {
-                println!("  warning: GitHub search for {name} unavailable ({e})");
-                None
-            }
-        };
-
-        if let Some(found) = step2 {
-            store.add_library(name, name, found.repo_url.as_deref(), found.docs_url.as_deref())?;
-            println!("  discovered (GitHub search): {name} -> {}", found.docs_url.as_deref().unwrap_or(found.repo_url.as_deref().unwrap_or("(no URL published)")));
-            summary.discovered += 1;
-            continue;
-        }
-
-        // Step 3: ask the user, interactively, right now — rather than just
-        // printing a list to act on later. `interact_text()` requires a real
-        // TTY (dialoguer reads raw terminal input, not just redirected
-        // stdin); in a non-interactive context (CI, piped input) it errors,
-        // and `.unwrap_or_default()` treats that the same as "left blank" —
-        // a safe no-op, not a crash.
-        if !no_interactive {
-            let prompt = format!("'{name}' not found via registry or GitHub search. Enter a docs URL (blank to skip)");
-            let answer: String = dialoguer::Input::new().with_prompt(prompt).allow_empty(true).interact_text().unwrap_or_default();
-            if !answer.trim().is_empty() {
-                store.add_library(name, name, None, Some(answer.trim()))?;
-                println!("  registered (user-provided): {name} -> {}", answer.trim());
-                summary.asked += 1;
-                continue;
-            }
-        }
-        summary.unresolved.push(name.clone());
-    }
-
-    Ok(summary)
 }
 
 fn api_key_generate() -> Result<()> {
@@ -683,75 +864,3 @@ fn api_key_generate() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod sync_docs_tests {
-    use super::*;
-    use docbrain_ingest::{DiscoveredLibrary, Ecosystem, LibraryDiscovery};
-
-    /// A fake `LibraryDiscovery` — no real network calls in a unit test.
-    /// `known` resolves via step 1 (registry), `github_only` resolves via
-    /// step 2 (GitHub search) after step 1 misses, and anything else misses
-    /// both steps entirely.
-    struct FakeDiscovery {
-        known: Vec<&'static str>,
-        github_only: Vec<&'static str>,
-    }
-
-    impl LibraryDiscovery for FakeDiscovery {
-        fn discover(&self, _ecosystem: Ecosystem, name: &str) -> Result<Option<DiscoveredLibrary>> {
-            Ok(self.known.contains(&name).then(|| DiscoveredLibrary {
-                name: name.to_string(),
-                description: None,
-                docs_url: Some(format!("https://registry.example/{name}")),
-                repo_url: None,
-            }))
-        }
-
-        fn search_github(&self, name: &str) -> Result<Option<DiscoveredLibrary>> {
-            Ok(self.github_only.contains(&name).then(|| DiscoveredLibrary {
-                name: name.to_string(),
-                description: None,
-                docs_url: None,
-                repo_url: Some(format!("https://github.com/example/{name}")),
-            }))
-        }
-    }
-
-    #[test]
-    fn discovery_order_prefers_registry_then_github_then_leaves_the_rest_unresolved() {
-        let store = docbrain_graph::SqliteDocbrainStore::open_in_memory().unwrap();
-        let discovery = FakeDiscovery { known: vec!["next"], github_only: vec!["some-tool"] };
-        let candidates = std::collections::BTreeSet::from([
-            (Ecosystem::Npm, "next".to_string()),
-            (Ecosystem::Npm, "some-tool".to_string()),
-            (Ecosystem::Npm, "totally-unknown".to_string()),
-        ]);
-
-        let summary = sync_candidates(&store, &discovery, &candidates, true).unwrap();
-
-        assert_eq!(summary.already_known, 0);
-        assert_eq!(summary.discovered, 2, "both the registry hit and the GitHub-only hit count as discovered");
-        assert_eq!(summary.asked, 0, "no_interactive must skip the prompt entirely");
-        assert_eq!(summary.unresolved, vec!["totally-unknown".to_string()]);
-
-        use docbrain_graph::DocbrainStore;
-        assert!(store.get_library("next").unwrap().is_some());
-        assert!(store.get_library("some-tool").unwrap().is_some());
-        assert!(store.get_library("totally-unknown").unwrap().is_none());
-    }
-
-    #[test]
-    fn a_library_already_known_is_not_rediscovered() {
-        let store = docbrain_graph::SqliteDocbrainStore::open_in_memory().unwrap();
-        use docbrain_graph::DocbrainStore;
-        store.add_library("next", "Next.js", None, Some("https://nextjs.org")).unwrap();
-
-        let discovery = FakeDiscovery { known: vec!["next"], github_only: vec![] };
-        let candidates = std::collections::BTreeSet::from([(Ecosystem::Npm, "next".to_string())]);
-
-        let summary = sync_candidates(&store, &discovery, &candidates, true).unwrap();
-
-        assert_eq!(summary.already_known, 1);
-        assert_eq!(summary.discovered, 0, "already-known libraries must not be re-queried against discovery");
-    }
-}

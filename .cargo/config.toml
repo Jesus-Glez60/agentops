@@ -3,4 +3,4 @@
 # default `download` feature (disabled in the workspace Cargo.toml) which would
 # otherwise fetch grammar binaries over the network at RUNTIME. See SECURITY.md.
 [env]
-TSLP_LANGUAGES = "python,javascript,typescript,go,rust"
+TSLP_LANGUAGES = "python,javascript,typescript,go,rust,cpp,csharp"

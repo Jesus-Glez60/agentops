@@ -24,6 +24,10 @@ agentops-agents-md = { path = "../agentops-agents-md" }
 agentops-llm = { path = "../agentops-llm" }
 agentops-embeddings = { path = "../agentops-embeddings" }
 agentops-graph-pg = { path = "../agentops-graph-pg" }
+agentops-retrieval = { path = "../agentops-retrieval" }
+notify-debouncer-full.workspace = true
+docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
+docbrain-ingest = { path = "../../../docbrain-core/crates/docbrain-ingest" }
 
 [dev-dependencies]
 tempfile = "3"

@@ -32,3 +32,11 @@ repo-map.md
 
 # Downloaded embedding model cache (multi-GB, fastembed's local cache dir)
 .fastembed_cache/
+
+
+# START Ruler Generated Files
+/.claude/agents
+/.claude/skills
+/CLAUDE.md
+/CLAUDE.md.bak
+# END Ruler Generated Files

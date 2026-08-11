@@ -1,0 +1,18 @@
+[package]
+name = "agentops-accounts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_accounts"
+
+[dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
+argon2.workspace = true
+agentops-security.workspace = true
+getrandom.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

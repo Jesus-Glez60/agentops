@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{GraphStore, NodeKind};
+use agentops_graph::{GraphStore, NewTask, NodeKind, TaskStatus};
 use serde_json::{json, Value};
 
 use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
@@ -78,15 +78,15 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "scan_repo",
-            description: "Scans the repo at `path` and persists it to the graph store — token-bounded change detection (Added/Changed/Removed), safe to call repeatedly. Set with_embeddings to also make new/changed symbols findable via semantic_search (local, no API cost, but real CPU latency — off by default).",
+            description: "Scans the repo at `path` and persists it to the graph store — token-bounded change detection (Added/Changed/Removed), safe to call repeatedly. Set with_embeddings to also make new/changed symbols findable via semantic_search (local, no API cost, but real CPU latency — off by default). Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
             access: AccessMode::Full,
             annotations: WRITE_IDEMPOTENT,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "with_embeddings": { "type": "boolean" } }, "required": ["path"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "with_embeddings": { "type": "boolean" }, "session_id": { "type": "string" } }, "required": ["path"] }),
             handler: tool_scan_repo,
         },
         ToolSpec {
             name: "add_note",
-            description: "Writes a new note (gotcha/decision/knowledge) to the repo's notes folder and ingests it into the graph in one step — the write-back tool for an agent that just learned something worth remembering. Omit note_type to let it be classified automatically. Set with_embeddings to make it findable via semantic_search.",
+            description: "Writes a new note (gotcha/decision/knowledge) to the repo's notes folder and ingests it into the graph in one step — the write-back tool for an agent that just learned something worth remembering. Omit note_type to let it be classified automatically. Set with_embeddings to make it findable via semantic_search. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
             access: AccessMode::Full,
             annotations: WRITE_IDEMPOTENT,
             input_schema: || {
@@ -99,6 +99,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "note_type": { "type": "string", "enum": ["gotcha", "decision", "knowledge"] },
                         "tags": { "type": "array", "items": { "type": "string" } },
                         "with_embeddings": { "type": "boolean" },
+                        "session_id": { "type": "string" },
                     },
                     "required": ["path", "title", "body"],
                 })
@@ -107,19 +108,84 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "ingest_notes",
-            description: "Walks a notes folder (a real vault or an unorganized one) and ingests every note into the graph — classifying freeform notes with no frontmatter/folder signal via the heuristic classifier. Set with_embeddings to make every note findable via semantic_search.",
+            description: "Walks a notes folder (a real vault or an unorganized one) and ingests every note into the graph — classifying freeform notes with no frontmatter/folder signal via the heuristic classifier. Set with_embeddings to make every note findable via semantic_search. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
             access: AccessMode::Full,
             annotations: WRITE_IDEMPOTENT,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "notes_path": { "type": "string" }, "with_embeddings": { "type": "boolean" } }, "required": ["path"] }),
+            input_schema: || {
+                json!({ "type": "object", "properties": { "path": { "type": "string" }, "notes_path": { "type": "string" }, "with_embeddings": { "type": "boolean" }, "session_id": { "type": "string" } }, "required": ["path"] })
+            },
             handler: tool_ingest_notes,
         },
         ToolSpec {
             name: "explain_symbol",
-            description: "Explains a symbol via the Anthropic API and persists the result as a Definition node linked to it. Requires AGENTOPS_ANTHROPIC_API_KEY. Costs a real API call — never run automatically during a scan.",
+            description: "Explains a symbol via the Anthropic API and persists the result as a Definition node linked to it. Requires AGENTOPS_ANTHROPIC_API_KEY. Costs a real API call — never run automatically during a scan. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
             access: AccessMode::Full,
             annotations: ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: true },
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" } }, "required": ["path", "symbol_id"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "session_id": { "type": "string" } }, "required": ["path", "symbol_id"] }),
             handler: tool_explain_symbol,
+        },
+        ToolSpec {
+            name: "get_session",
+            description: "Returns the correlated cross-tool activity feed for one session_id in a repo — every scan_repo/add_note/ingest_notes/explain_symbol call that was made with that same session_id, oldest first. Empty if session_id was never passed to any write tool for this repo.",
+            access: AccessMode::Advisor,
+            annotations: READ_ONLY,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path", "session_id"] }),
+            handler: tool_get_session,
+        },
+        ToolSpec {
+            name: "create_task",
+            description: "Creates a native task owned by AgentOps (not synced to Linear). Pass session_id to correlate future scan_repo/add_note/etc. calls into this task's activity feed via get_task_activity.",
+            access: AccessMode::Full,
+            annotations: WRITE_IDEMPOTENT,
+            input_schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "title": { "type": "string" },
+                        "description": { "type": "string" },
+                        "priority": { "type": "string" },
+                        "assignee": { "type": "string" },
+                        "session_id": { "type": "string" },
+                    },
+                    "required": ["path", "title"],
+                })
+            },
+            handler: tool_create_task,
+        },
+        ToolSpec {
+            name: "list_tasks",
+            description: "Lists every task (native or Linear-synced) recorded for a repo.",
+            access: AccessMode::Advisor,
+            annotations: READ_ONLY,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+            handler: tool_list_tasks,
+        },
+        ToolSpec {
+            name: "update_task_status",
+            description: "Moves a task to a new status (todo, in_progress, in_review, done, cancelled).",
+            access: AccessMode::Full,
+            annotations: WRITE_IDEMPOTENT,
+            input_schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "task_id": { "type": "integer" },
+                        "status": { "type": "string", "enum": ["todo", "in_progress", "in_review", "done", "cancelled"] },
+                    },
+                    "required": ["path", "task_id", "status"],
+                })
+            },
+            handler: tool_update_task_status,
+        },
+        ToolSpec {
+            name: "get_task_activity",
+            description: "The task's built-in final-audit view: every session_events row correlated under the task's session_id (see create_task's session_id), oldest first. Empty if the task has no session_id or no activity was recorded under it.",
+            access: AccessMode::Advisor,
+            annotations: READ_ONLY,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "task_id": { "type": "integer" } }, "required": ["path", "task_id"] }),
+            handler: tool_get_task_activity,
         },
         ToolSpec {
             name: "init_agents_md",
@@ -139,7 +205,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "semantic_search",
-            description: "Dense-vector search over whatever symbols/gotchas/decisions/notes have been embedded (see scan_repo/add_note/ingest_notes's with_embeddings flag) — complements get_symbol's exact-name lookup with 'find something like this' search. Only returns hits among nodes that were actually embedded; nothing is embedded by default.",
+            description: "Dense-vector search over whatever symbols/gotchas/decisions/notes have been embedded (see scan_repo/add_note/ingest_notes's with_embeddings flag) — complements get_symbol's exact-name lookup with 'find something like this' search. Only returns hits among nodes that were actually embedded; nothing is embedded by default. Set mode to 'hybrid' to fuse in lexical (keyword/BM25) and exact-name-match signals too — no embedding required for a node to be found via those signals, and a literal function-name query reliably surfaces it even when nothing was ever embedded.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
             input_schema: || {
@@ -150,6 +216,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "query": { "type": "string" },
                         "top_k": { "type": "integer" },
                         "kind": { "type": "string", "enum": ["symbol", "file", "gotcha", "decision", "note", "definition"] },
+                        "mode": { "type": "string", "enum": ["dense", "hybrid"] },
                     },
                     "required": ["path", "query"],
                 })
@@ -199,6 +266,18 @@ fn repo_context(args: &Value) -> anyhow::Result<(Box<dyn GraphStore>, String)> {
     let path = Path::new(path_str);
     let store = crate::store::open_store(path)?;
     Ok((store, repo_name(path)))
+}
+
+/// Module 6 (cross-tool session correlation): every write tool that accepts
+/// an optional `session_id` calls this after its own write succeeds. A
+/// missing/absent `session_id` is a normal, expected case (most callers
+/// don't correlate sessions) — a silent no-op, not an error.
+fn maybe_record_session_event(path: &Path, args: &Value, tool_name: &str, description: &str) -> anyhow::Result<()> {
+    if let Some(session_id) = get_str(args, "session_id") {
+        let store = crate::store::open_store(path)?;
+        store.record_session_event(&repo_name(path), session_id, tool_name, description)?;
+    }
+    Ok(())
 }
 
 fn tool_status(args: &Value) -> anyhow::Result<String> {
@@ -288,11 +367,25 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
         score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
     });
     if !affecting.is_empty() {
+        // Hallucination-prevention (bi-temporal versioning's actual payoff,
+        // not optional — see module-2's design doc): a gotcha/decision is
+        // only trustworthy if the symbol hasn't changed since it was last
+        // confirmed relevant. `edge.updated_at` is bumped every time
+        // `connect_many` re-matches/reinforces this note against this
+        // symbol (including on every rescan) — if the symbol has a version
+        // whose `valid_from` is *newer* than that, the code changed after
+        // the note was last confirmed, and the note might be stale. Plain
+        // string comparison is safe here: both timestamps always come from
+        // the same backend in the same format within one comparison.
+        let symbol_history = store.node_history(id)?;
+        let is_possibly_stale = |edge_updated_at: &str| symbol_history.iter().any(|v| v.valid_from.as_str() > edge_updated_at);
+
         let mut gotchas = Vec::new();
         let mut decisions = Vec::new();
         for edge in &affecting {
             if let Some(note) = store.get_node(&repo, edge.src_id)? {
-                let entry = format!("- {}: {}", note.name.as_deref().unwrap_or("(untitled)"), note.content.as_deref().unwrap_or(""));
+                let staleness = if is_possibly_stale(&edge.updated_at) { " ⚠ possibly stale — this symbol changed since this note was last confirmed relevant" } else { "" };
+                let entry = format!("- {}: {}{}", note.name.as_deref().unwrap_or("(untitled)"), note.content.as_deref().unwrap_or(""), staleness);
                 match note.kind {
                     NodeKind::Gotcha => gotchas.push(entry),
                     NodeKind::Decision => decisions.push(entry),
@@ -329,6 +422,11 @@ fn tool_get_changelog(args: &Value) -> anyhow::Result<String> {
 fn tool_scan_repo(args: &Value) -> anyhow::Result<String> {
     let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
     let summary = crate::scan::scan_and_persist(Path::new(path_str), get_bool(args, "with_embeddings"))?;
+    let description = format!(
+        "scanned: {} files, {} symbols, {} dependency edges ({} files pruned, {} symbols pruned)",
+        summary.files, summary.symbols, summary.dependency_edges, summary.pruned_files, summary.pruned_symbols
+    );
+    maybe_record_session_event(Path::new(path_str), args, "scan_repo", &description)?;
     Ok(format!(
         "Scanned {}: {} files, {} symbols, {} dependency edges ({} files pruned, {} symbols pruned)",
         path_str, summary.files, summary.symbols, summary.dependency_edges, summary.pruned_files, summary.pruned_symbols
@@ -358,6 +456,7 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
         agentops_notes::NoteType::Knowledge => "knowledge",
         agentops_notes::NoteType::Context => "context",
     };
+    maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"))?;
     Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols, {} reinforced).", result.file_path.display(), result.edges_written, result.edges_reinforced))
 }
 
@@ -370,6 +469,7 @@ fn tool_ingest_notes(args: &Value) -> anyhow::Result<String> {
     let summary = crate::notes::ingest_notes_dir(Path::new(path_str), explicit_notes_path.as_deref(), &classifier, &matcher, get_bool(args, "with_embeddings"))?;
 
     let notes_dir = agentops_notes::resolve_notes_path(Path::new(path_str), explicit_notes_path.as_deref());
+    maybe_record_session_event(Path::new(path_str), args, "ingest_notes", &format!("ingested {} note(s) from {}", summary.notes_written, notes_dir.display()))?;
     Ok(format!("Ingested {} note(s) from {}, wrote {} edge(s), reinforced {}.", summary.notes_written, notes_dir.display(), summary.edges_written, summary.edges_reinforced))
 }
 
@@ -409,6 +509,33 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
         None => None,
     };
 
+    // "hybrid" (Phase 4): fuses dense + lexical + exact-match via
+    // Reciprocal Rank Fusion (agentops_retrieval::search_hybrid) — finds
+    // an exact function-name query dense-only search would miss, and gives
+    // keyword-heavy queries real BM25 relevance, not just embedding
+    // similarity. Default stays "dense" (today's original behavior) so
+    // existing callers/tests see no change unless they opt in.
+    if get_str(args, "mode") == Some("hybrid") {
+        let hits = agentops_retrieval::search_hybrid(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, query, top_k, kind)?;
+        if hits.is_empty() {
+            return Ok("No matches.".to_string());
+        }
+        return Ok(hits
+            .iter()
+            .map(|h| {
+                let signals = [h.dense_rank.map(|_| "dense"), h.lexical_rank.map(|_| "lexical"), h.exact_rank.map(|_| "exact")].into_iter().flatten().collect::<Vec<_>>().join("+");
+                format!(
+                    "- {:?} {} (score {:.4}, signals: {signals}){}",
+                    h.node.kind,
+                    h.node.name.as_deref().unwrap_or("(untitled)"),
+                    h.fused_score,
+                    h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
     let embedding = agentops_embeddings::LocalEmbedder.embed(query)?;
     let hits = store.search_similar(&repo, &embedding, top_k, kind)?;
     if hits.is_empty() {
@@ -422,12 +549,86 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
         .join("\n"))
 }
 
+fn tool_get_session(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let session_id = get_str(args, "session_id").ok_or_else(|| anyhow::anyhow!("missing required 'session_id'"))?;
+    let events = store.session_events(&repo, session_id)?;
+    if events.is_empty() {
+        return Ok(format!("No activity recorded for session '{session_id}' in {repo}."));
+    }
+    Ok(events.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, e.description)).collect::<Vec<_>>().join("\n"))
+}
+
+fn parse_task_status(s: &str) -> Option<TaskStatus> {
+    match s {
+        "todo" => Some(TaskStatus::Todo),
+        "in_progress" => Some(TaskStatus::InProgress),
+        "in_review" => Some(TaskStatus::InReview),
+        "done" => Some(TaskStatus::Done),
+        "cancelled" => Some(TaskStatus::Cancelled),
+        _ => None,
+    }
+}
+
+fn tool_create_task(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let title = get_str(args, "title").ok_or_else(|| anyhow::anyhow!("missing required 'title'"))?;
+    let task = NewTask {
+        repo,
+        title: title.to_string(),
+        description: get_str(args, "description").map(String::from),
+        status: TaskStatus::Todo,
+        priority: get_str(args, "priority").map(String::from),
+        assignee: get_str(args, "assignee").map(String::from),
+        external_source: None,
+        external_id: None,
+        session_id: get_str(args, "session_id").map(String::from),
+    };
+    let id = store.create_task(task)?;
+    Ok(format!("Created task {id}: {title}"))
+}
+
+fn tool_list_tasks(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let tasks = store.list_tasks(&repo)?;
+    if tasks.is_empty() {
+        return Ok("No tasks recorded.".to_string());
+    }
+    Ok(tasks.iter().map(|t| format!("- [{}] task {}: {}", t.status.as_db_str(), t.id, t.title)).collect::<Vec<_>>().join("\n"))
+}
+
+fn tool_update_task_status(args: &Value) -> anyhow::Result<String> {
+    let (store, _repo) = repo_context(args)?;
+    let task_id = args.get("task_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'task_id'"))?;
+    let status_str = get_str(args, "status").ok_or_else(|| anyhow::anyhow!("missing required 'status'"))?;
+    let status = parse_task_status(status_str).ok_or_else(|| anyhow::anyhow!("invalid status '{status_str}'"))?;
+    store.update_task_status(task_id, status)?;
+    Ok(format!("Task {task_id} moved to {status_str}"))
+}
+
+fn tool_get_task_activity(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let task_id = args.get("task_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'task_id'"))?;
+    let task = store.get_task(task_id)?.ok_or_else(|| anyhow::anyhow!("task {task_id} not found"))?;
+    let Some(session_id) = &task.session_id else {
+        return Ok(format!("Task {task_id} ({}) has no session_id — nothing to correlate.", task.title));
+    };
+    let events = store.session_events(&repo, session_id)?;
+    if events.is_empty() {
+        return Ok(format!("Task {task_id} ({}) has session_id '{session_id}' but no activity recorded under it yet.", task.title));
+    }
+    Ok(events.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, e.description)).collect::<Vec<_>>().join("\n"))
+}
+
 fn tool_explain_symbol(args: &Value) -> anyhow::Result<String> {
     let (store, repo) = repo_context(args)?;
     let symbol_id = args.get("symbol_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'symbol_id'"))?;
     let config = agentops_llm::AnthropicConfig::from_env()?;
     let definition_id = agentops_llm::explain_symbol(store.as_ref(), &config, &repo, symbol_id)?;
     let definition = store.get_node(&repo, definition_id)?.ok_or_else(|| anyhow::anyhow!("definition node not found after creation"))?;
+    if let Some(session_id) = get_str(args, "session_id") {
+        store.record_session_event(&repo, session_id, "explain_symbol", &format!("explained symbol {symbol_id}"))?;
+    }
     Ok(definition.content.unwrap_or_default())
 }
 
@@ -537,6 +738,33 @@ mod tests {
         assert!(!result.is_error, "{:?}", result.content);
         assert!(result.content[0].text.contains("Known gotchas affecting this symbol"), "{:?}", result.content);
         assert!(result.content[0].text.contains("Token bug"), "{:?}", result.content);
+        assert!(!result.content[0].text.contains("possibly stale"), "a gotcha whose symbol hasn't changed since must not be flagged: {:?}", result.content);
+    }
+
+    /// Phase 2's actual payoff, not just a table nobody consults: a gotcha
+    /// must be visibly flagged once the symbol it's attached to changes
+    /// *after* the gotcha was last confirmed relevant — otherwise `get_symbol`
+    /// keeps confidently repeating advice that may no longer be true.
+    #[test]
+    fn get_symbol_flags_a_gotcha_as_stale_once_the_symbol_changes_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token bug", "body": "verify_token has a known workaround for a bug." })).unwrap();
+
+        // Ensure the edit lands in a later second than the edge's
+        // `updated_at` — same reasoning as agentops-graph's own
+        // bi-temporal tests (CURRENT_TIMESTAMP has second granularity).
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    return True\n").unwrap();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "verify_token" })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("Token bug"), "{:?}", result.content);
+        assert!(result.content[0].text.contains("possibly stale"), "a gotcha whose symbol changed since must be flagged: {:?}", result.content);
     }
 
     #[test]
@@ -574,5 +802,124 @@ mod tests {
         let reinforced_pos = text.find("Reinforced issue").expect("must appear");
         let rare_pos = text.find("Rare issue").expect("must appear");
         assert!(reinforced_pos < rare_pos, "the more-reinforced gotcha must be listed first: {text}");
+    }
+
+    /// Module 6's actual payoff: two separate MCP calls (simulating two
+    /// different clients/tools — e.g. Cursor scanning, Claude Code adding a
+    /// note) that happen to share one `session_id` must show up as one
+    /// correlated feed via `get_session`, protocol-native (nothing
+    /// AgentOps-specific about how the caller got the id).
+    #[test]
+    fn two_calls_sharing_a_session_id_produce_one_correlated_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let session_id = "sess-abc123";
+
+        let scan_result = call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "session_id": session_id })).unwrap();
+        assert!(!scan_result.is_error, "{:?}", scan_result.content);
+        let note_result = call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "found something", "body": "greet has a rare bug.", "session_id": session_id })).unwrap();
+        assert!(!note_result.is_error, "{:?}", note_result.content);
+        // A call under a *different* session must not leak into the feed.
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "session_id": "sess-unrelated" })).unwrap();
+
+        let session_result = call_tool(AccessMode::Full, "get_session", &json!({ "path": path, "session_id": session_id })).unwrap();
+        assert!(!session_result.is_error, "{:?}", session_result.content);
+        let text = &session_result.content[0].text;
+        assert!(text.contains("scan_repo"), "{text}");
+        assert!(text.contains("add_note"), "{text}");
+        assert_eq!(text.matches("sess-unrelated").count(), 0, "the other session must not appear: {text}");
+    }
+
+    /// Module 7's actual differentiator, not the CRUD: a task's own
+    /// `session_id` transitively pulls in everything Module 6 already
+    /// correlated under it — `get_task_activity` doesn't need its own
+    /// separate write path.
+    #[test]
+    fn get_task_activity_surfaces_everything_correlated_under_the_tasks_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let session_id = "task-sess-1";
+
+        let create_result = call_tool(AccessMode::Full, "create_task", &json!({ "path": path, "title": "fix greet", "session_id": session_id })).unwrap();
+        assert!(!create_result.is_error, "{:?}", create_result.content);
+        let task_id: i64 = create_result.content[0].text.split_whitespace().nth(2).unwrap().trim_end_matches(':').parse().unwrap();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "session_id": session_id })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "greet quirk", "body": "greet has a quirk.", "session_id": session_id })).unwrap();
+
+        let activity = call_tool(AccessMode::Full, "get_task_activity", &json!({ "path": path, "task_id": task_id })).unwrap();
+        assert!(!activity.is_error, "{:?}", activity.content);
+        let text = &activity.content[0].text;
+        assert!(text.contains("scan_repo"), "{text}");
+        assert!(text.contains("add_note"), "{text}");
+    }
+
+    #[test]
+    fn get_task_activity_reports_no_session_id_for_a_task_created_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let create_result = call_tool(AccessMode::Full, "create_task", &json!({ "path": path, "title": "untracked task" })).unwrap();
+        let task_id: i64 = create_result.content[0].text.split_whitespace().nth(2).unwrap().trim_end_matches(':').parse().unwrap();
+
+        let activity = call_tool(AccessMode::Full, "get_task_activity", &json!({ "path": path, "task_id": task_id })).unwrap();
+        assert!(activity.content[0].text.contains("no session_id"), "{:?}", activity.content);
+    }
+
+    #[test]
+    fn create_list_and_update_task_status_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let create_result = call_tool(AccessMode::Full, "create_task", &json!({ "path": path, "title": "do the thing" })).unwrap();
+        assert!(!create_result.is_error, "{:?}", create_result.content);
+        let task_id: i64 = create_result.content[0].text.split_whitespace().nth(2).unwrap().trim_end_matches(':').parse().unwrap();
+
+        let list_result = call_tool(AccessMode::Full, "list_tasks", &json!({ "path": path })).unwrap();
+        assert!(list_result.content[0].text.contains("do the thing"), "{:?}", list_result.content);
+        assert!(list_result.content[0].text.contains("[todo]"), "{:?}", list_result.content);
+
+        let update_result = call_tool(AccessMode::Full, "update_task_status", &json!({ "path": path, "task_id": task_id, "status": "in_progress" })).unwrap();
+        assert!(!update_result.is_error, "{:?}", update_result.content);
+
+        let list_after = call_tool(AccessMode::Full, "list_tasks", &json!({ "path": path })).unwrap();
+        assert!(list_after.content[0].text.contains("[in_progress]"), "{:?}", list_after.content);
+    }
+
+    /// Phase 4's actual payoff, exposed through the existing tool rather
+    /// than a new one: a literal function-name query surfaces the symbol
+    /// even though it was never embedded (with_embeddings left off), via
+    /// mode=hybrid's exact-match signal.
+    #[test]
+    fn semantic_search_hybrid_mode_finds_an_unembedded_symbol_by_exact_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token_signature():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": false })).unwrap();
+
+        let dense_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature" })).unwrap();
+        assert!(dense_result.content[0].text.contains("No matches"), "dense-only search finds nothing since nothing was embedded: {:?}", dense_result.content);
+
+        let hybrid_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid" })).unwrap();
+        assert!(!hybrid_result.is_error, "{:?}", hybrid_result.content);
+        assert!(hybrid_result.content[0].text.contains("verify_token_signature"), "{:?}", hybrid_result.content);
+        assert!(hybrid_result.content[0].text.contains("exact"), "the exact signal must be the one that found it: {:?}", hybrid_result.content);
+    }
+
+    #[test]
+    fn get_session_reports_no_activity_for_a_session_id_never_used() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        let result = call_tool(AccessMode::Full, "get_session", &json!({ "path": path, "session_id": "never-used" })).unwrap();
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("No activity recorded"), "{:?}", result.content);
     }
 }

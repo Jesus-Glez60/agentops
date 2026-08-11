@@ -205,8 +205,8 @@ mod tests {
         // Inserted second, but reinforced repeatedly — must still rank first.
         let popular_id = store.add_node(node(NodeKind::Gotcha, None, Some("popular-issue"), None, None, Some("Hit constantly."))).unwrap();
         let popular_edge = store.add_edge("demo", popular_id, symbol_id, EdgeRelation::Affects).unwrap();
-        store.reinforce_edge("demo", popular_edge).unwrap();
-        store.reinforce_edge("demo", popular_edge).unwrap();
+        store.reinforce_edge("demo", popular_edge, true).unwrap();
+        store.reinforce_edge("demo", popular_edge, true).unwrap();
 
         let doc = render_onboarding_doc(&store, "demo", &[PathBuf::from("src/auth.rs")]).unwrap();
         let popular_pos = doc.find("popular-issue").unwrap();

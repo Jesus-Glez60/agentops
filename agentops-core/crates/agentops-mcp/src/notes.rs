@@ -64,7 +64,7 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
 
     let notes = agentops_notes::walk_vault(&notes_dir, &classifier)?;
     let this_note = notes.into_iter().find(|n| n.title == title).ok_or_else(|| anyhow::anyhow!("wrote note but failed to re-parse it"))?;
-    let summary = agentops_notes::ingest_vault(store.as_ref(), &repo, std::slice::from_ref(&this_note), &matcher)?;
+    let summary = agentops_notes::ingest_vault(store.as_ref(), &repo, std::slice::from_ref(&this_note), &matcher, true)?;
 
     if with_embeddings {
         let node_kind = note_type.node_kind();
@@ -98,7 +98,7 @@ pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, cl
     let repo = repo_name(repo_path);
     let notes_dir = agentops_notes::resolve_notes_path(repo_path, notes_path_override);
     let notes = agentops_notes::walk_vault(&notes_dir, classifier)?;
-    let summary = agentops_notes::ingest_vault(store.as_ref(), &repo, &notes, matcher)?;
+    let summary = agentops_notes::ingest_vault(store.as_ref(), &repo, &notes, matcher, true)?;
 
     if with_embeddings {
         for kind in [NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note] {

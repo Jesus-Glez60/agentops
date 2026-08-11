@@ -1,0 +1,16 @@
+[package]
+name = "agentops-retrieval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_retrieval"
+
+[dependencies]
+anyhow.workspace = true
+agentops-graph = { path = "../agentops-graph" }
+agentops-embeddings = { path = "../agentops-embeddings" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -28,7 +28,11 @@ pub fn verify_api_key(raw: &str, expected_hash: &str) -> Result<()> {
     }
 }
 
-fn hash_api_key(raw: &str) -> String {
+/// Public so callers that need to look a token up by its hash (e.g. a
+/// session store indexing `sessions.token_hash`) can compute the same hash
+/// without duplicating this logic — `verify_api_key` alone only helps once
+/// you already know *which* row's hash to compare against.
+pub fn hash_api_key(raw: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(raw.as_bytes());
     hex_encode(&hasher.finalize())

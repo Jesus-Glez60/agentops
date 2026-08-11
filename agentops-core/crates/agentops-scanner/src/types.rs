@@ -9,6 +9,12 @@ pub enum Language {
     JavaScript,
     Go,
     Rust,
+    /// `.h`/`.c` (plain C) are deliberately not routed here — ambiguous
+    /// between C and C++ by extension alone, and out of scope for this
+    /// pass (C++-specific extensions only). Add a real `Language::C` if
+    /// plain-C coverage is ever requested.
+    Cpp,
+    CSharp,
 }
 
 impl Language {
@@ -20,11 +26,15 @@ impl Language {
             "js" | "jsx" | "mjs" => Some(Language::JavaScript),
             "go" => Some(Language::Go),
             "rs" => Some(Language::Rust),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Language::Cpp),
+            "cs" => Some(Language::CSharp),
             _ => None,
         }
     }
 
-    /// The identifier string `tree-sitter-language-pack` expects.
+    /// The identifier string `tree-sitter-language-pack` expects —
+    /// confirmed against its own `registry.rs`/`extensions.rs` (not
+    /// guessed): `"cpp"` and `"csharp"`, not `"cplusplus"`/`"c_sharp"`.
     pub fn tree_sitter_name(&self) -> &'static str {
         match self {
             Language::Python => "python",
@@ -32,6 +42,8 @@ impl Language {
             Language::JavaScript => "javascript",
             Language::Go => "go",
             Language::Rust => "rust",
+            Language::Cpp => "cpp",
+            Language::CSharp => "csharp",
         }
     }
 }

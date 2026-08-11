@@ -1,0 +1,19 @@
+[package]
+name = "agentops-linear"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_linear"
+
+[dependencies]
+anyhow.workspace = true
+agentops-graph = { path = "../agentops-graph" }
+serde.workspace = true
+serde_json.workspace = true
+ureq = { version = "3", features = ["json"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio.workspace = true

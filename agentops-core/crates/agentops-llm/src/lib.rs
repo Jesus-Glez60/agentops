@@ -305,6 +305,69 @@ impl agentops_notes::NoteClassifier for LlmAssistedClassifier<'_> {
     }
 }
 
+/// Three audience-tuned work summaries for one task's activity — Phase 6b
+/// Extension 2. Delimiter-tagged single-call response (`TECHNICAL:` /
+/// `NON_TECHNICAL:` / `CLIENT_FRIENDLY:`), parsed back out below — one
+/// Anthropic call is cheaper than three, and this delimiter approach is
+/// simple enough to not need a second call as a fallback; revisit if real
+/// output ever proves unreliable to parse.
+#[derive(Debug, Clone, Default)]
+pub struct TaskSummaries {
+    pub technical: String,
+    pub non_technical: String,
+    pub client_friendly: String,
+}
+
+const TECHNICAL_TAG: &str = "TECHNICAL:";
+const NON_TECHNICAL_TAG: &str = "NON_TECHNICAL:";
+const CLIENT_FRIENDLY_TAG: &str = "CLIENT_FRIENDLY:";
+
+/// Renders `activity` using the exact same format `tool_get_task_activity`
+/// (`agentops-mcp/src/tools.rs`) already uses for a human/agent-facing
+/// activity feed — deliberately not a second, silently-divergent copy of
+/// that rendering.
+fn render_activity(activity: &[agentops_graph::SessionEvent]) -> String {
+    activity.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, e.description)).collect::<Vec<_>>().join("\n")
+}
+
+/// Generates technical/non-technical/client-friendly summaries of a task's
+/// recorded activity (`SessionEvent`s correlated under its `session_id`),
+/// for pushing back to Linear as comments and/or printing to stdout.
+pub fn summarize_task_activity(config: &AnthropicConfig, task_title: &str, activity: &[agentops_graph::SessionEvent]) -> Result<TaskSummaries> {
+    if activity.is_empty() {
+        anyhow::bail!("no activity recorded for task {task_title:?} — nothing to summarize");
+    }
+
+    let prompt = format!(
+        "You are summarizing work done on a task, for three different audiences, based on a raw activity log.\n\n\
+         Task: {task_title}\n\nActivity log:\n{}\n\n\
+         Write three summaries, each on its own line(s), in exactly this format (including the tags, each on its own line):\n\n\
+         {TECHNICAL_TAG}\n<a precise, technical summary for another engineer>\n\n\
+         {NON_TECHNICAL_TAG}\n<a summary for a non-technical teammate — what changed and why, no jargon>\n\n\
+         {CLIENT_FRIENDLY_TAG}\n<a short summary suitable for sharing with an external client — outcome-focused, no internal implementation detail>\n\n\
+         Respond with only those three tagged sections, no preamble.",
+        render_activity(activity)
+    );
+
+    let result = call_anthropic(config, &prompt)?;
+    parse_task_summaries(&result.text)
+}
+
+fn parse_task_summaries(text: &str) -> Result<TaskSummaries> {
+    let extract = |tag: &str, next_tags: &[&str]| -> Option<String> {
+        let start = text.find(tag)? + tag.len();
+        let rest = &text[start..];
+        let end = next_tags.iter().filter_map(|t| rest.find(t)).min().unwrap_or(rest.len());
+        Some(rest[..end].trim().to_string())
+    };
+
+    let technical = extract(TECHNICAL_TAG, &[NON_TECHNICAL_TAG, CLIENT_FRIENDLY_TAG]).ok_or_else(|| anyhow::anyhow!("Anthropic response missing {TECHNICAL_TAG} section: {text}"))?;
+    let non_technical = extract(NON_TECHNICAL_TAG, &[CLIENT_FRIENDLY_TAG]).ok_or_else(|| anyhow::anyhow!("Anthropic response missing {NON_TECHNICAL_TAG} section: {text}"))?;
+    let client_friendly = extract(CLIENT_FRIENDLY_TAG, &[]).ok_or_else(|| anyhow::anyhow!("Anthropic response missing {CLIENT_FRIENDLY_TAG} section: {text}"))?;
+
+    Ok(TaskSummaries { technical, non_technical, client_friendly })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +551,52 @@ mod tests {
         // No gotcha/decision keywords at all -- genuinely ambiguous.
         let result = classifier.classify("The onboarding flow now supports three languages.").unwrap();
         assert_eq!(result, agentops_notes::NoteType::Decision);
+    }
+
+    fn event(created_at: &str, tool_name: &str, description: &str) -> agentops_graph::SessionEvent {
+        agentops_graph::SessionEvent { id: 0, repo: "demo".into(), session_id: "s1".into(), tool_name: tool_name.into(), description: description.into(), created_at: created_at.into() }
+    }
+
+    #[test]
+    fn parse_task_summaries_splits_all_three_tagged_sections() {
+        let text = "TECHNICAL:\nRewrote the auth middleware to use JWT.\n\nNON_TECHNICAL:\nMade logins faster and more secure.\n\nCLIENT_FRIENDLY:\nLogin is now faster.";
+        let summaries = parse_task_summaries(text).unwrap();
+        assert_eq!(summaries.technical, "Rewrote the auth middleware to use JWT.");
+        assert_eq!(summaries.non_technical, "Made logins faster and more secure.");
+        assert_eq!(summaries.client_friendly, "Login is now faster.");
+    }
+
+    #[test]
+    fn parse_task_summaries_errors_clearly_when_a_section_is_missing() {
+        let text = "TECHNICAL:\nsomething\n\nCLIENT_FRIENDLY:\nsomething else";
+        let err = parse_task_summaries(text).unwrap_err();
+        assert!(err.to_string().contains("NON_TECHNICAL"));
+    }
+
+    #[test]
+    fn summarize_task_activity_refuses_an_empty_activity_log() {
+        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into() };
+        let err = summarize_task_activity(&config, "Fix login bug", &[]).unwrap_err();
+        assert!(err.to_string().contains("nothing to summarize"));
+    }
+
+    #[tokio::test]
+    async fn summarize_task_activity_parses_a_real_shaped_response_and_includes_rendered_activity_in_the_prompt() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("scan_repo"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "TECHNICAL:\nRan scan_repo and upserted 3 symbols.\n\nNON_TECHNICAL:\nScanned the codebase for changes.\n\nCLIENT_FRIENDLY:\nProgress made on the requested feature."}],
+                "usage": {"input_tokens": 20, "output_tokens": 10}
+            })))
+            .mount(&server)
+            .await;
+
+        let config = mock_config(&server.uri());
+        let activity = vec![event("2026-08-11T00:00:00Z", "scan_repo", "scanned 3 files")];
+
+        let summaries = summarize_task_activity(&config, "Fix login bug", &activity).unwrap();
+        assert_eq!(summaries.technical, "Ran scan_repo and upserted 3 symbols.");
+        assert_eq!(summaries.client_friendly, "Progress made on the requested feature.");
     }
 }

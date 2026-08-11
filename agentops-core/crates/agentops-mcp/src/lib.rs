@@ -10,7 +10,9 @@ mod protocol;
 pub mod scan;
 mod server;
 mod store;
+mod sync_docs;
 mod tools;
+mod watch;
 
 pub use docgen::generate_docs;
 pub use init::{init_agents_md, InitResult};
@@ -18,7 +20,9 @@ pub use notes::{add_note, ingest_notes_dir, AddNoteResult};
 pub use protocol::{CallToolResult, ContentBlock, ToolAnnotations, ToolDefinition};
 pub use scan::{graph_db_path, persist, repo_name, scan_and_persist, ScanPersistSummary};
 pub use store::{describe_backend, open_store};
+pub use sync_docs::{sync_docs, SyncDocsSummary};
 pub use tools::{call_tool, list_tools, AccessMode};
+pub use watch::watch_and_rescan;
 
 use std::io::{BufRead, Write};
 

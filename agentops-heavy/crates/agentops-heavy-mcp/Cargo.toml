@@ -19,7 +19,8 @@ tokio.workspace = true
 agentops-heavy-embeddings = { path = "../agentops-heavy-embeddings" }
 agentops-graph.workspace = true
 docbrain-graph.workspace = true
-agentops-license = { path = "../agentops-license" }
+# agentops-license deliberately not a dependency this pass — 1.0 has no
+# payment gate at all (see this crate's lib.rs doc comment).
 
 [dev-dependencies]
 tempfile = "3"

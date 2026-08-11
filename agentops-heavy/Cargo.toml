@@ -7,6 +7,9 @@ members = [
     "crates/agentops-heavy-api",
     "crates/agentops-heavy-embeddings",
     "crates/agentops-heavy-mcp",
+    "crates/agentops-accounts",
+    "crates/agentops-integrations",
+    "crates/agentops-integration-modules",
 ]
 
 [workspace.package]
@@ -41,6 +44,9 @@ rsa = "0.9"
 wiremock = "0.6"
 fastembed = "5"
 qdrant-client = "1.18"
+argon2 = "0.5"
+aes-gcm = "0.10"
+getrandom = "0.4"
 
 # Cross-workspace path dependencies into the open-core light tier.
 agentops-security = { path = "../agentops-core/crates/agentops-security" }
@@ -55,3 +61,19 @@ agentops-graph = { path = "../agentops-core/crates/agentops-graph" }
 # search tier can index real doc_nodes content without docbrain-core itself
 # taking on any commercial-license or paid-infra dependency.
 docbrain-graph = { path = "../docbrain-core/crates/docbrain-graph" }
+
+# Phase 6 (Module 9, Linear webhook auto-kickoff): the scan/task-manager
+# use cases the webhook receiver dispatches to already live in the open
+# core, not duplicated here — same cross-workspace path-dependency
+# reasoning as agentops-graph/docbrain-graph above.
+agentops-mcp = { path = "../agentops-core/crates/agentops-mcp" }
+agentops-linear = { path = "../agentops-core/crates/agentops-linear" }
+agentops-llm = { path = "../agentops-core/crates/agentops-llm" }
+
+# Phase 7 (integrations vault + minimal accounts).
+agentops-accounts = { path = "crates/agentops-accounts" }
+agentops-integrations = { path = "crates/agentops-integrations" }
+
+# Phase 6c: the standard per-tenant enrollment mechanism for integration
+# modules (Linear auto-kickoff is the first consumer, not the only one).
+agentops-integration-modules = { path = "crates/agentops-integration-modules" }
