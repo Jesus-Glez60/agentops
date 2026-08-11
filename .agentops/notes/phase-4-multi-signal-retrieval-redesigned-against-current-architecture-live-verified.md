@@ -1,6 +1,0 @@
----
-title: "Phase 4 multi-signal retrieval redesigned against current architecture, live-verified"
-type: decision
----
-
-Module 3's original vault design assumed a separate heavy-tier tantivy crate on top of a Qdrant dense index -- both stale, since dense search already moved into agentops-core (agentops-embeddings + GraphStore::search_similar) in an earlier pass. Redesigned instead as: GraphStore::search_lexical (SQLite FTS5 external-content table with triggers, Postgres GENERATED tsvector column -- both database-native, auto-kept-in-sync, no second index to maintain) and GraphStore::search_exact (case-insensitive exact/substring name match), fused with dense via Reciprocal Rank Fusion in a new agentops-retrieval crate, exposed as semantic_search's mode=hybrid / agentops search --hybrid. Real bug caught during implementation: an FTS5 backfill INSERT with a self-referential 'WHERE id NOT IN (SELECT rowid FROM nodes_fts)' guard silently corrupts the index (content row lands, but MATCH never finds it) -- confirmed via a standalone probe crate, fixed by dropping the unnecessary guard (migrations only run once anyway). Live-verified against this repo: dense-only search for 'reinforce_edge' returns loosely-related neighbors and misses the actual un-embedded reinforce_edge symbols entirely; hybrid mode correctly surfaces all of them via the exact+lexical signals.
