@@ -14,10 +14,11 @@ use std::sync::Once;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use rusqlite_migration::{Migrations, M};
 
 use agentops_embeddings::EMBEDDING_DIM;
 
-use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NewNode, NewScanHistoryEntry, ScanChange, ScanHistory, ScanHistoryEntry};
+use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NewNode, NewScanHistoryEntry, RepoState, ScanChange, ScanHistory, ScanHistoryEntry};
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 
@@ -42,58 +43,100 @@ fn vec_table_migration() -> String {
     format!("CREATE VIRTUAL TABLE IF NOT EXISTS node_vectors USING vec0(node_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBEDDING_DIM}]);")
 }
 
-const MIGRATIONS: &str = "
-    CREATE TABLE IF NOT EXISTS nodes (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        kind        TEXT NOT NULL,
-        repo        TEXT NOT NULL,
-        path        TEXT,
-        name        TEXT,
-        container   TEXT,
-        start_line  INTEGER,
-        end_line    INTEGER,
-        content     TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_nodes_repo_kind ON nodes(repo, kind);
-    CREATE INDEX IF NOT EXISTS idx_nodes_repo_path ON nodes(repo, path);
+/// Ordered, tracked (via SQLite's `user_version` pragma) migration steps —
+/// replaces a single idempotent `CREATE TABLE IF NOT EXISTS` blob re-run on
+/// every open, which can never express "add a column to an existing,
+/// already-populated table." A database that predates this (like this
+/// repo's own `.context/graph.db`) starts at `user_version = 0`: `to_latest`
+/// harmlessly re-runs the old `CREATE TABLE IF NOT EXISTS` steps as no-ops,
+/// then applies the two genuinely new steps for the first time.
+const MIGRATIONS_SLICE: &[M<'_>] = &[
+    M::up(
+        "CREATE TABLE IF NOT EXISTS nodes (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind        TEXT NOT NULL,
+            repo        TEXT NOT NULL,
+            path        TEXT,
+            name        TEXT,
+            container   TEXT,
+            start_line  INTEGER,
+            end_line    INTEGER,
+            content     TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_nodes_repo_kind ON nodes(repo, kind);
+        CREATE INDEX IF NOT EXISTS idx_nodes_repo_path ON nodes(repo, path);",
+    ),
+    M::up(
+        "CREATE TABLE IF NOT EXISTS edges (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo      TEXT NOT NULL,
+            src_id    INTEGER NOT NULL REFERENCES nodes(id),
+            dst_id    INTEGER NOT NULL REFERENCES nodes(id),
+            relation  TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_edges_repo_src ON edges(repo, src_id);
+        CREATE INDEX IF NOT EXISTS idx_edges_repo_dst ON edges(repo, dst_id);",
+    ),
+    M::up(
+        "CREATE TABLE IF NOT EXISTS scan_history (
+            id               INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo             TEXT NOT NULL,
+            started_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            files_added      INTEGER NOT NULL DEFAULT 0,
+            files_changed    INTEGER NOT NULL DEFAULT 0,
+            files_removed    INTEGER NOT NULL DEFAULT 0,
+            symbols_added    INTEGER NOT NULL DEFAULT 0,
+            symbols_changed  INTEGER NOT NULL DEFAULT 0,
+            symbols_removed  INTEGER NOT NULL DEFAULT 0,
+            notes_added      INTEGER NOT NULL DEFAULT 0
+        );
+        CREATE INDEX IF NOT EXISTS idx_scan_history_repo ON scan_history(repo, started_at);",
+    ),
+    M::up(
+        // node_id is deliberately not a hard FK to nodes(id): a Removed
+        // entry's node has already been deleted by the time this table is
+        // read back.
+        "CREATE TABLE IF NOT EXISTS scan_history_entries (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            scan_id  INTEGER NOT NULL REFERENCES scan_history(id),
+            node_id  INTEGER NOT NULL,
+            kind     TEXT NOT NULL,
+            path     TEXT,
+            name     TEXT,
+            change   TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_scan_history_entries_scan ON scan_history_entries(scan_id);",
+    ),
+    // Module A: weighted, decaying `Affects` edges. `weight`'s `DEFAULT 1.0`
+    // is a real constant, allowed directly in `ALTER TABLE ADD COLUMN`.
+    // `updated_at` can't use `DEFAULT CURRENT_TIMESTAMP` the same way —
+    // confirmed against SQLite's own source that `ADD COLUMN` rejects any
+    // non-constant default ("Cannot add a column with non-constant
+    // default"), so it gets a constant placeholder default instead,
+    // immediately backfilled via `UPDATE` (which has no such restriction).
+    // Every future `add_edge` INSERT sets `updated_at` explicitly, so the
+    // `''` placeholder is only ever seen by this one backfill step.
+    M::up(
+        "ALTER TABLE edges ADD COLUMN weight REAL NOT NULL DEFAULT 1.0;
+        ALTER TABLE edges ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';
+        UPDATE edges SET updated_at = CURRENT_TIMESTAMP WHERE updated_at = '';",
+    ),
+    // Module C: repo state (state memory) — a single upserted-in-place
+    // snapshot row per repo, not a history table.
+    M::up(
+        "CREATE TABLE IF NOT EXISTS repo_state (
+            repo             TEXT PRIMARY KEY,
+            updated_at       TEXT NOT NULL,
+            last_scan_id     INTEGER,
+            top_gotcha_ids   TEXT NOT NULL,
+            top_decision_ids TEXT NOT NULL
+        );",
+    ),
+];
 
-    CREATE TABLE IF NOT EXISTS edges (
-        id        INTEGER PRIMARY KEY AUTOINCREMENT,
-        repo      TEXT NOT NULL,
-        src_id    INTEGER NOT NULL REFERENCES nodes(id),
-        dst_id    INTEGER NOT NULL REFERENCES nodes(id),
-        relation  TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_edges_repo_src ON edges(repo, src_id);
-    CREATE INDEX IF NOT EXISTS idx_edges_repo_dst ON edges(repo, dst_id);
-
-    CREATE TABLE IF NOT EXISTS scan_history (
-        id               INTEGER PRIMARY KEY AUTOINCREMENT,
-        repo             TEXT NOT NULL,
-        started_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-        files_added      INTEGER NOT NULL DEFAULT 0,
-        files_changed    INTEGER NOT NULL DEFAULT 0,
-        files_removed    INTEGER NOT NULL DEFAULT 0,
-        symbols_added    INTEGER NOT NULL DEFAULT 0,
-        symbols_changed  INTEGER NOT NULL DEFAULT 0,
-        symbols_removed  INTEGER NOT NULL DEFAULT 0,
-        notes_added      INTEGER NOT NULL DEFAULT 0
-    );
-    CREATE INDEX IF NOT EXISTS idx_scan_history_repo ON scan_history(repo, started_at);
-
-    -- node_id is deliberately not a hard FK to nodes(id): a Removed entry's
-    -- node has already been deleted by the time this table is read back.
-    CREATE TABLE IF NOT EXISTS scan_history_entries (
-        id       INTEGER PRIMARY KEY AUTOINCREMENT,
-        scan_id  INTEGER NOT NULL REFERENCES scan_history(id),
-        node_id  INTEGER NOT NULL,
-        kind     TEXT NOT NULL,
-        path     TEXT,
-        name     TEXT,
-        change   TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_scan_history_entries_scan ON scan_history_entries(scan_id);
-";
+fn migrations() -> Migrations<'static> {
+    Migrations::from_slice(MIGRATIONS_SLICE)
+}
 
 pub struct SqliteGraphStore {
     conn: Connection,
@@ -102,14 +145,19 @@ pub struct SqliteGraphStore {
 impl SqliteGraphStore {
     pub fn open(path: &Path) -> Result<Self> {
         ensure_vec_extension_registered();
-        let conn = agentops_sqlite_support::open(path, MIGRATIONS)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("creating parent dir for {}", path.display()))?;
+        }
+        let mut conn = Connection::open(path).with_context(|| format!("opening sqlite db at {}", path.display()))?;
+        migrations().to_latest(&mut conn).context("running graph store migrations")?;
         conn.execute_batch(&vec_table_migration()).context("creating node_vectors virtual table")?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         ensure_vec_extension_registered();
-        let conn = agentops_sqlite_support::open_in_memory(MIGRATIONS)?;
+        let mut conn = Connection::open_in_memory().context("opening in-memory sqlite db")?;
+        migrations().to_latest(&mut conn).context("running graph store migrations")?;
         conn.execute_batch(&vec_table_migration()).context("creating node_vectors virtual table")?;
         Ok(Self { conn })
     }
@@ -131,7 +179,27 @@ impl SqliteGraphStore {
 
     fn row_to_edge(row: &rusqlite::Row) -> rusqlite::Result<Edge> {
         let relation: String = row.get("relation")?;
-        Ok(Edge { id: row.get("id")?, repo: row.get("repo")?, src_id: row.get("src_id")?, dst_id: row.get("dst_id")?, relation: EdgeRelation::from_db_str(&relation) })
+        Ok(Edge {
+            id: row.get("id")?,
+            repo: row.get("repo")?,
+            src_id: row.get("src_id")?,
+            dst_id: row.get("dst_id")?,
+            relation: EdgeRelation::from_db_str(&relation),
+            weight: row.get("weight")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
+
+    fn row_to_repo_state(row: &rusqlite::Row) -> rusqlite::Result<RepoState> {
+        let top_gotcha_ids: String = row.get("top_gotcha_ids")?;
+        let top_decision_ids: String = row.get("top_decision_ids")?;
+        Ok(RepoState {
+            repo: row.get("repo")?,
+            updated_at: row.get("updated_at")?,
+            last_scan_id: row.get("last_scan_id")?,
+            top_gotcha_ids: serde_json::from_str(&top_gotcha_ids).unwrap_or_default(),
+            top_decision_ids: serde_json::from_str(&top_decision_ids).unwrap_or_default(),
+        })
     }
 
     fn row_to_scan_history(row: &rusqlite::Row) -> rusqlite::Result<ScanHistory> {
@@ -216,11 +284,24 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn add_edge(&self, repo: &str, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64> {
+        // `updated_at` is set explicitly here rather than relying on a
+        // schema DEFAULT — SQLite's ALTER TABLE ADD COLUMN can't take
+        // CURRENT_TIMESTAMP as a default (confirmed against SQLite's own
+        // source: "Cannot add a column with non-constant default"), so the
+        // column has no live default at all; every insert must supply it.
         self.conn.execute(
-            "INSERT INTO edges (repo, src_id, dst_id, relation) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO edges (repo, src_id, dst_id, relation, weight, updated_at) VALUES (?1, ?2, ?3, ?4, 1.0, CURRENT_TIMESTAMP)",
             rusqlite::params![repo, src_id, dst_id, relation.as_db_str()],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    fn reinforce_edge(&self, repo: &str, edge_id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE edges SET weight = MIN(weight + 0.5, 5.0), updated_at = CURRENT_TIMESTAMP WHERE repo = ?1 AND id = ?2",
+            rusqlite::params![repo, edge_id],
+        )?;
+        Ok(())
     }
 
     fn edges_from(&self, repo: &str, src_id: i64) -> Result<Vec<Edge>> {
@@ -347,6 +428,31 @@ impl GraphStore for SqliteGraphStore {
             }
         }
         Ok(hits)
+    }
+
+    fn refresh_repo_state(&self, repo: &str) -> Result<RepoState> {
+        let top_gotcha_ids = crate::rank_notes_by_weight(self, repo, NodeKind::Gotcha)?;
+        let top_decision_ids = crate::rank_notes_by_weight(self, repo, NodeKind::Decision)?;
+        let last_scan_id = self.latest_scan(repo)?.map(|s| s.id);
+        let now: String = self.conn.query_row("SELECT CURRENT_TIMESTAMP", [], |r| r.get(0))?;
+        let gotcha_json = serde_json::to_string(&top_gotcha_ids)?;
+        let decision_json = serde_json::to_string(&top_decision_ids)?;
+
+        agentops_sqlite_support::upsert(
+            &self.conn,
+            "repo_state",
+            &["repo", "updated_at", "last_scan_id", "top_gotcha_ids", "top_decision_ids"],
+            &["repo"],
+            &[&repo, &now, &last_scan_id, &gotcha_json, &decision_json],
+        )?;
+
+        Ok(RepoState { repo: repo.to_string(), updated_at: now, last_scan_id, top_gotcha_ids, top_decision_ids })
+    }
+
+    fn get_repo_state(&self, repo: &str) -> Result<Option<RepoState>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM repo_state WHERE repo = ?1")?;
+        let mut rows = stmt.query_map([repo], Self::row_to_repo_state)?;
+        Ok(rows.next().transpose()?)
     }
 }
 
@@ -561,5 +667,104 @@ mod tests {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let id = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
         assert!(store.set_embedding("repo-b", id, &unit_vec(0)).is_err());
+    }
+
+    #[test]
+    fn new_edges_start_at_weight_one_with_a_real_timestamp() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("g"))).unwrap();
+        let b = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        let edge_id = store.add_edge("repo-a", a, b, EdgeRelation::Affects).unwrap();
+
+        let edge = store.edges_from("repo-a", a).unwrap().into_iter().find(|e| e.id == edge_id).unwrap();
+        assert_eq!(edge.weight, 1.0);
+        assert!(!edge.updated_at.is_empty(), "updated_at must be populated on insert, not left blank");
+    }
+
+    #[test]
+    fn reinforce_edge_bumps_weight_and_caps_it() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("g"))).unwrap();
+        let b = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        let edge_id = store.add_edge("repo-a", a, b, EdgeRelation::Affects).unwrap();
+
+        for _ in 0..20 {
+            store.reinforce_edge("repo-a", edge_id).unwrap();
+        }
+
+        let edge = store.edges_from("repo-a", a).unwrap().into_iter().find(|e| e.id == edge_id).unwrap();
+        assert_eq!(edge.weight, 5.0, "weight must be capped, not grow unbounded");
+    }
+
+    #[test]
+    fn reinforce_edge_is_repo_scoped() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("g"))).unwrap();
+        let b = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        let edge_id = store.add_edge("repo-a", a, b, EdgeRelation::Affects).unwrap();
+
+        store.reinforce_edge("repo-b", edge_id).unwrap();
+
+        let edge = store.edges_from("repo-a", a).unwrap().into_iter().find(|e| e.id == edge_id).unwrap();
+        assert_eq!(edge.weight, 1.0, "reinforcing under the wrong repo must not affect the real edge");
+    }
+
+    #[test]
+    fn refresh_repo_state_ranks_gotchas_by_reinforced_weight() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let popular = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("popular"))).unwrap();
+        let rare = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("rare"))).unwrap();
+        let sym = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+
+        let popular_edge = store.add_edge("repo-a", popular, sym, EdgeRelation::Affects).unwrap();
+        store.add_edge("repo-a", rare, sym, EdgeRelation::Affects).unwrap();
+        store.reinforce_edge("repo-a", popular_edge).unwrap();
+        store.reinforce_edge("repo-a", popular_edge).unwrap();
+
+        let state = store.refresh_repo_state("repo-a").unwrap();
+        assert_eq!(state.top_gotcha_ids, vec![popular, rare], "the more-reinforced gotcha must rank first");
+        assert!(state.top_decision_ids.is_empty());
+
+        let cached = store.get_repo_state("repo-a").unwrap().unwrap();
+        assert_eq!(cached.top_gotcha_ids, state.top_gotcha_ids, "get_repo_state must return what refresh_repo_state just persisted");
+    }
+
+    #[test]
+    fn get_repo_state_returns_none_before_any_refresh() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        assert!(store.get_repo_state("repo-a").unwrap().is_none());
+    }
+
+    /// The exact scenario this repo's own `.context/graph.db` is in:
+    /// existing rows from before `rusqlite_migration` existed, at the
+    /// SQLite default `user_version = 0`. Confirms the migration both adds
+    /// the new columns/table *and* leaves existing rows intact.
+    #[test]
+    fn migrating_a_pre_existing_database_preserves_rows_and_adds_new_columns() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // Simulate the old, pre-migration-library schema: no weight/updated_at
+        // columns, no repo_state table — exactly what MIGRATIONS_SLICE's
+        // first four steps produce.
+        conn.execute_batch(
+            "CREATE TABLE nodes (id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, repo TEXT NOT NULL, path TEXT, name TEXT, container TEXT, start_line INTEGER, end_line INTEGER, content TEXT);
+             CREATE TABLE edges (id INTEGER PRIMARY KEY AUTOINCREMENT, repo TEXT NOT NULL, src_id INTEGER NOT NULL, dst_id INTEGER NOT NULL, relation TEXT NOT NULL);
+             INSERT INTO nodes (kind, repo, name) VALUES ('gotcha', 'repo-a', 'pre-existing');
+             INSERT INTO edges (repo, src_id, dst_id, relation) VALUES ('repo-a', 1, 1, 'affects');",
+        )
+        .unwrap();
+
+        let mut conn = conn;
+        migrations().to_latest(&mut conn).unwrap();
+
+        let mut store = SqliteGraphStore { conn };
+        let node = store.get_node("repo-a", 1).unwrap().unwrap();
+        assert_eq!(node.name.as_deref(), Some("pre-existing"), "pre-existing row must survive the migration");
+
+        let edge = store.edges_from("repo-a", 1).unwrap().into_iter().next().unwrap();
+        assert_eq!(edge.weight, 1.0, "pre-existing edges must backfill to the default weight");
+        assert!(!edge.updated_at.is_empty(), "pre-existing edges must backfill a real updated_at, not stay blank");
+
+        // Running it again must be a true no-op, not an error or a second backfill.
+        migrations().to_latest(&mut store.conn).unwrap();
     }
 }

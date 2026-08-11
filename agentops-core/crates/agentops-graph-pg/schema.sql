@@ -43,6 +43,18 @@ CREATE TABLE IF NOT EXISTS edges (
 CREATE INDEX IF NOT EXISTS idx_edges_repo_src ON edges(repo, src_id);
 CREATE INDEX IF NOT EXISTS idx_edges_repo_dst ON edges(repo, dst_id);
 
+-- Weighted, decaying `Affects` edges (see `agentops_graph::effective_weight`):
+-- `IF NOT EXISTS` on `ADD COLUMN` is real Postgres syntax (unlike SQLite,
+-- which has no equivalent — see `agentops-graph/src/sqlite.rs`'s
+-- `rusqlite_migration`-based approach instead), so a plain `ALTER TABLE`
+-- here is enough to reach an already-populated `edges` table too, not just
+-- a fresh one. `TIMESTAMPTZ`, matching `scan_history.started_at`'s existing
+-- convention, not `TEXT` — the Rust side reads it back cast to text (see
+-- `EDGES_COLUMNS` in `src/lib.rs`), the same pattern `SCAN_HISTORY_COLUMNS`
+-- already established for `started_at`.
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS weight DOUBLE PRECISION NOT NULL DEFAULT 1.0;
+ALTER TABLE edges ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+
 CREATE TABLE IF NOT EXISTS scan_history (
     id               BIGSERIAL PRIMARY KEY,
     repo             TEXT NOT NULL,
@@ -69,3 +81,15 @@ CREATE TABLE IF NOT EXISTS scan_history_entries (
     change   TEXT NOT NULL CHECK (change IN ('added', 'changed', 'removed'))
 );
 CREATE INDEX IF NOT EXISTS idx_scan_history_entries_scan ON scan_history_entries(scan_id);
+
+-- Repo state (state memory): a single upserted-in-place snapshot row per
+-- repo, deliberately not a history table (that's node_versions'/bi-temporal
+-- versioning's job for node content) — "what does this repo's graph
+-- currently think matters most."
+CREATE TABLE IF NOT EXISTS repo_state (
+    repo             TEXT PRIMARY KEY,
+    updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_scan_id     BIGINT,
+    top_gotcha_ids   TEXT NOT NULL,
+    top_decision_ids TEXT NOT NULL
+);

@@ -8,7 +8,7 @@
 //! notes folder are the *same* code path here — both are just a directory
 //! of Markdown files, some with frontmatter and some without.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use agentops_graph::{upsert_node, EdgeRelation, GraphStore, NewNode, NodeKind};
@@ -224,20 +224,34 @@ pub fn match_symbols(store: &dyn GraphStore, repo: &str, note_body: &str, min_na
     Ok(matches)
 }
 
-/// Connects `note_id` to every id in `targets` via `relation`, skipping any
-/// edge that already exists so re-running ingestion on unchanged notes
-/// doesn't accumulate duplicate edges.
-pub fn connect_many(store: &dyn GraphStore, repo: &str, note_id: i64, targets: &[i64], relation: EdgeRelation) -> Result<usize> {
-    let existing: HashSet<i64> = store.edges_from(repo, note_id)?.into_iter().filter(|e| e.relation == relation).map(|e| e.dst_id).collect();
-    let mut connected = 0;
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectSummary {
+    pub added: usize,
+    pub reinforced: usize,
+}
+
+/// Connects `note_id` to every id in `targets` via `relation`. An edge that
+/// already exists is **reinforced** (its weight bumped, see
+/// `GraphStore::reinforce_edge`) rather than silently skipped, so a note
+/// that keeps matching the same symbol across repeated ingestions (e.g.
+/// every rescan) strengthens that relationship over time instead of the
+/// second-and-later ingestions being a true no-op.
+pub fn connect_many(store: &dyn GraphStore, repo: &str, note_id: i64, targets: &[i64], relation: EdgeRelation) -> Result<ConnectSummary> {
+    let existing: HashMap<i64, i64> = store.edges_from(repo, note_id)?.into_iter().filter(|e| e.relation == relation).map(|e| (e.dst_id, e.id)).collect();
+    let mut summary = ConnectSummary::default();
     for &target_id in targets {
-        if existing.contains(&target_id) {
-            continue;
+        match existing.get(&target_id) {
+            Some(&edge_id) => {
+                store.reinforce_edge(repo, edge_id)?;
+                summary.reinforced += 1;
+            }
+            None => {
+                store.add_edge(repo, note_id, target_id, relation)?;
+                summary.added += 1;
+            }
         }
-        store.add_edge(repo, note_id, target_id, relation)?;
-        connected += 1;
     }
-    Ok(connected)
+    Ok(summary)
 }
 
 /// Picks which candidate symbols a note is actually about — the seam an
@@ -269,6 +283,7 @@ pub struct IngestSummary {
     pub notes_seen: usize,
     pub notes_written: usize,
     pub edges_written: usize,
+    pub edges_reinforced: usize,
 }
 
 /// Ingests `notes` into `repo`'s graph: one node per `VaultNote`
@@ -301,7 +316,9 @@ pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], mat
         summary.notes_written += 1;
 
         let targets = matcher.match_symbols(store, repo, &note.body)?;
-        summary.edges_written += connect_many(store, repo, note_id, &targets, EdgeRelation::Affects)?;
+        let connected = connect_many(store, repo, note_id, &targets, EdgeRelation::Affects)?;
+        summary.edges_written += connected.added;
+        summary.edges_reinforced += connected.reinforced;
     }
 
     Ok(summary)
@@ -424,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn connect_many_dedupes_against_already_existing_edges() {
+    fn connect_many_reinforces_instead_of_duplicating_an_existing_edge() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let note_id = store.add_node(NewNode { kind: NodeKind::Note, repo: "demo".into(), path: None, name: Some("n".into()), container: None, start_line: None, end_line: None, content: Some("x".into()) }).unwrap();
         let target_id = upsert_node(&store, node("demo", "a.rs", "f")).unwrap();
@@ -432,9 +449,12 @@ mod tests {
         let first = connect_many(&store, "demo", note_id, &[target_id], EdgeRelation::Affects).unwrap();
         let second = connect_many(&store, "demo", note_id, &[target_id], EdgeRelation::Affects).unwrap();
 
-        assert_eq!(first, 1);
-        assert_eq!(second, 0, "re-connecting the same target must not duplicate the edge");
-        assert_eq!(store.edges_from("demo", note_id).unwrap().len(), 1);
+        assert_eq!(first, ConnectSummary { added: 1, reinforced: 0 });
+        assert_eq!(second, ConnectSummary { added: 0, reinforced: 1 }, "re-connecting the same target must reinforce it, not duplicate or silently no-op");
+
+        let edges = store.edges_from("demo", note_id).unwrap();
+        assert_eq!(edges.len(), 1, "still exactly one edge, not duplicated");
+        assert_eq!(edges[0].weight, 1.5, "the second call's reinforcement must have bumped the weight");
     }
 
     #[test]

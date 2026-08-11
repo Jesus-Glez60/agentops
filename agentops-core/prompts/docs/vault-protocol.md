@@ -1,5 +1,36 @@
 # NOTES WRITE-BACK PROTOCOL
 
+## WHEN TO WRITE — don't wait for session end
+
+A real finding written only at "session end" is a finding that gets
+forgotten if the session ends abruptly, gets batched into one vague summary
+note instead of one node per distinct fact, or just never happens because
+"end of session" never felt like the right moment. Write at these points
+instead, as they happen:
+
+1. **Start of session, before substantial work begins.** Check for
+   already-recorded gotchas/decisions relevant to the task (`list_gotchas`,
+   `search`/`semantic_search`, or `get_symbol` on the specific code you're
+   about to touch) — so prior findings inform the work instead of being
+   silently rediscovered or contradicted.
+2. **During planning, the moment a real finding surfaces — not deferred
+   until the plan is done.** Research/audit work regularly turns up things
+   worth keeping: a library's real constraint found by checking its docs
+   (not assumed), a dependency-version conflict, a schema/API restriction
+   that would have shipped broken, an architectural decision made and the
+   reasoning behind it. Each one of these is its **own** note the moment
+   it's confirmed — not held until the end and folded into a single
+   catch-all summary. A summary note that says "also fixed several issues"
+   is not queryable the way `get_symbol`/`search` need it to be; five
+   distinct findings need five distinct nodes to individually resurface
+   later against the code they actually affect.
+3. **Session end.** The existing sweep — anything not already written
+   incrementally above gets caught here, not as the *only* mechanism.
+
+If you're unsure whether something is "worth" a note: if it changed a
+decision, contradicted an assumption, or would have caused a real bug had
+it not been caught, it's worth a note.
+
 ## ABSOLUTE RULES — Never deviate
 
 1. **ALWAYS read `AGENTS.md`** before writing a note. Extract the exact `NOTES_PATH`.

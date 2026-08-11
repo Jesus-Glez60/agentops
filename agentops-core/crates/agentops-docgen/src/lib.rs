@@ -18,8 +18,12 @@ use agentops_graph::{EdgeRelation, GraphStore, NodeKind};
 pub fn render_onboarding_doc(store: &dyn GraphStore, repo_name: &str, ranked_paths: &[std::path::PathBuf]) -> anyhow::Result<String> {
     let all_symbols = store.nodes_by_kind(repo_name, NodeKind::Symbol)?;
     let all_files = store.nodes_by_kind(repo_name, NodeKind::File)?;
-    let all_gotchas = store.nodes_by_kind(repo_name, NodeKind::Gotcha)?;
-    let all_decisions = store.nodes_by_kind(repo_name, NodeKind::Decision)?;
+    let mut all_gotchas = store.nodes_by_kind(repo_name, NodeKind::Gotcha)?;
+    let mut all_decisions = store.nodes_by_kind(repo_name, NodeKind::Decision)?;
+    // Most-reinforced first, so an agent reading this doc top-to-bottom
+    // sees what actually matters before what's floated by unconfirmed.
+    sort_notes_by_weight(store, repo_name, &mut all_gotchas)?;
+    sort_notes_by_weight(store, repo_name, &mut all_decisions)?;
 
     let mut out = String::new();
     out.push_str(&format!("# {repo_name} — engineering overview\n\n"));
@@ -82,8 +86,9 @@ fn render_notes(out: &mut String, store: &dyn GraphStore, repo_name: &str, notes
         let text = note.content.as_deref().unwrap_or("");
         out.push_str(&format!("**{name}**\n\n{text}\n\n"));
 
-        let edges = store.edges_from(repo_name, note.id)?;
-        for edge in edges.iter().filter(|e| e.relation == EdgeRelation::Affects) {
+        let mut edges: Vec<_> = store.edges_from(repo_name, note.id)?.into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
+        edges.sort_by(|a, b| edge_score(b).partial_cmp(&edge_score(a)).unwrap_or(std::cmp::Ordering::Equal));
+        for edge in &edges {
             if let Some(target) = store.get_node(repo_name, edge.dst_id)? {
                 let target_name = target.name.as_deref().unwrap_or("<unknown>");
                 let target_path = target.path.as_deref().unwrap_or("");
@@ -97,6 +102,25 @@ fn render_notes(out: &mut String, store: &dyn GraphStore, repo_name: &str, notes
 
 fn gotchas_affecting(store: &dyn GraphStore, repo_name: &str, symbol_id: i64) -> anyhow::Result<Vec<agentops_graph::Edge>> {
     Ok(store.edges_to(repo_name, symbol_id)?.into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect())
+}
+
+fn edge_score(edge: &agentops_graph::Edge) -> f64 {
+    agentops_graph::effective_weight(edge.weight, agentops_graph::age_days(&edge.updated_at))
+}
+
+/// Sorts `notes` (Gotcha/Decision nodes) by the sum of `effective_weight`
+/// across their own outgoing `Affects` edges, highest first — the same
+/// scoring `agentops_graph::rank_notes_by_weight` uses for `RepoState`'s
+/// top-5 cache, just applied here to the *full* list rather than truncated,
+/// since this doc is meant to show everything, in relevance order.
+fn sort_notes_by_weight(store: &dyn GraphStore, repo_name: &str, notes: &mut [agentops_graph::Node]) -> anyhow::Result<()> {
+    let mut scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::with_capacity(notes.len());
+    for note in notes.iter() {
+        let score: f64 = store.edges_from(repo_name, note.id)?.iter().filter(|e| e.relation == EdgeRelation::Affects).map(edge_score).sum();
+        scores.insert(note.id, score);
+    }
+    notes.sort_by(|a, b| scores[&b.id].partial_cmp(&scores[&a.id]).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(())
 }
 
 /// Writes the rendered doc to `path` (typically `<repo>/repo-map.md`).
@@ -166,6 +190,28 @@ mod tests {
         assert!(doc.contains("## Decisions"));
         assert!(doc.contains("passphrase-not-yet-kms-backed"));
         assert!(doc.contains("Affects: `generate_deploy_keypair_for_repo` in `src/keys.rs`"));
+    }
+
+    #[test]
+    fn known_gotchas_are_ordered_by_reinforced_weight_not_insertion_order() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let symbol_id = store.add_node(node(NodeKind::Symbol, Some("src/auth.rs"), Some("verify_token"), Some(1), Some(2), Some("fn verify_token() {}"))).unwrap();
+
+        // Inserted first, but never reinforced.
+        let rare_id = store.add_node(node(NodeKind::Gotcha, None, Some("rare-issue"), None, None, Some("Rarely hit."))).unwrap();
+        let rare_edge = store.add_edge("demo", rare_id, symbol_id, EdgeRelation::Affects).unwrap();
+        let _ = rare_edge;
+
+        // Inserted second, but reinforced repeatedly — must still rank first.
+        let popular_id = store.add_node(node(NodeKind::Gotcha, None, Some("popular-issue"), None, None, Some("Hit constantly."))).unwrap();
+        let popular_edge = store.add_edge("demo", popular_id, symbol_id, EdgeRelation::Affects).unwrap();
+        store.reinforce_edge("demo", popular_edge).unwrap();
+        store.reinforce_edge("demo", popular_edge).unwrap();
+
+        let doc = render_onboarding_doc(&store, "demo", &[PathBuf::from("src/auth.rs")]).unwrap();
+        let popular_pos = doc.find("popular-issue").unwrap();
+        let rare_pos = doc.find("rare-issue").unwrap();
+        assert!(popular_pos < rare_pos, "the more-reinforced gotcha must render first:\n{doc}");
     }
 
     /// Regression test for the repo-scoping fix this port made over `main`'s

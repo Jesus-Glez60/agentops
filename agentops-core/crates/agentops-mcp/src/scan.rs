@@ -165,6 +165,28 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
 
     store.record_scan(&repo, &scan_entries)?;
 
+    // Module B: auto re-match already-written notes against this scan's
+    // current symbols — closes a real, previously-documented gap
+    // (`.agentops/notes/notes-written-before-first-scan-never-attach-to-
+    // symbols.md`) where a note's `Affects` edges only ever formed at write
+    // time and never automatically refreshed on a later scan. Default-on,
+    // unlike `with_embeddings`: this is pure in-process regex matching over
+    // already-loaded data (no network/LLM cost), cheap enough not to gate
+    // behind a flag. A repo with no notes yet is a fast no-op (one
+    // `is_dir` check).
+    let notes_dir = agentops_notes::resolve_notes_path(path, None);
+    if notes_dir.is_dir() {
+        let classifier = agentops_notes::HeuristicClassifier;
+        let matcher = agentops_notes::WordBoundaryMatcher::default();
+        let notes = agentops_notes::walk_vault(&notes_dir, &classifier)?;
+        agentops_notes::ingest_vault(store.as_ref(), &repo, &notes, &matcher)?;
+    }
+
+    // Module C: refresh the repo-state snapshot now that both this scan and
+    // the note re-match above are reflected in the graph — same hook point,
+    // no new trigger/schedule needed.
+    store.refresh_repo_state(&repo)?;
+
     Ok(ScanPersistSummary { files: report.files.len(), symbols: symbol_count, dependency_edges, pruned_files: pruned_files.len(), pruned_symbols: pruned_symbols.len() })
 }
 
@@ -275,6 +297,50 @@ mod tests {
         assert_eq!(symbols.len(), 2, "found: {symbols:?}");
         let containers: std::collections::HashSet<_> = symbols.iter().map(|n| n.container.as_deref()).collect();
         assert_eq!(containers, std::collections::HashSet::from([Some("Foo"), Some("Bar")]));
+    }
+
+    /// Module B's actual bug-fix proof: a note written against a repo
+    /// *before* it's ever been scanned (so there were zero symbols to match
+    /// against at write time — the exact real gap recorded as
+    /// `.agentops/notes/notes-written-before-first-scan-never-attach-to-
+    /// symbols.md` in this repo's own graph) must end up attached with no
+    /// manual `ingest-notes` step, purely from the next scan running.
+    #[test]
+    fn a_note_written_before_the_first_scan_gets_auto_attached_on_the_next_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+
+        let notes_dir = dir.path().join(".agentops").join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("token-bug.md"), "---\ntitle: \"Token bug\"\ntype: gotcha\n---\n\nverify_token has a known workaround for a bug.\n").unwrap();
+
+        // No scan has ever run yet — the note above was written completely
+        // blind to any symbol. This first scan is what must auto-attach it.
+        scan_and_persist(dir.path(), false).unwrap();
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let gotcha = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().next().expect("the note must have been ingested");
+        let edges: Vec<_> = store.edges_from(&repo, gotcha.id).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
+        assert_eq!(edges.len(), 1, "must be attached to verify_token with no manual ingest-notes step: {edges:?}");
+    }
+
+    /// Module C: a scan must leave a fresh, queryable `repo_state` snapshot
+    /// behind — no separate refresh step required.
+    #[test]
+    fn scan_and_persist_refreshes_repo_state() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let notes_dir = dir.path().join(".agentops").join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("token-bug.md"), "---\ntitle: \"Token bug\"\ntype: gotcha\n---\n\nverify_token has a known workaround for a bug.\n").unwrap();
+
+        scan_and_persist(dir.path(), false).unwrap();
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let state = store.get_repo_state(&repo).unwrap().expect("persist() must refresh repo_state, not leave it unset");
+        assert_eq!(state.top_gotcha_ids.len(), 1);
     }
 
     #[test]

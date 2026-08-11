@@ -16,6 +16,7 @@ pub struct AddNoteResult {
     pub file_path: PathBuf,
     pub note_type: agentops_notes::NoteType,
     pub edges_written: usize,
+    pub edges_reinforced: usize,
 }
 
 /// Writes a new note to the repo's resolved notes folder and ingests it
@@ -74,7 +75,7 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
         }
     }
 
-    Ok(AddNoteResult { file_path, note_type, edges_written: summary.edges_written })
+    Ok(AddNoteResult { file_path, note_type, edges_written: summary.edges_written, edges_reinforced: summary.edges_reinforced })
 }
 
 /// Walks the repo's resolved notes folder and ingests every note found —

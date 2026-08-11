@@ -1,0 +1,6 @@
+---
+title: "Postgres TIMESTAMPTZ vs SQLite TEXT requires explicit ::text casts for shared Rust types"
+type: gotcha
+---
+
+Edge.updated_at is a plain Rust String, matching SqliteGraphStore's TEXT column. Assumed schema.sql's new edges.updated_at column could just be TEXT there too for symmetry, but checked the existing scan_history.started_at column first and found agentops-graph-pg already made a different, deliberate choice: TIMESTAMPTZ (idiomatic Postgres), read back via a named SCAN_HISTORY_COLUMNS constant that casts started_at::text AS started_at so row.get::<_, String> works without pulling in chrono. Followed that exact established precedent instead of introducing a second, inconsistent convention: edges.updated_at is TIMESTAMPTZ NOT NULL DEFAULT now(), and edges_from/edges_to/all_edges switched from SELECT * to a new EDGES_COLUMNS constant with updated_at::text AS updated_at. Also affects age_days's parser in agentops-graph: it only reads the first 19 characters of the timestamp string, tolerant of Postgres's trailing fractional-seconds/timezone suffix that SQLite's CURRENT_TIMESTAMP never produces, so the same pure function works unmodified against both backends' text output.

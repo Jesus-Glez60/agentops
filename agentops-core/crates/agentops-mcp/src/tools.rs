@@ -204,12 +204,48 @@ fn repo_context(args: &Value) -> anyhow::Result<(Box<dyn GraphStore>, String)> {
 fn tool_status(args: &Value) -> anyhow::Result<String> {
     let (store, repo) = repo_context(args)?;
     match store.latest_scan(&repo)? {
-        Some(scan) => Ok(format!(
-            "repo: {repo}\nlast scan: {}\nfiles: +{} ~{} -{}\nsymbols: +{} ~{} -{}",
-            scan.started_at, scan.files_added, scan.files_changed, scan.files_removed, scan.symbols_added, scan.symbols_changed, scan.symbols_removed
-        )),
+        Some(scan) => {
+            let mut out = format!(
+                "repo: {repo}\nlast scan: {}\nfiles: +{} ~{} -{}\nsymbols: +{} ~{} -{}",
+                scan.started_at, scan.files_added, scan.files_changed, scan.files_removed, scan.symbols_added, scan.symbols_changed, scan.symbols_removed
+            );
+            out.push_str(&render_repo_state_section(store.as_ref(), &repo)?);
+            Ok(out)
+        }
         None => Ok(format!("repo: {repo}\nno scans recorded yet — call scan_repo first")),
     }
+}
+
+/// `get_repo_state` returning `None` is a real, expected state (a repo
+/// scanned before this feature existed, or one with zero gotchas/decisions
+/// ever recorded) — omit the section entirely rather than erroring or
+/// printing an empty one.
+fn render_repo_state_section(store: &dyn GraphStore, repo: &str) -> anyhow::Result<String> {
+    let Some(state) = store.get_repo_state(repo)? else {
+        return Ok(String::new());
+    };
+    if state.top_gotcha_ids.is_empty() && state.top_decision_ids.is_empty() {
+        return Ok(String::new());
+    }
+
+    let names = |ids: &[i64]| -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(node) = store.get_node(repo, id)? {
+                out.push(node.name.unwrap_or_else(|| "(untitled)".to_string()));
+            }
+        }
+        Ok(out)
+    };
+
+    let mut out = String::new();
+    if !state.top_gotcha_ids.is_empty() {
+        out.push_str(&format!("\ntop gotchas: {}", names(&state.top_gotcha_ids)?.join(", ")));
+    }
+    if !state.top_decision_ids.is_empty() {
+        out.push_str(&format!("\ntop decisions: {}", names(&state.top_decision_ids)?.join(", ")));
+    }
+    Ok(out)
 }
 
 fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
@@ -222,12 +258,15 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
 }
 
 fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
+    use agentops_graph::EdgeRelation;
+
     let (store, repo) = repo_context(args)?;
     let name = get_str(args, "name").ok_or_else(|| anyhow::anyhow!("missing required 'name'"))?;
     let file = get_str(args, "file").map(Path::new);
     let id = agentops_llm::find_symbol_by_name(store.as_ref(), &repo, name, file)?;
     let node = store.get_node(&repo, id)?.ok_or_else(|| anyhow::anyhow!("symbol resolved but node #{id} not found"))?;
-    Ok(format!(
+
+    let mut out = format!(
         "{} ({}) — {}:{}-{}\n\n{}",
         node.name.as_deref().unwrap_or(name),
         "symbol",
@@ -235,7 +274,41 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
         node.start_line.unwrap_or(0),
         node.end_line.unwrap_or(0),
         node.content.as_deref().unwrap_or("")
-    ))
+    );
+
+    // Codebrain-2's payoff: a gotcha/decision recorded against this exact
+    // symbol should resurface right here, where an agent is actually about
+    // to touch the code — not just in the full generated repo-map doc.
+    let mut affecting: Vec<_> = store.edges_to(&repo, id)?.into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
+    // Most-relevant first — reinforced, recently-matched gotchas/decisions
+    // outrank ones nobody's confirmed still apply.
+    affecting.sort_by(|a, b| {
+        let score_a = agentops_graph::effective_weight(a.weight, agentops_graph::age_days(&a.updated_at));
+        let score_b = agentops_graph::effective_weight(b.weight, agentops_graph::age_days(&b.updated_at));
+        score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if !affecting.is_empty() {
+        let mut gotchas = Vec::new();
+        let mut decisions = Vec::new();
+        for edge in &affecting {
+            if let Some(note) = store.get_node(&repo, edge.src_id)? {
+                let entry = format!("- {}: {}", note.name.as_deref().unwrap_or("(untitled)"), note.content.as_deref().unwrap_or(""));
+                match note.kind {
+                    NodeKind::Gotcha => gotchas.push(entry),
+                    NodeKind::Decision => decisions.push(entry),
+                    _ => {}
+                }
+            }
+        }
+        if !gotchas.is_empty() {
+            out.push_str(&format!("\n\n## Known gotchas affecting this symbol\n\n{}", gotchas.join("\n")));
+        }
+        if !decisions.is_empty() {
+            out.push_str(&format!("\n\n## Decisions affecting this symbol\n\n{}", decisions.join("\n")));
+        }
+    }
+
+    Ok(out)
 }
 
 fn tool_get_changelog(args: &Value) -> anyhow::Result<String> {
@@ -285,7 +358,7 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
         agentops_notes::NoteType::Knowledge => "knowledge",
         agentops_notes::NoteType::Context => "context",
     };
-    Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols).", result.file_path.display(), result.edges_written))
+    Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols, {} reinforced).", result.file_path.display(), result.edges_written, result.edges_reinforced))
 }
 
 fn tool_ingest_notes(args: &Value) -> anyhow::Result<String> {
@@ -297,7 +370,7 @@ fn tool_ingest_notes(args: &Value) -> anyhow::Result<String> {
     let summary = crate::notes::ingest_notes_dir(Path::new(path_str), explicit_notes_path.as_deref(), &classifier, &matcher, get_bool(args, "with_embeddings"))?;
 
     let notes_dir = agentops_notes::resolve_notes_path(Path::new(path_str), explicit_notes_path.as_deref());
-    Ok(format!("Ingested {} note(s) from {}, wrote {} edge(s).", summary.notes_written, notes_dir.display(), summary.edges_written))
+    Ok(format!("Ingested {} note(s) from {}, wrote {} edge(s), reinforced {}.", summary.notes_written, notes_dir.display(), summary.edges_written, summary.edges_reinforced))
 }
 
 fn tool_init_agents_md(args: &Value) -> anyhow::Result<String> {
@@ -383,6 +456,34 @@ mod tests {
     }
 
     #[test]
+    fn status_surfaces_top_gotchas_after_a_scan_with_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token bug", "body": "verify_token has a known workaround for a bug." })).unwrap();
+        // add_note alone doesn't refresh repo_state — only persist() does
+        // (Module C's hook point) — so scan again to pick it up.
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+
+        let result = call_tool(AccessMode::Full, "status", &json!({ "path": path })).unwrap();
+        assert!(result.content[0].text.contains("top gotchas"), "{:?}", result.content);
+        assert!(result.content[0].text.contains("Token bug"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn status_omits_repo_state_section_when_none_recorded_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        let result = call_tool(AccessMode::Full, "status", &json!({ "path": path })).unwrap();
+        assert!(!result.content[0].text.contains("top gotchas"), "{:?}", result.content);
+    }
+
+    #[test]
     fn unknown_tool_name_is_rejected_before_dispatch() {
         let err = call_tool(AccessMode::Full, "totally_made_up_tool", &json!({})).unwrap_err();
         assert!(err.contains("unknown tool"));
@@ -415,5 +516,63 @@ mod tests {
 
         let gotchas_result = call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path })).unwrap();
         assert!(gotchas_result.content[0].text.contains("Token bug"));
+    }
+
+    /// Codebrain-2's actual payoff: a gotcha recorded against a symbol must
+    /// resurface when that exact symbol is pulled via `get_symbol` — not
+    /// just in the separately-generated full repo-map doc. Caught a real
+    /// gap this way: `get_symbol` originally never rendered `Affects` edges
+    /// at all, and separately, notes written before a repo's first scan had
+    /// nothing to match against and stayed permanently unattached.
+    #[test]
+    fn get_symbol_surfaces_gotchas_affecting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token bug", "body": "verify_token has a known workaround for a bug." })).unwrap();
+
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "verify_token" })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("Known gotchas affecting this symbol"), "{:?}", result.content);
+        assert!(result.content[0].text.contains("Token bug"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn get_symbol_omits_the_gotchas_section_when_none_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def untouched():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "untouched" })).unwrap();
+        assert!(!result.content[0].text.contains("Known gotchas affecting this symbol"), "{:?}", result.content);
+    }
+
+    /// A repeatedly-reinforced gotcha must outrank a once-matched one when
+    /// both affect the same symbol — re-adding the same note (same title,
+    /// same body) re-matches and reinforces its existing edge via
+    /// `connect_many`, rather than creating a duplicate.
+    #[test]
+    fn get_symbol_ranks_reinforced_gotchas_before_once_matched_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Rare issue", "body": "verify_token has a rare bug." })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Reinforced issue", "body": "verify_token has a frequently-hit bug." })).unwrap();
+        // Re-adding the same title/body re-matches and reinforces its
+        // existing edge instead of duplicating it.
+        for _ in 0..3 {
+            call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Reinforced issue", "body": "verify_token has a frequently-hit bug." })).unwrap();
+        }
+
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "verify_token" })).unwrap();
+        let text = &result.content[0].text;
+        let reinforced_pos = text.find("Reinforced issue").expect("must appear");
+        let rare_pos = text.find("Rare issue").expect("must appear");
+        assert!(reinforced_pos < rare_pos, "the more-reinforced gotcha must be listed first: {text}");
     }
 }

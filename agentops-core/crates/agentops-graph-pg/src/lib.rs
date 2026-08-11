@@ -20,7 +20,7 @@
 //! already-running Tokio runtime directly (nested `block_on` panics).
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, Node, NodeKind, ScanChange, ScanHistory, ScanHistoryEntry};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, Node, NodeKind, RepoState, ScanChange, ScanHistory, ScanHistoryEntry};
 use anyhow::Result;
 
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -71,8 +71,35 @@ fn row_to_node(row: &tokio_postgres::Row) -> Node {
 
 fn row_to_edge(row: &tokio_postgres::Row) -> Edge {
     let relation: String = row.get("relation");
-    Edge { id: row.get("id"), repo: row.get("repo"), src_id: row.get("src_id"), dst_id: row.get("dst_id"), relation: EdgeRelation::from_db_str(&relation) }
+    Edge {
+        id: row.get("id"),
+        repo: row.get("repo"),
+        src_id: row.get("src_id"),
+        dst_id: row.get("dst_id"),
+        relation: EdgeRelation::from_db_str(&relation),
+        weight: row.get("weight"),
+        updated_at: row.get("updated_at"),
+    }
 }
+
+fn row_to_repo_state(row: &tokio_postgres::Row) -> RepoState {
+    let top_gotcha_ids: String = row.get("top_gotcha_ids");
+    let top_decision_ids: String = row.get("top_decision_ids");
+    RepoState {
+        repo: row.get("repo"),
+        updated_at: row.get("updated_at"),
+        last_scan_id: row.get("last_scan_id"),
+        top_gotcha_ids: serde_json::from_str(&top_gotcha_ids).unwrap_or_default(),
+        top_decision_ids: serde_json::from_str(&top_decision_ids).unwrap_or_default(),
+    }
+}
+
+// `weight`/`updated_at` are plain typed columns already (not a Postgres
+// timestamp-vs-text mismatch the way `started_at` is), except `updated_at`
+// itself: `TIMESTAMPTZ` needs the same `::text` cast `SCAN_HISTORY_COLUMNS`
+// already established for `started_at`, so `row.get::<_, String>` works
+// without a `chrono`/`time` dependency.
+const EDGES_COLUMNS: &str = "id, repo, src_id, dst_id, relation, weight, updated_at::text AS updated_at";
 
 fn row_to_scan_history(row: &tokio_postgres::Row) -> ScanHistory {
     ScanHistory {
@@ -168,15 +195,29 @@ impl GraphStore for PostgresGraphStore {
     fn add_edge(&self, repo: &str, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            let row = client.query_one("INSERT INTO edges (repo, src_id, dst_id, relation) VALUES ($1,$2,$3,$4) RETURNING id", &[&repo, &src_id, &dst_id, &relation.as_db_str()]).await?;
+            let row = client
+                .query_one(
+                    "INSERT INTO edges (repo, src_id, dst_id, relation, weight, updated_at) VALUES ($1,$2,$3,$4,1.0,now()) RETURNING id",
+                    &[&repo, &src_id, &dst_id, &relation.as_db_str()],
+                )
+                .await?;
             Ok(row.get(0))
+        })
+    }
+
+    fn reinforce_edge(&self, repo: &str, edge_id: i64) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("UPDATE edges SET weight = LEAST(weight + 0.5, 5.0), updated_at = now() WHERE repo = $1 AND id = $2", &[&repo, &edge_id]).await?;
+            Ok(())
         })
     }
 
     fn edges_from(&self, repo: &str, src_id: i64) -> Result<Vec<Edge>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            let rows = client.query("SELECT * FROM edges WHERE repo = $1 AND src_id = $2", &[&repo, &src_id]).await?;
+            let sql = format!("SELECT {EDGES_COLUMNS} FROM edges WHERE repo = $1 AND src_id = $2");
+            let rows = client.query(&sql, &[&repo, &src_id]).await?;
             Ok(rows.iter().map(row_to_edge).collect())
         })
     }
@@ -184,7 +225,8 @@ impl GraphStore for PostgresGraphStore {
     fn edges_to(&self, repo: &str, dst_id: i64) -> Result<Vec<Edge>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            let rows = client.query("SELECT * FROM edges WHERE repo = $1 AND dst_id = $2", &[&repo, &dst_id]).await?;
+            let sql = format!("SELECT {EDGES_COLUMNS} FROM edges WHERE repo = $1 AND dst_id = $2");
+            let rows = client.query(&sql, &[&repo, &dst_id]).await?;
             Ok(rows.iter().map(row_to_edge).collect())
         })
     }
@@ -192,7 +234,8 @@ impl GraphStore for PostgresGraphStore {
     fn all_edges(&self, repo: &str) -> Result<Vec<Edge>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            let rows = client.query("SELECT * FROM edges WHERE repo = $1", &[&repo]).await?;
+            let sql = format!("SELECT {EDGES_COLUMNS} FROM edges WHERE repo = $1");
+            let rows = client.query(&sql, &[&repo]).await?;
             Ok(rows.iter().map(row_to_edge).collect())
         })
     }
@@ -323,6 +366,46 @@ impl GraphStore for PostgresGraphStore {
                     (node, distance as f32)
                 })
                 .collect())
+        })
+    }
+
+    fn refresh_repo_state(&self, repo: &str) -> Result<RepoState> {
+        // Ranking uses the exact same `rank_notes_by_weight` free function
+        // `SqliteGraphStore` calls — computed in Rust, not in SQL, so the
+        // two backends can never silently diverge on what "top" means.
+        let top_gotcha_ids = rank_notes_by_weight(self, repo, NodeKind::Gotcha)?;
+        let top_decision_ids = rank_notes_by_weight(self, repo, NodeKind::Decision)?;
+        let last_scan_id = self.latest_scan(repo)?.map(|s| s.id);
+        let gotcha_json = serde_json::to_string(&top_gotcha_ids)?;
+        let decision_json = serde_json::to_string(&top_decision_ids)?;
+
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client
+                .query_one(
+                    "INSERT INTO repo_state (repo, updated_at, last_scan_id, top_gotcha_ids, top_decision_ids)
+                     VALUES ($1, now(), $2, $3, $4)
+                     ON CONFLICT (repo) DO UPDATE SET
+                        updated_at = excluded.updated_at,
+                        last_scan_id = excluded.last_scan_id,
+                        top_gotcha_ids = excluded.top_gotcha_ids,
+                        top_decision_ids = excluded.top_decision_ids
+                     RETURNING updated_at::text",
+                    &[&repo, &last_scan_id, &gotcha_json, &decision_json],
+                )
+                .await?;
+            let updated_at: String = row.get(0);
+            Ok(RepoState { repo: repo.to_string(), updated_at, last_scan_id, top_gotcha_ids, top_decision_ids })
+        })
+    }
+
+    fn get_repo_state(&self, repo: &str) -> Result<Option<RepoState>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client
+                .query_opt("SELECT repo, updated_at::text AS updated_at, last_scan_id, top_gotcha_ids, top_decision_ids FROM repo_state WHERE repo = $1", &[&repo])
+                .await?;
+            Ok(row.as_ref().map(row_to_repo_state))
         })
     }
 }

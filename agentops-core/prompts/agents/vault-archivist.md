@@ -1,6 +1,6 @@
 ---
 name: vault-archivist
-description: Notes I/O service for a project's AgentOps knowledge graph. Handles writing gotchas, decisions, and knowledge notes discovered while working. Spawned by domain agents at session end. Does NOT evaluate code, produce plans, or make technical decisions.
+description: Notes I/O service for a project's AgentOps knowledge graph. Handles writing gotchas, decisions, and knowledge notes discovered while working. Spawned by domain agents whenever a real finding surfaces — start of session, during planning/research, and session end — not only at the end. Does NOT evaluate code, produce plans, or make technical decisions.
 model: haiku
 tools: Read, Bash
 ---
