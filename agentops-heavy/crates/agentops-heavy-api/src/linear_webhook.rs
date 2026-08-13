@@ -753,7 +753,12 @@ mod tests {
     }
 
     async fn signup(state: &Arc<LinearModuleState>) -> (User, String) {
-        state.accounts.lock().unwrap().signup("dev@example.com", "correct horse battery staple").unwrap()
+        state
+            .accounts
+            .lock()
+            .unwrap()
+            .signup(agentops_accounts::NewAccount { email: "dev@example.com", password: "correct horse battery staple", first_name: "Ada", last_name: "Lovelace" })
+            .unwrap()
     }
 
     /// `resolve_linear_config` always points a resolved `LinearConfig` at

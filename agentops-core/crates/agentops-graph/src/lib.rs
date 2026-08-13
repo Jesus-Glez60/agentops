@@ -55,6 +55,45 @@ impl NodeKind {
     }
 }
 
+/// Curation state for a `Gotcha` node's `prominence` field -- same
+/// as_db_str/from_db_str-backed-TEXT-column pattern as `TaskStatus`.
+/// Curation never removes/hides a gotcha (it's permanent knowledge an
+/// agent needs to keep seeing) -- `Reduced` only lowers how prominently it
+/// ranks, always paired with a `curation_reason` explaining why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NodeProminence {
+    Full,
+    Reduced,
+}
+
+impl NodeProminence {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            NodeProminence::Full => "full",
+            NodeProminence::Reduced => "reduced",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "reduced" => NodeProminence::Reduced,
+            _ => NodeProminence::Full,
+        }
+    }
+}
+
+/// Ranking-only multiplier for a `Reduced`-prominence node's relevance
+/// score -- 1.0 (no change) for `Full`. Never apply this to a value that's
+/// also displayed as a "real" number (raw cosine similarity, BM25/RRF
+/// fused score, KNN distance) -- multiply a copy used only as a sort key,
+/// so the number shown to a human or agent stays truthful.
+pub fn prominence_rank_multiplier(prominence: NodeProminence) -> f64 {
+    match prominence {
+        NodeProminence::Full => 1.0,
+        NodeProminence::Reduced => 0.1,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EdgeRelation {
     DependsOn,
@@ -106,6 +145,18 @@ pub struct Node {
     pub start_line: Option<i64>,
     pub end_line: Option<i64>,
     pub content: Option<String>,
+    /// Curation state for a `Gotcha` node (meaningless but harmless on other
+    /// kinds) -- all three default per the column's own SQL default (not
+    /// set via `NewNode`/`add_node`), moved via the dedicated `set_curation`
+    /// mutator only. Never touched by `upsert_node`/rescans, so a curated
+    /// gotcha's prominence/reason survives every future scan.
+    pub curated: bool,
+    pub prominence: NodeProminence,
+    /// `Some` (non-empty) iff `prominence == Reduced` -- why this gotcha's
+    /// prominence was lowered, shown alongside it everywhere it surfaces
+    /// (dashboard, MCP tools, docgen, prompts) so the demotion is never a
+    /// silent, unexplained downranking.
+    pub curation_reason: Option<String>,
 }
 
 /// Fields needed to add a node; `id` is assigned by the store.
@@ -407,6 +458,15 @@ pub trait GraphStore {
     /// Updates in place, preserving `id` — so edges into/out of this node
     /// (e.g. a `Gotcha`'s `Affects` edge) survive a rescan.
     fn update_node(&self, repo: &str, id: i64, start_line: Option<i64>, end_line: Option<i64>, content: Option<String>) -> Result<()>;
+    /// Marks a node curated and sets its prominence in one call -- there's
+    /// no standalone "mark curated but change nothing" action, since
+    /// choosing a prominence *is* the curation act. `reason` should be
+    /// `Some` (non-empty) when `prominence` is `Reduced`, `None` when
+    /// `Full` -- enforced by the API layer, not the store. A separate
+    /// mutator, not a new `update_node` parameter, so `upsert_node`
+    /// (called by every rescan/note-ingest) never touches it: a gotcha's
+    /// curation survives every future rescan the same way an embedding does.
+    fn set_curation(&self, repo: &str, node_id: i64, prominence: NodeProminence, reason: Option<&str>) -> Result<()>;
     fn delete_nodes(&self, repo: &str, ids: &[i64]) -> Result<()>;
 
     fn add_edge(&self, repo: &str, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64>;
@@ -544,16 +604,21 @@ pub fn rank_notes_by_weight(store: &dyn GraphStore, repo: &str, kind: NodeKind) 
     let nodes = store.nodes_by_kind(repo, kind)?;
     let mut scored: Vec<(i64, f64)> = Vec::with_capacity(nodes.len());
     for node in &nodes {
-        let score: f64 = store
-            .edges_from(repo, node.id)?
-            .iter()
-            .filter(|e| e.relation == EdgeRelation::Affects)
-            .map(|e| effective_weight(e.weight, age_days(&e.updated_at)))
-            .sum();
-        scored.push((node.id, score));
+        scored.push((node.id, note_score(store, repo, node)?));
     }
     scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     Ok(scored.into_iter().take(5).map(|(id, _)| id).collect())
+}
+
+/// A note's (Gotcha/Decision) overall relevance score: the sum of
+/// `effective_weight` across its own outgoing `Affects` edges, damped by
+/// `prominence_rank_multiplier` if it's been curated down. Shared by
+/// `rank_notes_by_weight` (above) and `agentops-docgen`'s full-list
+/// ordering, which previously each summed this independently -- one
+/// implementation instead of two crates hand-kept in sync.
+pub fn note_score(store: &dyn GraphStore, repo: &str, node: &Node) -> Result<f64> {
+    let raw: f64 = store.edges_from(repo, node.id)?.iter().filter(|e| e.relation == EdgeRelation::Affects).map(|e| effective_weight(e.weight, age_days(&e.updated_at))).sum();
+    Ok(raw * prominence_rank_multiplier(node.prominence))
 }
 
 /// Natural-key upsert: finds an existing node by `(repo, kind, path, name,

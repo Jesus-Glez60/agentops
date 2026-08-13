@@ -11,7 +11,7 @@
 
 use std::path::Path;
 
-use agentops_graph::{upsert_node, EdgeRelation, GraphStore, NewNode, Node, NodeKind};
+use agentops_graph::{upsert_node, EdgeRelation, GraphStore, NewNode, Node, NodeKind, NodeProminence};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -124,7 +124,7 @@ pub fn call_anthropic(config: &AnthropicConfig, prompt: &str) -> Result<LlmCallR
 /// already `Affects`-connected to it. Does NOT include full file content or
 /// sibling symbols' source — both cost and prompt-injection surface scale
 /// with what's included here.
-fn build_prompt(symbol: &Node, dep_paths: &[String], existing_notes: &[(NodeKind, String, String)]) -> String {
+fn build_prompt(symbol: &Node, dep_paths: &[String], existing_notes: &[(NodeKind, String, String, NodeProminence, Option<String>)]) -> String {
     let mut prompt = format!(
         "You are documenting a codebase. Explain concisely what this symbol does and why it might exist, for a developer or AI agent reading the code for the first time.\n\n\
          Symbol: {}\nFile: {}\n\n```\n{}\n```\n",
@@ -139,8 +139,17 @@ fn build_prompt(symbol: &Node, dep_paths: &[String], existing_notes: &[(NodeKind
 
     if !existing_notes.is_empty() {
         prompt.push_str("\nKnown notes already recorded against this symbol (acknowledge these if relevant, don't contradict them):\n");
-        for (kind, title, text) in existing_notes {
-            prompt.push_str(&format!("- [{kind:?}] {title}: {text}\n"));
+        for (kind, title, text, prominence, reason) in existing_notes {
+            // A curated-down note is still shown (it may still be
+            // relevant), just flagged so the model weighs it as lower
+            // confidence and understands why, instead of treating every
+            // recorded note as equally authoritative.
+            let demoted = if *prominence == NodeProminence::Reduced {
+                format!(" [lower confidence -- prominence reduced: {}]", reason.as_deref().unwrap_or("no reason recorded"))
+            } else {
+                String::new()
+            };
+            prompt.push_str(&format!("- [{kind:?}] {title}: {text}{demoted}\n"));
         }
     }
 
@@ -176,13 +185,13 @@ pub fn explain_symbol(store: &dyn GraphStore, config: &AnthropicConfig, repo: &s
         })
         .unwrap_or_default();
 
-    let existing_notes: Vec<(NodeKind, String, String)> = store
+    let existing_notes: Vec<(NodeKind, String, String, NodeProminence, Option<String>)> = store
         .edges_to(repo, symbol_id)?
         .into_iter()
         .filter(|e| e.relation == EdgeRelation::Affects)
         .filter_map(|e| store.get_node(repo, e.src_id).ok().flatten())
         .filter(|n| matches!(n.kind, NodeKind::Gotcha | NodeKind::Decision))
-        .map(|n| (n.kind, n.name.clone().unwrap_or_default(), n.content.clone().unwrap_or_default()))
+        .map(|n| (n.kind, n.name.clone().unwrap_or_default(), n.content.clone().unwrap_or_default(), n.prominence, n.curation_reason.clone()))
         .collect();
 
     let prompt = build_prompt(&symbol, &dep_paths, &existing_notes);
@@ -395,13 +404,37 @@ mod tests {
             start_line: Some(1),
             end_line: Some(5),
             content: Some("fn verify_token() {}".into()),
+            curated: false,
+            prominence: NodeProminence::Full,
+            curation_reason: None,
         };
-        let prompt = build_prompt(&node, &["src/config.rs".to_string()], &[(NodeKind::Gotcha, "off-by-one".into(), "expiry bug".into())]);
+        let prompt = build_prompt(&node, &["src/config.rs".to_string()], &[(NodeKind::Gotcha, "off-by-one".into(), "expiry bug".into(), NodeProminence::Full, None)]);
         assert!(prompt.contains("verify_token"));
         assert!(prompt.contains("fn verify_token() {}"));
         assert!(prompt.contains("src/config.rs"));
         assert!(prompt.contains("off-by-one"));
         assert!(prompt.contains("expiry bug"));
+    }
+
+    #[test]
+    fn build_prompt_flags_a_reduced_prominence_note_as_lower_confidence() {
+        let node = Node {
+            id: 1,
+            kind: NodeKind::Symbol,
+            repo: "demo".into(),
+            path: Some("src/auth.rs".into()),
+            name: Some("verify_token".into()),
+            container: None,
+            start_line: Some(1),
+            end_line: Some(5),
+            content: Some("fn verify_token() {}".into()),
+            curated: false,
+            prominence: NodeProminence::Full,
+            curation_reason: None,
+        };
+        let prompt = build_prompt(&node, &[], &[(NodeKind::Gotcha, "niche issue".into(), "rare edge case".into(), NodeProminence::Reduced, Some("only affects old Linux envs".into()))]);
+        assert!(prompt.contains("lower confidence"), "{prompt}");
+        assert!(prompt.contains("only affects old Linux envs"), "{prompt}");
     }
 
     #[test]

@@ -240,7 +240,7 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     println!("Linear auto-kickoff live: POST /linear/auto-kickoff (session-authed opt-in), /webhooks/linear.");
 
     app = app.merge(build_accounts_integrations_router(accounts, credentials, secrets));
-    println!("Accounts + integrations vault live: POST /auth/signup, POST /auth/login, GET /integrations, POST /integrations/{{provider}}.");
+    println!("Accounts + integrations vault live: POST /auth/signup, POST /auth/login, GET /auth/me, POST /auth/logout, GET /integrations, POST /integrations/{{provider}}.");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("agentops-heavy-api listening on {addr} (auth: {auth_status})");

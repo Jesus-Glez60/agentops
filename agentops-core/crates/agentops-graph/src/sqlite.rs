@@ -18,7 +18,7 @@ use rusqlite_migration::{Migrations, M};
 
 use agentops_embeddings::EMBEDDING_DIM;
 
-use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NewNode, NewScanHistoryEntry, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
+use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewNode, NewScanHistoryEntry, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 
@@ -233,6 +233,21 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
         END;
         INSERT INTO nodes_fts(rowid, name, content) SELECT id, name, content FROM nodes;",
     ),
+    // Gotcha review workflow: triage state for a node (meaningful for
+    // Gotcha kind, harmless/unused on others). A constant default -- unlike
+    // the earlier edges.updated_at migration, no backfill UPDATE is needed.
+    // Superseded by the curation columns below within the same session --
+    // the earlier `review_status` design modeled gotchas as bugs to close,
+    // which is wrong (see the curation columns' own comment). Dropped
+    // rather than left dead: `rusqlite` 0.40's bundled SQLite is well past
+    // 3.35 (2021), so DROP COLUMN on a plain unindexed TEXT column is safe.
+    M::up("ALTER TABLE nodes ADD COLUMN review_status TEXT NOT NULL DEFAULT 'open';"),
+    M::up(
+        "ALTER TABLE nodes DROP COLUMN review_status;
+        ALTER TABLE nodes ADD COLUMN curated INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE nodes ADD COLUMN prominence TEXT NOT NULL DEFAULT 'full';
+        ALTER TABLE nodes ADD COLUMN curation_reason TEXT;",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -265,6 +280,7 @@ impl SqliteGraphStore {
 
     fn row_to_node(row: &rusqlite::Row) -> rusqlite::Result<Node> {
         let kind: String = row.get("kind")?;
+        let prominence: String = row.get("prominence")?;
         Ok(Node {
             id: row.get("id")?,
             kind: NodeKind::from_db_str(&kind),
@@ -275,6 +291,9 @@ impl SqliteGraphStore {
             start_line: row.get("start_line")?,
             end_line: row.get("end_line")?,
             content: row.get("content")?,
+            curated: row.get("curated")?,
+            prominence: NodeProminence::from_db_str(&prominence),
+            curation_reason: row.get("curation_reason")?,
         })
     }
 
@@ -401,6 +420,14 @@ impl GraphStore for SqliteGraphStore {
         self.conn.execute(
             "UPDATE nodes SET start_line = ?1, end_line = ?2, content = ?3 WHERE repo = ?4 AND id = ?5",
             rusqlite::params![start_line, end_line, content, repo, id],
+        )?;
+        Ok(())
+    }
+
+    fn set_curation(&self, repo: &str, node_id: i64, prominence: NodeProminence, reason: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE nodes SET curated = 1, prominence = ?1, curation_reason = ?2 WHERE repo = ?3 AND id = ?4",
+            rusqlite::params![prominence.as_db_str(), reason, repo, node_id],
         )?;
         Ok(())
     }
@@ -1039,6 +1066,36 @@ mod tests {
         assert_eq!(hits[0].0.id, id);
     }
 
+    #[test]
+    fn new_nodes_default_to_uncurated_full_prominence() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("g"))).unwrap();
+        let n = store.get_node("repo-a", id).unwrap().unwrap();
+        assert!(!n.curated);
+        assert_eq!(n.prominence, NodeProminence::Full);
+        assert_eq!(n.curation_reason, None);
+    }
+
+    #[test]
+    fn set_curation_survives_a_subsequent_rescan() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let n = node("repo-a", NodeKind::Gotcha, None, Some("g"));
+        let id = upsert_node(&store, n.clone()).unwrap();
+
+        store.set_curation("repo-a", id, NodeProminence::Reduced, Some("only affects old Linux envs")).unwrap();
+        let curated = store.get_node("repo-a", id).unwrap().unwrap();
+        assert!(curated.curated);
+        assert_eq!(curated.prominence, NodeProminence::Reduced);
+        assert_eq!(curated.curation_reason.as_deref(), Some("only affects old Linux envs"));
+
+        // Same natural key upserted again, exactly what a rescan does --
+        // upsert_node must never touch curation, only set_curation.
+        upsert_node(&store, n).unwrap();
+        let after_rescan = store.get_node("repo-a", id).unwrap().unwrap();
+        assert_eq!(after_rescan.prominence, NodeProminence::Reduced, "a rescan must not silently reset a curated gotcha's prominence back to Full");
+        assert_eq!(after_rescan.curation_reason.as_deref(), Some("only affects old Linux envs"));
+    }
+
     /// Regression test for the other confirmed lifecycle pitfall: pruning a
     /// node must also clean up its `node_vectors` row, or a future
     /// `search_similar` could return a hit for a node_id that no longer
@@ -1144,6 +1201,26 @@ mod tests {
 
         let cached = store.get_repo_state("repo-a").unwrap().unwrap();
         assert_eq!(cached.top_gotcha_ids, state.top_gotcha_ids, "get_repo_state must return what refresh_repo_state just persisted");
+    }
+
+    #[test]
+    fn note_score_dampens_a_reduced_prominence_gotcha_below_an_otherwise_identical_full_one() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let full = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("full"))).unwrap();
+        let reduced = upsert_node(&store, node("repo-a", NodeKind::Gotcha, None, Some("reduced"))).unwrap();
+        let sym = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+
+        // Identical edges -- the only difference is curation.
+        store.add_edge("repo-a", full, sym, EdgeRelation::Affects).unwrap();
+        store.add_edge("repo-a", reduced, sym, EdgeRelation::Affects).unwrap();
+        store.set_curation("repo-a", reduced, NodeProminence::Reduced, Some("niche")).unwrap();
+
+        let full_node = store.get_node("repo-a", full).unwrap().unwrap();
+        let reduced_node = store.get_node("repo-a", reduced).unwrap().unwrap();
+        let full_score = crate::note_score(&store, "repo-a", &full_node).unwrap();
+        let reduced_score = crate::note_score(&store, "repo-a", &reduced_node).unwrap();
+        assert!(reduced_score < full_score, "a Reduced gotcha with identical edges must score lower: full={full_score}, reduced={reduced_score}");
+        assert!((reduced_score - full_score * 0.1).abs() < 1e-9, "expected exactly the 0.1 dampening multiplier: full={full_score}, reduced={reduced_score}");
     }
 
     #[test]

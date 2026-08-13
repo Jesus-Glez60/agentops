@@ -122,7 +122,15 @@ pub fn search_hybrid(store: &dyn GraphStore, embedder: &dyn Embedder, repo: &str
         hits.push(HybridHit { node, fused_score, dense_rank, lexical_rank, exact_rank });
     }
 
-    hits.sort_by(|a, b| b.fused_score.partial_cmp(&a.fused_score).unwrap_or(std::cmp::Ordering::Equal));
+    // Sort by a damped copy of fused_score, not the field itself -- a
+    // Reduced-prominence hit ranks lower (this is the MCP semantic_search
+    // tool's actual live ranking, the surface an agent sees mid-session)
+    // but `HybridHit.fused_score` stays the real RRF value callers display.
+    hits.sort_by(|a, b| {
+        let rank_a = a.fused_score * agentops_graph::prominence_rank_multiplier(a.node.prominence) as f32;
+        let rank_b = b.fused_score * agentops_graph::prominence_rank_multiplier(b.node.prominence) as f32;
+        rank_b.partial_cmp(&rank_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
     hits.truncate(top_k);
     Ok(hits)
 }
@@ -189,5 +197,25 @@ mod tests {
 
         let hits = search_hybrid(&store, &LocalEmbedder, "demo", "verify_token", 5, Some(NodeKind::Symbol)).unwrap();
         assert!(hits.iter().all(|h| h.node.kind == NodeKind::Symbol), "{hits:?}");
+    }
+
+    #[test]
+    fn a_reduced_prominence_hit_ranks_below_an_equally_matched_full_one_but_keeps_its_real_fused_score() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let full = symbol(&store, "demo", "a.rs", "verify_token_full", "fn verify_token_full() {}");
+        let reduced = symbol(&store, "demo", "b.rs", "verify_token_reduced", "fn verify_token_reduced() {}");
+
+        // Same node, before/after curation -- the one true test that
+        // curation never alters the displayed fused_score, independent of
+        // any incidental per-node rank differences elsewhere in the fusion.
+        let score_before = search_hybrid(&store, &LocalEmbedder, "demo", "verify_token", 5, None).unwrap().into_iter().find(|h| h.node.id == reduced).unwrap().fused_score;
+        store.set_curation("demo", reduced, agentops_graph::NodeProminence::Reduced, Some("niche")).unwrap();
+        let hits = search_hybrid(&store, &LocalEmbedder, "demo", "verify_token", 5, None).unwrap();
+        let reduced_hit = hits.iter().find(|h| h.node.id == reduced).expect("must still appear -- curation never hides a hit");
+        assert_eq!(reduced_hit.fused_score, score_before, "the displayed fused_score itself must stay real/undamped, not silently altered by curation");
+
+        let full_pos = hits.iter().position(|h| h.node.id == full).unwrap();
+        let reduced_pos = hits.iter().position(|h| h.node.id == reduced).unwrap();
+        assert!(full_pos < reduced_pos, "the Reduced-prominence hit must rank lower once curated: {hits:?}");
     }
 }

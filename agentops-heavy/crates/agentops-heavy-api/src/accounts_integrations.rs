@@ -14,7 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use agentops_accounts::{AccountStore, User};
+use agentops_accounts::{AccountStore, NewAccount, User};
 use agentops_integrations::{AuthType, CredentialStore, NewCredential};
 use agentops_repo_access::secrets::SecretsProvider;
 use axum::extract::{Path as AxumPath, Request, State};
@@ -41,6 +41,8 @@ pub fn build_accounts_integrations_router(accounts: AccountStore, credentials: C
         .route("/integrations/{provider}", post(store_integration).delete(delete_integration))
         .route("/integrations/{provider}/oauth/start", get(oauth_start))
         .route("/integrations/{provider}/oauth/callback", get(oauth_callback))
+        .route("/auth/me", get(me))
+        .route("/auth/logout", post(logout))
         .layer(middleware::from_fn_with_state(state.clone(), require_session))
         .route("/auth/signup", post(signup))
         .route("/auth/login", post(login))
@@ -64,7 +66,15 @@ async fn require_session(State(state): State<AccountsState>, mut req: Request, n
 }
 
 #[derive(Deserialize)]
-struct SignupOrLoginRequest {
+struct SignupRequest {
+    email: String,
+    password: String,
+    first_name: String,
+    last_name: String,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
     email: String,
     password: String,
 }
@@ -73,12 +83,14 @@ struct SignupOrLoginRequest {
 struct UserView {
     id: i64,
     email: String,
+    first_name: String,
+    last_name: String,
     tenant: String,
 }
 
 impl From<User> for UserView {
     fn from(u: User) -> Self {
-        UserView { id: u.id, email: u.email, tenant: u.tenant }
+        UserView { id: u.id, email: u.email, first_name: u.first_name, last_name: u.last_name, tenant: u.tenant }
     }
 }
 
@@ -88,20 +100,45 @@ struct AuthResponse {
     session_token: String,
 }
 
-async fn signup(State(state): State<AccountsState>, Json(req): Json<SignupOrLoginRequest>) -> (StatusCode, Json<serde_json::Value>) {
-    let result = { state.accounts.lock().unwrap().signup(&req.email, &req.password) };
+async fn signup(State(state): State<AccountsState>, Json(req): Json<SignupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let first_name = req.first_name.trim();
+    let last_name = req.last_name.trim();
+    if first_name.is_empty() || last_name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "first_name and last_name are required" })));
+    }
+
+    let result = { state.accounts.lock().unwrap().signup(NewAccount { email: &req.email, password: &req.password, first_name, last_name }) };
     match result {
         Ok((user, session_token)) => (StatusCode::CREATED, Json(serde_json::to_value(AuthResponse { user: user.into(), session_token }).unwrap())),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
     }
 }
 
-async fn login(State(state): State<AccountsState>, Json(req): Json<SignupOrLoginRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn login(State(state): State<AccountsState>, Json(req): Json<LoginRequest>) -> (StatusCode, Json<serde_json::Value>) {
     let result = { state.accounts.lock().unwrap().login(&req.email, &req.password) };
     match result {
         Ok((user, session_token)) => (StatusCode::OK, Json(serde_json::to_value(AuthResponse { user: user.into(), session_token }).unwrap())),
         Err(_) => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid email or password" }))),
     }
+}
+
+async fn me(axum::Extension(user): axum::Extension<User>) -> (StatusCode, Json<UserView>) {
+    (StatusCode::OK, Json(user.into()))
+}
+
+/// Revokes the presented session token server-side, so a stolen or
+/// forgotten-about token stops working immediately rather than merely
+/// being discarded client-side until its 30-day natural expiry.
+/// `require_session` already validated the token and inserted the `User`
+/// extension, but it doesn't hand the raw token forward — re-reading the
+/// `Authorization` header here is simpler than threading it through the
+/// middleware just for this one handler.
+async fn logout(headers: axum::http::HeaderMap, State(state): State<AccountsState>) -> StatusCode {
+    let token = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    if let Some(token) = token {
+        let _ = state.accounts.lock().unwrap().revoke_session(token);
+    }
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Serialize)]
@@ -206,7 +243,7 @@ mod tests {
 
         let signup_response = app
             .clone()
-            .oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"correct horse battery staple"}"#)).unwrap())
+            .oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"correct horse battery staple","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap())
             .await
             .unwrap();
         assert_eq!(signup_response.status(), StatusCode::CREATED);
@@ -217,6 +254,36 @@ mod tests {
         assert_eq!(list_response.status(), StatusCode::OK);
         let listed = body_json(list_response).await;
         assert_eq!(listed, serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn signup_returns_first_and_last_name_in_the_user_view() {
+        let app = test_router();
+        let response = app
+            .oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = body_json(response).await;
+        assert_eq!(body["user"]["first_name"], "Ada");
+        assert_eq!(body["user"]["last_name"], "Lovelace");
+    }
+
+    #[tokio::test]
+    async fn signup_rejects_a_blank_first_or_last_name() {
+        let app = test_router();
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"  ","last_name":"Lovelace"}"#)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = app
+            .oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev2@example.com","password":"pw","first_name":"Ada","last_name":""}"#)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -237,7 +304,7 @@ mod tests {
     async fn storing_then_listing_an_integration_never_returns_the_secret() {
         let app = test_router();
         let signup_response =
-            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw"}"#)).unwrap()).await.unwrap();
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
         let token = body_json(signup_response).await["session_token"].as_str().unwrap().to_string();
 
         let store_response = app
@@ -264,7 +331,7 @@ mod tests {
         let app = test_router();
 
         let sign_up = |email: &'static str, app: Router| async move {
-            let response = app.oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(format!(r#"{{"email":"{email}","password":"pw"}}"#))).unwrap()).await.unwrap();
+            let response = app.oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(format!(r#"{{"email":"{email}","password":"pw","first_name":"Ada","last_name":"Lovelace"}}"#))).unwrap()).await.unwrap();
             body_json(response).await["session_token"].as_str().unwrap().to_string()
         };
         let token_a = sign_up("a@example.com", app.clone()).await;
@@ -287,10 +354,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_auth_me_with_a_valid_session_returns_that_user() {
+        let app = test_router();
+        let signup_response =
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
+        let signed_up = body_json(signup_response).await;
+        let token = signed_up["session_token"].as_str().unwrap().to_string();
+
+        let me_response = app.oneshot(HttpRequest::get("/auth/me").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(me_response.status(), StatusCode::OK);
+        let me = body_json(me_response).await;
+        assert_eq!(me["email"], "dev@example.com");
+        assert_eq!(me, signed_up["user"]);
+    }
+
+    #[tokio::test]
+    async fn get_auth_me_with_no_session_token_is_rejected() {
+        let app = test_router();
+        let response = app.oneshot(HttpRequest::get("/auth/me").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn post_auth_logout_then_reusing_the_same_token_is_rejected() {
+        let app = test_router();
+        let signup_response =
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
+        let token = body_json(signup_response).await["session_token"].as_str().unwrap().to_string();
+
+        let logout_response = app.clone().oneshot(HttpRequest::post("/auth/logout").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(logout_response.status(), StatusCode::NO_CONTENT);
+
+        let me_response = app.oneshot(HttpRequest::get("/auth/me").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(me_response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
     async fn oauth_endpoints_report_not_implemented_rather_than_404() {
         let app = test_router();
         let signup_response =
-            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw"}"#)).unwrap()).await.unwrap();
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
         let token = body_json(signup_response).await["session_token"].as_str().unwrap().to_string();
 
         let response = app.oneshot(HttpRequest::get("/integrations/linear/oauth/start").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();

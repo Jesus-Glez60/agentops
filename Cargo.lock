@@ -20,6 +20,7 @@ dependencies = [
 name = "agentops-api"
 version = "0.1.0"
 dependencies = [
+ "agentops-embeddings",
  "agentops-graph",
  "agentops-manifest",
  "agentops-mcp",

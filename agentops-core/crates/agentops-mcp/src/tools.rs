@@ -329,11 +329,27 @@ fn render_repo_state_section(store: &dyn GraphStore, repo: &str) -> anyhow::Resu
 
 fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
     let (store, repo) = repo_context(args)?;
-    let gotchas = store.nodes_by_kind(&repo, NodeKind::Gotcha)?;
+    let mut gotchas = store.nodes_by_kind(&repo, NodeKind::Gotcha)?;
     if gotchas.is_empty() {
         return Ok("No gotchas recorded.".to_string());
     }
-    Ok(gotchas.iter().map(|n| format!("- {} (node {})", n.name.as_deref().unwrap_or("(untitled)"), n.id)).collect::<Vec<_>>().join("\n"))
+    // Full-prominence first -- every gotcha is still listed (this is
+    // permanent knowledge, never hidden), just ranked so a curated-down
+    // one doesn't dominate an agent's attention over ones nobody's
+    // demoted.
+    gotchas.sort_by_key(|n| n.prominence == agentops_graph::NodeProminence::Reduced);
+    Ok(gotchas
+        .iter()
+        .map(|n| {
+            let reduced = if n.prominence == agentops_graph::NodeProminence::Reduced {
+                format!(" ⚠ reduced prominence — {}", n.curation_reason.as_deref().unwrap_or("no reason recorded"))
+            } else {
+                String::new()
+            };
+            format!("- {} (node {}){reduced}", n.name.as_deref().unwrap_or("(untitled)"), n.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
@@ -358,12 +374,18 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
     // Codebrain-2's payoff: a gotcha/decision recorded against this exact
     // symbol should resurface right here, where an agent is actually about
     // to touch the code — not just in the full generated repo-map doc.
-    let mut affecting: Vec<_> = store.edges_to(&repo, id)?.into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
+    let affecting: Vec<_> = store.edges_to(&repo, id)?.into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
+    // Resolved once (not once for scoring, again for rendering) into a
+    // lookup both the sort and the render loop below share.
+    let notes_by_src: std::collections::HashMap<i64, agentops_graph::Node> = affecting.iter().filter_map(|e| store.get_node(&repo, e.src_id).ok().flatten().map(|n| (e.src_id, n))).collect();
+    let mut affecting = affecting;
     // Most-relevant first — reinforced, recently-matched gotchas/decisions
-    // outrank ones nobody's confirmed still apply.
+    // outrank ones nobody's confirmed still apply; a curated-down note is
+    // further damped so it doesn't outrank an un-curated one on weight alone.
     affecting.sort_by(|a, b| {
-        let score_a = agentops_graph::effective_weight(a.weight, agentops_graph::age_days(&a.updated_at));
-        let score_b = agentops_graph::effective_weight(b.weight, agentops_graph::age_days(&b.updated_at));
+        let dampen = |edge: &agentops_graph::Edge| notes_by_src.get(&edge.src_id).map(|n| agentops_graph::prominence_rank_multiplier(n.prominence)).unwrap_or(1.0);
+        let score_a = agentops_graph::effective_weight(a.weight, agentops_graph::age_days(&a.updated_at)) * dampen(a);
+        let score_b = agentops_graph::effective_weight(b.weight, agentops_graph::age_days(&b.updated_at)) * dampen(b);
         score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
     });
     if !affecting.is_empty() {
@@ -383,9 +405,14 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
         let mut gotchas = Vec::new();
         let mut decisions = Vec::new();
         for edge in &affecting {
-            if let Some(note) = store.get_node(&repo, edge.src_id)? {
+            if let Some(note) = notes_by_src.get(&edge.src_id) {
                 let staleness = if is_possibly_stale(&edge.updated_at) { " ⚠ possibly stale — this symbol changed since this note was last confirmed relevant" } else { "" };
-                let entry = format!("- {}: {}{}", note.name.as_deref().unwrap_or("(untitled)"), note.content.as_deref().unwrap_or(""), staleness);
+                let reduced = if note.prominence == agentops_graph::NodeProminence::Reduced {
+                    format!(" ⚠ reduced prominence — {}", note.curation_reason.as_deref().unwrap_or("no reason recorded"))
+                } else {
+                    String::new()
+                };
+                let entry = format!("- {}: {}{}{}", note.name.as_deref().unwrap_or("(untitled)"), note.content.as_deref().unwrap_or(""), staleness, reduced);
                 match note.kind {
                     NodeKind::Gotcha => gotchas.push(entry),
                     NodeKind::Decision => decisions.push(entry),
@@ -524,8 +551,13 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
             .iter()
             .map(|h| {
                 let signals = [h.dense_rank.map(|_| "dense"), h.lexical_rank.map(|_| "lexical"), h.exact_rank.map(|_| "exact")].into_iter().flatten().collect::<Vec<_>>().join("+");
+                let reduced = if h.node.prominence == agentops_graph::NodeProminence::Reduced {
+                    format!(" ⚠ reduced prominence — {}", h.node.curation_reason.as_deref().unwrap_or("no reason recorded"))
+                } else {
+                    String::new()
+                };
                 format!(
-                    "- {:?} {} (score {:.4}, signals: {signals}){}",
+                    "- {:?} {} (score {:.4}, signals: {signals}){}{reduced}",
                     h.node.kind,
                     h.node.name.as_deref().unwrap_or("(untitled)"),
                     h.fused_score,
@@ -537,14 +569,36 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
     }
 
     let embedding = agentops_embeddings::LocalEmbedder.embed(query)?;
-    let hits = store.search_similar(&repo, &embedding, top_k, kind)?;
+    // Fetch a buffer beyond top_k so re-ranking by curation has real hits
+    // to reorder against, same buffer-then-truncate shape search_hybrid
+    // already uses -- otherwise a curated-down node either never entered
+    // the result set at all, or got truncated away before it could be
+    // pushed down past ones that would otherwise rank just below it.
+    let fetch_k = (top_k * 3).max(10);
+    let mut hits = store.search_similar(&repo, &embedding, fetch_k, kind)?;
     if hits.is_empty() {
         return Ok("No matches (nothing embedded yet, or nothing close enough — see scan_repo/add_note/ingest_notes's with_embeddings flag).".to_string());
     }
+    // Lower distance is better, so a Reduced node's *effective* distance is
+    // pushed up (divided by the multiplier), not its raw distance changed --
+    // the displayed `distance` below stays the real, undamped value.
+    hits.sort_by(|(node_a, distance_a), (node_b, distance_b)| {
+        let rank_a = distance_a / agentops_graph::prominence_rank_multiplier(node_a.prominence) as f32;
+        let rank_b = distance_b / agentops_graph::prominence_rank_multiplier(node_b.prominence) as f32;
+        rank_a.partial_cmp(&rank_b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    hits.truncate(top_k);
 
     Ok(hits
         .iter()
-        .map(|(n, distance)| format!("- {:?} {} (distance {distance:.4}){}", n.kind, n.name.as_deref().unwrap_or("(untitled)"), n.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default()))
+        .map(|(n, distance)| {
+            let reduced = if n.prominence == agentops_graph::NodeProminence::Reduced {
+                format!(" ⚠ reduced prominence — {}", n.curation_reason.as_deref().unwrap_or("no reason recorded"))
+            } else {
+                String::new()
+            };
+            format!("- {:?} {} (distance {distance:.4}){}{reduced}", n.kind, n.name.as_deref().unwrap_or("(untitled)"), n.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
+        })
         .collect::<Vec<_>>()
         .join("\n"))
 }
@@ -802,6 +856,71 @@ mod tests {
         let reinforced_pos = text.find("Reinforced issue").expect("must appear");
         let rare_pos = text.find("Rare issue").expect("must appear");
         assert!(reinforced_pos < rare_pos, "the more-reinforced gotcha must be listed first: {text}");
+    }
+
+    #[test]
+    fn list_gotchas_annotates_a_reduced_prominence_entry_and_sorts_it_last() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Full prominence gotcha", "body": "greet has a known bug, kept as-is." })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Niche gotcha", "body": "greet has a rare bug that only affects old Linux envs." })).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let niche = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().find(|n| n.name.as_deref() == Some("Niche gotcha")).unwrap();
+        store.set_curation(&repo, niche.id, agentops_graph::NodeProminence::Reduced, Some("only affects old Linux envs")).unwrap();
+
+        let result = call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path })).unwrap();
+        let text = &result.content[0].text;
+        assert!(text.contains("⚠ reduced prominence — only affects old Linux envs"), "{text}");
+        let full_pos = text.find("Full prominence gotcha").unwrap();
+        let niche_pos = text.find("Niche gotcha").unwrap();
+        assert!(full_pos < niche_pos, "a Reduced-prominence gotcha must sort after Full ones, not before: {text}");
+    }
+
+    #[test]
+    fn get_symbol_annotates_and_demotes_a_reduced_prominence_gotcha() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Popular issue", "body": "verify_token has a common bug." })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Niche issue", "body": "verify_token has a rare bug." })).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let niche = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().find(|n| n.name.as_deref() == Some("Niche issue")).unwrap();
+        store.set_curation(&repo, niche.id, agentops_graph::NodeProminence::Reduced, Some("edge case, rarely hit")).unwrap();
+
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "verify_token" })).unwrap();
+        let text = &result.content[0].text;
+        assert!(text.contains("⚠ reduced prominence — edge case, rarely hit"), "{text}");
+        let popular_pos = text.find("Popular issue").unwrap();
+        let niche_pos = text.find("Niche issue").unwrap();
+        assert!(popular_pos < niche_pos, "even with identical raw weight, a Reduced gotcha must rank after a Full one: {text}");
+    }
+
+    #[test]
+    fn semantic_search_dense_mode_annotates_a_reduced_prominence_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": true })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token gotcha", "body": "verify_token has a known workaround.", "with_embeddings": true })).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let gotcha = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().next().unwrap();
+        store.set_curation(&repo, gotcha.id, agentops_graph::NodeProminence::Reduced, Some("narrow edge case")).unwrap();
+
+        let result = call_tool(AccessMode::Full, "semantic_search", &json!({ "path": path, "query": "verify_token workaround", "kind": "gotcha" })).unwrap();
+        let text = &result.content[0].text;
+        assert!(text.contains("⚠ reduced prominence — narrow edge case"), "{text}");
     }
 
     /// Module 6's actual payoff: two separate MCP calls (simulating two

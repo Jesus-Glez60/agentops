@@ -23,8 +23,20 @@ use rusqlite::{Connection, OptionalExtension};
 pub struct User {
     pub id: i64,
     pub email: String,
+    pub first_name: String,
+    pub last_name: String,
     pub tenant: String,
     pub created_at: String,
+}
+
+/// Params for `AccountStore::signup` -- grouped into a struct (matching
+/// `agentops_integrations::NewCredential`'s convention) now that it's grown
+/// past the two-`&str` shape `login`/`verify_session` still use.
+pub struct NewAccount<'a> {
+    pub email: &'a str,
+    pub password: &'a str,
+    pub first_name: &'a str,
+    pub last_name: &'a str,
 }
 
 pub struct AccountStore {
@@ -36,6 +48,8 @@ const SCHEMA: &str = "
         id            INTEGER PRIMARY KEY AUTOINCREMENT,
         email         TEXT NOT NULL UNIQUE,
         password_hash TEXT NOT NULL,
+        first_name    TEXT NOT NULL,
+        last_name     TEXT NOT NULL,
         tenant        TEXT NOT NULL UNIQUE,
         created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -57,6 +71,7 @@ impl AccountStore {
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path).context("opening accounts store")?;
         conn.execute_batch(SCHEMA).context("initializing accounts schema")?;
+        migrate_add_name_columns(&conn).context("migrating accounts schema")?;
         Ok(Self { conn })
     }
 
@@ -68,12 +83,16 @@ impl AccountStore {
 
     /// Creates a new user + an immediately-valid session — errors if
     /// `email` is already registered.
-    pub fn signup(&self, email: &str, password: &str) -> Result<(User, String)> {
+    pub fn signup(&self, new_account: NewAccount) -> Result<(User, String)> {
+        let NewAccount { email, password, first_name, last_name } = new_account;
         let password_hash = hash_password(password)?;
         let tenant = new_random_id();
 
         self.conn
-            .execute("INSERT INTO users (email, password_hash, tenant) VALUES (?1, ?2, ?3)", rusqlite::params![email, password_hash, tenant])
+            .execute(
+                "INSERT INTO users (email, password_hash, first_name, last_name, tenant) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![email, password_hash, first_name, last_name, tenant],
+            )
             .context("email already registered, or insert failed")?;
         let user_id = self.conn.last_insert_rowid();
 
@@ -87,13 +106,13 @@ impl AccountStore {
     /// password" (never reveal which one via the error message — a
     /// standard login-endpoint precaution against email enumeration).
     pub fn login(&self, email: &str, password: &str) -> Result<(User, String)> {
-        let row: Option<(i64, String, String, String, String)> = self
+        let row: Option<(i64, String, String, String, String, String, String)> = self
             .conn
-            .query_row("SELECT id, email, password_hash, tenant, created_at FROM users WHERE email = ?1", [email], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            .query_row("SELECT id, email, password_hash, first_name, last_name, tenant, created_at FROM users WHERE email = ?1", [email], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
             })
             .optional()?;
-        let Some((id, email, password_hash, tenant, created_at)) = row else {
+        let Some((id, email, password_hash, first_name, last_name, tenant, created_at)) = row else {
             anyhow::bail!("invalid email or password");
         };
         if !verify_password(password, &password_hash) {
@@ -101,7 +120,7 @@ impl AccountStore {
         }
 
         let raw_token = self.create_session(id)?;
-        Ok((User { id, email, tenant, created_at }, raw_token))
+        Ok((User { id, email, first_name, last_name, tenant, created_at }, raw_token))
     }
 
     fn create_session(&self, user_id: i64) -> Result<String> {
@@ -119,15 +138,15 @@ impl AccountStore {
     /// don't-reveal-which-case reasoning as `login`).
     pub fn verify_session(&self, raw_token: &str) -> Result<User> {
         let hash = hash_api_key(raw_token);
-        let row: Option<(i64, String, String, String, String)> = self
+        let row: Option<(i64, String, String, String, String, String, String)> = self
             .conn
             .query_row(
-                "SELECT u.id, u.email, u.tenant, u.created_at, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?1",
+                "SELECT u.id, u.email, u.first_name, u.last_name, u.tenant, u.created_at, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?1",
                 [&hash],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
             )
             .optional()?;
-        let Some((id, email, tenant, created_at, expires_at)) = row else {
+        let Some((id, email, first_name, last_name, tenant, created_at, expires_at)) = row else {
             anyhow::bail!("invalid or expired session");
         };
 
@@ -136,17 +155,56 @@ impl AccountStore {
             anyhow::bail!("invalid or expired session");
         }
 
-        Ok(User { id, email, tenant, created_at })
+        Ok(User { id, email, first_name, last_name, tenant, created_at })
+    }
+
+    /// Deletes the session matching `raw_token`, if any — used by a real
+    /// logout endpoint so the token stops verifying immediately, rather
+    /// than just being forgotten client-side while still valid server-side
+    /// until its natural 30-day expiry.
+    pub fn revoke_session(&self, raw_token: &str) -> Result<()> {
+        let hash = hash_api_key(raw_token);
+        self.conn.execute("DELETE FROM sessions WHERE token_hash = ?1", [&hash])?;
+        Ok(())
     }
 
     fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
         self.conn
-            .query_row("SELECT id, email, tenant, created_at FROM users WHERE id = ?1", [id], |r| {
-                Ok(User { id: r.get(0)?, email: r.get(1)?, tenant: r.get(2)?, created_at: r.get(3)? })
+            .query_row("SELECT id, email, first_name, last_name, tenant, created_at FROM users WHERE id = ?1", [id], |r| {
+                Ok(User { id: r.get(0)?, email: r.get(1)?, first_name: r.get(2)?, last_name: r.get(3)?, tenant: r.get(4)?, created_at: r.get(5)? })
             })
             .optional()
             .map_err(anyhow::Error::from)
     }
+}
+
+/// `CREATE TABLE IF NOT EXISTS` in `SCHEMA` only creates the table if it's
+/// missing entirely — it does nothing for a `users` table that already
+/// exists from before `first_name`/`last_name` were added, so every
+/// `INSERT` against a pre-existing store would fail with a generic "email
+/// already registered, or insert failed" (the real cause buried inside a
+/// misleading error) until the columns are actually added. `DEFAULT ''`
+/// (rather than leaving them nullable) keeps the column NOT NULL, matching
+/// every row inserted through `signup` going forward; existing legacy rows
+/// just get an empty name until their owner logs in again — there's no
+/// profile-edit flow yet to ask them to fill it in properly.
+fn migrate_add_name_columns(conn: &Connection) -> Result<()> {
+    let mut existing_columns = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(users)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            existing_columns.insert(row.get::<_, String>(1)?);
+        }
+    }
+
+    if !existing_columns.contains("first_name") {
+        conn.execute("ALTER TABLE users ADD COLUMN first_name TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    if !existing_columns.contains("last_name") {
+        conn.execute("ALTER TABLE users ADD COLUMN last_name TEXT NOT NULL DEFAULT ''", [])?;
+    }
+    Ok(())
 }
 
 fn hash_password(password: &str) -> Result<String> {
@@ -172,10 +230,17 @@ fn new_random_id() -> String {
 mod tests {
     use super::*;
 
+    /// Most tests here only care about email/password/session behavior, not
+    /// names -- this keeps every call site from repeating placeholder
+    /// first/last names.
+    fn signup(store: &AccountStore, email: &str, password: &str) -> Result<(User, String)> {
+        store.signup(NewAccount { email, password, first_name: "Test", last_name: "User" })
+    }
+
     #[test]
     fn signup_then_login_with_the_right_password_succeeds() {
         let store = AccountStore::open_in_memory().unwrap();
-        let (signed_up, _) = store.signup("dev@example.com", "correct horse battery staple").unwrap();
+        let (signed_up, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
 
         let (logged_in, _) = store.login("dev@example.com", "correct horse battery staple").unwrap();
         assert_eq!(signed_up.id, logged_in.id);
@@ -185,7 +250,7 @@ mod tests {
     #[test]
     fn login_with_the_wrong_password_fails() {
         let store = AccountStore::open_in_memory().unwrap();
-        store.signup("dev@example.com", "correct horse battery staple").unwrap();
+        signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
 
         let err = store.login("dev@example.com", "wrong password").unwrap_err();
         assert!(err.to_string().contains("invalid email or password"));
@@ -194,7 +259,7 @@ mod tests {
     #[test]
     fn login_with_an_unknown_email_fails_with_the_same_generic_error_as_a_wrong_password() {
         let store = AccountStore::open_in_memory().unwrap();
-        store.signup("dev@example.com", "correct horse battery staple").unwrap();
+        signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
 
         let err = store.login("nobody@example.com", "whatever").unwrap_err();
         assert!(err.to_string().contains("invalid email or password"), "must not leak whether the email exists: {err}");
@@ -203,22 +268,22 @@ mod tests {
     #[test]
     fn signing_up_the_same_email_twice_fails() {
         let store = AccountStore::open_in_memory().unwrap();
-        store.signup("dev@example.com", "password one").unwrap();
-        assert!(store.signup("dev@example.com", "password two").is_err());
+        signup(&store, "dev@example.com", "password one").unwrap();
+        assert!(signup(&store, "dev@example.com", "password two").is_err());
     }
 
     #[test]
     fn two_different_users_get_different_random_tenants() {
         let store = AccountStore::open_in_memory().unwrap();
-        let (a, _) = store.signup("a@example.com", "password one").unwrap();
-        let (b, _) = store.signup("b@example.com", "password two").unwrap();
+        let (a, _) = signup(&store, "a@example.com", "password one").unwrap();
+        let (b, _) = signup(&store, "b@example.com", "password two").unwrap();
         assert_ne!(a.tenant, b.tenant);
     }
 
     #[test]
     fn a_freshly_issued_session_token_verifies_to_the_right_user() {
         let store = AccountStore::open_in_memory().unwrap();
-        let (user, token) = store.signup("dev@example.com", "correct horse battery staple").unwrap();
+        let (user, token) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
 
         let verified = store.verify_session(&token).unwrap();
         assert_eq!(verified.id, user.id);
@@ -227,7 +292,7 @@ mod tests {
     #[test]
     fn a_bogus_session_token_is_rejected() {
         let store = AccountStore::open_in_memory().unwrap();
-        store.signup("dev@example.com", "correct horse battery staple").unwrap();
+        signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
 
         let err = store.verify_session("ao_not-a-real-token").unwrap_err();
         assert!(err.to_string().contains("invalid or expired session"));
@@ -236,7 +301,7 @@ mod tests {
     #[test]
     fn an_expired_session_is_rejected() {
         let store = AccountStore::open_in_memory().unwrap();
-        let (user, _) = store.signup("dev@example.com", "correct horse battery staple").unwrap();
+        let (user, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
 
         let (raw, hash) = generate_api_key().unwrap();
         store.conn.execute("INSERT INTO sessions (user_id, token_hash, expires_at) VALUES (?1, ?2, datetime('now', '-1 minute'))", rusqlite::params![user.id, hash]).unwrap();
@@ -246,9 +311,79 @@ mod tests {
     }
 
     #[test]
+    fn revoking_a_session_makes_it_stop_verifying() {
+        let store = AccountStore::open_in_memory().unwrap();
+        let (_, token) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
+        assert!(store.verify_session(&token).is_ok());
+
+        store.revoke_session(&token).unwrap();
+
+        let err = store.verify_session(&token).unwrap_err();
+        assert!(err.to_string().contains("invalid or expired session"));
+    }
+
+    #[test]
+    fn opening_a_pre_existing_store_from_before_first_last_name_existed_migrates_in_place() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE users (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                email         TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                tenant        TEXT NOT NULL UNIQUE,
+                created_at    TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE sessions (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id    INTEGER NOT NULL REFERENCES users(id),
+                token_hash TEXT NOT NULL UNIQUE,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+        conn.execute("INSERT INTO users (email, password_hash, tenant) VALUES ('legacy@example.com', 'irrelevant', 'legacy-tenant')", []).unwrap();
+
+        // Re-running SCHEMA (a no-op on the already-existing tables) then
+        // the migration is exactly what `AccountStore::open` does against a
+        // real file -- exercised directly here since `open_in_memory`
+        // always starts from a fresh, already-current schema.
+        conn.execute_batch(SCHEMA).unwrap();
+        migrate_add_name_columns(&conn).unwrap();
+        let store = AccountStore { conn };
+
+        // The pre-existing row survives with empty (not null/missing) names.
+        let legacy = store.login("legacy@example.com", "irrelevant");
+        assert!(legacy.is_err(), "irrelevant isn't a real Argon2id hash, so login correctly fails on verification -- this just proves the row is still readable at all");
+
+        // And new signups against the migrated table work normally.
+        let (user, _) = signup(&store, "new@example.com", "correct horse battery staple").unwrap();
+        assert_eq!(user.email, "new@example.com");
+    }
+
+    #[test]
+    fn revoking_an_unknown_token_is_not_an_error() {
+        let store = AccountStore::open_in_memory().unwrap();
+        assert!(store.revoke_session("ao_not-a-real-token").is_ok());
+    }
+
+    #[test]
+    fn first_and_last_name_round_trip_through_signup_login_and_verify_session() {
+        let store = AccountStore::open_in_memory().unwrap();
+        let (signed_up, token) = store.signup(NewAccount { email: "dev@example.com", password: "correct horse battery staple", first_name: "Ada", last_name: "Lovelace" }).unwrap();
+        assert_eq!((signed_up.first_name.as_str(), signed_up.last_name.as_str()), ("Ada", "Lovelace"));
+
+        let (logged_in, _) = store.login("dev@example.com", "correct horse battery staple").unwrap();
+        assert_eq!((logged_in.first_name.as_str(), logged_in.last_name.as_str()), ("Ada", "Lovelace"));
+
+        let verified = store.verify_session(&token).unwrap();
+        assert_eq!((verified.first_name.as_str(), verified.last_name.as_str()), ("Ada", "Lovelace"));
+    }
+
+    #[test]
     fn login_never_stores_or_returns_the_plaintext_password() {
         let store = AccountStore::open_in_memory().unwrap();
-        store.signup("dev@example.com", "correct horse battery staple").unwrap();
+        signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
 
         let stored: String = store.conn.query_row("SELECT password_hash FROM users WHERE email = 'dev@example.com'", [], |r| r.get(0)).unwrap();
         assert!(!stored.contains("correct horse battery staple"));

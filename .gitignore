@@ -14,6 +14,13 @@ apps/web/.env*.local
 .context/
 *.context.db
 
+# Local dev SQLite stores (accounts, repo connections, etc.) — created
+# wherever a binary happens to be run from if its own *_DB env var isn't
+# set; never intended to be committed.
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
 # Team/dev-only gotchas, decisions, and knowledge notes — internal engineering
 # context, not something to ship in a repo that may end up in a client's hands.
 # Kept locally (agentops note still writes here), just not committed.

@@ -27,21 +27,38 @@ use tower_http::cors::CorsLayer;
 
 use agentops_security::api_key::verify_api_key;
 
+mod repos;
+mod search;
+
 #[derive(Clone)]
-struct AppState {
+pub(crate) struct AppState {
     mode: AccessMode,
     /// SHA-256 hash of the required API key. `None` disables auth.
     api_key_hash: Option<String>,
+    /// Where `agentops-manifest`'s local scan registry lives for this
+    /// process — explicit rather than each handler resolving
+    /// `$HOME/.agentops/manifest.json` (or an env var) itself, both so
+    /// `run()` is the one place that decision is made and so tests can
+    /// inject an isolated tempdir path instead of racing on real global
+    /// state under parallel test execution.
+    pub(crate) manifest_path: PathBuf,
 }
 
 /// `api_key_hash`, if set, requires every request except `/health` to
 /// present a matching `Authorization: Bearer <key>` header.
-pub fn build_router(mode: AccessMode, api_key_hash: Option<String>) -> Router {
-    let state = AppState { mode, api_key_hash };
+pub fn build_router(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf) -> Router {
+    let state = AppState { mode, api_key_hash, manifest_path };
     Router::new()
         .route("/tools", get(list_tools_handler))
         .route("/tools/{name}", post(call_tool_handler))
         .route("/nodes", get(list_nodes_json))
+        .route("/repos", get(repos::list_repos_json))
+        .route("/repos/{name}/rescan", post(repos::rescan_repo_json))
+        .route("/repos/{name}/nodes/{id}", get(search::node_detail_json))
+        .route("/repos/{name}/nodes/{id}/curation", post(search::set_curation_json))
+        .route("/activity", get(repos::activity_json))
+        .route("/search", get(search::search_json))
+        .route("/gotchas", get(repos::gotchas_json))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .route("/health", get(health))
         .with_state(state)
@@ -68,7 +85,8 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
 pub async fn run(addr: &str, mode: AccessMode) -> anyhow::Result<()> {
     let api_key_hash = std::env::var("AGENTOPS_API_KEY_HASH").ok();
     let auth_status = if api_key_hash.is_some() { "API key required" } else { "UNAUTHENTICATED (set AGENTOPS_API_KEY_HASH to require a key)" };
-    let app = build_router(mode, api_key_hash);
+    let manifest_path = std::env::var("AGENTOPS_MANIFEST_PATH").map(PathBuf::from).unwrap_or_else(|_| agentops_manifest::default_manifest_path());
+    let app = build_router(mode, api_key_hash, manifest_path);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("agentops-api listening on {addr} (mode: {mode:?}, auth: {auth_status})");
     axum::serve(listener, app).await?;
@@ -99,7 +117,9 @@ struct NodesQuery {
     kind: Option<String>,
 }
 
-fn parse_kind(s: &str) -> Option<NodeKind> {
+/// `pub(crate)` so `search.rs`'s kind filter reuses this instead of a
+/// second copy of the same string-to-`NodeKind` mapping.
+pub(crate) fn parse_kind(s: &str) -> Option<NodeKind> {
     match s.to_lowercase().as_str() {
         "symbol" => Some(NodeKind::Symbol),
         "file" => Some(NodeKind::File),
@@ -159,17 +179,26 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    /// A manifest path pointing nowhere real yet -- `list_scanned_repos_at`
+    /// handles `NotFound` as an empty list, so tests that don't care about
+    /// `/repos` data can use this rather than touching the real
+    /// `$HOME/.agentops/manifest.json` (which would race other tests/the
+    /// developer's own real manifest under parallel test execution).
+    fn empty_manifest_path() -> PathBuf {
+        tempfile::tempdir().unwrap().keep().join("manifest.json")
+    }
+
     #[tokio::test]
     async fn health_check_ok() {
-        let app = build_router(AccessMode::Advisor, None);
+        let app = build_router(AccessMode::Advisor, None, empty_manifest_path());
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]
     async fn tools_list_respects_access_mode_over_http() {
-        let advisor_app = build_router(AccessMode::Advisor, None);
-        let full_app = build_router(AccessMode::Full, None);
+        let advisor_app = build_router(AccessMode::Advisor, None, empty_manifest_path());
+        let full_app = build_router(AccessMode::Full, None, empty_manifest_path());
 
         let advisor_resp = advisor_app.oneshot(Request::builder().uri("/tools").body(Body::empty()).unwrap()).await.unwrap();
         let advisor_body = body_json(advisor_resp).await;
@@ -185,7 +214,7 @@ mod tests {
         std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
         let path = dir.path().to_string_lossy().to_string();
 
-        let app = build_router(AccessMode::Full, None);
+        let app = build_router(AccessMode::Full, None, empty_manifest_path());
         let req = Request::builder()
             .method("POST")
             .uri("/tools/scan_repo")
@@ -208,7 +237,7 @@ mod tests {
     async fn a_full_only_tool_is_rejected_over_http_under_advisor_mode() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().to_string_lossy().to_string();
-        let app = build_router(AccessMode::Advisor, None);
+        let app = build_router(AccessMode::Advisor, None, empty_manifest_path());
         let req = Request::builder()
             .method("POST")
             .uri("/tools/scan_repo")
@@ -224,7 +253,7 @@ mod tests {
     #[tokio::test]
     async fn health_check_bypasses_auth_even_when_a_key_is_required() {
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(AccessMode::Advisor, Some(hash));
+        let app = build_router(AccessMode::Advisor, Some(hash), empty_manifest_path());
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -232,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn missing_api_key_is_rejected_when_one_is_required() {
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(AccessMode::Advisor, Some(hash));
+        let app = build_router(AccessMode::Advisor, Some(hash), empty_manifest_path());
         let resp = app.oneshot(Request::builder().uri("/tools").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -240,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn correct_api_key_is_accepted() {
         let (raw, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(AccessMode::Advisor, Some(hash));
+        let app = build_router(AccessMode::Advisor, Some(hash), empty_manifest_path());
         let req = Request::builder().uri("/tools").header("authorization", format!("Bearer {raw}")).body(Body::empty()).unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

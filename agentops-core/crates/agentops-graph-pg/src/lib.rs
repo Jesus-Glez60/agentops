@@ -20,7 +20,7 @@
 //! already-running Tokio runtime directly (nested `block_on` panics).
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, NewTask, Node, NodeKind, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
 use anyhow::Result;
 
 const SCHEMA: &str = include_str!("../schema.sql");
@@ -56,6 +56,7 @@ impl PostgresGraphStore {
 
 fn row_to_node(row: &tokio_postgres::Row) -> Node {
     let kind: String = row.get("kind");
+    let prominence: String = row.get("prominence");
     Node {
         id: row.get("id"),
         kind: NodeKind::from_db_str(&kind),
@@ -66,6 +67,9 @@ fn row_to_node(row: &tokio_postgres::Row) -> Node {
         start_line: row.get("start_line"),
         end_line: row.get("end_line"),
         content: row.get("content"),
+        curated: row.get("curated"),
+        prominence: NodeProminence::from_db_str(&prominence),
+        curation_reason: row.get("curation_reason"),
     }
 }
 
@@ -222,6 +226,14 @@ impl GraphStore for PostgresGraphStore {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
             client.execute("UPDATE nodes SET start_line = $1, end_line = $2, content = $3 WHERE repo = $4 AND id = $5", &[&start_line, &end_line, &content, &repo, &id]).await?;
+            Ok(())
+        })
+    }
+
+    fn set_curation(&self, repo: &str, node_id: i64, prominence: NodeProminence, reason: Option<&str>) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("UPDATE nodes SET curated = true, prominence = $1, curation_reason = $2 WHERE repo = $3 AND id = $4", &[&prominence.as_db_str(), &reason, &repo, &node_id]).await?;
             Ok(())
         })
     }
@@ -846,6 +858,28 @@ mod tests {
         assert_eq!(hits[0].0.id, id);
 
         store.delete_nodes("pg-repo-h", &[id]).unwrap();
+    }
+
+    #[test]
+    fn set_curation_survives_a_subsequent_rescan() {
+        let store = require_store!();
+        let n = node("pg-repo-review", NodeKind::Gotcha, None, Some("g"));
+        let id = upsert_node(&store, n.clone()).unwrap();
+        let fresh = store.get_node("pg-repo-review", id).unwrap().unwrap();
+        assert!(!fresh.curated);
+        assert_eq!(fresh.prominence, NodeProminence::Full);
+
+        store.set_curation("pg-repo-review", id, NodeProminence::Reduced, Some("only affects old Linux envs")).unwrap();
+        let curated = store.get_node("pg-repo-review", id).unwrap().unwrap();
+        assert_eq!(curated.prominence, NodeProminence::Reduced);
+        assert_eq!(curated.curation_reason.as_deref(), Some("only affects old Linux envs"));
+
+        // Same natural key upserted again, exactly what a rescan does.
+        upsert_node(&store, n).unwrap();
+        let after_rescan = store.get_node("pg-repo-review", id).unwrap().unwrap();
+        assert_eq!(after_rescan.prominence, NodeProminence::Reduced, "a rescan must not silently reset a curated gotcha's prominence back to Full");
+
+        store.delete_nodes("pg-repo-review", &[id]).unwrap();
     }
 
     /// Regression test for the exact reasoning `schema.sql` documents:

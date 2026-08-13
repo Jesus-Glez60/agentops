@@ -196,6 +196,24 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
         // reset the staleness clock `tool_get_symbol` compares against
         // `node_history` (see `GraphStore::reinforce_edge`'s doc comment).
         agentops_notes::ingest_vault(store.as_ref(), &repo, &notes, &matcher, false)?;
+
+        // Same post-ingestion embedding step `notes::ingest_notes_dir`
+        // already uses for the CLI/MCP bulk path -- `ingest_vault` itself
+        // has no embedding step at all, so without this, every automatic
+        // rescan (this function) would leave Gotcha/Decision/Note nodes
+        // permanently unembedded regardless of `with_embeddings`, unlike
+        // Symbol nodes just above. Found via live testing: the search
+        // page's kind=gotcha filter returned nothing until this was added.
+        if with_embeddings {
+            for kind in [NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note] {
+                for node in store.nodes_by_kind(&repo, kind)? {
+                    if let Some(content) = &node.content {
+                        let embedding = agentops_embeddings::LocalEmbedder.embed(content)?;
+                        store.set_embedding(&repo, node.id, &embedding)?;
+                    }
+                }
+            }
+        }
     }
 
     // Module C: refresh the repo-state snapshot now that both this scan and
@@ -390,6 +408,30 @@ mod tests {
         let gotcha = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().next().expect("the note must have been ingested");
         let edges: Vec<_> = store.edges_from(&repo, gotcha.id).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
         assert_eq!(edges.len(), 1, "must be attached to verify_token with no manual ingest-notes step: {edges:?}");
+    }
+
+    /// Regression test for a real gap found via live testing (the search
+    /// page's kind=gotcha filter returned nothing): `ingest_vault` itself
+    /// has no embedding step at all, unlike the symbol loop just above it
+    /// in `persist()` -- without this, `with_embeddings: true` embedded
+    /// every Symbol but silently left every Gotcha/Decision/Note node
+    /// unembedded on every automatic rescan, forever.
+    #[test]
+    fn rescanning_with_embeddings_enabled_also_embeds_gotcha_decision_and_note_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let notes_dir = dir.path().join(".agentops").join("notes");
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("token-bug.md"), "---\ntitle: \"Token bug\"\ntype: gotcha\n---\n\nverify_token has a known workaround for a bug.\n").unwrap();
+
+        scan_and_persist(dir.path(), true).unwrap();
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let gotcha = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().next().unwrap();
+        let query_embedding = agentops_embeddings::LocalEmbedder.embed("a workaround for verify_token").unwrap();
+        let hits = store.search_similar(&repo, &query_embedding, 5, Some(NodeKind::Gotcha)).unwrap();
+        assert!(hits.iter().any(|(node, _)| node.id == gotcha.id), "the Gotcha node must be findable via semantic search after a rescan with embeddings enabled: {hits:?}");
     }
 
     /// Module C: a scan must leave a fresh, queryable `repo_state` snapshot

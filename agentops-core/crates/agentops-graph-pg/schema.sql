@@ -164,4 +164,15 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS search_vector tsvector
     GENERATED ALWAYS AS (to_tsvector('english', coalesce(name, '') || ' ' || coalesce(content, ''))) STORED;
 CREATE INDEX IF NOT EXISTS idx_nodes_search_vector ON nodes USING gin(search_vector);
 
+-- Gotcha review workflow: triage state for a node (meaningful for Gotcha
+-- kind, harmless/unused on others) -- same TEXT-column-with-a-constant
+-- default shape as the SQLite migration for this same field.
+-- Superseded within the same session by the curation columns below -- the
+-- earlier `review_status` design modeled gotchas as bugs to close, which
+-- is wrong (see the curation columns' own comment in agentops-graph).
+ALTER TABLE nodes DROP COLUMN IF EXISTS review_status;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curated BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS prominence TEXT NOT NULL DEFAULT 'full';
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
+
 

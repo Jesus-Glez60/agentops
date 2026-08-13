@@ -71,6 +71,7 @@
   --node-file: var(--ink-500);
   --node-gotcha: var(--amber-500);
   --node-decision: var(--teal-400);
+  --node-note: var(--blue-500);
 
   --health-healthy: var(--green-400);
   --health-scanning: var(--blue-500);
@@ -81,6 +82,10 @@
   --relevance-strong: var(--green-400);
   --relevance-related: var(--blue-500);
   --relevance-supporting: var(--ink-500);
+
+  --curation-needs-curation: var(--amber-500);
+  --curation-kept: var(--green-400);
+  --curation-reduced: var(--ink-500);
 
   --radius: 0.5rem;
 }
@@ -130,6 +135,7 @@
   --color-node-file: var(--node-file);
   --color-node-gotcha: var(--node-gotcha);
   --color-node-decision: var(--node-decision);
+  --color-node-note: var(--node-note);
 
   --color-health-healthy: var(--health-healthy);
   --color-health-scanning: var(--health-scanning);
@@ -140,6 +146,10 @@
   --color-relevance-strong: var(--relevance-strong);
   --color-relevance-related: var(--relevance-related);
   --color-relevance-supporting: var(--relevance-supporting);
+
+  --color-curation-needs-curation: var(--curation-needs-curation);
+  --color-curation-kept: var(--curation-kept);
+  --color-curation-reduced: var(--curation-reduced);
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -170,9 +180,9 @@
   --color-sidebar-border: var(--sidebar-border);
   --color-sidebar-ring: var(--sidebar-ring);
 
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-  --font-heading: var(--font-geist-sans);
+  --font-sans: var(--font-body-sans);
+  --font-mono: var(--font-body-sans);
+  --font-heading: var(--font-body-sans);
 
   /* type scale — 20/16/13/13/11/12/10 per the mockup's design-system screen */
   --text-page-title: 20px;

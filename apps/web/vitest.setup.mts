@@ -48,3 +48,21 @@ Object.defineProperty(window, "localStorage", {
   value: new MemoryStorage(),
   writable: true,
 });
+
+// jsdom doesn't implement ResizeObserver at all -- cmdk (used by the
+// command palette) calls it unconditionally on mount, so any test that
+// renders it throws "ResizeObserver is not defined" without this stub.
+class ResizeObserverStub {
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+}
+
+Object.defineProperty(window, "ResizeObserver", {
+  value: ResizeObserverStub,
+  writable: true,
+});
+
+// jsdom also doesn't implement scrollIntoView -- cmdk calls it on the
+// active item whenever selection moves (including on mount).
+Element.prototype.scrollIntoView = () => {};

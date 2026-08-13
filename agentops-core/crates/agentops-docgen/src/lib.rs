@@ -84,7 +84,12 @@ fn render_notes(out: &mut String, store: &dyn GraphStore, repo_name: &str, notes
     for note in notes {
         let name = note.name.as_deref().unwrap_or("(untitled)");
         let text = note.content.as_deref().unwrap_or("");
-        out.push_str(&format!("**{name}**\n\n{text}\n\n"));
+        let reduced = if note.prominence == agentops_graph::NodeProminence::Reduced {
+            format!("\n\n⚠ **Reduced prominence** — {}", note.curation_reason.as_deref().unwrap_or("no reason recorded"))
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("**{name}**\n\n{text}{reduced}\n\n"));
 
         let mut edges: Vec<_> = store.edges_from(repo_name, note.id)?.into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
         edges.sort_by(|a, b| edge_score(b).partial_cmp(&edge_score(a)).unwrap_or(std::cmp::Ordering::Equal));
@@ -108,16 +113,17 @@ fn edge_score(edge: &agentops_graph::Edge) -> f64 {
     agentops_graph::effective_weight(edge.weight, agentops_graph::age_days(&edge.updated_at))
 }
 
-/// Sorts `notes` (Gotcha/Decision nodes) by the sum of `effective_weight`
-/// across their own outgoing `Affects` edges, highest first — the same
-/// scoring `agentops_graph::rank_notes_by_weight` uses for `RepoState`'s
-/// top-5 cache, just applied here to the *full* list rather than truncated,
-/// since this doc is meant to show everything, in relevance order.
+/// Sorts `notes` (Gotcha/Decision nodes) by `agentops_graph::note_score`
+/// (sum of `effective_weight` across outgoing `Affects` edges, damped for
+/// `Reduced` prominence), highest first -- the same scoring
+/// `rank_notes_by_weight` uses for `RepoState`'s top-5 cache, just applied
+/// here to the *full* list rather than truncated, since this doc is meant
+/// to show everything (curation only reorders, never hides), in relevance
+/// order.
 fn sort_notes_by_weight(store: &dyn GraphStore, repo_name: &str, notes: &mut [agentops_graph::Node]) -> anyhow::Result<()> {
     let mut scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::with_capacity(notes.len());
     for note in notes.iter() {
-        let score: f64 = store.edges_from(repo_name, note.id)?.iter().filter(|e| e.relation == EdgeRelation::Affects).map(edge_score).sum();
-        scores.insert(note.id, score);
+        scores.insert(note.id, agentops_graph::note_score(store, repo_name, note)?);
     }
     notes.sort_by(|a, b| scores[&b.id].partial_cmp(&scores[&a.id]).unwrap_or(std::cmp::Ordering::Equal));
     Ok(())
@@ -212,6 +218,27 @@ mod tests {
         let popular_pos = doc.find("popular-issue").unwrap();
         let rare_pos = doc.find("rare-issue").unwrap();
         assert!(popular_pos < rare_pos, "the more-reinforced gotcha must render first:\n{doc}");
+    }
+
+    #[test]
+    fn a_reduced_prominence_gotcha_renders_its_reason_and_sorts_below_an_equally_reinforced_full_one() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let symbol_id = store.add_node(node(NodeKind::Symbol, Some("src/auth.rs"), Some("verify_token"), Some(1), Some(2), Some("fn verify_token() {}"))).unwrap();
+
+        let full_id = store.add_node(node(NodeKind::Gotcha, None, Some("full-prominence-issue"), None, None, Some("Kept as-is."))).unwrap();
+        let full_edge = store.add_edge("demo", full_id, symbol_id, EdgeRelation::Affects).unwrap();
+        store.reinforce_edge("demo", full_edge, true).unwrap();
+
+        let reduced_id = store.add_node(node(NodeKind::Gotcha, None, Some("reduced-prominence-issue"), None, None, Some("Niche edge case."))).unwrap();
+        let reduced_edge = store.add_edge("demo", reduced_id, symbol_id, EdgeRelation::Affects).unwrap();
+        store.reinforce_edge("demo", reduced_edge, true).unwrap();
+        store.set_curation("demo", reduced_id, agentops_graph::NodeProminence::Reduced, Some("only affects old Linux envs")).unwrap();
+
+        let doc = render_onboarding_doc(&store, "demo", &[PathBuf::from("src/auth.rs")]).unwrap();
+        assert!(doc.contains("⚠ **Reduced prominence** — only affects old Linux envs"), "{doc}");
+        let full_pos = doc.find("full-prominence-issue").unwrap();
+        let reduced_pos = doc.find("reduced-prominence-issue").unwrap();
+        assert!(full_pos < reduced_pos, "an equally-reinforced but Reduced-prominence gotcha must render after the Full one:\n{doc}");
     }
 
     /// Regression test for the repo-scoping fix this port made over `main`'s

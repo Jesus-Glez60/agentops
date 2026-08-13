@@ -25,7 +25,10 @@ struct Manifest {
     repos: Vec<ManifestEntry>,
 }
 
-fn default_manifest_path() -> PathBuf {
+/// `pub` so a driving adapter that wants the real default path explicitly
+/// (e.g. `agentops-api`'s `run()`, choosing between this and an env-var
+/// override) doesn't have to duplicate the `$HOME`-joining logic.
+pub fn default_manifest_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".agentops").join("manifest.json")
 }
@@ -61,7 +64,8 @@ pub fn record_scan(repo_path: &Path) -> Result<()> {
     record_scan_at(&default_manifest_path(), repo_path)
 }
 
-fn record_scan_at(manifest_file: &Path, repo_path: &Path) -> Result<()> {
+/// `pub` for the same injectable-path reason as `list_scanned_repos_at`.
+pub fn record_scan_at(manifest_file: &Path, repo_path: &Path) -> Result<()> {
     let canonical = canonical_str(repo_path);
 
     let mut manifest = load(manifest_file)?;
@@ -77,7 +81,12 @@ pub fn list_scanned_repos() -> Result<Vec<ManifestEntry>> {
     list_scanned_repos_at(&default_manifest_path())
 }
 
-fn list_scanned_repos_at(manifest_file: &Path) -> Result<Vec<ManifestEntry>> {
+/// `pub` so a driving adapter that needs an injectable manifest path (e.g.
+/// `agentops-api`'s `GET /repos`, and its own tests) can list against a
+/// specific file rather than always the real `$HOME/.agentops/manifest.json`
+/// — avoids tests mutating shared global state or racing each other under
+/// parallel test execution.
+pub fn list_scanned_repos_at(manifest_file: &Path) -> Result<Vec<ManifestEntry>> {
     let mut manifest = load(manifest_file)?;
     manifest.repos.sort_by_key(|e| std::cmp::Reverse(e.last_scanned_at));
     Ok(manifest.repos)
