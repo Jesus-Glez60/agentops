@@ -106,6 +106,17 @@ CREATE TABLE IF NOT EXISTS repo_state (
     top_decision_ids TEXT NOT NULL
 );
 
+-- Documentation Viewer: a single upserted-in-place generated-doc-page
+-- snapshot per repo, same shape as repo_state above. `content` is an
+-- already-serialized `agentops_docgen::DocPage` JSON blob, written and read
+-- as opaque text (see agentops-graph's GraphStore::save_doc_page doc
+-- comment for why this crate never depends on that Rust type).
+CREATE TABLE IF NOT EXISTS doc_pages (
+    repo         TEXT PRIMARY KEY,
+    generated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    content      TEXT NOT NULL
+);
+
 -- Bi-temporal node versioning (Phase 2, 1.0 roadmap). node_id is
 -- deliberately not a hard FK — history must survive the node's own
 -- eventual pruning, same reasoning as scan_history_entries. TIMESTAMPTZ

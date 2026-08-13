@@ -234,3 +234,59 @@ export async function getRepoGraph(repo: string, kinds: NodeKind[] = []): Promis
   const qs = params.toString();
   return apiFetch<RepoGraphResponse>(AGENTOPS_API_URL, `/repos/${encodeURIComponent(repo)}/graph${qs ? `?${qs}` : ""}`);
 }
+
+// Documentation Viewer types mirror `agentops-docgen::model` exactly (see
+// that crate's `model.rs` for the Rust source of truth). `DocPage` is
+// `Serialize`-only in Rust -- these types are never sent back to the
+// server, only read from `GET /repos/{name}/docs`'s response.
+
+/** `#[serde(rename_all = "snake_case")]` on `DocGroup` -- no `execution_flows` variant exists yet (see that enum's own doc comment: no signal in the graph derives a call-chain "flow"). */
+export type DocGroup = "repository" | "core_modules" | "knowledge" | "setup";
+
+export interface SymbolRow {
+  name: string;
+  /** From a `Documents`-edge-connected `Definition` node's first line, when one exists (`explain_symbol`'s opt-in output) -- empty string otherwise, never fabricated. */
+  one_liner: string;
+  gotcha_count: number;
+  node_id: number;
+}
+
+/** `#[serde(tag = "block_type", rename_all = "snake_case")]` -- discriminated union, switch on `block_type`. */
+export type DocBlock =
+  | { block_type: "prose"; markdown: string }
+  | { block_type: "symbol_table"; file: string; rows: SymbolRow[] }
+  | { block_type: "dependency_chips"; deps: string[] }
+  | {
+      block_type: "knowledge_callout";
+      kind: NodeKind;
+      node_id: number;
+      title: string;
+      body: string;
+      /** e.g. "affects refreshSession()" -- empty string if the note has no Affects edge yet. */
+      affects: string;
+      /** `[path, line]` of the affected symbol/file, when known. */
+      source: [string, number] | null;
+    };
+
+export interface DocSection {
+  /** Stable slug -- nav href + TOC anchor. */
+  id: string;
+  group: DocGroup;
+  title: string;
+  blocks: DocBlock[];
+}
+
+export interface DocPage {
+  repo: string;
+  /** `ScanHistory.started_at` text, same lexicographically-sortable format as `ActivityEvent.started_at`. */
+  generated_at: string;
+  node_count: number;
+  sections: DocSection[];
+}
+
+/** Per-repo key -- unlike `REPOS_SWR_KEY`/`GOTCHAS_SWR_KEY` (one global list each), docs are scoped per repo, so callers compose `${DOCS_SWR_KEY}/${repo}` as the actual SWR key. */
+export const DOCS_SWR_KEY = "/docs";
+
+export async function getDocs(repo: string): Promise<DocPage> {
+  return apiFetch<DocPage>(AGENTOPS_API_URL, `/repos/${encodeURIComponent(repo)}/docs`);
+}

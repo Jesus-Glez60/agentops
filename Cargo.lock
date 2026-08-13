@@ -20,10 +20,12 @@ dependencies = [
 name = "agentops-api"
 version = "0.1.0"
 dependencies = [
+ "agentops-docgen",
  "agentops-embeddings",
  "agentops-graph",
  "agentops-manifest",
  "agentops-mcp",
+ "agentops-scanner",
  "agentops-security",
  "anyhow",
  "axum",
@@ -68,6 +70,7 @@ version = "0.1.0"
 dependencies = [
  "agentops-graph",
  "anyhow",
+ "serde",
 ]
 
 [[package]]

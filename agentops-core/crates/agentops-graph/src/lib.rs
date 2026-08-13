@@ -168,6 +168,21 @@ pub struct Node {
     pub curation_reason: Option<String>,
 }
 
+/// A single Core Modules grouping for the Documentation Viewer -- either
+/// LLM-labeled (`agentops-llm::group_core_modules`) or a directory-name
+/// heuristic fallback (`agentops-docgen::sectioned::build_doc_page`).
+/// Deliberately just data, and deliberately living here rather than in
+/// either producer/consumer crate: `agentops-docgen` and `agentops-llm`
+/// both depend on `agentops-graph` already but must not depend on each
+/// other (docgen stays network-free; llm stays scan/rank-free), so this
+/// crate is the one place both can share the type without creating a
+/// cycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleLabel {
+    pub label: String,
+    pub file_paths: Vec<String>,
+}
+
 /// Fields needed to add a node; `id` is assigned by the store.
 #[derive(Debug, Clone)]
 pub struct NewNode {
@@ -534,6 +549,21 @@ pub trait GraphStore {
     /// — a real, expected state for a repo scanned before this feature
     /// existed, not an error.
     fn get_repo_state(&self, repo: &str) -> Result<Option<RepoState>>;
+
+    /// Upserts `repo`'s generated Documentation Viewer page as an
+    /// already-serialized JSON blob (`agentops_docgen::DocPage`, serialized
+    /// by the caller). Deliberately typed as a plain string rather than
+    /// `&DocPage`: `agentops-docgen` depends on this crate for `GraphStore`,
+    /// so the reverse dependency would be a cycle. The caller (`agentops-mcp`,
+    /// which already depends on both `agentops-graph` and
+    /// `agentops-docgen`) owns the typed value and the `serde_json::to_string`
+    /// call; this trait only ever sees opaque text.
+    fn save_doc_page(&self, repo: &str, generated_at: &str, content_json: &str) -> Result<()>;
+    /// Reads back `(generated_at, content_json)` for `repo`, if a doc page
+    /// has ever been generated for it. `None` is the expected state for a
+    /// repo scanned before this feature existed, or before its first scan
+    /// completes.
+    fn get_doc_page(&self, repo: &str) -> Result<Option<(String, String)>>;
 
     /// Records `node_id`'s content as of now: closes whatever version was
     /// previously open for it (if any — a no-op for a brand-new node's

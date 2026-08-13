@@ -10,3 +10,4 @@ name = "agentops_docgen"
 [dependencies]
 anyhow.workspace = true
 agentops-graph = { path = "../agentops-graph" }
+serde.workspace = true

@@ -7,6 +7,12 @@ use std::path::Path;
 
 use agentops_graph::{EdgeRelation, GraphStore, NodeKind};
 
+mod model;
+mod sectioned;
+
+pub use model::{DocBlock, DocGroup, DocPage, DocSection, SymbolRow};
+pub use sectioned::build_doc_page;
+
 /// Renders a full onboarding/engineering doc: repo stats, a ranked file/symbol
 /// map, and every gotcha node together with the symbol it's edge-connected to
 /// (Codebrain-2's payoff — this is where a prior gotcha actually resurfaces for
@@ -105,7 +111,10 @@ fn render_notes(out: &mut String, store: &dyn GraphStore, repo_name: &str, notes
     Ok(())
 }
 
-fn gotchas_affecting(store: &dyn GraphStore, repo_name: &str, symbol_id: i64) -> anyhow::Result<Vec<agentops_graph::Edge>> {
+/// `pub(crate)` so `sectioned.rs` reuses the exact same "which gotchas
+/// apply to this symbol" lookup rather than a second, potentially-drifting
+/// copy.
+pub(crate) fn gotchas_affecting(store: &dyn GraphStore, repo_name: &str, symbol_id: i64) -> anyhow::Result<Vec<agentops_graph::Edge>> {
     Ok(store.edges_to(repo_name, symbol_id)?.into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect())
 }
 
@@ -120,7 +129,7 @@ fn edge_score(edge: &agentops_graph::Edge) -> f64 {
 /// here to the *full* list rather than truncated, since this doc is meant
 /// to show everything (curation only reorders, never hides), in relevance
 /// order.
-fn sort_notes_by_weight(store: &dyn GraphStore, repo_name: &str, notes: &mut [agentops_graph::Node]) -> anyhow::Result<()> {
+pub(crate) fn sort_notes_by_weight(store: &dyn GraphStore, repo_name: &str, notes: &mut [agentops_graph::Node]) -> anyhow::Result<()> {
     let mut scores: std::collections::HashMap<i64, f64> = std::collections::HashMap::with_capacity(notes.len());
     for note in notes.iter() {
         scores.insert(note.id, agentops_graph::note_score(store, repo_name, note)?);

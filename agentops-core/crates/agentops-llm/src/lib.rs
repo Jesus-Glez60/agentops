@@ -9,9 +9,9 @@
 //! (`NoteClassifier`) — both live here rather than in `agentops-notes`
 //! itself so that crate never gains a network dependency.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use agentops_graph::{upsert_node, EdgeRelation, GraphStore, NewNode, Node, NodeKind, NodeProminence};
+use agentops_graph::{upsert_node, EdgeRelation, GraphStore, ModuleLabel, NewNode, Node, NodeKind, NodeProminence};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +48,24 @@ struct MessagesRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     messages: Vec<MessageIn<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<OutputConfig>,
+}
+
+/// Anthropic's structured-outputs request shape — `output_config.format:
+/// json_schema` guarantees a schema-conforming JSON response, rather than
+/// this crate's older delimiter-tagged free-text parsing convention (see
+/// `parse_task_summaries`). Only used by `group_core_modules` so far; every
+/// other call site still passes `None` and gets free text back, unchanged.
+#[derive(Serialize)]
+struct OutputConfig {
+    format: OutputFormat,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum OutputFormat {
+    JsonSchema { schema: serde_json::Value },
 }
 
 #[derive(Serialize)]
@@ -88,7 +106,18 @@ pub struct LlmCallResult {
 /// 401 (bad/missing key) and 429 (rate limit) to distinct, clearly-labeled
 /// errors rather than a generic transport failure.
 pub fn call_anthropic(config: &AnthropicConfig, prompt: &str) -> Result<LlmCallResult> {
-    let request = MessagesRequest { model: &config.model, max_tokens: config.max_tokens, messages: vec![MessageIn { role: "user", content: prompt }] };
+    send_messages(config, prompt, None)
+}
+
+/// Same as `call_anthropic`, but constrains the response to `schema` via
+/// Anthropic's `output_config.format: json_schema` — the response text is
+/// guaranteed-valid JSON matching `schema`, not free text to parse.
+fn call_anthropic_json(config: &AnthropicConfig, prompt: &str, schema: serde_json::Value) -> Result<LlmCallResult> {
+    send_messages(config, prompt, Some(OutputConfig { format: OutputFormat::JsonSchema { schema } }))
+}
+
+fn send_messages(config: &AnthropicConfig, prompt: &str, output_config: Option<OutputConfig>) -> Result<LlmCallResult> {
+    let request = MessagesRequest { model: &config.model, max_tokens: config.max_tokens, messages: vec![MessageIn { role: "user", content: prompt }], output_config };
 
     let mut response = ureq::post(&config.api_url)
         .header("x-api-key", &config.api_key)
@@ -362,6 +391,64 @@ pub fn summarize_task_activity(config: &AnthropicConfig, task_title: &str, activ
     parse_task_summaries(&result.text)
 }
 
+/// Groups `ranked_paths` into a small number of named, developer-recognizable
+/// modules (e.g. "Authentication", "Indexing Engine") for the Documentation
+/// Viewer's Core Modules nav section — the labeled counterpart to
+/// `agentops-docgen::sectioned`'s directory-name heuristic fallback, which
+/// callers should use if this errors (network failure, malformed response,
+/// etc.) rather than propagating the failure into doc generation. Uses
+/// `output_config: json_schema` rather than the delimiter-tagged parsing
+/// `summarize_task_activity` uses, since the whole point of this call is
+/// structured `{label, file_paths[]}` data, not prose.
+pub fn group_core_modules(config: &AnthropicConfig, repo: &str, ranked_paths: &[PathBuf]) -> Result<Vec<ModuleLabel>> {
+    if ranked_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let file_list = ranked_paths.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\n");
+    let prompt = format!(
+        "You are documenting the architecture of a codebase named {repo}. Below is its file list, ranked by centrality \
+         in the dependency graph (most-referenced first).\n\nFiles:\n{file_list}\n\n\
+         Group these files into 3-8 named modules a developer or AI agent onboarding to this repo would recognize \
+         (e.g. \"Authentication\", \"Indexing Engine\") — meaningful architectural names, not raw directory names. \
+         Every file should belong to at most one module; omit files that don't fit a coherent module rather than \
+         forcing them into one."
+    );
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "modules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string" },
+                        "file_paths": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["label", "file_paths"],
+                    "additionalProperties": false
+                }
+            }
+        },
+        "required": ["modules"],
+        "additionalProperties": false
+    });
+
+    let result = call_anthropic_json(config, &prompt, schema)?;
+    parse_module_groups(&result.text)
+}
+
+#[derive(Deserialize)]
+struct ModuleGroups {
+    modules: Vec<ModuleLabel>,
+}
+
+fn parse_module_groups(text: &str) -> Result<Vec<ModuleLabel>> {
+    let parsed: ModuleGroups = serde_json::from_str(text).with_context(|| format!("parsing Anthropic module-grouping JSON response: {text}"))?;
+    Ok(parsed.modules)
+}
+
 fn parse_task_summaries(text: &str) -> Result<TaskSummaries> {
     let extract = |tag: &str, next_tags: &[&str]| -> Option<String> {
         let start = text.find(tag)? + tag.len();
@@ -631,5 +718,46 @@ mod tests {
         let summaries = summarize_task_activity(&config, "Fix login bug", &activity).unwrap();
         assert_eq!(summaries.technical, "Ran scan_repo and upserted 3 symbols.");
         assert_eq!(summaries.client_friendly, "Progress made on the requested feature.");
+    }
+
+    #[test]
+    fn group_core_modules_short_circuits_with_no_network_call_when_given_no_paths() {
+        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into() };
+        let groups = group_core_modules(&config, "demo", &[]).unwrap();
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn parse_module_groups_deserializes_into_module_labels() {
+        let text = r#"{"modules":[{"label":"Authentication","file_paths":["src/auth/session.ts","src/auth/oauth.ts"]}]}"#;
+        let groups = parse_module_groups(text).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "Authentication");
+        assert_eq!(groups[0].file_paths, vec!["src/auth/session.ts", "src/auth/oauth.ts"]);
+    }
+
+    #[test]
+    fn parse_module_groups_errors_clearly_on_malformed_json() {
+        let err = parse_module_groups("not json").unwrap_err();
+        assert!(err.to_string().contains("parsing Anthropic module-grouping JSON response"));
+    }
+
+    #[tokio::test]
+    async fn group_core_modules_sends_output_config_json_schema_and_parses_the_response() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("json_schema"))
+            .and(wiremock::matchers::body_string_contains("src/auth/session.ts"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "{\"modules\":[{\"label\":\"Authentication\",\"file_paths\":[\"src/auth/session.ts\"]}]}"}],
+                "usage": {"input_tokens": 20, "output_tokens": 10}
+            })))
+            .mount(&server)
+            .await;
+
+        let config = mock_config(&server.uri());
+        let groups = group_core_modules(&config, "demo", &[PathBuf::from("src/auth/session.ts")]).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "Authentication");
     }
 }

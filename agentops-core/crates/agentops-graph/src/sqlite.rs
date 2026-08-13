@@ -248,6 +248,20 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
         ALTER TABLE nodes ADD COLUMN prominence TEXT NOT NULL DEFAULT 'full';
         ALTER TABLE nodes ADD COLUMN curation_reason TEXT;",
     ),
+    // Documentation Viewer: a single upserted-in-place generated-doc-page
+    // snapshot per repo, same shape as repo_state above. `content` is an
+    // already-serialized `agentops_docgen::DocPage` JSON blob -- this crate
+    // never depends on that type (see `GraphStore::save_doc_page`'s doc
+    // comment), it only ever stores/returns opaque text. A brand-new table,
+    // so none of the ALTER-TABLE gotchas above (non-constant defaults,
+    // CREATE TABLE IF NOT EXISTS not migrating existing columns) apply.
+    M::up(
+        "CREATE TABLE IF NOT EXISTS doc_pages (
+            repo         TEXT PRIMARY KEY,
+            generated_at TEXT NOT NULL,
+            content      TEXT NOT NULL
+        );",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -682,6 +696,17 @@ impl GraphStore for SqliteGraphStore {
     fn get_repo_state(&self, repo: &str) -> Result<Option<RepoState>> {
         let mut stmt = self.conn.prepare("SELECT * FROM repo_state WHERE repo = ?1")?;
         let mut rows = stmt.query_map([repo], Self::row_to_repo_state)?;
+        Ok(rows.next().transpose()?)
+    }
+
+    fn save_doc_page(&self, repo: &str, generated_at: &str, content_json: &str) -> Result<()> {
+        agentops_sqlite_support::upsert(&self.conn, "doc_pages", &["repo", "generated_at", "content"], &["repo"], &[&repo, &generated_at, &content_json])?;
+        Ok(())
+    }
+
+    fn get_doc_page(&self, repo: &str) -> Result<Option<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT generated_at, content FROM doc_pages WHERE repo = ?1")?;
+        let mut rows = stmt.query_map([repo], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         Ok(rows.next().transpose()?)
     }
 
@@ -1201,6 +1226,24 @@ mod tests {
 
         let cached = store.get_repo_state("repo-a").unwrap().unwrap();
         assert_eq!(cached.top_gotcha_ids, state.top_gotcha_ids, "get_repo_state must return what refresh_repo_state just persisted");
+    }
+
+    #[test]
+    fn save_doc_page_upserts_and_get_doc_page_returns_none_before_any_save() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        assert!(store.get_doc_page("repo-a").unwrap().is_none());
+
+        store.save_doc_page("repo-a", "2026-01-01T00:00:00", "{\"repo\":\"repo-a\"}").unwrap();
+        let (generated_at, content) = store.get_doc_page("repo-a").unwrap().unwrap();
+        assert_eq!(generated_at, "2026-01-01T00:00:00");
+        assert_eq!(content, "{\"repo\":\"repo-a\"}");
+
+        // Upsert, not insert-once -- a later scan's regenerated page replaces
+        // the old one in place rather than erroring on the PK conflict.
+        store.save_doc_page("repo-a", "2026-01-02T00:00:00", "{\"repo\":\"repo-a\",\"v\":2}").unwrap();
+        let (generated_at, content) = store.get_doc_page("repo-a").unwrap().unwrap();
+        assert_eq!(generated_at, "2026-01-02T00:00:00");
+        assert_eq!(content, "{\"repo\":\"repo-a\",\"v\":2}");
     }
 
     #[test]

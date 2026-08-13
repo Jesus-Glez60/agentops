@@ -257,6 +257,14 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
     // no new trigger/schedule needed.
     store.refresh_repo_state(&repo)?;
 
+    // Documentation Viewer: regenerate and persist this repo's doc page.
+    // Best-effort — a doc-generation hiccup (or, if `AGENTOPS_ANTHROPIC_API_KEY`
+    // isn't set, the LLM module-labeling step failing outright) must never
+    // fail the scan itself, so every error here is logged and swallowed.
+    if let Err(err) = crate::docgen::persist_doc_page(store.as_ref(), path, &repo, &report.files) {
+        eprintln!("warning: failed to regenerate the documentation page for {repo:?}: {err:#}");
+    }
+
     Ok(ScanPersistSummary { files: report.files.len(), symbols: symbol_count, dependency_edges, reference_edges, pruned_files: pruned_files.len(), pruned_symbols: pruned_symbols.len() })
 }
 

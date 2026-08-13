@@ -530,6 +530,39 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn save_doc_page(&self, repo: &str, generated_at: &str, content_json: &str) -> Result<()> {
+        // `generated_at` comes from the caller (it's the same
+        // `ScanHistory.started_at` text value already embedded inside
+        // `content_json`'s `DocPage.generated_at` field — see
+        // `agentops-mcp`'s orchestration) rather than a fresh `now()` here,
+        // so the DB column and the JSON blob's own field can never drift
+        // apart. `::timestamptz` parses the TEXT scan timestamp the same
+        // way `edges.updated_at`'s established `TIMESTAMPTZ` columns
+        // already accept SQLite-formatted text elsewhere in this crate.
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client
+                .execute(
+                    "INSERT INTO doc_pages (repo, generated_at, content)
+                     VALUES ($1, $2::timestamptz, $3)
+                     ON CONFLICT (repo) DO UPDATE SET
+                        generated_at = excluded.generated_at,
+                        content = excluded.content",
+                    &[&repo, &generated_at, &content_json],
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn get_doc_page(&self, repo: &str) -> Result<Option<(String, String)>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client.query_opt("SELECT generated_at::text AS generated_at, content FROM doc_pages WHERE repo = $1", &[&repo]).await?;
+            Ok(row.as_ref().map(|r| (r.get::<_, String>(0), r.get::<_, String>(1))))
+        })
+    }
+
     fn snapshot_node_version(&self, node_id: i64, content: Option<&str>, start_line: Option<i64>, end_line: Option<i64>) -> Result<()> {
         self.rt.block_on(async {
             let mut client = self.pool.get().await?;

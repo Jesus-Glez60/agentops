@@ -22,6 +22,8 @@ agentops-security = { path = "../agentops-security" }
 agentops-graph = { path = "../agentops-graph" }
 agentops-manifest = { path = "../agentops-manifest" }
 agentops-embeddings = { path = "../agentops-embeddings" }
+agentops-docgen = { path = "../agentops-docgen" }
+agentops-scanner = { path = "../agentops-scanner" }
 tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
