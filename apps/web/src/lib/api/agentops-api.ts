@@ -164,3 +164,73 @@ export async function setCuration(repo: string, id: number, prominence: NodeProm
     body: JSON.stringify({ prominence: prominence.toLowerCase(), reason }),
   });
 }
+
+/**
+ * The Knowledge Graph screen's 4 tabs, mapped onto real `EdgeRelation`s
+ * (there's no `Calls`/`Contains` edge in the graph) -- see
+ * `agentops-api/src/subgraph.rs`'s `mode_filter`:
+ * `local` = DependsOn+Documents+Affects both directions, `dep_chain` =
+ * DependsOn outgoing only, `impact` = DependsOn incoming only, `knowledge`
+ * = Affects both directions.
+ */
+export type GraphMode = "local" | "dep_chain" | "impact" | "knowledge";
+
+export interface SubgraphNode {
+  id: number;
+  kind: NodeKind;
+  name: string | null;
+  path: string | null;
+  curated: boolean;
+  prominence: NodeProminence;
+  /** BFS distance from the seed node; 0 for the seed itself. */
+  depth: number;
+}
+
+export interface SubgraphEdge {
+  id: number;
+  src_id: number;
+  dst_id: number;
+  relation: "DependsOn" | "Documents" | "Affects" | "References";
+  /** "depends on" / "documents" / "affects" / "references" -- see search.rs's relation_label. No "← " prefix: direction is conveyed structurally via src_id/dst_id. */
+  label: string;
+}
+
+export interface SubgraphResponse {
+  seed_id: number;
+  mode: GraphMode;
+  depth: number;
+  nodes: SubgraphNode[];
+  edges: SubgraphEdge[];
+  /** `true` if the backend's NODE_CAP (150) was hit -- the response is a partial subgraph, not the full neighborhood. */
+  truncated: boolean;
+}
+
+export interface SubgraphOptions {
+  /** 1-4; server defaults to 2 and clamps regardless of what's sent. */
+  depth?: number;
+  /** Empty/omitted = no filter. */
+  kinds?: NodeKind[];
+}
+
+export async function getSubgraph(repo: string, id: number, mode: GraphMode, options: SubgraphOptions = {}): Promise<SubgraphResponse> {
+  const params = new URLSearchParams({ mode });
+  if (options.depth) params.set("depth", String(options.depth));
+  if (options.kinds?.length) params.set("kind", options.kinds.map((k) => k.toLowerCase()).join(","));
+  return apiFetch<SubgraphResponse>(AGENTOPS_API_URL, `/repos/${encodeURIComponent(repo)}/nodes/${id}/graph?${params.toString()}`);
+}
+
+/** Every node/edge in a repo, not centered on any seed -- the Knowledge Graph screen's "pick a repo" entry point. `SubgraphNode.depth` is always 0 here (there's no BFS distance without a seed). */
+export interface RepoGraphResponse {
+  repo: string;
+  nodes: SubgraphNode[];
+  edges: SubgraphEdge[];
+  /** `true` if the backend's NODE_CAP (150) was hit -- expect this often for large repos unless `kinds` narrows the result. */
+  truncated: boolean;
+}
+
+export async function getRepoGraph(repo: string, kinds: NodeKind[] = []): Promise<RepoGraphResponse> {
+  const params = new URLSearchParams();
+  if (kinds.length) params.set("kind", kinds.map((k) => k.toLowerCase()).join(","));
+  const qs = params.toString();
+  return apiFetch<RepoGraphResponse>(AGENTOPS_API_URL, `/repos/${encodeURIComponent(repo)}/graph${qs ? `?${qs}` : ""}`);
+}

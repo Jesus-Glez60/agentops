@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use petgraph::algo::page_rank::page_rank;
 use petgraph::graph::DiGraph;
 
-use crate::types::{Language, ScannedFile};
+use crate::types::{Language, ScannedFile, Symbol};
 
 const DAMPING_FACTOR: f64 = 0.85;
 const ITERATIONS: usize = 20;
@@ -68,6 +68,37 @@ pub fn resolve_dependency_edges(repo_root: &Path, files: &[ScannedFile]) -> Vec<
         }
     }
     edges
+}
+
+/// Same-file symbol-to-symbol references, AST-precise: for each symbol
+/// whose `references` set names another symbol defined in the same file,
+/// returns `(from_index, to_index)` pairs into `symbols`. A name matching
+/// more than one sibling (e.g. `new()` inside two different `impl` blocks)
+/// produces an edge to all of them -- over-inclusive, not silent; there's
+/// no way to disambiguate which one a bare identifier means without real
+/// semantic analysis, which this pass deliberately doesn't attempt.
+/// Symbols from the regex fallback (`references` always empty, since
+/// there's no AST to walk there) naturally produce nothing here -- see
+/// `agentops_notes::match_same_file_references` for that path instead.
+pub fn resolve_same_file_symbol_references(symbols: &[Symbol]) -> Vec<(usize, usize)> {
+    let mut indices_by_name: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, s) in symbols.iter().enumerate() {
+        indices_by_name.entry(s.name.as_str()).or_default().push(i);
+    }
+
+    let mut pairs = Vec::new();
+    for (from_idx, symbol) in symbols.iter().enumerate() {
+        for referenced_name in &symbol.references {
+            if let Some(target_indices) = indices_by_name.get(referenced_name.as_str()) {
+                for &to_idx in target_indices {
+                    if to_idx != from_idx {
+                        pairs.push((from_idx, to_idx));
+                    }
+                }
+            }
+        }
+    }
+    pairs
 }
 
 /// Resolves a Rust `use crate::...`/`use super::...`/`use self::...`
@@ -286,6 +317,41 @@ mod tests {
 
     fn rust_file(path: &str, deps: &[&str]) -> ScannedFile {
         ScannedFile { path: PathBuf::from(path), language: Language::Rust, symbols: vec![], deps: deps.iter().map(|s| s.to_string()).collect(), chunks: vec![], used_tree_sitter: false }
+    }
+
+    fn symbol(name: &str, references: &[&str]) -> Symbol {
+        Symbol { name: name.to_string(), container: None, kind: "function".to_string(), start_line: 1, end_line: 2, source: String::new(), references: references.iter().map(|s| s.to_string()).collect() }
+    }
+
+    #[test]
+    fn resolve_same_file_symbol_references_finds_a_match() {
+        let symbols = vec![symbol("a", &["b"]), symbol("b", &[])];
+        let pairs = resolve_same_file_symbol_references(&symbols);
+        assert_eq!(pairs, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn resolve_same_file_symbol_references_matches_all_same_named_siblings() {
+        // Two `new` symbols (e.g. from different `impl` blocks) -- a bare
+        // reference to `new` can't be disambiguated, so it must point at
+        // both, over-inclusive rather than silently picking one.
+        let symbols = vec![symbol("caller", &["new"]), symbol("new", &[]), symbol("new", &[])];
+        let mut pairs = resolve_same_file_symbol_references(&symbols);
+        pairs.sort();
+        assert_eq!(pairs, vec![(0, 1), (0, 2)]);
+    }
+
+    #[test]
+    fn resolve_same_file_symbol_references_produces_nothing_for_empty_references() {
+        // Regex-fallback-extracted symbols always have empty `references`.
+        let symbols = vec![symbol("a", &[]), symbol("b", &[])];
+        assert!(resolve_same_file_symbol_references(&symbols).is_empty());
+    }
+
+    #[test]
+    fn resolve_same_file_symbol_references_never_self_references() {
+        let symbols = vec![symbol("factorial", &["factorial"])];
+        assert!(resolve_same_file_symbol_references(&symbols).is_empty());
     }
 
     #[test]

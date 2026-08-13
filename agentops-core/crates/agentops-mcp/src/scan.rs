@@ -23,6 +23,10 @@ pub struct ScanPersistSummary {
     pub files: usize,
     pub symbols: usize,
     pub dependency_edges: usize,
+    /// Same-file symbol-to-symbol `References` edges (AST-precise where
+    /// tree-sitter parsed the file, word-boundary fallback otherwise) --
+    /// see `agentops_scanner::resolve_same_file_symbol_references`.
+    pub reference_edges: usize,
     pub pruned_files: usize,
     pub pruned_symbols: usize,
 }
@@ -74,8 +78,12 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
     let mut scan_entries: Vec<NewScanHistoryEntry> = Vec::new();
     let mut new_file_ids: HashSet<i64> = HashSet::new();
     let mut files_with_symbol_changes: HashSet<i64> = HashSet::new();
+    // Same-file symbol `References` pairs, accumulated across every file --
+    // see the block after the main loop for how each path is chosen.
+    let mut reference_pairs: Vec<(i64, i64)> = Vec::new();
 
     for file in &report.files {
+        let mut file_symbol_ids: Vec<i64> = Vec::with_capacity(file.symbols.len());
         let path_str = file.path.to_string_lossy().to_string();
         let existing_file = store.find_node(&repo, NodeKind::File, Some(&path_str), None, None)?;
         let file_id = upsert_node(
@@ -105,6 +113,7 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
                 },
             )?;
             kept_symbol_ids.push(symbol_id);
+            file_symbol_ids.push(symbol_id);
             symbol_count += 1;
 
             let change = match &existing_symbol {
@@ -129,6 +138,22 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
                     let embedding = agentops_embeddings::LocalEmbedder.embed(&symbol.source)?;
                     store.set_embedding(&repo, symbol_id, &embedding)?;
                 }
+            }
+        }
+
+        // Same-file symbol references: AST-precise (via each symbol's
+        // pre-collected `references` set) when tree-sitter parsed this
+        // file, word-boundary text matching as a fallback when it didn't
+        // (no AST to walk in that case). `file_symbol_ids` lines up 1:1
+        // with `file.symbols` since both were built in this same loop.
+        if file.used_tree_sitter {
+            for (from_idx, to_idx) in agentops_scanner::resolve_same_file_symbol_references(&file.symbols) {
+                reference_pairs.push((file_symbol_ids[from_idx], file_symbol_ids[to_idx]));
+            }
+        } else {
+            let triples: Vec<(i64, &str, &str)> = file_symbol_ids.iter().zip(&file.symbols).map(|(&id, s)| (id, s.name.as_str(), s.source.as_str())).collect();
+            for (from_id, to_id, _) in agentops_notes::match_same_file_references(&triples, 4)? {
+                reference_pairs.push((from_id, to_id));
             }
         }
     }
@@ -173,6 +198,17 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
             store.add_edge(&repo, from_id, to_id, EdgeRelation::DependsOn)?;
             dependency_edges += 1;
         }
+    }
+
+    // Reference edges are likewise fully replaced per touched symbol each
+    // scan, not diffed -- same convention as DependsOn above.
+    for &symbol_id in &kept_symbol_ids {
+        store.delete_edges_from(&repo, symbol_id, EdgeRelation::References)?;
+    }
+    let mut reference_edges = 0;
+    for (from_id, to_id) in &reference_pairs {
+        store.add_edge(&repo, *from_id, *to_id, EdgeRelation::References)?;
+        reference_edges += 1;
     }
 
     store.record_scan(&repo, &scan_entries)?;
@@ -221,7 +257,7 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
     // no new trigger/schedule needed.
     store.refresh_repo_state(&repo)?;
 
-    Ok(ScanPersistSummary { files: report.files.len(), symbols: symbol_count, dependency_edges, pruned_files: pruned_files.len(), pruned_symbols: pruned_symbols.len() })
+    Ok(ScanPersistSummary { files: report.files.len(), symbols: symbol_count, dependency_edges, reference_edges, pruned_files: pruned_files.len(), pruned_symbols: pruned_symbols.len() })
 }
 
 #[cfg(test)]
@@ -467,5 +503,58 @@ mod tests {
         let store = open_store(dir.path());
         let repo = repo_name(dir.path());
         assert_eq!(store.all_edges(&repo).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn same_file_symbols_that_reference_each_other_get_reference_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn helper() -> i32 { 1 }\n\nfn main() -> i32 { helper() }\n").unwrap();
+
+        let summary = scan_and_persist(dir.path(), false).unwrap();
+        assert_eq!(summary.reference_edges, 1);
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let symbols = store.nodes_by_kind(&repo, NodeKind::Symbol).unwrap();
+        let main_fn = symbols.iter().find(|s| s.name.as_deref() == Some("main")).unwrap();
+        let helper_fn = symbols.iter().find(|s| s.name.as_deref() == Some("helper")).unwrap();
+        let edges = store.edges_from(&repo, main_fn.id).unwrap();
+        assert!(edges.iter().any(|e| e.dst_id == helper_fn.id && e.relation == EdgeRelation::References));
+    }
+
+    #[test]
+    fn a_symbol_name_mentioned_only_in_a_comment_gets_no_reference_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn helper() -> i32 { 1 }\n\n// does not call helper, just mentions it\nfn main() -> i32 { 2 }\n").unwrap();
+
+        let summary = scan_and_persist(dir.path(), false).unwrap();
+        assert_eq!(summary.reference_edges, 0, "a comment mentioning a sibling's name must never produce a reference edge");
+    }
+
+    #[test]
+    fn reference_edges_are_fully_replaced_not_accumulated_on_rescan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn helper() -> i32 { 1 }\n\nfn main() -> i32 { helper() }\n").unwrap();
+
+        let summary1 = scan_and_persist(dir.path(), false).unwrap();
+        assert_eq!(summary1.reference_edges, 1);
+        let summary2 = scan_and_persist(dir.path(), false).unwrap();
+        assert_eq!(summary2.reference_edges, 1, "rescanning an unchanged file must not accumulate duplicate reference edges");
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let references: Vec<_> = store.all_edges(&repo).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::References).collect();
+        assert_eq!(references.len(), 1);
+    }
+
+    #[test]
+    fn symbols_in_different_files_with_matching_names_never_get_a_reference_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "fn helper() -> i32 { 1 }\n\nfn main() -> i32 { 2 }\n").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "fn helper() -> i32 { 2 }\n").unwrap();
+
+        let summary = scan_and_persist(dir.path(), false).unwrap();
+        assert_eq!(summary.reference_edges, 0, "no call in either file's symbols references anything -- a same-named symbol in a different file must not spuriously match");
     }
 }

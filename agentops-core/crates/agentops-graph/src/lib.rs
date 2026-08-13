@@ -103,6 +103,13 @@ pub enum EdgeRelation {
     /// to badge a symbol with "N known gotcha(s) apply"; reversing this
     /// direction silently breaks that badging with no error anywhere.
     Affects,
+    /// A symbol references another symbol defined in the **same file** —
+    /// directed **from the referencing symbol to the referenced one**.
+    /// Detected via same-file identifier matching (AST-precise where
+    /// tree-sitter parsed the file, word-boundary text matching as a
+    /// fallback where it didn't) — not real call-graph analysis, and never
+    /// cross-file. See `agentops_scanner::resolve_same_file_symbol_references`.
+    References,
 }
 
 impl EdgeRelation {
@@ -111,6 +118,7 @@ impl EdgeRelation {
             EdgeRelation::DependsOn => "depends_on",
             EdgeRelation::Documents => "documents",
             EdgeRelation::Affects => "affects",
+            EdgeRelation::References => "references",
         }
     }
 
@@ -118,6 +126,7 @@ impl EdgeRelation {
         match s {
             "documents" => EdgeRelation::Documents,
             "affects" => EdgeRelation::Affects,
+            "references" => EdgeRelation::References,
             _ => EdgeRelation::DependsOn,
         }
     }
@@ -655,6 +664,18 @@ pub fn prune_stale_nodes(store: &dyn GraphStore, repo: &str, kind: NodeKind, kee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edge_relation_db_str_round_trips_for_every_variant() {
+        // `from_db_str` has a catch-all `_ => DependsOn` fallback (for
+        // forward-compat with unknown future strings) -- a missing arm for
+        // a real variant would silently mislabel it as DependsOn instead of
+        // failing loudly, so this test exists specifically to catch that
+        // one-line omission class of bug.
+        for relation in [EdgeRelation::DependsOn, EdgeRelation::Documents, EdgeRelation::Affects, EdgeRelation::References] {
+            assert_eq!(EdgeRelation::from_db_str(relation.as_db_str()), relation);
+        }
+    }
 
     #[test]
     fn effective_weight_at_zero_age_equals_the_raw_weight() {

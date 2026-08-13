@@ -16,11 +16,21 @@ export function NodeDetailSections({
   detail,
   branch,
   onSelectConnected,
+  splitKnowledge = false,
 }: {
   detail: NodeDetail;
   branch: string | null | undefined;
   onSelectConnected: (node: ConnectedNode) => void;
+  /** When true, partitions `connected` into an "Attached knowledge" section
+   * (Gotcha/Decision) shown before "Relationships" (everything else) --
+   * the Knowledge Graph screen's layout. Default false preserves the
+   * single flat "Connected nodes" list the search and gotchas pages
+   * already render, unchanged. */
+  splitKnowledge?: boolean;
 }) {
+  const knowledgeNodes = splitKnowledge ? detail.connected.filter((n) => n.kind === "Gotcha" || n.kind === "Decision") : [];
+  const otherNodes = splitKnowledge ? detail.connected.filter((n) => n.kind !== "Gotcha" && n.kind !== "Decision") : detail.connected;
+
   return (
     <>
       {/* Never hidden -- a Reduced-prominence node is still fully real
@@ -76,11 +86,29 @@ export function NodeDetailSections({
         </div>
       )}
 
-      {detail.connected.length > 0 && (
+      {knowledgeNodes.length > 0 && (
         <div className="flex flex-col gap-2">
-          <p className="text-label uppercase tracking-wide text-ink-500">Connected nodes</p>
+          <p className="text-label uppercase tracking-wide text-ink-500">Attached knowledge</p>
           <div className="flex flex-col gap-2">
-            {detail.connected.map((node) => (
+            {knowledgeNodes.map((node) => (
+              <ConnectedNodeRow
+                key={`${node.relation}:${node.id}`}
+                relation={relationText(node.relation)}
+                kind={node.kind}
+                kindLabel={kindLabel(node.kind)}
+                label={connectedNodeLabel(node)}
+                onClick={() => onSelectConnected(node)}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+
+      {otherNodes.length > 0 && (
+        <div className="flex flex-col gap-2">
+          <p className="text-label uppercase tracking-wide text-ink-500">{splitKnowledge ? "Relationships" : "Connected nodes"}</p>
+          <div className="flex flex-col gap-2">
+            {otherNodes.map((node) => (
               <ConnectedNodeRow
                 key={`${node.relation}:${node.id}`}
                 relation={relationText(node.relation)}

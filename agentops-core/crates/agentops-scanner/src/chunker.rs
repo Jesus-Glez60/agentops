@@ -71,8 +71,8 @@ mod tests {
     fn emits_one_chunk_per_symbol_plus_header() {
         let source = "def a():\n    pass\n\ndef b():\n    pass\n";
         let symbols = vec![
-            Symbol { name: "a".into(), container: None, kind: "function".into(), start_line: 1, end_line: 2, source: "def a():\n    pass".into() },
-            Symbol { name: "b".into(), container: None, kind: "function".into(), start_line: 4, end_line: 5, source: "def b():\n    pass".into() },
+            Symbol { name: "a".into(), container: None, kind: "function".into(), start_line: 1, end_line: 2, source: "def a():\n    pass".into(), references: Vec::new() },
+            Symbol { name: "b".into(), container: None, kind: "function".into(), start_line: 4, end_line: 5, source: "def b():\n    pass".into(), references: Vec::new() },
         ];
         let chunks = chunk_file(source, &symbols);
         assert_eq!(chunks.len(), 3);
@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn truncates_long_symbols_at_150_lines() {
         let long_source = (0..300).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-        let symbol = Symbol { name: "big".into(), container: None, kind: "function".into(), start_line: 1, end_line: 300, source: long_source };
+        let symbol = Symbol { name: "big".into(), container: None, kind: "function".into(), start_line: 1, end_line: 300, source: long_source, references: Vec::new() };
         let chunk = symbol_chunk(&symbol);
         assert!(chunk.text.contains("[truncated]"));
         assert_eq!(chunk.text.lines().count(), MAX_SYMBOL_LINES + 1);

@@ -7,6 +7,6 @@ mod vault;
 
 pub use config::{default_notes_path, resolve_notes_path, write_notes_path};
 pub use vault::{
-    connect_many, heuristic_score, ingest_vault, match_symbols, walk_vault, HeuristicClassifier, IngestSummary, NoteClassifier, NoteType, SymbolMatcher,
-    VaultNote, WordBoundaryMatcher,
+    connect_many, heuristic_score, ingest_vault, match_same_file_references, match_symbols, walk_vault, HeuristicClassifier, IngestSummary, NoteClassifier,
+    NoteType, SymbolMatcher, VaultNote, WordBoundaryMatcher,
 };

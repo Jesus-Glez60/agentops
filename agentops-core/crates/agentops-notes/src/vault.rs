@@ -195,33 +195,63 @@ fn first_h1(body: &str) -> Option<String> {
 /// naturally appears once.
 const MAX_NAME_OCCURRENCES: usize = 3;
 
+/// Pure, storeless name-matching core: which of `candidates` (id, name) are
+/// word-boundary-mentioned in `text`, deduped against framework-convention
+/// noise names (`MAX_NAME_OCCURRENCES`), longest-name-first so a more
+/// specific match wins over a short substring collision. Shared by
+/// `match_symbols` (repo-wide candidates vs. one note body) and
+/// `match_same_file_references` (per-file candidates vs. each symbol's own
+/// source, called once per symbol in that file).
+fn match_names_in_text(candidates: &[(i64, &str)], text: &str, min_name_len: usize) -> Result<Vec<(i64, usize)>> {
+    let mut name_counts: HashMap<&str, usize> = HashMap::new();
+    for (_, name) in candidates {
+        *name_counts.entry(*name).or_insert(0) += 1;
+    }
+
+    let mut ranked: Vec<&(i64, &str)> = candidates.iter().filter(|(_, name)| name.len() >= min_name_len && name_counts.get(name).copied().unwrap_or(0) <= MAX_NAME_OCCURRENCES).collect();
+    ranked.sort_by_key(|(_, name)| std::cmp::Reverse(name.len()));
+
+    let mut matches = Vec::new();
+    for (id, name) in ranked {
+        let pattern = Regex::new(&format!(r"\b{}\b", regex::escape(name))).context("building word-boundary pattern")?;
+        if pattern.is_match(text) {
+            matches.push((*id, name.len()));
+        }
+    }
+    Ok(matches)
+}
+
 /// Cheap, no-network default symbol matcher: word-boundary regex over
 /// `note_body`, returning **all** matches above `min_name_len` characters
 /// (one note can affect several symbols), ranked longest-name-first so a
 /// more specific match wins over a short substring collision.
 pub fn match_symbols(store: &dyn GraphStore, repo: &str, note_body: &str, min_name_len: usize) -> Result<Vec<(i64, usize)>> {
     let all_symbols = store.nodes_by_kind(repo, NodeKind::Symbol)?;
+    let candidates: Vec<(i64, &str)> = all_symbols.iter().filter_map(|s| s.name.as_deref().map(|n| (s.id, n))).collect();
+    match_names_in_text(&candidates, note_body, min_name_len)
+}
 
-    let mut name_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for s in &all_symbols {
-        if let Some(name) = s.name.as_deref() {
-            *name_counts.entry(name).or_insert(0) += 1;
+/// Fallback same-file symbol reference detection for files where
+/// tree-sitter parsing failed (`ScannedFile.used_tree_sitter == false`) --
+/// full-body word-boundary text matching, since there's no AST to walk in
+/// that case. Only meant to be called for that fallback case; the
+/// AST-precise `agentops_scanner::resolve_same_file_symbol_references` is
+/// the primary path for every file tree-sitter successfully parsed. Purely
+/// in-memory, no `GraphStore` round trip -- `scan.rs` already has this data
+/// before persistence finishes. Self-matches excluded (a symbol's body
+/// always contains its own name at least once; that's not a reference
+/// worth an edge for).
+pub fn match_same_file_references(symbols: &[(i64, &str, &str)], min_name_len: usize) -> Result<Vec<(i64, i64, usize)>> {
+    let candidates: Vec<(i64, &str)> = symbols.iter().map(|(id, name, _)| (*id, *name)).collect();
+    let mut pairs = Vec::new();
+    for (from_id, _, source) in symbols {
+        for (to_id, len) in match_names_in_text(&candidates, source, min_name_len)? {
+            if to_id != *from_id {
+                pairs.push((*from_id, to_id, len));
+            }
         }
     }
-
-    let mut candidates: Vec<&agentops_graph::Node> =
-        all_symbols.iter().filter(|s| s.name.as_deref().is_some_and(|n| n.len() >= min_name_len && name_counts.get(n).copied().unwrap_or(0) <= MAX_NAME_OCCURRENCES)).collect();
-    candidates.sort_by_key(|s| std::cmp::Reverse(s.name.as_deref().map(str::len).unwrap_or(0)));
-
-    let mut matches = Vec::new();
-    for symbol in &candidates {
-        let name = symbol.name.as_deref().unwrap_or_default();
-        let pattern = Regex::new(&format!(r"\b{}\b", regex::escape(name))).context("building word-boundary pattern")?;
-        if pattern.is_match(note_body) {
-            matches.push((symbol.id, name.len()));
-        }
-    }
-    Ok(matches)
+    Ok(pairs)
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -447,6 +477,38 @@ mod tests {
 
         let matches = match_symbols(&store, "demo", "Calls verify_token here.", 4).unwrap();
         assert!(matches.is_empty(), "a same-named symbol in a different repo must not match");
+    }
+
+    #[test]
+    fn match_same_file_references_finds_a_word_boundary_mention() {
+        let symbols = [(1_i64, "helper", "fn main() { helper(); }"), (2_i64, "helper", "")];
+        let pairs = match_same_file_references(&symbols, 4).unwrap();
+        assert_eq!(pairs.len(), 1);
+        assert_eq!((pairs[0].0, pairs[0].1), (1, 2));
+    }
+
+    #[test]
+    fn match_same_file_references_excludes_self_matches() {
+        // Every symbol's own source trivially contains its own name --
+        // that's not a reference worth an edge for.
+        let symbols = [(1_i64, "factorial", "fn factorial(n: u64) -> u64 { n * factorial(n - 1) }")];
+        assert!(match_same_file_references(&symbols, 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn match_same_file_references_never_sees_cross_file_candidates() {
+        // Candidates are only ever whatever's passed in this call -- no
+        // store lookup, so cross-file leakage is impossible by construction,
+        // not just by convention.
+        let symbols = [(1_i64, "helper", "fn main() { helper(); }")];
+        assert!(match_same_file_references(&symbols, 4).unwrap().is_empty(), "helper isn't in this slice's candidates, so it can't match");
+    }
+
+    #[test]
+    fn match_same_file_references_respects_noise_and_min_len_filters() {
+        let symbols = [(1_i64, "caller", "fn caller() { let id = 1; POST(); }"), (2_i64, "id", ""), (3_i64, "POST", ""), (4_i64, "POST", ""), (5_i64, "POST", ""), (6_i64, "POST", "")];
+        let pairs = match_same_file_references(&symbols, 4).unwrap();
+        assert!(pairs.is_empty(), "'id' below min_name_len and 'POST' repeated past MAX_NAME_OCCURRENCES must both be excluded: {pairs:?}");
     }
 
     #[test]

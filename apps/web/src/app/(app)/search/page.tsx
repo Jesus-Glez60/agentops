@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
-import { SearchIcon, SearchX } from "lucide-react";
+import { SearchIcon, SearchX, Workflow } from "lucide-react";
 import { getNodeDetail, getRepos, REPOS_SWR_KEY, search, type ConnectedNode, type NodeKind } from "@/lib/api/agentops-api";
 import { getRecentSearches, pushRecentSearch } from "@/lib/recent-searches";
 import { kindLabel } from "@/lib/node-detail-formatting";
@@ -36,6 +37,18 @@ const EXAMPLE_QUESTIONS = [
 ];
 
 export default function SearchPage() {
+  // useSearchParams requires a Suspense boundary during static generation --
+  // the actual page content lives in SearchPageInner below.
+  return (
+    <Suspense fallback={null}>
+      <SearchPageInner />
+    </Suspense>
+  );
+}
+
+function SearchPageInner() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [query, setQuery] = useState("");
   const [submittedQuery, setSubmittedQuery] = useState<string | null>(null);
   const [kinds, setKinds] = useState<NodeKind[]>([]);
@@ -49,6 +62,18 @@ export default function SearchPage() {
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setRecent(getRecentSearches());
+  }, []);
+
+  // A pre-filled query via `?q=` -- e.g. the graph screen's "Search" action
+  // button links here instead of duplicating search UI. Runs once on mount
+  // only (empty deps): editing the input afterward shouldn't keep getting
+  // clobbered by the URL param.
+  useEffect(() => {
+    const q = searchParams.get("q");
+    if (q?.trim()) {
+      runSearch(q);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const { data: results, isLoading } = useSWR(
@@ -187,7 +212,18 @@ export default function SearchPage() {
                   <p className="text-subheading text-ink-100">{selected.name ?? selected.path ?? `Node ${selected.id}`}</p>
                   <p className="text-mono-path text-ink-500">{selected.path ?? selected.repo}</p>
                 </div>
-                <CopyButton value={`${selected.repo}:${selected.kind}:${selected.id}`} label="Copy ID" />
+                <div className="flex shrink-0 items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    className="gap-1.5"
+                    onClick={() => router.push(`/graph?repo=${encodeURIComponent(selected.repo)}&node=${selected.id}`)}
+                  >
+                    <Workflow className="size-3.5" />
+                    View in graph
+                  </Button>
+                  <CopyButton value={`${selected.repo}:${selected.kind}:${selected.id}`} label="Copy ID" />
+                </div>
               </div>
 
               {!detail && <p className="text-body text-ink-500">Loading details…</p>}

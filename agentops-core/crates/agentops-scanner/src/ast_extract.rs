@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -27,6 +28,39 @@ fn definition_kinds(lang: Language) -> &'static [&'static str] {
         // right node kind to match on.
         Language::Cpp => &["class_specifier", "struct_specifier", "function_definition"],
         Language::CSharp => &["class_declaration", "struct_declaration", "enum_declaration", "method_declaration"],
+    }
+}
+
+/// Node kinds tree-sitter uses for plain identifier references, per
+/// language -- used to collect a symbol's `references` set (see
+/// `collect_identifiers`). Comments and string literals are never these
+/// kinds in any of these grammars, so walking for them naturally excludes
+/// comment/string text with no separate skip-list required. Mostly just
+/// `"identifier"`; a few grammars split out a type- or field-specific
+/// identifier kind for qualified/member access (`Foo.bar`, `pkg.Type`)
+/// that would otherwise be missed.
+fn reference_kinds(lang: Language) -> &'static [&'static str] {
+    match lang {
+        Language::Python => &["identifier"],
+        Language::TypeScript | Language::JavaScript => &["identifier", "property_identifier", "type_identifier"],
+        Language::Go => &["identifier", "type_identifier", "field_identifier"],
+        Language::Rust => &["identifier", "type_identifier", "field_identifier"],
+        Language::Cpp => &["identifier", "field_identifier", "type_identifier"],
+        Language::CSharp => &["identifier"],
+    }
+}
+
+/// Collects the text of every descendant node (including `node` itself)
+/// whose kind is in `kinds` -- same recursion shape as `collect_definitions`,
+/// just gathering identifier text instead of definition symbols.
+fn collect_identifiers(node: &Node, src: &str, kinds: &[&str], out: &mut HashSet<String>) {
+    if kinds.contains(&node.kind().as_str()) {
+        out.insert(node_text(src, node).to_string());
+    }
+    for i in 0..node.child_count() as u32 {
+        if let Some(child) = node.child(i) {
+            collect_identifiers(&child, src, kinds, out);
+        }
     }
 }
 
@@ -129,6 +163,10 @@ fn collect_definitions(language: Language, node: &Node, src: &str, kinds: &[&str
         }
         .unwrap_or_else(|| "<anonymous>".to_string());
 
+        let mut references = HashSet::new();
+        collect_identifiers(node, src, reference_kinds(language), &mut references);
+        references.remove(&name);
+
         out.push(Symbol {
             name,
             container: scope.map(str::to_string),
@@ -136,6 +174,7 @@ fn collect_definitions(language: Language, node: &Node, src: &str, kinds: &[&str
             start_line: node.start_position().row + 1,
             end_line: node.end_position().row + 1,
             source: node_text(src, node).to_string(),
+            references: references.into_iter().collect(),
         });
     }
 
@@ -219,7 +258,7 @@ fn python_regex_fallback(source: &str) -> Vec<Symbol> {
             end = j;
         }
 
-        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n"), references: Vec::new() });
     }
 
     symbols
@@ -242,7 +281,7 @@ fn js_regex_fallback(source: &str) -> Vec<Symbol> {
         };
 
         let (end, _) = brace_depth_end(&lines, i);
-        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n"), references: Vec::new() });
     }
 
     symbols
@@ -262,7 +301,7 @@ fn go_regex_fallback(source: &str) -> Vec<Symbol> {
         let kind = if line.trim_start().starts_with("func (") { "method" } else { "function" };
 
         let (end, _) = brace_depth_end(&lines, i);
-        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n"), references: Vec::new() });
     }
 
     symbols
@@ -291,7 +330,7 @@ fn rust_regex_fallback(source: &str) -> Vec<Symbol> {
         };
 
         let (end, _) = brace_or_semicolon_end(&lines, i);
-        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n"), references: Vec::new() });
     }
 
     symbols
@@ -312,7 +351,7 @@ fn cpp_regex_fallback(source: &str) -> Vec<Symbol> {
         };
 
         let (end, _) = brace_depth_end(&lines, i);
-        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n"), references: Vec::new() });
     }
 
     symbols
@@ -335,7 +374,7 @@ fn csharp_regex_fallback(source: &str) -> Vec<Symbol> {
         };
 
         let (end, _) = brace_depth_end(&lines, i);
-        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n") });
+        symbols.push(Symbol { name, container: None, kind: kind.to_string(), start_line: i + 1, end_line: end + 1, source: lines[i..=end].join("\n"), references: Vec::new() });
     }
 
     symbols
@@ -445,6 +484,63 @@ mod tests {
         let render = symbols.iter().find(|s| s.name == "render").unwrap();
         assert_eq!(render.container.as_deref(), Some("Widget"), "a method inside impl Widget must be qualified by Widget");
         assert_eq!(widget.container, None, "a top-level struct has no enclosing container");
+    }
+
+    #[test]
+    fn a_function_calling_a_sibling_gets_it_in_references() {
+        let src = "fn helper() -> i32 {\n    1\n}\n\nfn main() {\n    let x = helper();\n    println!(\"{x}\");\n}\n";
+        let (symbols, used_ts) = extract_symbols(Language::Rust, src);
+        assert!(used_ts);
+        let main_fn = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(main_fn.references.iter().any(|r| r == "helper"), "references: {:?}", main_fn.references);
+    }
+
+    #[test]
+    fn a_symbol_name_mentioned_only_in_a_comment_is_not_a_reference() {
+        // The whole reason AST identifier-node walking was chosen over
+        // full-text regex matching: a comment mentioning another symbol's
+        // name must never produce a false reference edge.
+        let src = "fn helper() -> i32 {\n    1\n}\n\n// This does NOT call helper, just mentions it in prose.\nfn main() {\n    let x = 1;\n    println!(\"{x}\");\n}\n";
+        let (symbols, used_ts) = extract_symbols(Language::Rust, src);
+        assert!(used_ts);
+        let main_fn = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(!main_fn.references.iter().any(|r| r == "helper"), "references: {:?}", main_fn.references);
+    }
+
+    #[test]
+    fn a_symbol_name_mentioned_only_in_a_string_literal_is_not_a_reference() {
+        let src = "fn helper() -> i32 {\n    1\n}\n\nfn main() {\n    let s = \"helper\";\n    println!(\"{s}\");\n}\n";
+        let (symbols, used_ts) = extract_symbols(Language::Rust, src);
+        assert!(used_ts);
+        let main_fn = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(!main_fn.references.iter().any(|r| r == "helper"), "references: {:?}", main_fn.references);
+    }
+
+    #[test]
+    fn a_symbol_never_references_itself() {
+        let src = "fn factorial(n: u64) -> u64 {\n    if n == 0 { 1 } else { n * factorial(n - 1) }\n}\n";
+        let (symbols, used_ts) = extract_symbols(Language::Rust, src);
+        assert!(used_ts);
+        let factorial = symbols.iter().find(|s| s.name == "factorial").unwrap();
+        assert!(!factorial.references.iter().any(|r| r == "factorial"), "references: {:?}", factorial.references);
+    }
+
+    #[test]
+    fn python_reference_detection_also_excludes_comments() {
+        let src = "def helper():\n    return 1\n\n\n# does not call helper\ndef main():\n    return 2\n";
+        let (symbols, used_ts) = extract_symbols(Language::Python, src);
+        assert!(used_ts);
+        let main_fn = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(!main_fn.references.iter().any(|r| r == "helper"), "references: {:?}", main_fn.references);
+    }
+
+    #[test]
+    fn typescript_reference_detection_finds_a_call_to_a_sibling_function() {
+        let src = "function helper(): number {\n  return 1;\n}\n\nfunction main(): number {\n  return helper();\n}\n";
+        let (symbols, used_ts) = extract_symbols(Language::TypeScript, src);
+        assert!(used_ts);
+        let main_fn = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert!(main_fn.references.iter().any(|r| r == "helper"), "references: {:?}", main_fn.references);
     }
 
     /// Regression test for a confirmed real bug found via live testing

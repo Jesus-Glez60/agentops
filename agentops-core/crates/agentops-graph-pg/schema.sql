@@ -55,6 +55,18 @@ CREATE INDEX IF NOT EXISTS idx_edges_repo_dst ON edges(repo, dst_id);
 ALTER TABLE edges ADD COLUMN IF NOT EXISTS weight DOUBLE PRECISION NOT NULL DEFAULT 1.0;
 ALTER TABLE edges ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
+-- Widens the `relation` CHECK to admit `EdgeRelation::References` (same-file
+-- symbol-to-symbol edges). `edges_relation_check` is Postgres's default
+-- auto-generated name for the unnamed inline CHECK above (`<table>_<column>
+-- _check`) -- this is the first time this codebase has ever widened a CHECK
+-- constraint post-creation, so this exact name was verified against a real
+-- Postgres instance rather than assumed (see agentops-graph-pg's tests).
+-- `IF EXISTS`/re-`ADD` makes this idempotent across repeated migrations the
+-- same way every other `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in this
+-- file already is.
+ALTER TABLE edges DROP CONSTRAINT IF EXISTS edges_relation_check;
+ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depends_on', 'documents', 'affects', 'references'));
+
 CREATE TABLE IF NOT EXISTS scan_history (
     id               BIGSERIAL PRIMARY KEY,
     repo             TEXT NOT NULL,

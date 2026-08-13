@@ -174,11 +174,14 @@ pub struct NodeDetail {
     pub curation_reason: Option<String>,
 }
 
-fn relation_label(relation: EdgeRelation, incoming: bool) -> String {
+/// `pub(crate)` so `subgraph.rs` reuses this instead of re-deriving the
+/// same match statement.
+pub(crate) fn relation_label(relation: EdgeRelation, incoming: bool) -> String {
     let label = match relation {
         EdgeRelation::DependsOn => "depends on",
         EdgeRelation::Documents => "documents",
         EdgeRelation::Affects => "affects",
+        EdgeRelation::References => "references",
     };
     if incoming { format!("← {label}") } else { label.to_string() }
 }

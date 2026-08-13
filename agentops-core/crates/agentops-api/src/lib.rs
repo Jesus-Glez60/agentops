@@ -29,6 +29,7 @@ use agentops_security::api_key::verify_api_key;
 
 mod repos;
 mod search;
+mod subgraph;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -56,6 +57,8 @@ pub fn build_router(mode: AccessMode, api_key_hash: Option<String>, manifest_pat
         .route("/repos/{name}/rescan", post(repos::rescan_repo_json))
         .route("/repos/{name}/nodes/{id}", get(search::node_detail_json))
         .route("/repos/{name}/nodes/{id}/curation", post(search::set_curation_json))
+        .route("/repos/{name}/nodes/{id}/graph", get(subgraph::subgraph_json))
+        .route("/repos/{name}/graph", get(subgraph::repo_graph_json))
         .route("/activity", get(repos::activity_json))
         .route("/search", get(search::search_json))
         .route("/gotchas", get(repos::gotchas_json))

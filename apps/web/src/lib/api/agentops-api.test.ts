@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { getActivity, getNodeDetail, getRepos, rescanRepo, search } from "@/lib/api/agentops-api";
+import { getActivity, getNodeDetail, getRepoGraph, getRepos, getSubgraph, rescanRepo, search } from "@/lib/api/agentops-api";
 
 describe("agentops-api client", () => {
   const fetchMock = vi.fn();
@@ -84,5 +84,60 @@ describe("agentops-api client", () => {
   it("getNodeDetail surfaces a 404 via ApiError", async () => {
     fetchMock.mockResolvedValue({ ok: false, status: 404, json: async () => ({ error: "no such node" }) });
     await expect(getNodeDetail("agentops", 999)).rejects.toThrow("no such node");
+  });
+
+  it("getSubgraph hits GET /repos/{name}/nodes/{id}/graph with the mode and URL-encodes the repo name", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ seed_id: 1, mode: "local", depth: 2, nodes: [], edges: [], truncated: false }) });
+    const subgraph = await getSubgraph("my repo", 1, "local");
+    expect(subgraph).toEqual({ seed_id: 1, mode: "local", depth: 2, nodes: [], edges: [], truncated: false });
+    const [url] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url));
+    expect(parsed.pathname).toBe("/repos/my%20repo/nodes/1/graph");
+    expect(parsed.searchParams.get("mode")).toBe("local");
+  });
+
+  it("getSubgraph encodes depth and kinds into the query string", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ seed_id: 1, mode: "dep_chain", depth: 3, nodes: [], edges: [], truncated: false }) });
+    await getSubgraph("agentops", 1, "dep_chain", { depth: 3, kinds: ["Symbol", "File"] });
+    const [url] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url));
+    expect(parsed.searchParams.get("depth")).toBe("3");
+    expect(parsed.searchParams.get("kind")).toBe("symbol,file");
+  });
+
+  it("getSubgraph omits depth/kind params when options are empty", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ seed_id: 1, mode: "local", depth: 2, nodes: [], edges: [], truncated: false }) });
+    await getSubgraph("agentops", 1, "local");
+    const [url] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url));
+    expect(parsed.searchParams.has("depth")).toBe(false);
+    expect(parsed.searchParams.has("kind")).toBe(false);
+  });
+
+  it("getSubgraph surfaces backend errors via ApiError", async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 400, json: async () => ({ error: "invalid 'mode'" }) });
+    await expect(getSubgraph("agentops", 1, "local")).rejects.toThrow("invalid 'mode'");
+  });
+
+  it("getRepoGraph hits GET /repos/{name}/graph with no query string when kinds is empty", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ repo: "agentops", nodes: [], edges: [], truncated: false }) });
+    await getRepoGraph("my repo");
+    const [url] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url));
+    expect(parsed.pathname).toBe("/repos/my%20repo/graph");
+    expect(parsed.search).toBe("");
+  });
+
+  it("getRepoGraph encodes kinds into the query string", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ repo: "agentops", nodes: [], edges: [], truncated: false }) });
+    await getRepoGraph("agentops", ["Gotcha", "Decision"]);
+    const [url] = fetchMock.mock.calls[0];
+    const parsed = new URL(String(url));
+    expect(parsed.searchParams.get("kind")).toBe("gotcha,decision");
+  });
+
+  it("getRepoGraph surfaces backend errors via ApiError", async () => {
+    fetchMock.mockResolvedValue({ ok: false, status: 404, json: async () => ({ error: "no such repo" }) });
+    await expect(getRepoGraph("nope")).rejects.toThrow("no such repo");
   });
 });

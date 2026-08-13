@@ -771,6 +771,27 @@ mod tests {
     }
 
     #[test]
+    fn references_edges_are_accepted_by_the_widened_relation_check_constraint() {
+        // Regression test for the schema.sql migration this test file's
+        // `connect()` re-applies on every run: `edges.relation`'s CHECK
+        // constraint originally only admitted 'depends_on'/'documents'/
+        // 'affects' -- without the widened constraint, this insert fails
+        // with a real Postgres constraint-violation error, not a silent
+        // no-op, so this is a meaningful live check that the migration
+        // actually took effect against a real instance.
+        let store = require_store!();
+        let a = upsert_node(&store, node("pg-repo-refs", NodeKind::Symbol, Some("a.rs"), Some("foo"))).unwrap();
+        let b = upsert_node(&store, node("pg-repo-refs", NodeKind::Symbol, Some("a.rs"), Some("bar"))).unwrap();
+        store.add_edge("pg-repo-refs", a, b, EdgeRelation::References).unwrap();
+
+        let edges = store.edges_from("pg-repo-refs", a).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].relation, EdgeRelation::References, "must round-trip as References, not silently fall back to DependsOn");
+
+        store.delete_nodes("pg-repo-refs", &[a, b]).unwrap();
+    }
+
+    #[test]
     fn edges_are_repo_scoped() {
         let store = require_store!();
         let a = upsert_node(&store, node("pg-repo-d", NodeKind::Symbol, Some("a.rs"), Some("foo"))).unwrap();

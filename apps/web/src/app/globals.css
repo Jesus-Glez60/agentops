@@ -216,4 +216,32 @@
   html {
     @apply font-sans;
   }
+
+  /* React Flow's <Controls/> ships its own light-theme CSS (white buttons,
+     dark icon strokes) that isn't dark-mode aware -- overridden here rather
+     than per-instance since every graph canvas on this screen wants the
+     same dark styling. `!important` matches the specificity React Flow's
+     own base.css uses for these same selectors. */
+  .react-flow__controls {
+    @apply overflow-hidden rounded-md border border-border-strong shadow-none;
+  }
+  .react-flow__controls-button {
+    background: var(--panel) !important;
+    border-bottom-color: var(--border-strong) !important;
+    fill: var(--ink-300) !important;
+    stroke: var(--ink-300) !important;
+  }
+  .react-flow__controls-button:hover {
+    background: var(--raised) !important;
+  }
+  .react-flow__controls-button:disabled {
+    fill: var(--ink-500) !important;
+    stroke: var(--ink-500) !important;
+  }
+  .react-flow__attribution {
+    background: transparent !important;
+  }
+  .react-flow__attribution a {
+    color: var(--ink-500) !important;
+  }
 }

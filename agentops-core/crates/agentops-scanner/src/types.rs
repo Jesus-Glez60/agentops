@@ -65,6 +65,14 @@ pub struct Symbol {
     pub start_line: usize,
     pub end_line: usize,
     pub source: String,
+    /// Identifier-kind node text found within this symbol's own body via
+    /// the tree-sitter walk — always empty via the regex fallback (there's
+    /// no AST to walk there). Comments and string literals are never
+    /// `identifier`-kind nodes in any supported grammar, so they're
+    /// excluded with no skip-list needed. Used to detect same-file symbol
+    /// references (`resolve_same_file_symbol_references`) — not a real
+    /// call graph, just "this symbol's body mentions that identifier."
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

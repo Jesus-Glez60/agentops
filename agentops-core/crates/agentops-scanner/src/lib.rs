@@ -15,7 +15,7 @@ mod ranker;
 mod types;
 mod walker;
 
-pub use ranker::{rank_files, resolve_dependency_edges};
+pub use ranker::{rank_files, resolve_dependency_edges, resolve_same_file_symbol_references};
 pub use types::{Chunk, ChunkKind, Language, ScannedFile, Symbol};
 pub use walker::watchable_dirs;
 

@@ -429,10 +429,11 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embedding
         println!("Pruned {} stale file node(s) and {} stale symbol node(s) from prior scans.", summary.pruned_files, summary.pruned_symbols);
     }
     println!(
-        "Wrote {} file node(s), {} symbol node(s), {} dependency edge(s) to {}",
+        "Wrote {} file node(s), {} symbol node(s), {} dependency edge(s), {} reference edge(s) to {}",
         summary.files,
         summary.symbols,
         summary.dependency_edges,
+        summary.reference_edges,
         agentops_mcp::describe_backend(path)
     );
 
