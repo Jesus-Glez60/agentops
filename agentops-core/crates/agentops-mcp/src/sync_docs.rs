@@ -17,6 +17,10 @@ pub struct SyncDocsSummary {
     pub already_known: u32,
     pub discovered: u32,
     pub unresolved: Vec<String>,
+    /// Manifest-declared `(repo, library)` version pairs upserted this run
+    /// — only counts libraries already known to the store (see
+    /// `record_declared_versions`'s doc comment).
+    pub versions_recorded: u32,
 }
 
 /// `~/.agentops/docbrain.db` — duplicated (not depended-on) from
@@ -48,7 +52,30 @@ pub fn sync_docs(repo_path: &Path, docbrain_db_path: Option<&Path>) -> Result<Sy
     let db_path = docbrain_db_path.map(Path::to_path_buf).unwrap_or_else(default_docbrain_db_path);
     let store = docbrain_graph::SqliteDocbrainStore::open(&db_path).context("opening docbrain store")?;
 
-    sync_candidates(&store, &RegistryDiscovery, &candidates)
+    let mut summary = sync_candidates(&store, &RegistryDiscovery, &candidates)?;
+    summary.versions_recorded = record_declared_versions(&store, repo_path)?;
+    Ok(summary)
+}
+
+/// Manifest-declared versions (`package.json`/`Cargo.toml`), recorded
+/// against whatever library each declared name already resolves to in the
+/// store — run after `sync_candidates` so libraries discovered from this
+/// same repo's imports are already registered and can receive their
+/// declared-version row in the same pass. A manifest entry for a library
+/// docbrain has never heard of (import-based discovery never found it,
+/// e.g. a build-only dependency) is silently skipped, not discovered —
+/// deferred scope, not a bug.
+fn record_declared_versions(store: &dyn docbrain_graph::DocbrainStore, repo_path: &Path) -> Result<u32> {
+    let declared = agentops_scanner::extract_declared_dependencies(repo_path);
+    let repo_identifier = repo_path.to_string_lossy().to_string();
+    let mut recorded = 0u32;
+    for dep in &declared {
+        if store.get_library(&dep.name)?.is_some() {
+            store.upsert_repo_library_version(&repo_identifier, &dep.name, &dep.version)?;
+            recorded += 1;
+        }
+    }
+    Ok(recorded)
 }
 
 /// The discovery loop on its own, for testability against a fake
@@ -64,14 +91,14 @@ fn sync_candidates(store: &dyn docbrain_graph::DocbrainStore, discovery: &dyn Li
 
         let step1 = discovery.discover(*ecosystem, name).unwrap_or(None);
         if let Some(found) = step1 {
-            store.add_library(name, name, found.repo_url.as_deref(), found.docs_url.as_deref())?;
+            store.add_library(name, name, found.description.as_deref(), found.repo_url.as_deref(), found.docs_url.as_deref())?;
             summary.discovered += 1;
             continue;
         }
 
         let step2 = discovery.search_github(name).unwrap_or(None);
         if let Some(found) = step2 {
-            store.add_library(name, name, found.repo_url.as_deref(), found.docs_url.as_deref())?;
+            store.add_library(name, name, found.description.as_deref(), found.repo_url.as_deref(), found.docs_url.as_deref())?;
             summary.discovered += 1;
             continue;
         }
@@ -124,7 +151,7 @@ mod tests {
     fn a_library_already_known_is_not_rediscovered() {
         let store = docbrain_graph::SqliteDocbrainStore::open_in_memory().unwrap();
         use docbrain_graph::DocbrainStore;
-        store.add_library("next", "Next.js", None, Some("https://nextjs.org")).unwrap();
+        store.add_library("next", "Next.js", None, None, Some("https://nextjs.org")).unwrap();
 
         let discovery = FakeDiscovery { known: vec!["next"], github_only: vec![] };
         let candidates = BTreeSet::from([(Ecosystem::Npm, "next".to_string())]);
@@ -133,5 +160,37 @@ mod tests {
 
         assert_eq!(summary.already_known, 1);
         assert_eq!(summary.discovered, 0, "already-known libraries must not be re-queried against discovery");
+    }
+
+    #[test]
+    fn manifest_declared_version_is_recorded_when_the_slug_already_matches() {
+        let store = docbrain_graph::SqliteDocbrainStore::open_in_memory().unwrap();
+        use docbrain_graph::DocbrainStore;
+        // The import classifier normalizes to the bare npm package name
+        // ("next"), so the manifest parser's `package.json` key must match
+        // that exactly for the repo_library_versions join to find it — the
+        // risk flagged in the plan.
+        store.add_library("next", "Next.js", None, None, Some("https://nextjs.org")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"dependencies": {"next": "16.2.12"}}"#).unwrap();
+
+        let recorded = record_declared_versions(&store, dir.path()).unwrap();
+        assert_eq!(recorded, 1);
+
+        let usage = store.repos_using_library("next").unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].declared_version, "16.2.12");
+    }
+
+    #[test]
+    fn manifest_declared_version_for_an_unknown_library_is_silently_skipped() {
+        let store = docbrain_graph::SqliteDocbrainStore::open_in_memory().unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), r#"{"dependencies": {"totally-unregistered": "1.0.0"}}"#).unwrap();
+
+        let recorded = record_declared_versions(&store, dir.path()).unwrap();
+        assert_eq!(recorded, 0, "a manifest dependency docbrain has never registered contributes no repo_library_versions row");
     }
 }

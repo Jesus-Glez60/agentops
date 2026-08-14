@@ -8,9 +8,10 @@ use std::sync::Once;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use rusqlite_migration::{Migrations, M};
 use sha2::{Digest, Sha256};
 
-use crate::{ChangelogEntry, DocEdge, DocNode, DocbrainStore, EdgeRelation, Job, JobStatus, Library, NewDocNode, NodeKind, SearchHit, UpsertOutcome};
+use crate::{ChangelogEntry, DocEdge, DocNode, DocbrainStore, EdgeRelation, Job, JobStatus, Library, NewDocNode, NodeKind, RepoLibraryUsage, SearchHit, UpsertOutcome};
 
 /// Embedding dimension for docbrain's default model (BGE-small-en-v1.5).
 /// Re-exported from `agentops-embeddings` (the single source of truth,
@@ -38,7 +39,17 @@ fn ensure_vec_extension_registered() {
     });
 }
 
-const MIGRATIONS: &str = "
+/// Ordered, tracked (via SQLite's `user_version` pragma) migration steps —
+/// same reasoning and pattern as `agentops-graph::sqlite`'s `MIGRATIONS_SLICE`:
+/// a single idempotent `CREATE TABLE IF NOT EXISTS` blob re-run on every open
+/// can never express "add a column to an existing, already-populated table."
+/// A database that predates this (any existing `docbrain.db`) starts at
+/// `user_version = 0`: `to_latest` harmlessly re-runs the first step's
+/// `CREATE TABLE IF NOT EXISTS`es as no-ops, then applies the new step for
+/// the first time.
+const MIGRATIONS_SLICE: &[M<'_>] = &[
+    M::up(
+        "
     CREATE TABLE IF NOT EXISTS libraries (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         slug        TEXT NOT NULL UNIQUE,
@@ -101,7 +112,28 @@ const MIGRATIONS: &str = "
         created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
         updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
-";
+",
+    ),
+    M::up(
+        "ALTER TABLE libraries ADD COLUMN description TEXT;
+
+    CREATE TABLE IF NOT EXISTS repo_library_versions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        repo_identifier  TEXT NOT NULL,
+        library_id       INTEGER NOT NULL REFERENCES libraries(id),
+        declared_version TEXT NOT NULL,
+        updated_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_library_versions_dedup
+        ON repo_library_versions(repo_identifier, library_id);
+    CREATE INDEX IF NOT EXISTS idx_repo_library_versions_library
+        ON repo_library_versions(library_id);",
+    ),
+];
+
+fn migrations() -> Migrations<'static> {
+    Migrations::from_slice(MIGRATIONS_SLICE)
+}
 
 fn vec_table_migration() -> String {
     format!("CREATE VIRTUAL TABLE IF NOT EXISTS doc_node_vectors USING vec0(node_id INTEGER PRIMARY KEY, embedding FLOAT[{EMBEDDING_DIM}]);")
@@ -114,16 +146,25 @@ pub struct SqliteDocbrainStore {
 impl SqliteDocbrainStore {
     pub fn open(path: &Path) -> Result<Self> {
         ensure_vec_extension_registered();
-        let conn = agentops_sqlite_support::open(path, MIGRATIONS)?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| format!("creating parent dir for {}", path.display()))?;
+        }
+        let mut conn = Connection::open(path).with_context(|| format!("opening sqlite db at {}", path.display()))?;
+        migrations().to_latest(&mut conn).context("running docbrain store migrations")?;
         conn.execute_batch(&vec_table_migration()).context("creating doc_node_vectors virtual table")?;
         Ok(Self { conn })
     }
 
     pub fn open_in_memory() -> Result<Self> {
         ensure_vec_extension_registered();
-        let conn = agentops_sqlite_support::open_in_memory(MIGRATIONS)?;
+        let mut conn = Connection::open_in_memory().context("opening in-memory sqlite db")?;
+        migrations().to_latest(&mut conn).context("running docbrain store migrations")?;
         conn.execute_batch(&vec_table_migration()).context("creating doc_node_vectors virtual table")?;
         Ok(Self { conn })
+    }
+
+    fn repo_library_version_row(row: &rusqlite::Row) -> rusqlite::Result<RepoLibraryUsage> {
+        Ok(RepoLibraryUsage { repo_identifier: row.get("repo_identifier")?, declared_version: row.get("declared_version")?, updated_at: row.get("updated_at")? })
     }
 
     fn library_id(&self, slug: &str) -> Result<Option<i64>> {
@@ -137,29 +178,37 @@ impl SqliteDocbrainStore {
         self.library_id(slug)?.ok_or_else(|| anyhow::anyhow!("no library '{slug}' registered"))
     }
 
-    fn stats_for(&self, library_id: i64) -> rusqlite::Result<(i64, i64, Vec<String>, i64)> {
+    #[allow(clippy::type_complexity)]
+    fn stats_for(&self, library_id: i64) -> rusqlite::Result<(i64, i64, Vec<String>, i64, i64, Option<String>)> {
         let doc_snapshots: i64 = self.conn.query_row("SELECT COUNT(*) FROM doc_snapshots WHERE library_id = ?1", [library_id], |r| r.get(0))?;
         let changelog_versions: i64 =
             self.conn.query_row("SELECT COUNT(*) FROM changelog_versions WHERE library_id = ?1", [library_id], |r| r.get(0))?;
         let total_nodes: i64 = self.conn.query_row("SELECT COUNT(*) FROM doc_nodes WHERE library_id = ?1", [library_id], |r| r.get(0))?;
         let mut stmt = self.conn.prepare("SELECT DISTINCT version FROM doc_snapshots WHERE library_id = ?1 ORDER BY version")?;
         let versions = stmt.query_map([library_id], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok((doc_snapshots, changelog_versions, versions, total_nodes))
+        let used_in_count: i64 =
+            self.conn.query_row("SELECT COUNT(*) FROM repo_library_versions WHERE library_id = ?1", [library_id], |r| r.get(0))?;
+        let last_indexed_at: Option<String> =
+            self.conn.query_row("SELECT MAX(scraped_at) FROM doc_snapshots WHERE library_id = ?1", [library_id], |r| r.get(0))?;
+        Ok((doc_snapshots, changelog_versions, versions, total_nodes, used_in_count, last_indexed_at))
     }
 
     fn row_to_library(&self, row: &rusqlite::Row) -> rusqlite::Result<Library> {
         let id: i64 = row.get("id")?;
-        let (doc_snapshots, changelog_versions, versions, total_nodes) = self.stats_for(id)?;
+        let (doc_snapshots, changelog_versions, versions, total_nodes, used_in_count, last_indexed_at) = self.stats_for(id)?;
         Ok(Library {
             id,
             slug: row.get("slug")?,
             name: row.get("name")?,
+            description: row.get("description")?,
             github_repo: row.get("github_repo")?,
             docs_url: row.get("docs_url")?,
             doc_snapshots,
             changelog_versions,
             versions,
             total_nodes,
+            used_in_count,
+            last_indexed_at,
         })
     }
 
@@ -176,6 +225,17 @@ impl SqliteDocbrainStore {
             kind: NodeKind::from_db_str(&kind),
         })
     }
+
+    fn row_to_changelog_entry(row: &rusqlite::Row) -> rusqlite::Result<ChangelogEntry> {
+        Ok(ChangelogEntry {
+            id: row.get("id")?,
+            library_id: row.get("library_id")?,
+            from_version: row.get("from_version")?,
+            to_version: row.get("to_version")?,
+            entry: row.get("entry")?,
+            breaking: row.get::<_, i64>("breaking")? != 0,
+        })
+    }
 }
 
 fn embedding_to_bytes(v: &[f32]) -> Vec<u8> {
@@ -183,13 +243,13 @@ fn embedding_to_bytes(v: &[f32]) -> Vec<u8> {
 }
 
 impl DocbrainStore for SqliteDocbrainStore {
-    fn add_library(&self, slug: &str, name: &str, github_repo: Option<&str>, docs_url: Option<&str>) -> Result<i64> {
+    fn add_library(&self, slug: &str, name: &str, description: Option<&str>, github_repo: Option<&str>, docs_url: Option<&str>) -> Result<i64> {
         agentops_sqlite_support::upsert(
             &self.conn,
             "libraries",
-            &["slug", "name", "github_repo", "docs_url"],
+            &["slug", "name", "description", "github_repo", "docs_url"],
             &["slug"],
-            &[&slug, &name, &github_repo, &docs_url],
+            &[&slug, &name, &description, &github_repo, &docs_url],
         )
     }
 
@@ -202,6 +262,31 @@ impl DocbrainStore for SqliteDocbrainStore {
     fn list_libraries(&self) -> Result<Vec<Library>> {
         let mut stmt = self.conn.prepare("SELECT * FROM libraries ORDER BY slug")?;
         let rows = stmt.query_map([], |row| self.row_to_library(row))?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn upsert_repo_library_version(&self, repo_identifier: &str, slug: &str, declared_version: &str) -> Result<()> {
+        let library_id = self.authorized_library_id(slug)?;
+        // Not routed through `agentops_sqlite_support::upsert` -- that
+        // helper binds every value as a `ToSql` parameter, so passing
+        // "CURRENT_TIMESTAMP" as a value would insert that literal string
+        // rather than evaluate the SQL function. Hand-written instead.
+        self.conn.execute(
+            "INSERT INTO repo_library_versions (repo_identifier, library_id, declared_version, updated_at)
+             VALUES (?1, ?2, ?3, CURRENT_TIMESTAMP)
+             ON CONFLICT (repo_identifier, library_id)
+             DO UPDATE SET declared_version = excluded.declared_version, updated_at = CURRENT_TIMESTAMP",
+            rusqlite::params![repo_identifier, library_id, declared_version],
+        )?;
+        Ok(())
+    }
+
+    fn repos_using_library(&self, slug: &str) -> Result<Vec<RepoLibraryUsage>> {
+        let library_id = self.authorized_library_id(slug)?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT repo_identifier, declared_version, updated_at FROM repo_library_versions WHERE library_id = ?1 ORDER BY repo_identifier")?;
+        let rows = stmt.query_map([library_id], Self::repo_library_version_row)?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
@@ -339,16 +424,14 @@ impl DocbrainStore for SqliteDocbrainStore {
         let library_id = self.authorized_library_id(slug)?;
         let mut stmt =
             self.conn.prepare("SELECT * FROM changelog_versions WHERE library_id = ?1 AND from_version = ?2 AND to_version = ?3")?;
-        let rows = stmt.query_map(rusqlite::params![library_id, from_version, to_version], |row| {
-            Ok(ChangelogEntry {
-                id: row.get("id")?,
-                library_id: row.get("library_id")?,
-                from_version: row.get("from_version")?,
-                to_version: row.get("to_version")?,
-                entry: row.get("entry")?,
-                breaking: row.get::<_, i64>("breaking")? != 0,
-            })
-        })?;
+        let rows = stmt.query_map(rusqlite::params![library_id, from_version, to_version], Self::row_to_changelog_entry)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn list_changelog(&self, slug: &str) -> Result<Vec<ChangelogEntry>> {
+        let library_id = self.authorized_library_id(slug)?;
+        let mut stmt = self.conn.prepare("SELECT * FROM changelog_versions WHERE library_id = ?1 ORDER BY id DESC")?;
+        let rows = stmt.query_map([library_id], Self::row_to_changelog_entry)?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
@@ -389,15 +472,15 @@ mod tests {
 
     fn store_with_library(slug: &str) -> SqliteDocbrainStore {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library(slug, slug, None, Some("https://example.com/docs")).unwrap();
+        store.add_library(slug, slug, None, None, Some("https://example.com/docs")).unwrap();
         store
     }
 
     #[test]
     fn add_library_is_idempotent_by_slug() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        let id1 = store.add_library("next", "Next.js", None, Some("https://nextjs.org/docs")).unwrap();
-        let id2 = store.add_library("next", "Next.js", Some("vercel/next.js"), Some("https://nextjs.org/docs")).unwrap();
+        let id1 = store.add_library("next", "Next.js", None, None, Some("https://nextjs.org/docs")).unwrap();
+        let id2 = store.add_library("next", "Next.js", None, Some("vercel/next.js"), Some("https://nextjs.org/docs")).unwrap();
         assert_eq!(id1, id2, "re-registering the same slug must not create a duplicate library");
         assert_eq!(store.list_libraries().unwrap().len(), 1);
     }
@@ -450,10 +533,23 @@ mod tests {
     }
 
     #[test]
+    fn list_changelog_returns_every_entry_most_recent_first() {
+        let store = store_with_library("next");
+        store.add_changelog_entry("next", "1.0", "1.1", "first", false).unwrap();
+        store.add_changelog_entry("next", "1.1", "1.2", "second", false).unwrap();
+        store.add_changelog_entry("next", "1.2", "1.3", "third", false).unwrap();
+
+        let all = store.list_changelog("next").unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].entry, "third", "most recently synced entry must come first");
+        assert_eq!(all[2].entry, "first");
+    }
+
+    #[test]
     fn search_similar_finds_the_nearest_embedding_and_respects_library_scope() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("a", "A", None, None).unwrap();
-        store.add_library("b", "B", None, None).unwrap();
+        store.add_library("a", "A", None, None, None).unwrap();
+        store.add_library("b", "B", None, None, None).unwrap();
 
         let mut close = vec![1.0_f32; EMBEDDING_DIM];
         close[0] = 1.1;
@@ -499,6 +595,36 @@ mod tests {
         let prose_only = store.search_similar(&vector, 5, None, Some(NodeKind::CodeExample)).unwrap();
         assert_eq!(prose_only.len(), 1);
         assert_eq!(prose_only[0].node.kind, NodeKind::Prose);
+    }
+
+    #[test]
+    fn add_library_persists_description() {
+        let store = SqliteDocbrainStore::open_in_memory().unwrap();
+        store.add_library("next", "Next.js", Some("The React framework"), None, None).unwrap();
+        assert_eq!(store.get_library("next").unwrap().unwrap().description.as_deref(), Some("The React framework"));
+    }
+
+    #[test]
+    fn repo_library_version_upsert_is_idempotent_by_repo_and_library() {
+        let store = store_with_library("next");
+        store.upsert_repo_library_version("/repos/app", "next", "15.1.0").unwrap();
+        store.upsert_repo_library_version("/repos/app", "next", "15.2.0").unwrap();
+
+        let usage = store.repos_using_library("next").unwrap();
+        assert_eq!(usage.len(), 1, "re-syncing the same repo must update, not duplicate, its declared version");
+        assert_eq!(usage[0].declared_version, "15.2.0");
+        assert_eq!(store.get_library("next").unwrap().unwrap().used_in_count, 1);
+    }
+
+    #[test]
+    fn repos_using_library_is_scoped_per_library() {
+        let store = SqliteDocbrainStore::open_in_memory().unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
+        store.add_library("react", "React", None, None, None).unwrap();
+        store.upsert_repo_library_version("/repos/app", "next", "15.1.0").unwrap();
+
+        assert_eq!(store.repos_using_library("next").unwrap().len(), 1);
+        assert_eq!(store.repos_using_library("react").unwrap().len(), 0);
     }
 
     #[test]

@@ -43,15 +43,33 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "discover_library",
-            description: "On-demand discovery: looks up a package's docs/repo URLs via its registry (npm or pypi) and registers it. Falls through to 'not found' if the registry has no such package, for the caller to try GitHub search or ask the user next.",
+            description: "On-demand discovery: looks up a package's docs/repo URLs via its registry (npm, pypi, cargo, go, or nuget) and registers it. Falls through to 'not found' if the registry has no such package, for the caller to try GitHub search, register_library, or ask the user next.",
             input_schema: || {
                 json!({
                     "type": "object",
-                    "properties": { "ecosystem": { "type": "string", "enum": ["npm", "pypi"] }, "name": { "type": "string" } },
+                    "properties": { "ecosystem": { "type": "string", "enum": ["npm", "pypi", "cargo", "go", "nuget"] }, "name": { "type": "string" } },
                     "required": ["ecosystem", "name"],
                 })
             },
             handler: tool_discover_library,
+        },
+        ToolSpec {
+            name: "register_library",
+            description: "Registers a library directly from caller-supplied metadata, with no registry lookup -- for anything with no package-manager entry at all (e.g. a product with its own standalone docs site, like Clerk or Stripe). Use discover_library first for anything published to npm/pypi/cargo/go/nuget; this is the fallback for everything else.",
+            input_schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "slug": { "type": "string" },
+                        "name": { "type": "string" },
+                        "docs_url": { "type": "string" },
+                        "github_repo": { "type": "string" },
+                        "description": { "type": "string" },
+                    },
+                    "required": ["slug", "name", "docs_url"],
+                })
+            },
+            handler: tool_register_library,
         },
         ToolSpec {
             name: "scrape_library",
@@ -140,6 +158,12 @@ fn tool_specs() -> Vec<ToolSpec> {
             handler: tool_get_changelog,
         },
         ToolSpec {
+            name: "list_changelog",
+            description: "Every synced changelog entry for a library, most recent first -- unlike get_changelog, not scoped to one exact version pair. Use this to show/summarize a library's changelog history; use get_changelog only when you already know the exact consecutive release tags to diff.",
+            input_schema: || json!({ "type": "object", "properties": { "slug": { "type": "string" } }, "required": ["slug"] }),
+            handler: tool_list_changelog,
+        },
+        ToolSpec {
             name: "get_job_status",
             description: "Polls a background scrape_library/sync_changelogs job's status and result message.",
             input_schema: || json!({ "type": "object", "properties": { "job_id": { "type": "integer" } }, "required": ["job_id"] }),
@@ -202,20 +226,39 @@ fn tool_discover_library(store: &dyn DocbrainStore, _db_path: &Path, args: &Valu
     let ecosystem = match ecosystem_str {
         "npm" => docbrain_ingest::Ecosystem::Npm,
         "pypi" => docbrain_ingest::Ecosystem::PyPi,
-        other => anyhow::bail!("invalid ecosystem '{other}', expected 'npm' or 'pypi'"),
+        "cargo" => docbrain_ingest::Ecosystem::Cargo,
+        "go" => docbrain_ingest::Ecosystem::Go,
+        "nuget" => docbrain_ingest::Ecosystem::NuGet,
+        other => anyhow::bail!("invalid ecosystem '{other}', expected one of: npm, pypi, cargo, go, nuget"),
     };
 
     match docbrain_ingest::RegistryDiscovery.discover(ecosystem, name)? {
         Some(found) => {
-            store.add_library(name, name, found.repo_url.as_deref(), found.docs_url.as_deref())?;
+            store.add_library(name, name, found.description.as_deref(), found.repo_url.as_deref(), found.docs_url.as_deref())?;
             Ok(format!(
                 "Discovered and registered '{name}'. docs: {} repo: {}",
                 found.docs_url.as_deref().unwrap_or("(none published)"),
                 found.repo_url.as_deref().unwrap_or("(none published)"),
             ))
         }
-        None => Ok(format!("'{name}' not found on {ecosystem_str}. Try discover_library's GitHub-search fallback or ask the user for a docs URL.")),
+        None => Ok(format!("'{name}' not found on {ecosystem_str}. Try discover_library's GitHub-search fallback, or register_library if it has no package-manager entry at all.")),
     }
+}
+
+/// The manual-registration path for anything with no package-manager entry
+/// -- a product with its own standalone docs site (Clerk, Stripe, ...).
+/// Same underlying `add_library` call `discover_library` and the CLI's
+/// interactive fallback already use, just with caller-supplied metadata
+/// instead of a registry lookup.
+fn tool_register_library(store: &dyn DocbrainStore, _db_path: &Path, args: &Value) -> Result<String> {
+    let slug = get_str(args, "slug").ok_or_else(|| anyhow::anyhow!("missing required 'slug'"))?;
+    let name = get_str(args, "name").ok_or_else(|| anyhow::anyhow!("missing required 'name'"))?;
+    let docs_url = get_str(args, "docs_url").ok_or_else(|| anyhow::anyhow!("missing required 'docs_url'"))?;
+    let github_repo = get_str(args, "github_repo");
+    let description = get_str(args, "description");
+
+    store.add_library(slug, name, description, github_repo, Some(docs_url))?;
+    Ok(format!("Registered '{slug}' ({name}). docs: {docs_url}"))
 }
 
 fn tool_scrape_library(store: &dyn DocbrainStore, db_path: &Path, args: &Value) -> Result<String> {
@@ -384,6 +427,19 @@ fn tool_get_changelog(store: &dyn DocbrainStore, _db_path: &Path, args: &Value) 
     Ok(entries.iter().map(|e| format!("{}{}", if e.breaking { "[BREAKING] " } else { "" }, e.entry)).collect::<Vec<_>>().join("\n"))
 }
 
+fn tool_list_changelog(store: &dyn DocbrainStore, _db_path: &Path, args: &Value) -> Result<String> {
+    let slug = get_str(args, "slug").ok_or_else(|| anyhow::anyhow!("missing required 'slug'"))?;
+    let entries = store.list_changelog(slug)?;
+    if entries.is_empty() {
+        return Ok(format!("No changelog entries synced for {slug}."));
+    }
+    Ok(entries
+        .iter()
+        .map(|e| format!("## {} → {}{}\n{}", e.from_version, e.to_version, if e.breaking { " [BREAKING]" } else { "" }, e.entry))
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
 fn tool_get_job_status(store: &dyn DocbrainStore, _db_path: &Path, args: &Value) -> Result<String> {
     let job_id = args.get("job_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'job_id'"))?;
     let job = store.get_job(job_id)?.ok_or_else(|| anyhow::anyhow!("no job {job_id}"))?;
@@ -426,7 +482,7 @@ mod tests {
     #[test]
     fn get_docs_stops_before_exceeding_the_token_budget() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("next", "Next.js", None, None).unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
         for i in 0..5 {
             let content = format!("chunk {i} content");
             let hash = docbrain_graph::content_hash(&content);
@@ -451,7 +507,7 @@ mod tests {
     #[test]
     fn search_docs_returns_a_hit_plus_its_edge_connected_context_within_budget() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("next", "Next.js", None, None).unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
 
         let main_text = "How do I configure the API key for authentication?";
         let neighbor_text = "Set the API_KEY environment variable before starting the server.";
@@ -519,7 +575,7 @@ mod tests {
     #[test]
     fn search_docs_excludes_code_examples_by_default_but_get_code_examples_returns_them() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("next", "Next.js", None, None).unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
 
         let prose_text = "Wrap the segment name in square brackets to create a dynamic route.";
         let code_text = "```tsx\nexport default function BlogPostPage() {}\n```";

@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn get_docs_reports_not_found_with_available_versions() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("next", "Next.js", None, None).unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
         store.add_doc_snapshot("next", "15.0").unwrap();
 
         let outcome = get_docs(&store, "next", "16.0", 2000, false).unwrap();
@@ -150,7 +150,7 @@ mod tests {
     #[test]
     fn get_docs_excludes_code_examples_by_default() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("next", "Next.js", None, None).unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
         let prose_hash = content_hash("prose");
         let code_hash = content_hash("code");
         store
@@ -175,7 +175,7 @@ mod tests {
     #[test]
     fn search_docs_excludes_code_examples_from_hits_and_edge_walk_by_default() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("next", "Next.js", None, None).unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
         let vector = vec![1.0_f32; docbrain_graph::EMBEDDING_DIM];
         let prose_hash = content_hash("prose");
         let code_hash = content_hash("code");
@@ -214,7 +214,7 @@ mod tests {
     #[test]
     fn get_code_examples_returns_only_has_example_targets() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("next", "Next.js", None, None).unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
         let a_hash = content_hash("a");
         let b_hash = content_hash("b");
         let a = store.upsert_doc_node("next", NewDocNode { version: "1.0", topic: "a", content: "a", content_hash: &a_hash, token_count: 1, embedding: None, kind: NodeKind::Prose }).unwrap().node_id();

@@ -48,6 +48,7 @@ pub fn build_router(store: SqliteDocbrainStore, db_path: PathBuf, api_key_hash: 
         .route("/tools", get(list_tools_handler))
         .route("/tools/{name}", post(call_tool_handler))
         .route("/libraries", get(list_libraries_json))
+        .route("/libraries/{slug}", get(get_library_json))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .route("/health", get(health))
         .with_state(state)
@@ -98,10 +99,72 @@ async fn list_tools_handler() -> Json<Value> {
 /// tool-result text.
 async fn list_libraries_json(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let store = state.store.lock().unwrap();
-    match store.list_libraries() {
-        Ok(libs) => (StatusCode::OK, Json(json!({ "libraries": libs }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
-    }
+    let libs = match store.list_libraries() {
+        Ok(libs) => libs,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+
+    // Only libraries with real ingested content -- `sync_docs`'s
+    // import/manifest-based auto-discovery registers a name+registry-metadata
+    // row for every dependency it finds, whether or not anyone ever scrapes
+    // its docs. Surfacing all of those here would make this a mirror of a
+    // repo's package.json, not "what docbrain actually has" -- the dashboard's
+    // one real consumer of this endpoint. `list_libraries` (the MCP tool) is
+    // unaffected: agents still see the full registry there.
+    let libs: Vec<_> = libs.into_iter().filter(|lib| !lib.versions.is_empty()).collect();
+
+    // `has_mismatch` per row, same derived-at-read-time comparison as the
+    // detail endpoint — N+1 `repos_using_library` calls, one per library,
+    // acceptable at the table sizes a self-hosted docbrain instance
+    // actually has (same tradeoff already accepted in `stats_for`).
+    let libs_json: Vec<Value> = libs
+        .into_iter()
+        .map(|lib| {
+            let has_mismatch = store
+                .repos_using_library(&lib.slug)
+                .map(|used_in| used_in.iter().any(|u| lib.versions.last().is_some_and(|latest| latest != &u.declared_version)))
+                .unwrap_or(false);
+            let mut value = serde_json::to_value(&lib).unwrap();
+            value["has_mismatch"] = json!(has_mismatch);
+            value
+        })
+        .collect();
+
+    (StatusCode::OK, Json(json!({ "libraries": libs_json })))
+}
+
+/// Detail-by-slug JSON — the mockup's identity block, tabs, and
+/// repos-using-this sidebar all need one library plus its `used_in` list
+/// plus a derived mismatch flag, which `/tools/get_library`'s MCP-text
+/// format can't give a UI cheaply.
+async fn get_library_json(State(state): State<AppState>, AxumPath(slug): AxumPath<String>) -> (StatusCode, Json<Value>) {
+    let store = state.store.lock().unwrap();
+    let library = match store.get_library(&slug) {
+        Ok(Some(library)) => library,
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("no library '{slug}' registered") }))),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    let used_in = match store.repos_using_library(&slug) {
+        Ok(used_in) => used_in,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+
+    // Mismatch is derived at read time against the latest indexed version
+    // (versions come back ascending from the store), never stored.
+    let latest_version = library.versions.last().cloned();
+    let used_in_json: Vec<Value> = used_in
+        .iter()
+        .map(|u| {
+            json!({
+                "repo_identifier": u.repo_identifier,
+                "declared_version": u.declared_version,
+                "updated_at": u.updated_at,
+                "mismatch": latest_version.as_deref().is_some_and(|latest| latest != u.declared_version),
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(json!({ "library": library, "used_in": used_in_json })))
 }
 
 async fn call_tool_handler(State(state): State<AppState>, AxumPath(name): AxumPath<String>, body: Option<Json<Value>>) -> (StatusCode, Json<Value>) {
@@ -139,7 +202,8 @@ mod tests {
     #[tokio::test]
     async fn libraries_json_endpoint_returns_structured_data() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("react", "React", None, Some("https://react.dev")).unwrap();
+        store.add_library("react", "React", None, None, Some("https://react.dev")).unwrap();
+        store.add_doc_snapshot("react", "19.1.0").unwrap();
 
         let app = build_router(store, PathBuf::from("unused.db"), None);
         let resp = app.oneshot(Request::builder().uri("/libraries").body(Body::empty()).unwrap()).await.unwrap();
@@ -148,6 +212,49 @@ mod tests {
         let libs = body["libraries"].as_array().unwrap();
         assert_eq!(libs.len(), 1);
         assert_eq!(libs[0]["slug"], "react");
+    }
+
+    #[tokio::test]
+    async fn libraries_json_endpoint_omits_registered_but_never_scraped_libraries() {
+        let store = SqliteDocbrainStore::open_in_memory().unwrap();
+        // Auto-discovered via sync_docs's import/manifest scanning -- name +
+        // registry metadata only, never actually scraped.
+        store.add_library("left-pad", "left-pad", None, None, Some("https://npmjs.com/left-pad")).unwrap();
+
+        let app = build_router(store, PathBuf::from("unused.db"), None);
+        let resp = app.oneshot(Request::builder().uri("/libraries").body(Body::empty()).unwrap()).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["libraries"].as_array().unwrap().len(), 0, "a library with no doc_snapshot must not appear in the dashboard's list");
+    }
+
+    #[tokio::test]
+    async fn get_library_json_returns_404_for_an_unknown_slug() {
+        let store = SqliteDocbrainStore::open_in_memory().unwrap();
+        let app = build_router(store, PathBuf::from("unused.db"), None);
+        let resp = app.oneshot(Request::builder().uri("/libraries/nope").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_library_json_includes_used_in_with_a_derived_mismatch_flag() {
+        let store = SqliteDocbrainStore::open_in_memory().unwrap();
+        store.add_library("next", "Next.js", None, None, Some("https://nextjs.org")).unwrap();
+        store.add_doc_snapshot("next", "16.2.12").unwrap();
+        store.upsert_repo_library_version("/repos/app", "next", "15.1.0").unwrap();
+        store.upsert_repo_library_version("/repos/other", "next", "16.2.12").unwrap();
+
+        let app = build_router(store, PathBuf::from("unused.db"), None);
+        let resp = app.oneshot(Request::builder().uri("/libraries/next").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+
+        assert_eq!(body["library"]["slug"], "next");
+        let used_in = body["used_in"].as_array().unwrap();
+        assert_eq!(used_in.len(), 2);
+        let app_row = used_in.iter().find(|u| u["repo_identifier"] == "/repos/app").unwrap();
+        assert_eq!(app_row["mismatch"], true, "declared 15.1.0 vs latest indexed 16.2.12 must be flagged");
+        let other_row = used_in.iter().find(|u| u["repo_identifier"] == "/repos/other").unwrap();
+        assert_eq!(other_row["mismatch"], false, "declared version matching the latest indexed version is not a mismatch");
     }
 
     #[tokio::test]
@@ -162,7 +269,7 @@ mod tests {
     #[tokio::test]
     async fn calling_a_tool_over_http_reuses_the_same_dispatch_as_mcp() {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library("react", "React", None, Some("https://react.dev")).unwrap();
+        store.add_library("react", "React", None, None, Some("https://react.dev")).unwrap();
 
         let app = build_router(store, PathBuf::from("unused.db"), None);
         let req = Request::builder()

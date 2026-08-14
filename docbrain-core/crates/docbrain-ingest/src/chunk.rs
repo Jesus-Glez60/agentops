@@ -302,7 +302,7 @@ mod tests {
 
     fn store_with_library(slug: &str) -> SqliteDocbrainStore {
         let store = SqliteDocbrainStore::open_in_memory().unwrap();
-        store.add_library(slug, slug, None, Some("https://example.com/docs")).unwrap();
+        store.add_library(slug, slug, None, None, Some("https://example.com/docs")).unwrap();
         store
     }
 

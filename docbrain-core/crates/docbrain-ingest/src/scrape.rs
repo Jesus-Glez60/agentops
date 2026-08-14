@@ -42,18 +42,22 @@ pub struct ScrapedPage {
 
 /// Fetches `url` and extracts its content, preferring a clean Markdown
 /// export over HTML scraping when the site offers one. If `max_pages` is
-/// greater than 1, also follows up to `max_pages - 1` same-origin,
-/// same-path-prefix links found on the landing page's HTML — a shallow,
-/// bounded crawl. Link discovery always uses HTML (Markdown exports don't
-/// reliably expose the same nav structure), even when the page content
-/// itself is fetched as Markdown.
+/// greater than 1, also follows up to `max_pages - 1` further pages: an
+/// `llms.txt` index (llmstxt.org's emerging convention — a curated
+/// Markdown link list most real doc sites now publish specifically to
+/// point an LLM/crawler at actual content, not nav/marketing chrome) if
+/// one is found, falling back to same-origin, same-path-prefix links
+/// scraped off the landing page's HTML otherwise. Link discovery always
+/// uses HTML for the fallback path (Markdown exports don't reliably expose
+/// the same nav structure), even when the page content itself is fetched
+/// as Markdown.
 pub fn scrape_docs(url: &str, max_pages: usize) -> Result<Vec<ScrapedPage>> {
     let base = Url::parse(url).with_context(|| format!("parsing docs URL '{url}'"))?;
     let html = fetch(url)?;
     let mut pages = vec![scrape_one_page(url, &html)];
 
     if max_pages > 1 {
-        let links = same_scope_links(&html, &base);
+        let links = fetch_llms_txt_links(&base).unwrap_or_else(|| same_scope_links(&html, &base));
         for link in links.into_iter().take(max_pages - 1) {
             match fetch(link.as_str()) {
                 Ok(page_html) => pages.push(scrape_one_page(link.as_str(), &page_html)),
@@ -67,6 +71,91 @@ pub fn scrape_docs(url: &str, max_pages: usize) -> Result<Vec<ScrapedPage>> {
     }
 
     Ok(pages)
+}
+
+/// Tries a handful of conventional locations for a site's `llms.txt`
+/// (llmstxt.org: a Markdown file of `[Title](url): description` links,
+/// meant to be exactly the "here's our real documentation, skip the rest
+/// of the site" index docbrain's own shallow crawl wants) — relative to
+/// the docs URL's own directory first (most specific), then the docs path
+/// with an `llms.txt` sibling, then the site root. Returns `None` if none
+/// resolve to a non-empty link list, letting the caller fall back to HTML
+/// link-scraping.
+fn fetch_llms_txt_links(base: &Url) -> Option<Vec<Url>> {
+    let mut candidates = Vec::new();
+    if let Ok(sibling) = base.join("llms.txt") {
+        candidates.push(sibling);
+    }
+    if let Ok(mut root) = Url::parse(&format!("{}://{}", base.scheme(), base.host_str()?)) {
+        root.set_path("/llms.txt");
+        candidates.push(root.clone());
+        root.set_path("/docs/llms.txt");
+        candidates.push(root);
+    }
+    candidates.dedup();
+
+    for candidate in candidates {
+        let Some(links) = fetch_and_parse_llms_txt(&candidate) else { continue };
+        if links.is_empty() {
+            continue;
+        }
+
+        // Some sites publish a root-level "meta" llms.txt whose own links
+        // are a mix of the docs index, blog posts, and marketing/learn
+        // pages (confirmed live: nextjs.org's root llms.txt is exactly
+        // this) rather than a direct list of documentation pages — but one
+        // of those links points to a more specific, nested llms.txt (e.g.
+        // covering just /docs) that *does* list real content pages. Follow
+        // that one hop deeper instead of crawling the meta index's own
+        // mixed link list, which would pull in blog/learn pages docbrain
+        // has no business scraping as "the library's docs".
+        if let Some(nested_url) = links.iter().find(|u| u.as_str() != candidate.as_str() && u.path().ends_with("llms.txt")) {
+            if let Some(nested_links) = fetch_and_parse_llms_txt(nested_url) {
+                if !nested_links.is_empty() {
+                    return Some(nested_links);
+                }
+            }
+        }
+
+        return Some(links);
+    }
+    None
+}
+
+fn fetch_and_parse_llms_txt(url: &Url) -> Option<Vec<Url>> {
+    let mut resp = ureq::get(url.as_str()).header("User-Agent", "docbrain-ingest").call().ok()?;
+    let body = resp.body_mut().read_to_string().ok()?;
+    Some(extract_markdown_links(&body, url))
+}
+
+/// Every `[text](url)` target in `markdown`, resolved against `base` and
+/// deduplicated in first-seen order — llms.txt's own link list, not the
+/// heading-anchor extraction `extract_markdown_anchor_links` does (that one
+/// only tracks in-page `#fragment` links; this one wants the real target
+/// URLs, same-page or not).
+fn extract_markdown_links(markdown: &str, base: &Url) -> Vec<Url> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut links = Vec::new();
+    for line in markdown.lines() {
+        let mut rest = line;
+        while let Some(start) = rest.find("](") {
+            let after = &rest[start + 2..];
+            let Some(end) = after.find(')') else { break };
+            let target = &after[..end];
+            rest = &after[end + 1..];
+
+            let Ok(resolved) = base.join(target) else { continue };
+            if resolved.scheme() != "http" && resolved.scheme() != "https" {
+                continue;
+            }
+            let mut normalized = resolved.clone();
+            normalized.set_fragment(None);
+            if seen.insert(normalized.to_string()) {
+                links.push(normalized);
+            }
+        }
+    }
+    links
 }
 
 /// Tries a clean Markdown export of `url` first; falls back to extracting
@@ -394,6 +483,60 @@ mod tests {
                 assert!(body.contains('#'), "expected real Markdown heading syntax in the body");
             }
             None => eprintln!("skipping network-dependent assertion: no markdown export reachable right now"),
+        }
+    }
+
+    #[test]
+    fn extracts_and_resolves_links_out_of_an_llms_txt_style_document() {
+        let markdown = "# Docs\n\n> Summary line, not a link.\n\n## Getting Started\n\n- [Installation](https://example.com/docs/install): set up the project\n- [Relative page](/docs/other): a relative link\n- [Anchor only](#skip-me): should be skipped\n- [Mailto](mailto:someone@example.com): should be skipped\n";
+        let base = Url::parse("https://example.com/docs/llms.txt").unwrap();
+        let links = extract_markdown_links(markdown, &base);
+        let paths: Vec<String> = links.iter().map(|u| u.to_string()).collect();
+        assert!(paths.contains(&"https://example.com/docs/install".to_string()));
+        assert!(paths.contains(&"https://example.com/docs/other".to_string()), "a root-relative link must resolve against the base URL");
+        assert!(!paths.iter().any(|p| p.contains("skip-me")), "a same-page anchor link must not be treated as a followable page");
+        assert!(!paths.iter().any(|p| p.starts_with("mailto:")), "a non-http(s) link must be skipped");
+    }
+
+    #[test]
+    fn duplicate_links_in_llms_txt_are_deduplicated_in_first_seen_order() {
+        let markdown = "- [A](https://example.com/a)\n- [A again](https://example.com/a)\n- [B](https://example.com/b)\n";
+        let base = Url::parse("https://example.com/llms.txt").unwrap();
+        let links = extract_markdown_links(markdown, &base);
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].as_str(), "https://example.com/a");
+        assert_eq!(links[1].as_str(), "https://example.com/b");
+    }
+
+    // Network-dependent: confirms docbrain actually prefers a real site's
+    // published llms.txt over blind HTML crawling when both are available.
+    #[test]
+    fn finds_a_real_sites_published_llms_txt() {
+        let base = Url::parse("https://nextjs.org").unwrap();
+        match fetch_llms_txt_links(&base) {
+            Some(links) => {
+                assert!(!links.is_empty());
+                assert!(links.iter().all(|u| u.host_str() == Some("nextjs.org")), "llms.txt-derived links should stay on the docs site");
+            }
+            None => eprintln!("skipping network-dependent assertion: nextjs.org's llms.txt not reachable right now"),
+        }
+    }
+
+    // Regression test for a real, confirmed case: nextjs.org's root
+    // llms.txt is a site-wide meta index (docs + blog + Learn courses)
+    // whose own links point to a more specific /docs/llms.txt containing
+    // the actual content-page list. Following the meta index's raw links
+    // directly pulled in blog posts and a 404 error page instead of real
+    // documentation.
+    #[test]
+    fn follows_a_meta_llms_txt_one_hop_to_the_real_content_index() {
+        let base = Url::parse("https://nextjs.org").unwrap();
+        match fetch_llms_txt_links(&base) {
+            Some(links) => {
+                assert!(links.iter().any(|u| u.path().contains("/docs/app/getting-started")), "expected real Next.js doc pages from the nested /docs/llms.txt, not the meta index's own mixed links");
+                assert!(!links.iter().any(|u| u.path().starts_with("/blog")), "must not pull in blog posts from the root meta index");
+            }
+            None => eprintln!("skipping network-dependent assertion: nextjs.org's llms.txt not reachable right now"),
         }
     }
 }

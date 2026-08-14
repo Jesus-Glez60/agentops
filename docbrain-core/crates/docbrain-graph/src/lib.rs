@@ -28,6 +28,10 @@ pub struct Library {
     pub id: i64,
     pub slug: String,
     pub name: String,
+    /// Fetched during discovery (npm/PyPI/GitHub metadata) and persisted —
+    /// previously discarded at every call site despite `DiscoveredLibrary`
+    /// already carrying it.
+    pub description: Option<String>,
     pub github_repo: Option<String>,
     pub docs_url: Option<String>,
     pub doc_snapshots: i64,
@@ -35,6 +39,24 @@ pub struct Library {
     /// Distinct versions with at least one doc_snapshot, ascending.
     pub versions: Vec<String>,
     pub total_nodes: i64,
+    /// Count of distinct repos with a `repo_library_versions` row for this
+    /// library — computed, not stored, so both list and detail views get
+    /// "used in N repos" without a second per-library query.
+    pub used_in_count: i64,
+    /// `MAX(doc_snapshots.scraped_at)` — `None` if never scraped.
+    pub last_indexed_at: Option<String>,
+}
+
+/// One repo's declared dependency on a library, from manifest parsing
+/// (`agentops_scanner::extract_declared_dependencies`), not import scanning.
+/// `repo_identifier` is a plain path/name string -- no FK, since a repo's
+/// own graph lives in an entirely separate SQLite/Postgres store from
+/// docbrain's.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RepoLibraryUsage {
+    pub repo_identifier: String,
+    pub declared_version: String,
+    pub updated_at: String,
 }
 
 /// What a neuron actually holds. `CodeExample` nodes are split out of their
@@ -210,9 +232,19 @@ pub struct Job {
 /// backend, if gatekeeping is added later) can implement this without
 /// touching any use-case or MCP-handler code.
 pub trait DocbrainStore {
-    fn add_library(&self, slug: &str, name: &str, github_repo: Option<&str>, docs_url: Option<&str>) -> Result<i64>;
+    fn add_library(&self, slug: &str, name: &str, description: Option<&str>, github_repo: Option<&str>, docs_url: Option<&str>) -> Result<i64>;
     fn get_library(&self, slug: &str) -> Result<Option<Library>>;
     fn list_libraries(&self) -> Result<Vec<Library>>;
+
+    /// Upserts the declared version for `(repo_identifier, slug)` — keyed
+    /// on that pair, so re-running `sync_docs` for the same repo updates
+    /// the existing row rather than duplicating it. Errors if `slug` isn't
+    /// a registered library (call after registration/discovery, not before).
+    fn upsert_repo_library_version(&self, repo_identifier: &str, slug: &str, declared_version: &str) -> Result<()>;
+    /// Every repo with a recorded declared version for `slug`, ordered by
+    /// `repo_identifier`. Mismatch against the library's latest indexed
+    /// version is derived by the caller at read time, not stored here.
+    fn repos_using_library(&self, slug: &str) -> Result<Vec<RepoLibraryUsage>>;
 
     fn add_doc_snapshot(&self, slug: &str, version: &str) -> Result<i64>;
 
@@ -240,6 +272,16 @@ pub trait DocbrainStore {
     /// never duplicates a row (the confirmed gap in `main`'s plain `INSERT`).
     fn add_changelog_entry(&self, slug: &str, from_version: &str, to_version: &str, entry: &str, breaking: bool) -> Result<i64>;
     fn get_changelog(&self, slug: &str, from_version: &str, to_version: &str) -> Result<Vec<ChangelogEntry>>;
+    /// Every synced entry for `slug`, most recent first (`id DESC` — entries
+    /// are inserted in the order `sync_changelogs` fetched them, newest
+    /// release first). Unlike `get_changelog`, not scoped to one exact
+    /// `(from_version, to_version)` pair — real GitHub release tags (what
+    /// changelog entries are keyed on) and a library's coarser
+    /// doc-snapshot versions (what `scrape_library` was told to fetch) are
+    /// different granularities with no guaranteed exact match, so a UI
+    /// showing "the changelog for this library" needs the full history,
+    /// not a lookup that silently returns nothing for a mismatched pair.
+    fn list_changelog(&self, slug: &str) -> Result<Vec<ChangelogEntry>>;
 
     fn create_job(&self, job_type: &str, slug: &str) -> Result<i64>;
     fn complete_job(&self, id: i64, status: JobStatus, message: &str) -> Result<()>;

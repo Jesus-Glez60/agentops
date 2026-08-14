@@ -11,10 +11,12 @@
 mod ast_extract;
 mod chunker;
 mod dep_extract;
+mod manifest;
 mod ranker;
 mod types;
 mod walker;
 
+pub use manifest::{extract_declared_dependencies, DeclaredDependency};
 pub use ranker::{rank_files, resolve_dependency_edges, resolve_same_file_symbol_references};
 pub use types::{Chunk, ChunkKind, Language, ScannedFile, Symbol};
 pub use walker::watchable_dirs;

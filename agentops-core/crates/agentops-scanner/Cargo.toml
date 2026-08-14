@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 regex.workspace = true
 walkdir.workspace = true
+toml.workspace = true
 agentops-security = { path = "../agentops-security" }
 
 [dev-dependencies]

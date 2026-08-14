@@ -24,10 +24,24 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+/// One per package manager for a language this project's scanner actually
+/// supports (`agentops_scanner::Language`: Python, TypeScript/JavaScript,
+/// Go, Rust, C#) — C++ has no single dominant package manager (vcpkg vs.
+/// Conan vs. system packages), so it's left to the manual/custom
+/// registration path (`register_library`) rather than guessing one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Ecosystem {
     Npm,
     PyPi,
+    /// crates.io, for Rust.
+    Cargo,
+    /// Go modules — no registry metadata API exists (proxy.golang.org only
+    /// serves version lists/zips), so `discover_go` derives docs/repo URLs
+    /// directly from the module path's host+path convention instead of
+    /// hitting a JSON API.
+    Go,
+    /// NuGet, for C#/.NET.
+    NuGet,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +94,9 @@ fn discover(ecosystem: Ecosystem, name: &str) -> Result<Option<DiscoveredLibrary
     let result = match ecosystem {
         Ecosystem::Npm => discover_npm(name)?,
         Ecosystem::PyPi => discover_pypi(name)?,
+        Ecosystem::Cargo => discover_cargo(name)?,
+        Ecosystem::Go => discover_go(name)?,
+        Ecosystem::NuGet => discover_nuget(name)?,
     };
     cache().lock().expect("discovery cache mutex poisoned").insert(key, result.clone());
     Ok(result)
@@ -152,6 +169,106 @@ fn discover_pypi(name: &str) -> Result<Option<DiscoveredLibrary>> {
     let repo_url = REPO_URL_KEYS.iter().find_map(|k| project_urls.get(*k).cloned());
 
     Ok(Some(DiscoveredLibrary { name: name.to_string(), description: parsed.info.summary, docs_url, repo_url }))
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoResponse {
+    #[serde(rename = "crate")]
+    krate: CratesIoCrate,
+}
+
+#[derive(Debug, Deserialize)]
+struct CratesIoCrate {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    homepage: Option<String>,
+    #[serde(default)]
+    documentation: Option<String>,
+    #[serde(default)]
+    repository: Option<String>,
+}
+
+fn discover_cargo(name: &str) -> Result<Option<DiscoveredLibrary>> {
+    let url = format!("https://crates.io/api/v1/crates/{name}");
+    // crates.io rejects requests with no identifying User-Agent (their
+    // documented API etiquette policy) rather than just rate-limiting them.
+    let response = ureq::get(&url).header("User-Agent", "docbrain-ingest (agentops)").call();
+    let mut response = match response {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("fetching crates.io metadata for '{name}'")),
+    };
+
+    let parsed: CratesIoResponse = response.body_mut().read_json().with_context(|| format!("parsing crates.io response for '{name}'"))?;
+    Ok(Some(DiscoveredLibrary {
+        name: name.to_string(),
+        description: parsed.krate.description,
+        // docs.rs (the `documentation` field) over the crate's homepage --
+        // that's the actual generated API reference, not a marketing page.
+        docs_url: parsed.krate.documentation.or(parsed.krate.homepage),
+        repo_url: parsed.krate.repository,
+    }))
+}
+
+/// No registry metadata API exists for Go modules (the module proxy only
+/// serves version lists and zip archives) -- Go's own convention is that
+/// the module path *is* the repo host+path, so docs/repo URLs are derived
+/// directly rather than looked up. Confirms the module actually exists by
+/// probing pkg.go.dev (which resolves and indexes real modules) instead of
+/// returning a guessed URL unconditionally.
+fn discover_go(name: &str) -> Result<Option<DiscoveredLibrary>> {
+    let docs_url = format!("https://pkg.go.dev/{name}");
+    let response = ureq::get(&docs_url).call();
+    match response {
+        Ok(_) => {}
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("checking pkg.go.dev for '{name}'")),
+    }
+
+    Ok(Some(DiscoveredLibrary { name: name.to_string(), description: None, docs_url: Some(docs_url), repo_url: derive_go_repo_url(name) }))
+}
+
+/// Only github.com/gitlab.com/bitbucket.org module paths map cleanly to a
+/// repo URL, by truncating at the third path segment (owner/repo) -- other
+/// hosts (e.g. a custom vanity import path) don't follow that convention,
+/// so this returns `None` rather than guessing wrong.
+fn derive_go_repo_url(module_path: &str) -> Option<String> {
+    ["github.com/", "gitlab.com/", "bitbucket.org/"].iter().find(|host| module_path.starts_with(**host)).map(|_| {
+        let segments: Vec<&str> = module_path.splitn(4, '/').collect();
+        format!("https://{}", segments[..segments.len().min(3)].join("/"))
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct NuGetSearchResponse {
+    #[serde(default)]
+    data: Vec<NuGetPackage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NuGetPackage {
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default, rename = "projectUrl")]
+    project_url: Option<String>,
+}
+
+fn discover_nuget(name: &str) -> Result<Option<DiscoveredLibrary>> {
+    // NuGet's flat-container index (version list only) has no description/
+    // homepage; the search endpoint is the one that returns package
+    // metadata, queried for an exact package id match.
+    let url = format!("https://azuresearch-usnc.nuget.org/query?q=packageid:{name}&take=1");
+    let response = ureq::get(&url).call();
+    let mut response = match response {
+        Ok(r) => r,
+        Err(ureq::Error::StatusCode(404)) => return Ok(None),
+        Err(e) => return Err(e).with_context(|| format!("fetching NuGet metadata for '{name}'")),
+    };
+
+    let parsed: NuGetSearchResponse = response.body_mut().read_json().with_context(|| format!("parsing NuGet response for '{name}'"))?;
+    let Some(pkg) = parsed.data.into_iter().next() else { return Ok(None) };
+    Ok(Some(DiscoveredLibrary { name: name.to_string(), description: pkg.description, docs_url: pkg.project_url.clone(), repo_url: pkg.project_url }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -264,5 +381,46 @@ mod tests {
             Ok(None) => panic!("expected 'left-pad' to exist on npm"),
             Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
         }
+    }
+
+    #[test]
+    fn discovers_a_well_known_crate() {
+        match discover(Ecosystem::Cargo, "serde") {
+            Ok(Some(result)) => assert!(result.repo_url.is_some() || result.docs_url.is_some()),
+            Ok(None) => panic!("expected 'serde' to exist on crates.io"),
+            Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
+        }
+    }
+
+    #[test]
+    fn discovers_a_well_known_go_module() {
+        match discover(Ecosystem::Go, "github.com/gin-gonic/gin") {
+            Ok(Some(result)) => {
+                assert_eq!(result.docs_url.as_deref(), Some("https://pkg.go.dev/github.com/gin-gonic/gin"));
+                assert_eq!(result.repo_url.as_deref(), Some("https://github.com/gin-gonic/gin"));
+            }
+            Ok(None) => panic!("expected 'github.com/gin-gonic/gin' to resolve on pkg.go.dev"),
+            Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
+        }
+    }
+
+    #[test]
+    fn discovers_a_well_known_nuget_package() {
+        match discover(Ecosystem::NuGet, "Newtonsoft.Json") {
+            Ok(Some(result)) => assert!(result.repo_url.is_some() || result.docs_url.is_some()),
+            Ok(None) => panic!("expected 'Newtonsoft.Json' to exist on NuGet"),
+            Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
+        }
+    }
+
+    #[test]
+    fn go_module_repo_url_is_derived_for_known_forge_hosts() {
+        assert_eq!(derive_go_repo_url("github.com/gin-gonic/gin"), Some("https://github.com/gin-gonic/gin".to_string()));
+        assert_eq!(derive_go_repo_url("github.com/owner/repo/v2"), Some("https://github.com/owner/repo".to_string()), "a major-version suffix segment must not become part of the repo URL");
+    }
+
+    #[test]
+    fn go_module_repo_url_is_not_guessed_for_a_vanity_import_path() {
+        assert_eq!(derive_go_repo_url("example.com/foo"), None);
     }
 }

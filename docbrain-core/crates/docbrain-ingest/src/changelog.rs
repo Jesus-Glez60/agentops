@@ -53,16 +53,26 @@ struct GitHubRelease {
     prerelease: bool,
 }
 
-/// Fetches every release for `owner/repo` (paginating via the `Link`
-/// header) and pairs up consecutive non-draft/non-prerelease releases into
-/// changelog entries. `token`, if given, is sent as a Bearer token to raise
-/// GitHub's rate limit past the 60 req/hr unauthenticated default. Not
-/// `pub` — `GitHubReleasesSync` (the adapter) is the public surface.
+/// Releases are returned newest-first, and a changelog only needs recent
+/// version pairs — capped well short of GitHub's own pagination-depth limit
+/// on this endpoint (confirmed live: `vercel/next.js` has thousands of
+/// canary releases, whose `Link: rel="next"` chain runs past a depth GitHub
+/// itself refuses with `422` — burning the entire loop, and most of an
+/// unauthenticated caller's 60 req/hr budget, on releases nobody's diffing
+/// against anyway).
+const MAX_PAGES: usize = 5;
+
+/// Fetches up to `MAX_PAGES` pages of releases for `owner/repo` (paginating
+/// via the `Link` header) and pairs up consecutive non-draft/non-prerelease
+/// releases into changelog entries. `token`, if given, is sent as a Bearer
+/// token to raise GitHub's rate limit past the 60 req/hr unauthenticated
+/// default. Not `pub` — `GitHubReleasesSync` (the adapter) is the public
+/// surface.
 fn sync_github_releases(owner: &str, repo: &str, token: Option<&str>) -> Result<Vec<ChangelogFetchEntry>> {
     let mut url = format!("https://api.github.com/repos/{owner}/{repo}/releases?per_page=100");
     let mut all_releases: Vec<GitHubRelease> = Vec::new();
 
-    loop {
+    for page_num in 0..MAX_PAGES {
         let mut req = ureq::get(&url).header("User-Agent", "docbrain-ingest");
         if let Some(t) = token {
             req = req.header("Authorization", &format!("Bearer {t}"));
@@ -78,6 +88,10 @@ fn sync_github_releases(owner: &str, repo: &str, token: Option<&str>) -> Result<
             Err(ureq::Error::StatusCode(404)) => {
                 anyhow::bail!("no GitHub repo '{owner}/{repo}' found, or it has no releases API access")
             }
+            // GitHub's own pagination-depth cap on this endpoint — not a
+            // caller error. Stop and use whatever's already been fetched
+            // rather than failing the whole sync over releases this deep.
+            Err(ureq::Error::StatusCode(422)) if page_num > 0 => break,
             Err(e) => return Err(e).with_context(|| format!("fetching releases for {owner}/{repo}")),
         };
 
@@ -185,6 +199,18 @@ mod tests {
     fn syncs_real_releases_from_a_well_known_repo() {
         match sync_github_releases("psf", "requests", None) {
             Ok(entries) => assert!(entries.iter().all(|e| !e.from_version.is_empty() && !e.to_version.is_empty())),
+            Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
+        }
+    }
+
+    // Regression test for a real, confirmed failure: `vercel/next.js` has
+    // thousands of releases (canary builds); paginating until GitHub's own
+    // depth cap previously surfaced as a fatal 422 partway through,
+    // silently killing changelog sync for any deeply-paginated repo.
+    #[test]
+    fn a_repo_with_deep_release_history_returns_recent_entries_instead_of_erroring() {
+        match sync_github_releases("vercel", "next.js", None) {
+            Ok(entries) => assert!(!entries.is_empty(), "expected at least the most recent page's changelog pairs"),
             Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
         }
     }

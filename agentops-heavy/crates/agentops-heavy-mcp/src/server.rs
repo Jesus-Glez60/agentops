@@ -140,7 +140,7 @@ mod tests {
         {
             use docbrain_graph::{DocbrainStore, NewDocNode, NodeKind as DocNodeKind};
             let store = docbrain_graph::SqliteDocbrainStore::open(&db_path).unwrap();
-            store.add_library("next", "Next.js", None, Some("https://nextjs.org/docs")).unwrap();
+            store.add_library("next", "Next.js", None, None, Some("https://nextjs.org/docs")).unwrap();
             store
                 .upsert_doc_node(
                     "next",

@@ -15,7 +15,7 @@ fn main() -> anyhow::Result<()> {
     let _ = std::fs::remove_file(&db_path);
     let store = SqliteDocbrainStore::open(&db_path)?;
 
-    store.add_library("nextjs", "Next.js", Some("vercel/next.js"), Some("https://nextjs.org/docs/app/getting-started"))?;
+    store.add_library("nextjs", "Next.js", None, Some("vercel/next.js"), Some("https://nextjs.org/docs/app/getting-started"))?;
 
     println!("Scraping Next.js 16 docs (this hits the real network)...");
     let outcomes = docbrain_mcp::call_tool(

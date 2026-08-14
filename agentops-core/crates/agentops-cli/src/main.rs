@@ -832,7 +832,7 @@ fn sync_docs(path: &Path, db: Option<&Path>, no_interactive: bool) -> Result<()>
                 let answer: String = dialoguer::Input::new().with_prompt(prompt).allow_empty(true).interact_text().unwrap_or_default();
                 if !answer.trim().is_empty() {
                     use docbrain_graph::DocbrainStore;
-                    store.add_library(name, name, None, Some(answer.trim()))?;
+                    store.add_library(name, name, None, None, Some(answer.trim()))?;
                     println!("  registered (user-provided): {name} -> {}", answer.trim());
                     asked += 1;
                     continue;
