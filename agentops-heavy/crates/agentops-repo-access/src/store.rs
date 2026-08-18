@@ -179,6 +179,15 @@ impl ConnectionStore {
         }
         Ok(())
     }
+
+    /// Deletes every repo connection for `tenant` -- the leaf step of the
+    /// org-deletion cascade (`POST /team/delete-organization`). Returns the
+    /// number of rows removed, purely informational (the caller doesn't
+    /// branch on it -- unlike `set_status`, zero deleted rows is a normal
+    /// outcome here, not a signal something went wrong).
+    pub fn delete_all_for_tenant(&self, tenant: &str) -> Result<usize> {
+        self.conn.execute("DELETE FROM repo_connections WHERE tenant = ?1", [tenant]).context("deleting all repo connections for tenant")
+    }
 }
 
 fn row_to_connection(row: &rusqlite::Row) -> rusqlite::Result<RepoConnection> {
@@ -222,6 +231,22 @@ mod tests {
         assert_eq!(fetched.repo_url, "git@github.com:acme/widgets.git");
         assert_eq!(fetched.method, ConnectionMethod::Ssh);
         assert_eq!(fetched.public_key_openssh.as_deref(), Some(keypair.public_key_openssh.as_str()));
+    }
+
+    #[test]
+    fn delete_all_for_tenant_removes_only_that_tenants_connections() {
+        let store = test_store();
+        let keypair_a1 = test_keypair("acme", "repo-1");
+        let keypair_a2 = test_keypair("acme", "repo-2");
+        let keypair_b = test_keypair("globex", "repo-1");
+        store.create_ssh_connection("acme", "repo-1", "git@github.com:acme/widgets.git", &keypair_a1).unwrap();
+        store.create_ssh_connection("acme", "repo-2", "git@github.com:acme/gizmos.git", &keypair_a2).unwrap();
+        store.create_ssh_connection("globex", "repo-1", "git@github.com:globex/gadgets.git", &keypair_b).unwrap();
+
+        let deleted = store.delete_all_for_tenant("acme").unwrap();
+        assert_eq!(deleted, 2);
+        assert!(store.list_connections("acme").unwrap().is_empty());
+        assert_eq!(store.list_connections("globex").unwrap().len(), 1, "a different tenant's connections must survive");
     }
 
     #[test]

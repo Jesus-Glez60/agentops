@@ -41,15 +41,19 @@ use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use tower_http::cors::CorsLayer;
 
+use agentops_accounts::{AccountStore, User};
 use agentops_heavy_embeddings::SemanticIndex;
 use agentops_repo_access::secrets::SecretsProvider;
 use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnection};
 use agentops_security::api_key::verify_api_key;
+use agentops_teams::TeamStore;
 
 mod accounts_integrations;
 mod linear_webhook;
+mod team;
 pub use accounts_integrations::build_accounts_integrations_router;
 pub use linear_webhook::{AutoKickoffTeamConfig, SeenDeliveries};
+pub use team::build_team_router;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -68,6 +72,13 @@ pub struct AppState {
     /// (`<org>.db`, or `default.db` when no `org` is given) — see the
     /// module doc comment for why this replaces `main`'s `TenantContext`.
     docbrain_db_dir: std::path::PathBuf,
+    /// `Some` once a deployment has accounts/teams wired up (session auth
+    /// available for `/repos/*` alongside the existing API-key path);
+    /// `None` keeps this router's original self-hosted-single-operator
+    /// behavior byte-for-byte (API-key-only, client-supplied `tenant`) —
+    /// see `require_api_key_or_session`'s doc comment.
+    accounts: Option<Arc<Mutex<AccountStore>>>,
+    teams: Option<Arc<Mutex<TeamStore>>>,
 }
 
 pub fn build_router(
@@ -77,8 +88,19 @@ pub fn build_router(
     api_key_hash: Option<String>,
     search_index: Option<Arc<AsyncMutex<SemanticIndex>>>,
     docbrain_db_dir: std::path::PathBuf,
+    accounts: Option<AccountStore>,
+    teams: Option<TeamStore>,
 ) -> Router {
-    let state = AppState { store: Arc::new(Mutex::new(store)), secrets, github_app_slug, api_key_hash, search_index, docbrain_db_dir };
+    let state = AppState {
+        store: Arc::new(Mutex::new(store)),
+        secrets,
+        github_app_slug,
+        api_key_hash,
+        search_index,
+        docbrain_db_dir,
+        accounts: accounts.map(|a| Arc::new(Mutex::new(a))),
+        teams: teams.map(|t| Arc::new(Mutex::new(t))),
+    };
     Router::new()
         .route("/repos/connect", post(connect_repo))
         .route("/repos", get(list_repos))
@@ -88,10 +110,34 @@ pub fn build_router(
         .route("/search", get(search_query_handler))
         .route("/docs/search/index", post(docs_search_index_handler))
         .route("/docs/search", get(docs_search_query_handler))
-        .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
+        .layer(middleware::from_fn_with_state(state.clone(), require_api_key_or_session))
         .route("/health", get(health))
         .with_state(state)
         .layer(CorsLayer::permissive())
+}
+
+/// Session-first, API-key-fallback: if `accounts` is configured and the
+/// bearer token verifies as a live session, a `User` extension is
+/// inserted and the request proceeds on the **session path** (handlers
+/// below branch on `Option<Extension<User>>`'s presence to pick tenant
+/// derivation and capability gating). Otherwise falls through to the
+/// original API-key check unchanged -- byte-for-byte the same behavior
+/// this router always had when `accounts` is `None` (the deployment truly
+/// has no session concept, e.g. a bare `agentops-heavy-api` invocation not
+/// wired to `run()`'s full stack) or when the bearer token simply isn't a
+/// valid session token (a real API key, or garbage either way ends up
+/// re-checked against `verify_api_key` exactly as before).
+async fn require_api_key_or_session(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    if let Some(accounts) = &state.accounts {
+        if let Some(token) = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) {
+            let verified = { accounts.lock().unwrap().verify_session(token) };
+            if let Ok(user) = verified {
+                req.extensions_mut().insert(user);
+                return next.run(req).await;
+            }
+        }
+    }
+    require_api_key(State(state), req, next).await
 }
 
 async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
@@ -107,6 +153,18 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
         Some(raw) if verify_api_key(raw, expected_hash).is_ok() => next.run(req).await,
         _ => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid API key" }))).into_response(),
     }
+}
+
+/// Session path: server-derived tenant from the verified `User`, ignoring
+/// any client-supplied value entirely (the core fix this migration makes
+/// -- a session can't spoof another tenant by editing a query param).
+/// API-key path: unchanged, client-supplied `tenant` required (the
+/// existing self-hosted-single-operator trust model, kept exactly as-is).
+fn resolve_tenant(user: &Option<axum::Extension<User>>, provided: Option<&str>) -> Result<String, (StatusCode, Json<Value>)> {
+    if let Some(axum::Extension(user)) = user {
+        return Ok(user.tenant.clone());
+    }
+    provided.map(str::to_string).ok_or_else(|| (StatusCode::BAD_REQUEST, Json(json!({ "error": "tenant is required" }))))
 }
 
 async fn health() -> &'static str {
@@ -144,6 +202,11 @@ fn default_accounts_db_path() -> std::path::PathBuf {
 fn default_integrations_db_path() -> std::path::PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     std::path::PathBuf::from(home).join(".agentops").join("integrations.sqlite")
+}
+
+fn default_teams_db_path() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".agentops").join("teams.sqlite")
 }
 
 /// Resolves a `LinearConfig` for `tenant` — **vault only, deliberately no
@@ -206,7 +269,17 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     let docbrain_db_dir = std::env::var("DOCBRAIN_DB_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| default_docbrain_db_dir());
     std::fs::create_dir_all(&docbrain_db_dir)?;
 
-    let mut app = build_router(store, secrets.clone(), github_app_slug, api_key_hash, search_index, docbrain_db_dir);
+    // Resolved early (rather than alongside the other accounts/teams
+    // connections further down) because `build_router`'s own
+    // `/repos/*` session path needs its own independent connections to
+    // both files, same "second connection to the same store" pattern
+    // `accounts_for_linear`/`accounts_for_teams` already established below.
+    let accounts_db_path = std::env::var("AGENTOPS_ACCOUNTS_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| default_accounts_db_path());
+    let teams_db_path = std::env::var("AGENTOPS_TEAMS_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| default_teams_db_path());
+    let accounts_for_repos = agentops_accounts::AccountStore::open(&accounts_db_path)?;
+    let teams_for_repos = agentops_teams::TeamStore::open(&teams_db_path)?;
+
+    let mut app = build_router(store, secrets.clone(), github_app_slug, api_key_hash, search_index, docbrain_db_dir.clone(), Some(accounts_for_repos), Some(teams_for_repos));
 
     // Phase 7: accounts + the generic integrations vault. Phase 6c: the
     // generic per-tenant module-enrollment store (Linear auto-kickoff is
@@ -216,7 +289,6 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     // own independent second connections to the same files rather than
     // sharing these — see `linear_webhook::LinearModuleState`'s doc comment
     // for why that's a deliberate choice, not an accidental duplicate.
-    let accounts_db_path = std::env::var("AGENTOPS_ACCOUNTS_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| default_accounts_db_path());
     let credentials_db_path = std::env::var("AGENTOPS_INTEGRATIONS_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| default_integrations_db_path());
     let modules_db_path = std::env::var("AGENTOPS_MODULES_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| default_modules_db_path());
     let accounts = agentops_accounts::AccountStore::open(&accounts_db_path)?;
@@ -239,8 +311,24 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     }
     println!("Linear auto-kickoff live: POST /linear/auto-kickoff (session-authed opt-in), /webhooks/linear.");
 
-    app = app.merge(build_accounts_integrations_router(accounts, credentials, secrets));
+    // Independent connection to teams.sqlite, same pattern as
+    // `accounts_for_repos`/`accounts_for_teams` -- needed to gate the
+    // org-wide `/integrations*` routes behind `integrations.manage`.
+    let teams_for_integrations = agentops_teams::TeamStore::open(&teams_db_path)?;
+    app = app.merge(build_accounts_integrations_router(accounts, credentials, secrets, teams_for_integrations));
     println!("Accounts + integrations vault live: POST /auth/signup, POST /auth/login, GET /auth/me, POST /auth/logout, GET /integrations, POST /integrations/{{provider}}.");
+
+    // Team Management's Members tab — own connection to the same
+    // accounts.sqlite/teams.sqlite (see `team` module's doc comment for
+    // why, matching `accounts_for_linear`/`accounts_for_repos` above). Also
+    // its own `credentials`/`docbrain_db_dir` -- needed only by
+    // `POST /team/delete-organization`'s cascade.
+    let accounts_for_teams = agentops_accounts::AccountStore::open(&accounts_db_path)?;
+    let teams = agentops_teams::TeamStore::open(&teams_db_path)?;
+    let repos_for_teams = ConnectionStore::open(db_path)?;
+    let credentials_for_teams = agentops_integrations::CredentialStore::open(&credentials_db_path)?;
+    app = app.merge(build_team_router(accounts_for_teams, teams, repos_for_teams, credentials_for_teams, docbrain_db_dir));
+    println!("Team Management live: GET /team, GET /team/members, PATCH/DELETE /team/members/{{id}}, GET/PUT /team/repo-access, POST /team/delete-organization.");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("agentops-heavy-api listening on {addr} (auth: {auth_status})");
@@ -250,7 +338,14 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
 
 #[derive(Debug, Deserialize)]
 struct ConnectRequest {
-    tenant: String,
+    /// `None` on the session path (the frontend never sends it, tenant is
+    /// derived from the session instead); required on the API-key path.
+    /// See `resolve_tenant`. `#[serde(default)]` even though `serde_json`
+    /// already defaults a missing `Option` field to `None` on its own --
+    /// kept for symmetry with `TenantQuery::tenant` below, where the
+    /// attribute is load-bearing, not just belt-and-suspenders.
+    #[serde(default)]
+    tenant: Option<String>,
     repo_id: String,
     repo_url: String,
 }
@@ -284,14 +379,52 @@ impl From<RepoConnection> for ConnectionView {
     }
 }
 
-async fn connect_repo(State(state): State<AppState>, Json(req): Json<ConnectRequest>) -> (StatusCode, Json<Value>) {
-    let keypair = match agentops_repo_access::generate_deploy_keypair_for_repo(state.secrets.as_ref(), &req.tenant, &req.repo_id) {
+/// Session-path-only capability gate -- a `None` `user` (API-key path)
+/// skips it entirely, matching that path's existing trust model (a valid
+/// API key already implies full access, same as before this migration).
+fn require_session_capability(state: &AppState, user: &Option<axum::Extension<User>>, tenant: &str, capability: &str) -> Result<(), (StatusCode, Json<Value>)> {
+    let Some(axum::Extension(user)) = user else { return Ok(()) };
+    let Some(teams) = &state.teams else {
+        // A session verified but this deployment has no `teams` store
+        // wired up -- an inconsistent configuration (accounts without
+        // teams), fail closed rather than silently granting access.
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "session auth is configured but team/capability data is not" }))));
+    };
+    let teams = teams.lock().unwrap();
+    // Must run before the capability check -- a brand-new user who has
+    // never touched `/team/*` has no membership row at all yet, and
+    // `has_capability` fails closed for that (correctly, in isolation).
+    // Without this, such a user would be universally 403'd from every
+    // session-authed `/repos/*` route, since only `/team/*` handlers used
+    // to run this backfill. Caught via live testing against this exact
+    // scenario (a fresh signup hitting `/repos` before ever visiting Team
+    // Management), not assumed.
+    if let Err(e) = teams.ensure_membership(tenant, user.id) {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))));
+    }
+    match agentops_teams::has_capability(&teams, tenant, user.id, capability) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err((StatusCode::FORBIDDEN, Json(json!({ "error": format!("missing required capability: {capability}") })))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))),
+    }
+}
+
+async fn connect_repo(State(state): State<AppState>, user: Option<axum::Extension<User>>, Json(req): Json<ConnectRequest>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, req.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
+        return e;
+    }
+
+    let keypair = match agentops_repo_access::generate_deploy_keypair_for_repo(state.secrets.as_ref(), &tenant, &req.repo_id) {
         Ok(k) => k,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("generating deploy key: {e}") }))),
     };
 
     let store = state.store.lock().unwrap();
-    match store.create_ssh_connection(&req.tenant, &req.repo_id, &req.repo_url, &keypair) {
+    match store.create_ssh_connection(&tenant, &req.repo_id, &req.repo_url, &keypair) {
         Ok(connection) => {
             let view = ConnectionView::from(connection);
             (
@@ -308,24 +441,95 @@ async fn connect_repo(State(state): State<AppState>, Json(req): Json<ConnectRequ
 
 #[derive(Debug, Deserialize)]
 struct TenantQuery {
-    tenant: String,
+    /// `None` on the session path -- see `ConnectRequest::tenant`. Also
+    /// deliberately **ignored** on the session path even when a client
+    /// sends one (`resolve_tenant` never reads it once a `User` is
+    /// present), so a session-authed caller can't spoof another tenant by
+    /// setting `?tenant=` to something other than their own.
+    ///
+    /// `#[serde(default)]` is **load-bearing** here, not decorative --
+    /// `axum::extract::Query` deserializes via `serde_urlencoded`, which
+    /// (unlike `serde_json`) does not treat a struct's only field being
+    /// `Option<T>` as automatically satisfied when the query string is
+    /// totally absent; without this attribute, a bare `GET /repos` with no
+    /// `?tenant=` at all 400s with "missing field `tenant`" before the
+    /// handler ever runs. Caught via live testing against a real server
+    /// (curl) after this exact request shape passed clean in every
+    /// in-process `Router::oneshot` test -- worth flagging as a real gap
+    /// in that testing approach's fidelity for `Query` extractors
+    /// specifically, not just a one-off bug.
+    #[serde(default)]
+    tenant: Option<String>,
 }
 
-async fn list_repos(State(state): State<AppState>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
-    let store = state.store.lock().unwrap();
-    match store.list_connections(&q.tenant) {
-        Ok(connections) => {
-            let views: Vec<ConnectionView> = connections.into_iter().map(ConnectionView::from).collect();
-            (StatusCode::OK, Json(json!({ "connections": views })))
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+async fn list_repos(State(state): State<AppState>, user: Option<axum::Extension<User>>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, q.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_VIEW) {
+        return e;
     }
+
+    let connections = {
+        let store = state.store.lock().unwrap();
+        match store.list_connections(&tenant) {
+            Ok(c) => c,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        }
+    };
+
+    // Session path only: filter to repos this member actually has access
+    // to (role default + any per-user override) -- omitted from the
+    // response entirely, not just hidden client-side. The API-key path is
+    // unfiltered, matching its existing full-access trust model.
+    let connections = if let (Some(axum::Extension(user)), Some(teams)) = (&user, &state.teams) {
+        let teams = teams.lock().unwrap();
+        match connections
+            .into_iter()
+            .map(|c| {
+                let allowed = agentops_teams::effective_repo_access(&teams, &tenant, user.id, &c.id)?;
+                Ok((c, allowed))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
+        {
+            Ok(with_access) => with_access.into_iter().filter(|(_, allowed)| *allowed).map(|(c, _)| c).collect(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        }
+    } else {
+        connections
+    };
+
+    // Server-computed, so the frontend never reimplements capability logic
+    // client-side just to decide whether to show a "Connect repository"
+    // button -- API-key path always `true` (full access, matching that
+    // path's existing trust model, same as the filtering above).
+    let can_connect = if let (Some(axum::Extension(user)), Some(teams)) = (&user, &state.teams) {
+        let teams = teams.lock().unwrap();
+        match agentops_teams::has_capability(&teams, &tenant, user.id, agentops_teams::CAP_REPOS_CONNECT) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        }
+    } else {
+        true
+    };
+
+    let views: Vec<ConnectionView> = connections.into_iter().map(ConnectionView::from).collect();
+    (StatusCode::OK, Json(json!({ "connections": views, "can_connect": can_connect })))
 }
 
-async fn verify_repo(State(state): State<AppState>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+async fn verify_repo(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, q.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
+        return e;
+    }
+
     let connection = {
         let store = state.store.lock().unwrap();
-        match store.get_connection(&q.tenant, &id) {
+        match store.get_connection(&tenant, &id) {
             Ok(Some(c)) => c,
             Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such connection for this tenant" }))),
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
@@ -336,17 +540,17 @@ async fn verify_repo(State(state): State<AppState>, AxumPath(id): AxumPath<Strin
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "connection has no SSH key (not an SSH-method connection)" })));
     };
 
-    let result = verify_ssh_connection(state.secrets.as_ref(), &q.tenant, &id, encrypted_key, &connection.repo_url);
+    let result = verify_ssh_connection(state.secrets.as_ref(), &tenant, &id, encrypted_key, &connection.repo_url);
 
     let store = state.store.lock().unwrap();
     match &result {
         Ok(()) => {
-            let _ = store.set_status(&q.tenant, &id, ConnectionStatus::Active);
+            let _ = store.set_status(&tenant, &id, ConnectionStatus::Active);
             (StatusCode::OK, Json(json!({ "status": "active" })))
         }
         Err(e) => {
             let reason = e.to_string();
-            let _ = store.set_status(&q.tenant, &id, ConnectionStatus::Failed(reason.clone()));
+            let _ = store.set_status(&tenant, &id, ConnectionStatus::Failed(reason.clone()));
             (StatusCode::OK, Json(json!({ "status": "failed", "reason": reason })))
         }
     }
@@ -587,15 +791,190 @@ mod tests {
     #[tokio::test]
     async fn health_check_ok() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    fn signup(accounts: &agentops_accounts::AccountStore, email: &str) -> (User, String) {
+        accounts.signup(agentops_accounts::NewAccount { email, password: "correct horse battery staple", first_name: "Ada", last_name: "Lovelace" }).unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_key_path_is_unaffected_when_no_session_store_is_configured_and_still_requires_a_body_tenant() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/repos/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"repo_id": "widgets", "repo_url": "git@github.com:acme/widgets.git"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "no session and no body tenant -- must not silently pick a tenant");
+    }
+
+    #[tokio::test]
+    async fn session_authed_list_repos_ignores_a_spoofed_tenant_query_param() {
+        let (store, secrets) = test_state();
+        // A connection that belongs to a *different* tenant, seeded
+        // directly on the store before it's handed to the router.
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), "other-tenant", "other-repo").unwrap();
+            store.create_ssh_connection("other-tenant", "other-repo", "git@github.com:other/other.git", &keypair).unwrap();
+        }
+
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&user.tenant, user.id, "admin").unwrap();
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "own-repo").unwrap();
+            store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/own.git", &keypair).unwrap();
+        }
+
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+
+        let spoofed = Request::builder().uri("/repos?tenant=other-tenant").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap();
+        let resp = app.oneshot(spoofed).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let connections = body["connections"].as_array().unwrap();
+        assert_eq!(connections.len(), 1, "must only ever see the session's own tenant's repos, regardless of the query param");
+        assert_eq!(connections[0]["repo_url"], "git@github.com:acme/own.git");
+    }
+
+    /// Regression test for a real bug caught via live testing: a brand-new
+    /// signup who has never touched `/team/*` has no membership row yet,
+    /// so `has_capability` (correctly, in isolation) fails closed --
+    /// without `require_session_capability` also running
+    /// `teams.ensure_membership` first, such a user was universally 403'd
+    /// from every session-authed `/repos/*` route, since only `/team/*`
+    /// handlers used to run that backfill.
+    #[tokio::test]
+    async fn a_brand_new_signup_who_never_touched_team_management_can_still_use_repos() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (_, token) = signup(&accounts, "fresh@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+
+        let list = app.clone().oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+        assert_eq!(body_json(list).await["can_connect"], true, "a brand-new user's first touch backfills them as admin, same as /team/*");
+
+        let connect = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos/connect")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"repo_id": "widgets", "repo_url": "git@github.com:acme/widgets.git"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(connect.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn get_repos_reports_can_connect_based_on_the_callers_capability() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (admin, admin_token) = signup(&accounts, "admin@example.com");
+        let (viewer, viewer_token) = signup(&accounts, "viewer@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        teams.add_member(&admin.tenant, viewer.id, "viewer").unwrap();
+        accounts.switch_tenant(viewer.id, &admin.tenant).unwrap();
+
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+
+        let admin_view = app.clone().oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {admin_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_json(admin_view).await["can_connect"], true);
+
+        let viewer_view = app.oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {viewer_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_json(viewer_view).await["can_connect"], false);
+    }
+
+    #[tokio::test]
+    async fn session_authed_connect_requires_the_repos_connect_capability() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (admin, admin_token) = signup(&accounts, "admin@example.com");
+        let (viewer, viewer_token) = signup(&accounts, "viewer@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        teams.add_member(&admin.tenant, viewer.id, "viewer").unwrap();
+        accounts.switch_tenant(viewer.id, &admin.tenant).unwrap();
+
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+
+        let forbidden = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos/connect")
+                    .header("authorization", format!("Bearer {viewer_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"repo_id": "widgets", "repo_url": "git@github.com:acme/widgets.git"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN, "a viewer lacks repos.connect");
+
+        let allowed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/repos/connect")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(json!({"repo_id": "widgets", "repo_url": "git@github.com:acme/widgets.git"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::CREATED, "an admin has repos.connect");
+    }
+
+    #[tokio::test]
+    async fn session_authed_list_repos_filters_out_a_repo_with_an_explicit_no_access_override() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (admin, admin_token) = signup(&accounts, "admin@example.com");
+        let (dev, dev_token) = signup(&accounts, "dev@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        teams.add_member(&admin.tenant, dev.id, "member").unwrap();
+        accounts.switch_tenant(dev.id, &admin.tenant).unwrap();
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &admin.tenant, "widgets").unwrap();
+            store.create_ssh_connection(&admin.tenant, "widgets", "git@github.com:acme/widgets.git", &keypair).unwrap();
+        }
+        // `dev` has `repos.view` (a member does by default) but is
+        // explicitly denied access to this specific repo.
+        teams.set_repo_override(&admin.tenant, dev.id, "widgets", false).unwrap();
+
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+
+        let admin_view = app.clone().oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {admin_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        let body = body_json(admin_view).await;
+        assert_eq!(body["connections"].as_array().unwrap().len(), 1, "admin can see it");
+
+        let dev_view = app.oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {dev_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(dev_view.status(), StatusCode::OK, "dev has repos.view, so the request itself succeeds");
+        let body = body_json(dev_view).await;
+        assert_eq!(body["connections"].as_array().unwrap().len(), 0, "the override-denied repo is omitted from the response entirely, not just hidden client-side");
     }
 
     #[tokio::test]
     async fn connect_then_list_round_trips_over_http() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
 
         let connect_req = Request::builder()
             .method("POST")
@@ -624,7 +1003,7 @@ mod tests {
     #[tokio::test]
     async fn list_never_leaks_across_tenants() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
 
         for (tenant, repo_id, url) in [("acme", "w", "url-a"), ("globex", "g", "url-b")] {
             let req = Request::builder()
@@ -646,7 +1025,7 @@ mod tests {
     #[tokio::test]
     async fn verify_against_unreachable_host_marks_connection_failed() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
 
         let connect_req = Request::builder()
             .method("POST")
@@ -671,7 +1050,7 @@ mod tests {
     #[tokio::test]
     async fn install_url_404s_when_no_app_is_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -679,7 +1058,7 @@ mod tests {
     #[tokio::test]
     async fn install_url_returns_the_configured_slug() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain-dir"), None, None);
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -690,7 +1069,7 @@ mod tests {
     async fn missing_api_key_is_rejected_when_one_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"), None, None);
         let resp = app.oneshot(Request::builder().uri("/repos?tenant=acme").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -699,7 +1078,7 @@ mod tests {
     async fn health_check_bypasses_auth_even_when_a_key_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"), None, None);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -707,7 +1086,7 @@ mod tests {
     #[tokio::test]
     async fn search_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
         let resp = app.oneshot(Request::builder().uri("/search?path=/tmp/x&q=hello").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -715,7 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn search_index_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
         let req = Request::builder()
             .method("POST")
             .uri("/search/index")
@@ -729,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn docs_search_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
         let resp = app.oneshot(Request::builder().uri("/docs/search?slug=next&q=hello").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -737,7 +1116,7 @@ mod tests {
     #[tokio::test]
     async fn docs_search_index_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
         let req = Request::builder()
             .method("POST")
             .uri("/docs/search/index")
@@ -788,7 +1167,7 @@ mod tests {
         let search_index = Some(Arc::new(AsyncMutex::new(index)));
 
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, search_index, docbrain_db_dir);
+        let app = build_router(store, secrets, None, None, search_index, docbrain_db_dir, None, None);
 
         let index_req = Request::builder()
             .method("POST")
@@ -855,7 +1234,7 @@ mod tests {
         let search_index = Some(Arc::new(AsyncMutex::new(index)));
 
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, search_index, PathBuf::from("unused-docbrain-dir"));
+        let app = build_router(store, secrets, None, None, search_index, PathBuf::from("unused-docbrain-dir"), None, None);
 
         let index_req = Request::builder()
             .method("POST")

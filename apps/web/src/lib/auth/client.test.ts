@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AuthClientError, loginWithPassword, logout, signupWithPassword } from "@/lib/auth/client";
+import { AuthClientError, loginWithPassword, completeLogin2fa, logout, signupWithPassword } from "@/lib/auth/client";
 
 describe("auth client", () => {
   const fetchMock = vi.fn();
@@ -55,5 +55,26 @@ describe("auth client", () => {
     await logout();
 
     expect(fetchMock).toHaveBeenCalledWith("/api/auth/logout", { method: "POST" });
+  });
+
+  it("loginWithPassword returns a TwoFactorChallenge (not a SessionUser) when the backend 202s", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ two_factor_required: true, challenge_token: "raw-challenge-token" }) });
+
+    const result = await loginWithPassword("dev@example.com", "pw");
+
+    expect("two_factor_required" in result && result.two_factor_required).toBe(true);
+    expect((result as { challenge_token: string }).challenge_token).toBe("raw-challenge-token");
+  });
+
+  it("completeLogin2fa posts to /api/auth/login/2fa with the challenge token and code, and returns the user", async () => {
+    fetchMock.mockResolvedValue({ ok: true, json: async () => ({ user: { id: 1, email: "dev@example.com", tenant: "abc" } }) });
+
+    const user = await completeLogin2fa("raw-challenge-token", "123456");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/auth/login/2fa",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ challenge_token: "raw-challenge-token", code: "123456" }) }),
+    );
+    expect(user).toEqual({ id: 1, email: "dev@example.com", tenant: "abc" });
   });
 });

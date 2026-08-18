@@ -3,7 +3,7 @@
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
 import { toast } from "sonner";
-import { loginWithPassword, AuthClientError } from "@/lib/auth/client";
+import { loginWithPassword, completeLogin2fa, AuthClientError } from "@/lib/auth/client";
 import { validateEmail, validateRequired } from "@/lib/auth/validation";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,6 +17,8 @@ export function LoginForm({ redirectTo }: { redirectTo: string }) {
   const [password, setPassword] = useState("");
   const [attemptedSubmit, setAttemptedSubmit] = useState(false);
   const [pending, setPending] = useState(false);
+  const [challengeToken, setChallengeToken] = useState<string | null>(null);
+  const [code, setCode] = useState("");
 
   const emailError = validateEmail(email);
   const passwordError = validateRequired(password, "Password");
@@ -30,7 +32,11 @@ export function LoginForm({ redirectTo }: { redirectTo: string }) {
 
     setPending(true);
     try {
-      await loginWithPassword(email, password);
+      const result = await loginWithPassword(email, password);
+      if ("two_factor_required" in result) {
+        setChallengeToken(result.challenge_token);
+        return;
+      }
       router.push(redirectTo);
       router.refresh();
     } catch (err) {
@@ -43,6 +49,39 @@ export function LoginForm({ redirectTo }: { redirectTo: string }) {
     } finally {
       setPending(false);
     }
+  }
+
+  async function handleSubmit2fa(e: FormEvent) {
+    e.preventDefault();
+    if (!challengeToken || !code.trim()) return;
+    setPending(true);
+    try {
+      await completeLogin2fa(challengeToken, code.trim());
+      router.push(redirectTo);
+      router.refresh();
+    } catch (err) {
+      const message = err instanceof AuthClientError ? err.message : "Something went wrong. Please try again.";
+      toast.error(message);
+    } finally {
+      setPending(false);
+    }
+  }
+
+  if (challengeToken) {
+    return (
+      <form onSubmit={handleSubmit2fa} className="space-y-4" noValidate>
+        <div className="space-y-1.5">
+          <label htmlFor="login-2fa-code" className="text-section text-ink-300">
+            Two-factor code
+          </label>
+          <Input id="login-2fa-code" inputMode="numeric" autoComplete="one-time-code" placeholder="123456" value={code} onChange={(e) => setCode(e.target.value)} disabled={pending} autoFocus />
+          <p className="text-body text-ink-500">Enter the code from your authenticator app, or a backup code.</p>
+        </div>
+        <Button type="submit" className="w-full" disabled={pending || !code.trim()}>
+          {pending ? "Verifying…" : "Verify"}
+        </Button>
+      </form>
+    );
   }
 
   return (

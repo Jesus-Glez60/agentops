@@ -39,6 +39,20 @@ pub trait SecretsProvider {
     /// derivations collide: they diverge on the very first byte fed to the
     /// MAC, not just somewhere in the middle of the input.
     fn integration_key(&self, tenant: &str) -> Result<Zeroizing<Vec<u8>>>;
+
+    /// A per-*user* (not just per-tenant) 32-byte AES-256-GCM key for a
+    /// member's personal integration credentials (e.g. their own Linear
+    /// connection, separate from the org-wide vault `integration_key`
+    /// serves). Deliberately its own domain-separation label, not
+    /// `integration_key(tenant)` reused with the row scoped by `user_id` in
+    /// SQL alone -- reusing that key would mean every member's personal
+    /// secret, and the org-wide vault's secrets, all sit under one
+    /// identical key, with isolation enforced *only* by a `WHERE user_id =
+    /// ?` clause a future bug (or a debug tool reading the table directly)
+    /// could bypass. This derivation diverges from every other one on this
+    /// trait starting at the first byte fed to the MAC, same reasoning
+    /// `integration_key` itself documents.
+    fn user_integration_key(&self, tenant: &str, user_id: i64) -> Result<Zeroizing<Vec<u8>>>;
 }
 
 /// Derives a per-repo passphrase from one master key via
@@ -81,6 +95,15 @@ impl SecretsProvider for EnvSecretsProvider {
         let mut mac = Hmac::<Sha256>::new_from_slice(&self.master_key).context("constructing HMAC")?;
         mac.update(b"integration-key\0");
         mac.update(tenant.as_bytes());
+        Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
+    }
+
+    fn user_integration_key(&self, tenant: &str, user_id: i64) -> Result<Zeroizing<Vec<u8>>> {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.master_key).context("constructing HMAC")?;
+        mac.update(b"user-integration-key\0");
+        mac.update(tenant.as_bytes());
+        mac.update(&[0u8]);
+        mac.update(&user_id.to_le_bytes());
         Ok(Zeroizing::new(mac.finalize().into_bytes().to_vec()))
     }
 }
@@ -156,5 +179,27 @@ mod tests {
         let integration = provider.integration_key("acme").unwrap();
         let repo = provider.repo_passphrase("acme", "").unwrap();
         assert_ne!(*integration, *repo, "the two derivations must diverge by construction, not by luck");
+    }
+
+    #[test]
+    fn user_integration_key_is_deterministic_per_user_and_differs_across_users_and_tenants() {
+        let provider = test_provider();
+        let u1a = provider.user_integration_key("acme", 1).unwrap();
+        let u1b = provider.user_integration_key("acme", 1).unwrap();
+        let u2 = provider.user_integration_key("acme", 2).unwrap();
+        let other_tenant = provider.user_integration_key("other", 1).unwrap();
+        assert_eq!(*u1a, *u1b);
+        assert_ne!(*u1a, *u2, "different users in the same tenant must derive different keys");
+        assert_ne!(*u1a, *other_tenant, "the same user id in a different tenant must derive a different key");
+    }
+
+    #[test]
+    fn user_integration_key_never_collides_with_integration_key_or_repo_passphrase() {
+        let provider = test_provider();
+        let user_key = provider.user_integration_key("acme", 1).unwrap();
+        let org_key = provider.integration_key("acme").unwrap();
+        let repo_key = provider.repo_passphrase("acme", "1").unwrap();
+        assert_ne!(*user_key, *org_key, "a member's personal key must not be the same key that encrypts the org-wide vault");
+        assert_ne!(*user_key, *repo_key);
     }
 }

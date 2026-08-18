@@ -25,7 +25,9 @@ agentops-linear.workspace = true
 agentops-llm.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+getrandom.workspace = true
 agentops-accounts.workspace = true
+agentops-teams.workspace = true
 agentops-integrations.workspace = true
 agentops-integration-modules.workspace = true
 # agentops-license deliberately not a dependency this pass — 1.0 has no
@@ -36,3 +38,7 @@ tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 wiremock.workspace = true
+# Only to compute a valid TOTP code in tests, from the `secret` a
+# `/auth/2fa/enroll` response returns -- production code never constructs
+# a `TOTP` directly in this crate, that stays inside agentops-accounts.
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }

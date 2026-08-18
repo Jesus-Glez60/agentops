@@ -8,6 +8,7 @@ members = [
     "crates/agentops-heavy-embeddings",
     "crates/agentops-heavy-mcp",
     "crates/agentops-accounts",
+    "crates/agentops-teams",
     "crates/agentops-integrations",
     "crates/agentops-integration-modules",
 ]
@@ -73,6 +74,12 @@ agentops-llm = { path = "../agentops-core/crates/agentops-llm" }
 # Phase 7 (integrations vault + minimal accounts).
 agentops-accounts = { path = "crates/agentops-accounts" }
 agentops-integrations = { path = "crates/agentops-integrations" }
+
+# Profile + Team Management: organization/membership/invite/audit-log
+# concerns, kept out of agentops-accounts (identity/auth only) the same
+# way agentops-repo-access is its own crate rather than folded into
+# whatever else touches repos.
+agentops-teams = { path = "crates/agentops-teams" }
 
 # Phase 6c: the standard per-tenant enrollment mechanism for integration
 # modules (Linear auto-kickoff is the first consumer, not the only one).

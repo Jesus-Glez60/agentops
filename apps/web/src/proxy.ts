@@ -20,7 +20,9 @@ export function proxy(request: NextRequest) {
 }
 
 export const config = {
-  // Everything except: the login page itself, the auth API routes, and
+  // Everything except: the login page itself, the auth API routes, the
+  // public invite-preview page and its API route (a visitor previewing an
+  // invite link isn't signed in yet -- that's the whole point), and
   // Next.js internals/static assets.
-  matcher: ["/((?!login|api/auth|_next/static|_next/image|favicon.ico).*)"],
+  matcher: ["/((?!login|api/auth|invite/|api/invites|_next/static|_next/image|favicon.ico).*)"],
 };
