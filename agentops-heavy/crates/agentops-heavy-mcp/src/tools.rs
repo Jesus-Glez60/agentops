@@ -61,6 +61,15 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["slug"],
             }),
         },
+        ToolDefinition {
+            name: "consolidate_model",
+            description: "On-demand: LoRA fine-tune a small local code model on this repo's own curated Gotcha/Decision notes (CLS-inspired plan, Initiative 6), so future code-explanation assistance can be grounded in this repo's own reviewed knowledge instead of only a frontier model's frozen training data. Downloads the base model on first run, trains a fresh adapter, and only promotes it if it doesn't regress a held-out eval versus whatever's currently active. Heavier and slower than semantic_index/end_session (real CPU training, not just embedding) — never run automatically, invoke explicitly when there's enough newly curated knowledge to be worth consolidating.",
+            input_schema: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"],
+            }),
+        },
     ]
 }
 
@@ -70,6 +79,7 @@ pub async fn call_tool(index: &mut SemanticIndex, name: &str, args: &Value) -> C
         "semantic_index" => tool_semantic_index(index, args).await,
         "search_docs" => tool_search_docs(index, args).await,
         "index_docs" => tool_index_docs(index, args).await,
+        "consolidate_model" => tool_consolidate_model(args).await,
         other => return CallToolResult::error(format!("unknown tool '{other}'")),
     };
 
@@ -186,4 +196,36 @@ async fn tool_index_docs(index: &mut SemanticIndex, args: &Value) -> anyhow::Res
 
     let count = index.index_items(&items).await?;
     Ok(format!("Indexed {count} doc section(s) for {slug}"))
+}
+
+/// Runs a full Initiative 6 consolidation pass. Unlike every other tool in
+/// this file, this one is fully synchronous internally (`consolidate_model`
+/// does its own blocking model download/training/eval, no async I/O at
+/// all) — no `&mut SemanticIndex` needed, and no `.await` inside the
+/// `{ ... }` block that owns the `SqliteGraphStore` for the same
+/// !Sync-across-await reason `tool_semantic_index` documents, even though
+/// here the whole call happens to be synchronous anyway.
+async fn tool_consolidate_model(args: &Value) -> anyhow::Result<String> {
+    let path = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path' argument"))?;
+
+    let repo_path = std::path::Path::new(path);
+    let db_path = repo_path.join(".context").join("graph.db");
+    let store = SqliteGraphStore::open(&db_path).map_err(|e| anyhow::anyhow!("opening graph store at {}: {e}", db_path.display()))?;
+    let repo = agentops_heavy_embeddings::repo_name(repo_path);
+
+    let report = agentops_heavy_consolidate::consolidate_model(&store, &repo)?;
+
+    if !report.attempted {
+        return Ok(format!("Skipped: {}", report.reason));
+    }
+
+    Ok(format!(
+        "{}\nexamples used: {}\ncandidate score: {:.3}\nbaseline score: {:.3}\npromoted: {}{}",
+        report.reason,
+        report.examples_used,
+        report.candidate_score,
+        report.baseline_score,
+        report.promoted,
+        report.promoted_version.map(|v| format!("\npromoted version: v{v}")).unwrap_or_default(),
+    ))
 }

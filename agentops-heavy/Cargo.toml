@@ -11,6 +11,7 @@ members = [
     "crates/agentops-teams",
     "crates/agentops-integrations",
     "crates/agentops-integration-modules",
+    "crates/agentops-heavy-consolidate",
 ]
 
 [workspace.package]
@@ -70,6 +71,16 @@ docbrain-graph = { path = "../docbrain-core/crates/docbrain-graph" }
 agentops-mcp = { path = "../agentops-core/crates/agentops-mcp" }
 agentops-linear = { path = "../agentops-core/crates/agentops-linear" }
 agentops-llm = { path = "../agentops-core/crates/agentops-llm" }
+
+# Initiative 6 (CLS-inspired retrieval plan): local LoRA-flavored
+# code-explanation consolidation. `agentops-retrieval` for
+# `pattern_complete`'s training-example context assembly;
+# `agentops-embeddings` for the frozen BGE-small embedder the eval gate
+# scores generated text against (independent of anything Initiative 6
+# itself trains, so the eval signal can't just reward drifting toward the
+# eval metric's own idea of quality).
+agentops-retrieval = { path = "../agentops-core/crates/agentops-retrieval" }
+agentops-embeddings = { path = "../agentops-core/crates/agentops-embeddings" }
 
 # Phase 7 (integrations vault + minimal accounts).
 agentops-accounts = { path = "crates/agentops-accounts" }

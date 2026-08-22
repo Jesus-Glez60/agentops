@@ -198,4 +198,28 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curated BOOLEAN NOT NULL DEFAULT fals
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS prominence TEXT NOT NULL DEFAULT 'full';
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 
+-- Initiative 2 (CLS-inspired retrieval plan) adds NodeKind::DocSection and
+-- EdgeRelation::Covers -- both CHECK constraints need widening, same
+-- idempotent DROP CONSTRAINT IF EXISTS / re-ADD pattern already used above
+-- for edges_relation_check's `references` addition. This is the first time
+-- `nodes_kind_check` (Postgres's default auto-generated name for the
+-- unnamed inline CHECK in the original CREATE TABLE, `<table>_<column>
+-- _check`) has ever been widened post-creation.
+ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_kind_check;
+ALTER TABLE nodes ADD CONSTRAINT nodes_kind_check CHECK (kind IN ('symbol', 'file', 'gotcha', 'decision', 'definition', 'note', 'doc_section'));
+
+ALTER TABLE edges DROP CONSTRAINT IF EXISTS edges_relation_check;
+ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depends_on', 'documents', 'affects', 'references', 'covers'));
+
+-- Initiative 3 (CLS-inspired retrieval plan) added Node.last_touched_at on
+-- the SQLite backend only, deliberately not here: `nodes` queries in
+-- src/lib.rs are almost all `SELECT *` (unlike `edges`, which already has a
+-- dedicated `EDGES_COLUMNS` constant with a `::text` cast for exactly this
+-- reason) -- wiring this column in properly means replacing every one of
+-- those `SELECT *` call sites with an explicit, `::text`-cast column list,
+-- a wide change with no live Postgres instance reachable in the session
+-- that added it to verify against. `Node.last_touched_at` is `Option<String>`
+-- specifically so `PostgresGraphStore` can return `None` (recency ranking
+-- becomes a no-op there, not a crash) until this is done properly.
+
 

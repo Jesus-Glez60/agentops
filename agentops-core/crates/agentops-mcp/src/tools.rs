@@ -125,12 +125,28 @@ fn tool_specs() -> Vec<ToolSpec> {
             handler: tool_explain_symbol,
         },
         ToolSpec {
+            name: "related_context",
+            description: "Pattern completion around a symbol (Initiative 4, CLS-inspired retrieval plan): finds symbols elsewhere in the repo that are similar (dense embedding, requires with_embeddings from an earlier scan) or graph-connected (Personalized PageRank over Affects/References edges) to the given symbol, and returns each one's own recorded Gotcha/Decision notes. Read-only, no LLM call — the same recombined context explain_symbol now folds into its prompt automatically, exposed directly so an agent session can ask 'what's associated with this symbol' without triggering a full explanation.",
+            access: AccessMode::Advisor,
+            annotations: READ_ONLY,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "top_k": { "type": "integer" } }, "required": ["path", "symbol_id"] }),
+            handler: tool_related_context,
+        },
+        ToolSpec {
             name: "get_session",
             description: "Returns the correlated cross-tool activity feed for one session_id in a repo — every scan_repo/add_note/ingest_notes/explain_symbol call that was made with that same session_id, oldest first. Empty if session_id was never passed to any write tool for this repo.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
             input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path", "session_id"] }),
             handler: tool_get_session,
+        },
+        ToolSpec {
+            name: "end_session",
+            description: "Signals that an agent session is done (Initiative 5, CLS-inspired retrieval plan) and triggers embedding consolidation: trains a small per-repo projection head on top of the frozen base embeddings, using this repo's own plasticity-shaped Affects/References edges as a replay buffer, and promotes it only if it doesn't regress retrieval quality against whatever's currently active. Requires session_id to have been passed to at least one earlier write tool call in this repo (scan_repo/add_note/ingest_notes/explain_symbol) — otherwise there's no recorded activity to confirm consolidation is warranted. No-ops gracefully (never errors) if there isn't enough plasticity signal yet. Real, if modest, CPU cost — call once at the natural end of a work session, not after every tool call.",
+            access: AccessMode::Full,
+            annotations: ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: false },
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path", "session_id"] }),
+            handler: tool_end_session,
         },
         ToolSpec {
             name: "create_task",
@@ -205,7 +221,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "semantic_search",
-            description: "Dense-vector search over whatever symbols/gotchas/decisions/notes have been embedded (see scan_repo/add_note/ingest_notes's with_embeddings flag) — complements get_symbol's exact-name lookup with 'find something like this' search. Only returns hits among nodes that were actually embedded; nothing is embedded by default. Set mode to 'hybrid' to fuse in lexical (keyword/BM25) and exact-name-match signals too — no embedding required for a node to be found via those signals, and a literal function-name query reliably surfaces it even when nothing was ever embedded.",
+            description: "Dense-vector search over whatever symbols/gotchas/decisions/notes have been embedded (see scan_repo/add_note/ingest_notes's with_embeddings flag) — complements get_symbol's exact-name lookup with 'find something like this' search. Only returns hits among nodes that were actually embedded; nothing is embedded by default. Set mode to 'hybrid' to fuse in lexical (keyword/BM25) and exact-name-match signals too — no embedding required for a node to be found via those signals, and a literal function-name query reliably surfaces it even when nothing was ever embedded. With mode 'hybrid', set graph_expand to also spread activation from the fused top hits across Affects/References edges (Personalized PageRank) so graph-connected results can outrank a purely textual/semantic match — off by default. Set mode to 'gist_then_detail' for two-tier retrieval: first matches the repo's generated documentation sections (the compressed 'gist' of a module/repo), then searches only the symbols/gotchas/decisions those matched sections actually cover — sharper results for a broad/module-level query, at the cost of ignoring kind filtering and anything outside a matched section's coverage (falls back to an unscoped search if no section matches).",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
             input_schema: || {
@@ -216,7 +232,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "query": { "type": "string" },
                         "top_k": { "type": "integer" },
                         "kind": { "type": "string", "enum": ["symbol", "file", "gotcha", "decision", "note", "definition"] },
-                        "mode": { "type": "string", "enum": ["dense", "hybrid"] },
+                        "mode": { "type": "string", "enum": ["dense", "hybrid", "gist_then_detail"] },
+                        "graph_expand": { "type": "boolean" },
                     },
                     "required": ["path", "query"],
                 })
@@ -536,6 +553,24 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
         None => None,
     };
 
+    // "gist_then_detail" (Initiative 2, CLS-inspired retrieval plan):
+    // two-tier retrieval over agentops-docgen's already-compressed
+    // NodeKind::DocSection "gist" tier, then a detail-tier search scoped to
+    // what the matched section(s) actually cover. `kind` doesn't apply to
+    // this mode -- the gist pass is always DocSection-only by construction,
+    // the detail pass is always unfiltered by kind.
+    if get_str(args, "mode") == Some("gist_then_detail") {
+        let hits = agentops_retrieval::search_gist_then_detail(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, query, top_k)?;
+        if hits.is_empty() {
+            return Ok("No matches.".to_string());
+        }
+        return Ok(hits
+            .iter()
+            .map(|h| format!("- {:?} {} (score {:.4}){}", h.node.kind, h.node.name.as_deref().unwrap_or("(untitled)"), h.fused_score, h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
     // "hybrid" (Phase 4): fuses dense + lexical + exact-match via
     // Reciprocal Rank Fusion (agentops_retrieval::search_hybrid) — finds
     // an exact function-name query dense-only search would miss, and gives
@@ -543,7 +578,17 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
     // similarity. Default stays "dense" (today's original behavior) so
     // existing callers/tests see no change unless they opt in.
     if get_str(args, "mode") == Some("hybrid") {
-        let hits = agentops_retrieval::search_hybrid(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, query, top_k, kind)?;
+        // `graph_expand` (Initiative 0, CLS-inspired retrieval plan): seeds
+        // a bounded, in-memory Personalized PageRank from the RRF-fused top
+        // hits and folds each node's graph-connectedness into the sort key.
+        // Off by default so existing callers see no behavior change.
+        let graph_expand = get_bool(args, "graph_expand");
+        // Initiative 5: if this repo has a promoted projection head, the
+        // dense signal re-ranks through it instead of raw base-embedding
+        // similarity. `None` for a never-consolidated repo, transparently
+        // falling back to today's unprojected ranking.
+        let projector = crate::consolidate::load_active_projector(&repo);
+        let hits = agentops_retrieval::search_hybrid(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, query, top_k, kind, graph_expand, projector.as_ref().map(|p| p as &dyn agentops_retrieval::EmbeddingProjector))?;
         if hits.is_empty() {
             return Ok("No matches.".to_string());
         }
@@ -551,13 +596,14 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
             .iter()
             .map(|h| {
                 let signals = [h.dense_rank.map(|_| "dense"), h.lexical_rank.map(|_| "lexical"), h.exact_rank.map(|_| "exact")].into_iter().flatten().collect::<Vec<_>>().join("+");
+                let graph = h.graph_score.filter(|s| *s > 0.0).map(|s| format!(", graph {s:.4}")).unwrap_or_default();
                 let reduced = if h.node.prominence == agentops_graph::NodeProminence::Reduced {
                     format!(" ⚠ reduced prominence — {}", h.node.curation_reason.as_deref().unwrap_or("no reason recorded"))
                 } else {
                     String::new()
                 };
                 format!(
-                    "- {:?} {} (score {:.4}, signals: {signals}){}{reduced}",
+                    "- {:?} {} (score {:.4}, signals: {signals}{graph}){}{reduced}",
                     h.node.kind,
                     h.node.name.as_deref().unwrap_or("(untitled)"),
                     h.fused_score,
@@ -611,6 +657,29 @@ fn tool_get_session(args: &Value) -> anyhow::Result<String> {
         return Ok(format!("No activity recorded for session '{session_id}' in {repo}."));
     }
     Ok(events.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, e.description)).collect::<Vec<_>>().join("\n"))
+}
+
+fn tool_end_session(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let session_id = get_str(args, "session_id").ok_or_else(|| anyhow::anyhow!("missing required 'session_id'"))?;
+
+    let events = store.session_events(&repo, session_id)?;
+    if events.is_empty() {
+        return Ok(format!("No activity recorded for session '{session_id}' in {repo} — nothing to consolidate."));
+    }
+
+    let report = crate::consolidate::run_embedding_consolidation(store.as_ref(), &repo)?;
+    if !report.attempted {
+        return Ok(format!("Consolidation skipped: {}", report.reason));
+    }
+    Ok(format!(
+        "Consolidation ran on {} example(s) (candidate recall@{} {:.3} vs. baseline {:.3}): {}",
+        report.examples_used,
+        agentops_embeddings_train::RECALL_K,
+        report.candidate_recall,
+        report.baseline_recall,
+        report.reason
+    ))
 }
 
 fn parse_task_status(s: &str) -> Option<TaskStatus> {
@@ -672,6 +741,34 @@ fn tool_get_task_activity(args: &Value) -> anyhow::Result<String> {
         return Ok(format!("Task {task_id} ({}) has session_id '{session_id}' but no activity recorded under it yet.", task.title));
     }
     Ok(events.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, e.description)).collect::<Vec<_>>().join("\n"))
+}
+
+fn tool_related_context(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let symbol_id = args.get("symbol_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'symbol_id'"))?;
+    let top_k = args.get("top_k").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+
+    let results = agentops_retrieval::pattern_complete(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, symbol_id, top_k)?;
+    if results.is_empty() {
+        return Ok("No related symbols found.".to_string());
+    }
+    Ok(results
+        .iter()
+        .map(|m| {
+            let via = match m.via {
+                agentops_retrieval::PatternCompletionSource::Similar(s) => format!("similar, {s:.2} cosine similarity"),
+                agentops_retrieval::PatternCompletionSource::Graph(s) => format!("graph-connected, {s:.4} PageRank mass"),
+            };
+            let notes = if m.notes.is_empty() {
+                String::new()
+            } else {
+                let rendered = m.notes.iter().map(|(kind, title, text, _, _)| format!("    - [{kind:?}] {title}: {text}")).collect::<Vec<_>>().join("\n");
+                format!("\n{rendered}")
+            };
+            format!("- {} ({via}){}{notes}", m.node.name.as_deref().unwrap_or("(untitled)"), m.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
 }
 
 fn tool_explain_symbol(args: &Value) -> anyhow::Result<String> {
@@ -1028,6 +1125,130 @@ mod tests {
         assert!(!hybrid_result.is_error, "{:?}", hybrid_result.content);
         assert!(hybrid_result.content[0].text.contains("verify_token_signature"), "{:?}", hybrid_result.content);
         assert!(hybrid_result.content[0].text.contains("exact"), "the exact signal must be the one that found it: {:?}", hybrid_result.content);
+    }
+
+    /// `related_context` (Initiative 4) end-to-end over MCP: a symbol
+    /// referencing another symbol elsewhere in the file must surface that
+    /// connected symbol's own recorded gotcha, without any LLM call.
+    #[test]
+    fn related_context_surfaces_a_graph_connected_symbols_gotcha() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def helper():\n    pass\n\ndef seed():\n    return helper()\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Helper workaround", "body": "helper has a known workaround for a bug." })).unwrap();
+
+        let store = crate::store::open_store(std::path::Path::new(&path)).unwrap();
+        let repo = crate::scan::repo_name(std::path::Path::new(&path));
+        let seed_id = store.find_node(&repo, agentops_graph::NodeKind::Symbol, Some("auth.py"), Some("seed"), None).unwrap().unwrap().id;
+        drop(store);
+
+        let result = call_tool(AccessMode::Advisor, "related_context", &json!({ "path": path, "symbol_id": seed_id })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("helper"), "{:?}", result.content);
+        assert!(result.content[0].text.contains("Helper workaround"), "{:?}", result.content);
+        assert!(result.content[0].text.contains("graph-connected"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn related_context_reports_no_matches_for_an_isolated_symbol() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def lonely():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+
+        let store = crate::store::open_store(std::path::Path::new(&path)).unwrap();
+        let repo = crate::scan::repo_name(std::path::Path::new(&path));
+        let id = store.find_node(&repo, agentops_graph::NodeKind::Symbol, Some("main.py"), Some("lonely"), None).unwrap().unwrap().id;
+        drop(store);
+
+        let result = call_tool(AccessMode::Advisor, "related_context", &json!({ "path": path, "symbol_id": id })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("No related symbols found"), "{:?}", result.content);
+    }
+
+    /// `end_session` (Initiative 5) refuses to consolidate for a
+    /// `session_id` that never did anything in this repo -- the gate
+    /// `run_embedding_consolidation` is deliberately never even reached
+    /// for.
+    #[test]
+    fn end_session_reports_nothing_to_consolidate_for_an_unused_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+
+        let result = call_tool(AccessMode::Full, "end_session", &json!({ "path": path, "session_id": "never-used" })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("nothing to consolidate"), "{:?}", result.content);
+    }
+
+    /// End-to-end over MCP: a session that did real work (scan_repo with a
+    /// session_id) is a valid `end_session` call -- it must not error even
+    /// though a single freshly-scanned tiny repo has far fewer than
+    /// `MIN_REPLAY_PAIRS` plasticity-bearing edges yet, so the honest
+    /// outcome here is a graceful skip, not a promoted model. The heavier
+    /// "enough real signal to actually train and promote" path is already
+    /// covered by `agentops-embeddings-train`'s own
+    /// `consolidate_trains_and_promotes_on_a_first_real_run` test; this
+    /// test's job is only the MCP tool wiring (session gating, dispatch,
+    /// response formatting), not re-proving the ML internals.
+    #[test]
+    fn end_session_runs_consolidation_when_the_session_did_real_work() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "session_id": "sess-e2e" })).unwrap();
+
+        let result = call_tool(AccessMode::Full, "end_session", &json!({ "path": path, "session_id": "sess-e2e" })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("Consolidation skipped:"), "a tiny fresh repo has too few plasticity-bearing pairs to train on yet: {:?}", result.content);
+
+        let repo = crate::scan::repo_name(dir.path());
+        let _ = std::fs::remove_dir_all(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".agentops").join("models").join(&repo));
+    }
+
+    /// `mode=gist_then_detail` (Initiative 2) end-to-end over MCP: a scan
+    /// with embeddings enabled indexes the generated overview DocSection as
+    /// its own searchable node, and a query matching it must return real
+    /// results, not "No matches" -- the whole point of Initiative 2 being
+    /// that docgen's output stops being search-invisible.
+    #[test]
+    fn semantic_search_gist_then_detail_mode_returns_real_results_after_a_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": true })).unwrap();
+
+        let result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "repository overview symbols indexed", "mode": "gist_then_detail" })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(!result.content[0].text.contains("No matches"), "the indexed overview section must be findable: {:?}", result.content);
+    }
+
+    /// `graph_expand` (Initiative 0) is opt-in over the MCP surface:
+    /// omitting it must leave the ranking/fused score untouched, and passing
+    /// it must not error even for a lone symbol with no `Affects`/
+    /// `References` edges -- it trivially becomes its own PPR seed (nonzero
+    /// self-restart mass), so the *text* does gain a `graph` annotation, but
+    /// the underlying `fused_score` and hit identity/order must be identical
+    /// either way, since there's no second node for activation to actually
+    /// redistribute toward.
+    #[test]
+    fn semantic_search_hybrid_mode_accepts_graph_expand_without_erroring_or_changing_the_fused_score() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token_signature():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": false })).unwrap();
+
+        let default_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid" })).unwrap();
+        let expanded_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid", "graph_expand": true })).unwrap();
+        assert!(!expanded_result.is_error, "{:?}", expanded_result.content);
+        assert!(expanded_result.content[0].text.contains("verify_token_signature"), "{:?}", expanded_result.content);
+        assert!(expanded_result.content[0].text.contains("score 0.0328"), "the fused score itself must be unaffected by graph_expand: {:?}", expanded_result.content);
+        assert!(!default_result.content[0].text.contains("graph "), "graph_expand off must never render a graph-score annotation: {:?}", default_result.content);
+        assert!(expanded_result.content[0].text.contains("graph "), "graph_expand on must render the annotation once a node has nonzero PPR mass: {:?}", expanded_result.content);
     }
 
     #[test]

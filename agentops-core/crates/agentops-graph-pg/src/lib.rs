@@ -70,6 +70,10 @@ fn row_to_node(row: &tokio_postgres::Row) -> Node {
         curated: row.get("curated"),
         prominence: NodeProminence::from_db_str(&prominence),
         curation_reason: row.get("curation_reason"),
+        // Initiative 3 (CLS-inspired retrieval plan): not wired up on this
+        // backend yet -- see schema.sql's own note. `None` makes recency
+        // ranking a no-op here rather than reading a wrong/absent column.
+        last_touched_at: None,
     }
 }
 
@@ -314,6 +318,14 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn delete_edge(&self, repo: &str, edge_id: i64) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("DELETE FROM edges WHERE repo = $1 AND id = $2", &[&repo, &edge_id]).await?;
+            Ok(())
+        })
+    }
+
     fn record_scan(&self, repo: &str, entries: &[NewScanHistoryEntry]) -> Result<i64> {
         self.rt.block_on(async {
             let mut client = self.pool.get().await?;
@@ -398,6 +410,16 @@ impl GraphStore for PostgresGraphStore {
             let updated = client.execute("UPDATE nodes SET embedding = $1 WHERE repo = $2 AND id = $3", &[&vector, &repo, &node_id]).await?;
             anyhow::ensure!(updated == 1, "node #{node_id} not found in repo {repo:?}");
             Ok(())
+        })
+    }
+
+    fn get_embedding(&self, repo: &str, node_id: i64) -> Result<Option<Vec<f32>>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client.query_opt("SELECT embedding FROM nodes WHERE repo = $1 AND id = $2", &[&repo, &node_id]).await?;
+            let Some(row) = row else { return Ok(None) };
+            let vector: Option<pgvector::Vector> = row.get("embedding");
+            Ok(vector.map(|v| v.to_vec()))
         })
     }
 

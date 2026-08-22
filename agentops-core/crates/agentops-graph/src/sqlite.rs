@@ -35,8 +35,19 @@ fn ensure_vec_extension_registered() {
     });
 }
 
+/// `sqlite-vec`'s own hard ceiling on a `vec0` `MATCH ... AND k = ?` query
+/// -- confirmed live against this repo's own real `node_vectors` table
+/// ("k value in knn query too large, provided N and the limit is 4096").
+const SQLITE_VEC_MAX_K: i64 = 4096;
+
 fn embedding_to_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+/// Inverse of `embedding_to_bytes` -- `vec0` stores/returns a packed
+/// little-endian `f32` blob, the same layout `fastembed`'s own output uses.
+fn bytes_to_embedding(bytes: &[u8]) -> Vec<f32> {
+    bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
 /// Turns a free-text query into an FTS5 `MATCH` expression that can't
@@ -262,6 +273,22 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
             content      TEXT NOT NULL
         );",
     ),
+    // Initiative 3 (CLS-inspired retrieval plan): recency-weighted search
+    // ranking. Same non-constant-default-rejected-by-ADD-COLUMN workaround
+    // as edges.updated_at above -- constant '' placeholder, backfilled via
+    // UPDATE. Every future add_node/update_node sets this explicitly to
+    // CURRENT_TIMESTAMP, so the placeholder is only ever seen by this one
+    // backfill step. **Must stay the last entry in this slice** --
+    // `rusqlite_migration` tracks progress purely by position (`user_version`
+    // as an index/count into MIGRATIONS_SLICE), not by content, so inserting
+    // a step anywhere but the end would silently skip it on every
+    // already-migrated database (confirmed by reasoning through the
+    // mechanism directly; caught and fixed before this ever ran against a
+    // real db, not after).
+    M::up(
+        "ALTER TABLE nodes ADD COLUMN last_touched_at TEXT NOT NULL DEFAULT '';
+        UPDATE nodes SET last_touched_at = CURRENT_TIMESTAMP WHERE last_touched_at = '';",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -308,6 +335,7 @@ impl SqliteGraphStore {
             curated: row.get("curated")?,
             prominence: NodeProminence::from_db_str(&prominence),
             curation_reason: row.get("curation_reason")?,
+            last_touched_at: row.get("last_touched_at")?,
         })
     }
 
@@ -400,7 +428,7 @@ impl SqliteGraphStore {
 impl GraphStore for SqliteGraphStore {
     fn add_node(&self, node: NewNode) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO nodes (kind, repo, path, name, container, start_line, end_line, content) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO nodes (kind, repo, path, name, container, start_line, end_line, content, last_touched_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)",
             rusqlite::params![node.kind.as_db_str(), node.repo, node.path, node.name, node.container, node.start_line, node.end_line, node.content],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -431,8 +459,23 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn update_node(&self, repo: &str, id: i64, start_line: Option<i64>, end_line: Option<i64>, content: Option<String>) -> Result<()> {
+        // `last_touched_at` only bumps when `content` actually changes, not
+        // on every call -- `upsert_node` calls this unconditionally for
+        // every already-existing node on every rescan (matching every
+        // symbol, changed or not), so an unconditional bump here would make
+        // every node in a repeatedly-scanned repo look equally "fresh" after
+        // any scan, defeating recency ranking as a meaningful signal. `IS
+        // NOT` (not `!=`) for a NULL-safe comparison -- a File node's
+        // `content` is always NULL, and plain `!=` against NULL is NULL
+        // (never true) in standard SQL, which would make a File's
+        // last_touched_at never update at all. The `CASE` expression's
+        // `content` reference reads the pre-update row (SQLite evaluates
+        // every SET clause's right-hand side against the row's old values),
+        // so this correctly compares old vs. new within one statement.
         self.conn.execute(
-            "UPDATE nodes SET start_line = ?1, end_line = ?2, content = ?3 WHERE repo = ?4 AND id = ?5",
+            "UPDATE nodes SET start_line = ?1, end_line = ?2, content = ?3,
+                last_touched_at = CASE WHEN content IS NOT ?3 THEN CURRENT_TIMESTAMP ELSE last_touched_at END
+            WHERE repo = ?4 AND id = ?5",
             rusqlite::params![start_line, end_line, content, repo, id],
         )?;
         Ok(())
@@ -537,6 +580,11 @@ impl GraphStore for SqliteGraphStore {
         Ok(())
     }
 
+    fn delete_edge(&self, repo: &str, edge_id: i64) -> Result<()> {
+        self.conn.execute("DELETE FROM edges WHERE repo = ?1 AND id = ?2", rusqlite::params![repo, edge_id])?;
+        Ok(())
+    }
+
     fn record_scan(&self, repo: &str, entries: &[NewScanHistoryEntry]) -> Result<i64> {
         let count = |kind: NodeKind, change: ScanChange| entries.iter().filter(|e| e.kind == kind && e.change == change).count() as i64;
         let files_added = count(NodeKind::File, ScanChange::Added);
@@ -611,6 +659,15 @@ impl GraphStore for SqliteGraphStore {
         Ok(())
     }
 
+    fn get_embedding(&self, repo: &str, node_id: i64) -> Result<Option<Vec<f32>>> {
+        if self.get_node(repo, node_id)?.is_none() {
+            return Ok(None);
+        }
+        let mut stmt = self.conn.prepare("SELECT embedding FROM node_vectors WHERE node_id = ?1")?;
+        let mut rows = stmt.query_map([node_id], |row| row.get::<_, Vec<u8>>(0))?;
+        Ok(rows.next().transpose()?.map(|bytes| bytes_to_embedding(&bytes)))
+    }
+
     fn search_similar(&self, repo: &str, embedding: &[f32], top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
         anyhow::ensure!(embedding.len() == EMBEDDING_DIM, "query embedding has {} dims, expected {EMBEDDING_DIM}", embedding.len());
 
@@ -618,7 +675,19 @@ impl GraphStore for SqliteGraphStore {
         // support varies by version, and this scan is cheap at the node
         // counts a self-hosted instance actually has. Same technique
         // `docbrain-graph`'s `search_similar` already uses and documents.
-        let fetch_k = (top_k * 8).max(50) as i64;
+        //
+        // Clamped at `SQLITE_VEC_MAX_K` regardless of how large `top_k * 8`
+        // gets -- sqlite-vec's `vec0` table rejects any `k > 4096` outright
+        // ("k value in knn query too large"). A real, live failure caught
+        // via E2E testing against this repo's own graph.db: a caller several
+        // layers up (`agentops-retrieval::search_gist_then_detail`, itself
+        // called through `search_hybrid`'s own `*3` dense fetch_k) passed a
+        // large `top_k` that multiplied out to 24000 by the time it reached
+        // here. Rather than have every caller up the chain reason about
+        // this multiplier stack-up, the actual technical constraint is
+        // enforced once, at the one place that issues the real `MATCH ...
+        // k = ?` query.
+        let fetch_k = ((top_k * 8).max(50) as i64).min(SQLITE_VEC_MAX_K);
         let mut stmt = self.conn.prepare("SELECT node_id, distance FROM node_vectors WHERE embedding MATCH ?1 AND k = ?2 ORDER BY distance")?;
         let rows = stmt.query_map(rusqlite::params![embedding_to_bytes(embedding), fetch_k], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
 
@@ -851,6 +920,39 @@ mod tests {
     }
 
     #[test]
+    fn a_new_node_gets_a_real_last_touched_at_timestamp_not_the_migration_placeholder() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("foo"))).unwrap();
+        let n = store.get_node("repo-a", id).unwrap().unwrap();
+        assert!(n.last_touched_at.as_deref().is_some_and(|ts| !ts.is_empty()), "{:?}", n.last_touched_at);
+    }
+
+    #[test]
+    fn update_node_only_bumps_last_touched_at_when_content_actually_changes() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let mut n = node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("foo"));
+        n.content = Some("fn foo() {}".to_string());
+        let id = upsert_node(&store, n.clone()).unwrap();
+
+        // Force a distinguishable, obviously-synthetic last_touched_at so
+        // this test doesn't depend on real clock resolution (SQLite's
+        // CURRENT_TIMESTAMP is only second-precision, too coarse to
+        // reliably observe "did it change" within one fast test run).
+        store.conn.execute("UPDATE nodes SET last_touched_at = '2020-01-01 00:00:00' WHERE id = ?1", [id]).unwrap();
+
+        // Same content -- must NOT bump.
+        upsert_node(&store, n.clone()).unwrap();
+        let unchanged = store.get_node("repo-a", id).unwrap().unwrap();
+        assert_eq!(unchanged.last_touched_at.as_deref(), Some("2020-01-01 00:00:00"), "an unchanged rescan must not refresh last_touched_at, or every node in a repeatedly-scanned repo would look equally fresh");
+
+        // Different content -- must bump away from the synthetic value.
+        n.content = Some("fn foo() { changed }".to_string());
+        upsert_node(&store, n).unwrap();
+        let changed = store.get_node("repo-a", id).unwrap().unwrap();
+        assert_ne!(changed.last_touched_at.as_deref(), Some("2020-01-01 00:00:00"), "a genuine content change must refresh last_touched_at");
+    }
+
+    #[test]
     fn find_node_null_safe_comparison_does_not_cross_match_different_names() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         // Two File nodes, both with name = NULL, must be distinguishable by path.
@@ -962,6 +1064,30 @@ mod tests {
     }
 
     #[test]
+    fn get_embedding_round_trips_the_exact_vector_set_embedding_wrote() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        let v = unit_vec(3);
+        store.set_embedding("repo-a", id, &v).unwrap();
+
+        let got = store.get_embedding("repo-a", id).unwrap().unwrap();
+        assert_eq!(got, v);
+    }
+
+    #[test]
+    fn get_embedding_is_none_for_a_node_that_was_never_embedded() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
+        assert!(store.get_embedding("repo-a", id).unwrap().is_none());
+    }
+
+    #[test]
+    fn get_embedding_is_none_for_an_unknown_node() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        assert!(store.get_embedding("repo-a", 999_999).unwrap().is_none());
+    }
+
+    #[test]
     fn search_similar_ranks_nearest_first() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let close = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("close"))).unwrap();
@@ -972,6 +1098,19 @@ mod tests {
         let hits = store.search_similar("repo-a", &unit_vec(0), 2, None).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].0.id, close, "the near vector must rank first: {hits:?}");
+    }
+
+    /// A huge `top_k` must never reach sqlite-vec's `MATCH ... k = ?` at a
+    /// value above its own hard `k <= 4096` ceiling -- confirmed live
+    /// against this repo's own real graph.db that an unclamped `top_k * 8`
+    /// does exactly that (a caller several layers up multiplied out to
+    /// 24000). This test doesn't need real embedded data; it only needs
+    /// `search_similar` to not error out.
+    #[test]
+    fn search_similar_clamps_a_huge_top_k_to_sqlite_vecs_own_limit() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let hits = store.search_similar("repo-a", &unit_vec(0), 10_000, None).unwrap();
+        assert!(hits.is_empty(), "no embeddings exist yet, but the call itself must not error: {hits:?}");
     }
 
     #[test]
@@ -1206,6 +1345,39 @@ mod tests {
 
         let edge = store.edges_from("repo-a", a).unwrap().into_iter().find(|e| e.id == edge_id).unwrap();
         assert_eq!(edge.weight, 1.0, "reinforcing under the wrong repo must not affect the real edge");
+    }
+
+    #[test]
+    fn delete_edge_removes_exactly_the_named_edge_and_no_other() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("a"))).unwrap();
+        let b = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("b.rs"), Some("b"))).unwrap();
+        let c = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("c.rs"), Some("c"))).unwrap();
+        let to_delete = store.add_edge("repo-a", a, b, EdgeRelation::References).unwrap();
+        let to_keep = store.add_edge("repo-a", a, c, EdgeRelation::References).unwrap();
+
+        store.delete_edge("repo-a", to_delete).unwrap();
+
+        let remaining: Vec<i64> = store.edges_from("repo-a", a).unwrap().into_iter().map(|e| e.id).collect();
+        assert_eq!(remaining, vec![to_keep]);
+    }
+
+    #[test]
+    fn delete_edge_under_the_wrong_repo_is_a_no_op_not_an_error() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("a.rs"), Some("a"))).unwrap();
+        let b = upsert_node(&store, node("repo-a", NodeKind::Symbol, Some("b.rs"), Some("b"))).unwrap();
+        let edge_id = store.add_edge("repo-a", a, b, EdgeRelation::References).unwrap();
+
+        store.delete_edge("repo-b", edge_id).unwrap();
+
+        assert_eq!(store.edges_from("repo-a", a).unwrap().len(), 1, "deleting under the wrong repo must not touch the real edge");
+    }
+
+    #[test]
+    fn delete_edge_on_an_unknown_id_is_a_no_op_not_an_error() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.delete_edge("repo-a", 999_999).unwrap();
     }
 
     #[test]

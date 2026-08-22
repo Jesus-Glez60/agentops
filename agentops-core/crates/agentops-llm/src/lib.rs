@@ -19,6 +19,11 @@ const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const DEFAULT_MAX_TOKENS: u32 = 1024;
+/// How many pattern-completed symbols (Initiative 4) `explain_symbol` pulls
+/// in as possibly-related context -- most get filtered out by
+/// `build_prompt`'s own "must have at least one note" check anyway, so this
+/// is deliberately generous rather than tightly tuned.
+const PATTERN_COMPLETE_K: usize = 5;
 
 /// Anthropic API configuration — `AGENTOPS_ANTHROPIC_API_KEY` follows the
 /// `AGENTOPS_<SUBSYSTEM>_<PURPOSE>` env var convention.
@@ -149,11 +154,20 @@ fn send_messages(config: &AnthropicConfig, prompt: &str, output_config: Option<O
 
 /// Builds the prompt for explaining `symbol` — its full source, plus
 /// light, cheap context: the symbol's file's `DependsOn` targets
-/// (file-level, not a transitive closure) and any `Gotcha`/`Decision` notes
-/// already `Affects`-connected to it. Does NOT include full file content or
-/// sibling symbols' source — both cost and prompt-injection surface scale
-/// with what's included here.
-fn build_prompt(symbol: &Node, dep_paths: &[String], existing_notes: &[(NodeKind, String, String, NodeProminence, Option<String>)]) -> String {
+/// (file-level, not a transitive closure), any `Gotcha`/`Decision` notes
+/// already `Affects`-connected to it, and — since Initiative 4 of the
+/// CLS-inspired retrieval plan — pattern-completed context recombined from
+/// similar/graph-connected symbols elsewhere in the repo
+/// (`agentops_retrieval::pattern_complete`). Does NOT include full file
+/// content or sibling symbols' source directly — both cost and
+/// prompt-injection surface scale with what's included here; `related`
+/// only ever contributes another symbol's *notes*, never its raw source.
+fn build_prompt(
+    symbol: &Node,
+    dep_paths: &[String],
+    existing_notes: &[(NodeKind, String, String, NodeProminence, Option<String>)],
+    related: &[agentops_retrieval::PatternCompletionMatch],
+) -> String {
     let mut prompt = format!(
         "You are documenting a codebase. Explain concisely what this symbol does and why it might exist, for a developer or AI agent reading the code for the first time.\n\n\
          Symbol: {}\nFile: {}\n\n```\n{}\n```\n",
@@ -179,6 +193,24 @@ fn build_prompt(symbol: &Node, dep_paths: &[String], existing_notes: &[(NodeKind
                 String::new()
             };
             prompt.push_str(&format!("- [{kind:?}] {title}: {text}{demoted}\n"));
+        }
+    }
+
+    let related_with_notes: Vec<&agentops_retrieval::PatternCompletionMatch> = related.iter().filter(|m| !m.notes.is_empty()).collect();
+    if !related_with_notes.is_empty() {
+        // Only symbols that actually carry their own notes are worth
+        // spending prompt budget on -- a pattern-completed symbol with no
+        // recorded knowledge contributes nothing an explanation can use.
+        prompt.push_str("\nPossibly related context from similar symbols elsewhere in this repo (may or may not be directly relevant -- weigh accordingly, don't assume it applies here):\n");
+        for m in related_with_notes {
+            let via = match m.via {
+                agentops_retrieval::PatternCompletionSource::Similar(s) => format!("similar, {s:.2} cosine similarity"),
+                agentops_retrieval::PatternCompletionSource::Graph(s) => format!("graph-connected, {s:.4} PageRank mass"),
+            };
+            prompt.push_str(&format!("- {} ({via}):\n", m.node.name.as_deref().unwrap_or("<unnamed>")));
+            for (kind, title, text, _, _) in &m.notes {
+                prompt.push_str(&format!("  - [{kind:?}] {title}: {text}\n"));
+            }
         }
     }
 
@@ -223,7 +255,12 @@ pub fn explain_symbol(store: &dyn GraphStore, config: &AnthropicConfig, repo: &s
         .map(|n| (n.kind, n.name.clone().unwrap_or_default(), n.content.clone().unwrap_or_default(), n.prominence, n.curation_reason.clone()))
         .collect();
 
-    let prompt = build_prompt(&symbol, &dep_paths, &existing_notes);
+    // Pattern-completed context (Initiative 4, CLS-inspired retrieval
+    // plan): notes from similar/graph-connected symbols elsewhere in the
+    // repo, on top of `existing_notes`' seed-symbol-only view.
+    let related = agentops_retrieval::pattern_complete(store, &agentops_embeddings::LocalEmbedder, repo, symbol_id, PATTERN_COMPLETE_K)?;
+
+    let prompt = build_prompt(&symbol, &dep_paths, &existing_notes, &related);
     let result = call_anthropic(config, &prompt)?;
 
     let definition_id = upsert_node(
@@ -494,8 +531,9 @@ mod tests {
             curated: false,
             prominence: NodeProminence::Full,
             curation_reason: None,
+            last_touched_at: None,
         };
-        let prompt = build_prompt(&node, &["src/config.rs".to_string()], &[(NodeKind::Gotcha, "off-by-one".into(), "expiry bug".into(), NodeProminence::Full, None)]);
+        let prompt = build_prompt(&node, &["src/config.rs".to_string()], &[(NodeKind::Gotcha, "off-by-one".into(), "expiry bug".into(), NodeProminence::Full, None)], &[]);
         assert!(prompt.contains("verify_token"));
         assert!(prompt.contains("fn verify_token() {}"));
         assert!(prompt.contains("src/config.rs"));
@@ -518,8 +556,9 @@ mod tests {
             curated: false,
             prominence: NodeProminence::Full,
             curation_reason: None,
+            last_touched_at: None,
         };
-        let prompt = build_prompt(&node, &[], &[(NodeKind::Gotcha, "niche issue".into(), "rare edge case".into(), NodeProminence::Reduced, Some("only affects old Linux envs".into()))]);
+        let prompt = build_prompt(&node, &[], &[(NodeKind::Gotcha, "niche issue".into(), "rare edge case".into(), NodeProminence::Reduced, Some("only affects old Linux envs".into()))], &[]);
         assert!(prompt.contains("lower confidence"), "{prompt}");
         assert!(prompt.contains("only affects old Linux envs"), "{prompt}");
     }
@@ -618,6 +657,39 @@ mod tests {
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].dst_id, symbol_id);
         assert_eq!(edges[0].relation, EdgeRelation::Documents);
+    }
+
+    /// Initiative 4: `explain_symbol`'s prompt must actually include
+    /// pattern-completed context from a graph-connected symbol that carries
+    /// its own notes -- asserted by only satisfying the mock when the sent
+    /// request body contains that recombined content, so the test fails
+    /// (mock returns an unmatched-request error) if the wiring is broken,
+    /// not just checked after the fact against a fixed mock response.
+    #[tokio::test]
+    async fn explain_symbol_includes_pattern_completed_context_from_a_connected_symbol() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_string_contains("watch out"))
+            .and(wiremock::matchers::body_string_contains("edge case in the connected helper"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "Verifies a bearer token, related to a known edge case elsewhere."}],
+                "usage": {"input_tokens": 10, "output_tokens": 5}
+            })))
+            .mount(&server)
+            .await;
+
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let symbol_id = symbol_node(&store, "demo", "src/auth.rs", "verify_token", "fn verify_token() {}");
+        let connected_id = symbol_node(&store, "demo", "src/helpers.rs", "connected_helper", "fn connected_helper() {}");
+        store.add_edge("demo", symbol_id, connected_id, EdgeRelation::References).unwrap();
+        let gotcha_id = upsert_node(&store, NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some("watch out".into()), container: None, start_line: None, end_line: None, content: Some("edge case in the connected helper".into()) })
+            .unwrap();
+        store.add_edge("demo", gotcha_id, connected_id, EdgeRelation::Affects).unwrap();
+        let config = mock_config(&server.uri());
+
+        let definition_id = explain_symbol(&store, &config, "demo", symbol_id).unwrap();
+        let definition = store.get_node("demo", definition_id).unwrap().unwrap();
+        assert_eq!(definition.content.as_deref(), Some("Verifies a bearer token, related to a known edge case elsewhere."));
     }
 
     #[tokio::test]

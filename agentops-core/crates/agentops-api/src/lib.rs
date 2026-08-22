@@ -60,6 +60,7 @@ pub fn build_router(mode: AccessMode, api_key_hash: Option<String>, manifest_pat
         .route("/repos/{name}/nodes/{id}/curation", post(search::set_curation_json))
         .route("/repos/{name}/nodes/{id}/graph", get(subgraph::subgraph_json))
         .route("/repos/{name}/graph", get(subgraph::repo_graph_json))
+        .route("/repos/{name}/edges/{id}/reinforce", post(subgraph::reinforce_edge_json))
         .route("/repos/{name}/docs", get(docs::docs_json))
         .route("/activity", get(repos::activity_json))
         .route("/search", get(search::search_json))

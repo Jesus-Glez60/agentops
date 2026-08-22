@@ -182,6 +182,7 @@ pub(crate) fn relation_label(relation: EdgeRelation, incoming: bool) -> String {
         EdgeRelation::Documents => "documents",
         EdgeRelation::Affects => "affects",
         EdgeRelation::References => "references",
+        EdgeRelation::Covers => "covers",
     };
     if incoming { format!("← {label}") } else { label.to_string() }
 }

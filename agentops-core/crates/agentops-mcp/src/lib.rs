@@ -3,6 +3,7 @@
 //! `scan_and_persist` for the actual scan-persistence use case, shared
 //! identically by the CLI and the MCP `scan_repo` tool.
 
+mod consolidate;
 mod docgen;
 mod init;
 mod notes;

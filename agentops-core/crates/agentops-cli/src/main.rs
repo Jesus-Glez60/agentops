@@ -136,6 +136,12 @@ enum Command {
         /// embedded (--with-embeddings left off).
         #[arg(long)]
         hybrid: bool,
+        /// With --hybrid, also spread activation from the fused top hits
+        /// across Affects/References edges (Personalized PageRank) so a
+        /// graph-connected result can outrank a purely textual/semantic
+        /// match. Ignored without --hybrid.
+        #[arg(long)]
+        graph_expand: bool,
         query: String,
     },
     /// Generate an LLM explanation of a symbol (requires
@@ -383,7 +389,7 @@ fn main() -> Result<()> {
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
         }
-        Command::Search { path, top_k, kind, hybrid, query } => search(&path, top_k, kind, hybrid, &query),
+        Command::Search { path, top_k, kind, hybrid, graph_expand, query } => search(&path, top_k, kind, hybrid, graph_expand, &query),
         Command::Explain { path, symbol, file } => explain(&path, &symbol, file.as_deref()),
         Command::Watch { path, with_embeddings } => {
             open_store(&path).context("repo must be scanned at least once (run `agentops install` first) before watching it")?;
@@ -760,21 +766,22 @@ fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classi
     Ok(())
 }
 
-fn search(path: &Path, top_k: usize, kind: Option<SearchKindArg>, hybrid: bool, query: &str) -> Result<()> {
+fn search(path: &Path, top_k: usize, kind: Option<SearchKindArg>, hybrid: bool, graph_expand: bool, query: &str) -> Result<()> {
     use agentops_embeddings::Embedder;
 
     let (store, repo) = open_store(path)?;
     let kind = kind.map(NodeKind::from);
 
     if hybrid {
-        let hits = agentops_retrieval::search_hybrid(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, query, top_k, kind)?;
+        let hits = agentops_retrieval::search_hybrid(store.as_ref(), &agentops_embeddings::LocalEmbedder, &repo, query, top_k, kind, graph_expand, None)?;
         if hits.is_empty() {
             println!("No matches.");
             return Ok(());
         }
         for h in &hits {
             let signals = [h.dense_rank.map(|_| "dense"), h.lexical_rank.map(|_| "lexical"), h.exact_rank.map(|_| "exact")].into_iter().flatten().collect::<Vec<_>>().join("+");
-            println!("{:?} {} (score {:.4}, signals: {signals}){}", h.node.kind, h.node.name.as_deref().unwrap_or("(untitled)"), h.fused_score, h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default());
+            let graph = h.graph_score.filter(|s| *s > 0.0).map(|s| format!(", graph {s:.4}")).unwrap_or_default();
+            println!("{:?} {} (score {:.4}, signals: {signals}{graph}){}", h.node.kind, h.node.name.as_deref().unwrap_or("(untitled)"), h.fused_score, h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default());
         }
         return Ok(());
     }

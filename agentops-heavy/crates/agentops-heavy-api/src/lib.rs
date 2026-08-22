@@ -110,6 +110,7 @@ pub fn build_router(
         .route("/search", get(search_query_handler))
         .route("/docs/search/index", post(docs_search_index_handler))
         .route("/docs/search", get(docs_search_query_handler))
+        .route("/consolidate/model", post(consolidate_model_handler))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key_or_session))
         .route("/health", get(health))
         .with_state(state)
@@ -723,6 +724,59 @@ async fn docs_search_query_handler(State(state): State<AppState>, Query(q): Quer
             (StatusCode::OK, Json(json!({ "results": results })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct ConsolidateModelRequest {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ConsolidateModelResponse {
+    attempted: bool,
+    promoted: bool,
+    examples_used: usize,
+    candidate_score: f64,
+    baseline_score: f64,
+    promoted_version: Option<u32>,
+    reason: String,
+}
+
+/// On-demand REST trigger for Initiative 6 (CLS-inspired retrieval plan):
+/// LoRA fine-tunes a small local code model on this repo's own curated
+/// Gotcha/Decision notes. No `search_index`/Qdrant dependency at all —
+/// unlike every other handler in this file, this one doesn't touch
+/// `AppState.search_index`. Runs on a blocking thread (`spawn_blocking`):
+/// `agentops_heavy_consolidate::consolidate_model` does real, synchronous
+/// CPU work (model download on first run, training, eval) that would
+/// otherwise stall this server's whole async runtime for the entire
+/// duration of a call, unlike every other handler here.
+async fn consolidate_model_handler(Json(req): Json<ConsolidateModelRequest>) -> (StatusCode, Json<Value>) {
+    let result = tokio::task::spawn_blocking(move || {
+        let repo_path = std::path::Path::new(&req.path);
+        let db_path = repo_path.join(".context").join("graph.db");
+        let store = agentops_graph::SqliteGraphStore::open(&db_path).map_err(|e| anyhow::anyhow!("opening graph store at {}: {e}", db_path.display()))?;
+        let repo = agentops_heavy_embeddings::repo_name(repo_path);
+        agentops_heavy_consolidate::consolidate_model(&store, &repo)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(report)) => (
+            StatusCode::OK,
+            Json(json!(ConsolidateModelResponse {
+                attempted: report.attempted,
+                promoted: report.promoted,
+                examples_used: report.examples_used,
+                candidate_score: report.candidate_score,
+                baseline_score: report.baseline_score,
+                promoted_version: report.promoted_version,
+                reason: report.reason,
+            })),
+        ),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("consolidation task panicked: {e}") }))),
     }
 }
 

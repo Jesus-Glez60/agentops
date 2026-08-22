@@ -11,6 +11,8 @@ name = "agentops_llm"
 anyhow.workspace = true
 agentops-graph = { path = "../agentops-graph" }
 agentops-notes = { path = "../agentops-notes" }
+agentops-retrieval = { path = "../agentops-retrieval" }
+agentops-embeddings = { path = "../agentops-embeddings" }
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3", features = ["json"] }

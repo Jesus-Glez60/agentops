@@ -17,6 +17,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 agentops-heavy-embeddings = { path = "../agentops-heavy-embeddings" }
+agentops-heavy-consolidate = { path = "../agentops-heavy-consolidate" }
 agentops-graph.workspace = true
 docbrain-graph.workspace = true
 # agentops-license deliberately not a dependency this pass — 1.0 has no

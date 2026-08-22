@@ -1,0 +1,21 @@
+[package]
+name = "agentops-embeddings-train"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_embeddings_train"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+agentops-graph = { path = "../agentops-graph" }
+agentops-embeddings = { path = "../agentops-embeddings" }
+candle-core = "0.8"
+candle-nn = "0.8"
+rand = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

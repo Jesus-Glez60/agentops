@@ -79,10 +79,10 @@ fn count_by_kind(nodes: &[Node]) -> RepoCounts {
                 }
             }
             NodeKind::Decision => counts.decisions += 1,
-            // Definition/Note aren't part of this dashboard's four-segment
-            // breakdown (matches the design tokens already established for
-            // Symbols/Files/Gotchas/Decisions specifically).
-            NodeKind::Definition | NodeKind::Note => {}
+            // Definition/Note/DocSection aren't part of this dashboard's
+            // four-segment breakdown (matches the design tokens already
+            // established for Symbols/Files/Gotchas/Decisions specifically).
+            NodeKind::Definition | NodeKind::Note | NodeKind::DocSection => {}
         }
     }
     counts

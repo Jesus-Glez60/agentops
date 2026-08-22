@@ -5,6 +5,7 @@ members = [
     "agentops-core/crates/agentops-graph",
     "agentops-core/crates/agentops-sqlite-support",
     "agentops-core/crates/agentops-embeddings",
+    "agentops-core/crates/agentops-embeddings-train",
     "agentops-core/crates/agentops-docgen",
     "agentops-core/crates/agentops-retrieval",
     "agentops-core/crates/agentops-notes",

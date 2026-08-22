@@ -200,15 +200,45 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
         }
     }
 
-    // Reference edges are likewise fully replaced per touched symbol each
-    // scan, not diffed -- same convention as DependsOn above.
-    for &symbol_id in &kept_symbol_ids {
-        store.delete_edges_from(&repo, symbol_id, EdgeRelation::References)?;
+    // Reference edges are plastic (Initiative 1, CLS-inspired retrieval
+    // plan) -- unlike DependsOn above, no longer fully deleted and
+    // recreated per touched symbol each scan. A reference re-confirmed this
+    // scan reinforces its existing edge (bumping weight, same mechanism a
+    // repeat-matched `Affects` edge already uses) instead of resetting to
+    // weight 1.0; a reference whose target genuinely disappeared is pruned
+    // via `delete_edge` rather than the whole per-symbol set being wiped.
+    let mut new_targets_by_symbol: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for (from_id, to_id) in &reference_pairs {
+        new_targets_by_symbol.entry(*from_id).or_default().insert(*to_id);
     }
     let mut reference_edges = 0;
-    for (from_id, to_id) in &reference_pairs {
-        store.add_edge(&repo, *from_id, *to_id, EdgeRelation::References)?;
-        reference_edges += 1;
+    for &symbol_id in &kept_symbol_ids {
+        let existing: Vec<_> = store.edges_from(&repo, symbol_id)?.into_iter().filter(|e| e.relation == EdgeRelation::References).collect();
+        let new_targets = new_targets_by_symbol.get(&symbol_id).cloned().unwrap_or_default();
+
+        for edge in &existing {
+            if new_targets.contains(&edge.dst_id) {
+                // Still referenced this scan -- reinforce, don't recreate.
+                // `bump_confirmed_at: false`, same convention as the
+                // automatic note rematch below: this is a passive rescan
+                // re-observation, not a deliberate human reconfirmation, so
+                // it must not reset the staleness clock `tool_get_symbol`
+                // compares against `node_history`.
+                store.reinforce_edge(&repo, edge.id, false)?;
+            } else {
+                // No longer referenced this scan -- pruned, not left to
+                // decay forever as a stale edge.
+                store.delete_edge(&repo, edge.id)?;
+            }
+        }
+
+        let existing_targets: HashSet<i64> = existing.iter().map(|e| e.dst_id).collect();
+        for &to_id in &new_targets {
+            if !existing_targets.contains(&to_id) {
+                store.add_edge(&repo, symbol_id, to_id, EdgeRelation::References)?;
+            }
+            reference_edges += 1;
+        }
     }
 
     store.record_scan(&repo, &scan_entries)?;
@@ -261,7 +291,7 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
     // Best-effort — a doc-generation hiccup (or, if `AGENTOPS_ANTHROPIC_API_KEY`
     // isn't set, the LLM module-labeling step failing outright) must never
     // fail the scan itself, so every error here is logged and swallowed.
-    if let Err(err) = crate::docgen::persist_doc_page(store.as_ref(), path, &repo, &report.files) {
+    if let Err(err) = crate::docgen::persist_doc_page(store.as_ref(), path, &repo, &report.files, with_embeddings) {
         eprintln!("warning: failed to regenerate the documentation page for {repo:?}: {err:#}");
     }
 
@@ -540,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_edges_are_fully_replaced_not_accumulated_on_rescan() {
+    fn reference_edges_are_reinforced_not_accumulated_on_rescan() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("main.rs"), "fn helper() -> i32 { 1 }\n\nfn main() -> i32 { helper() }\n").unwrap();
 
@@ -552,7 +582,29 @@ mod tests {
         let store = open_store(dir.path());
         let repo = repo_name(dir.path());
         let references: Vec<_> = store.all_edges(&repo).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::References).collect();
-        assert_eq!(references.len(), 1);
+        assert_eq!(references.len(), 1, "still exactly one edge, not a duplicate -- upsert-and-reinforce, not accumulate");
+        assert_eq!(references[0].weight, 1.5, "a reference re-confirmed on rescan must reinforce its existing edge's weight (Initiative 1), not reset it to a fresh 1.0");
+    }
+
+    #[test]
+    fn a_reference_edge_is_pruned_once_its_target_reference_disappears() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_rs = dir.path().join("main.rs");
+        std::fs::write(&main_rs, "fn helper() -> i32 { 1 }\n\nfn main() -> i32 { helper() }\n").unwrap();
+        scan_and_persist(dir.path(), false).unwrap();
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        assert_eq!(store.all_edges(&repo).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::References).count(), 1);
+        drop(store);
+
+        // `main` no longer calls `helper` -- the reference is gone.
+        std::fs::write(&main_rs, "fn helper() -> i32 { 1 }\n\nfn main() -> i32 { 2 }\n").unwrap();
+        let summary2 = scan_and_persist(dir.path(), false).unwrap();
+        assert_eq!(summary2.reference_edges, 0, "the disappeared reference must not be counted");
+
+        let store = open_store(dir.path());
+        assert!(store.all_edges(&repo).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::References).next().is_none(), "the stale edge must be pruned, not left behind decaying forever");
     }
 
     #[test]

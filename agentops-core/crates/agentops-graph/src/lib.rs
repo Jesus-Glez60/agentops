@@ -29,6 +29,19 @@ pub enum NodeKind {
     Decision,
     Definition,
     Note,
+    /// One `agentops-docgen::DocSection` indexed as its own searchable node
+    /// (Initiative 2, CLS-inspired retrieval plan) -- the "gist"/cortical
+    /// tier: `content` is the section's blocks flattened to plain text,
+    /// `name` is the section title, `path` is `"doc_section:{section.id}"`
+    /// (stable across regenerations, same pseudo-path idiom
+    /// `agentops-notes` already uses for vault notes: `"vault:{source_path}"`).
+    /// Connected to the underlying nodes it covers via `EdgeRelation::Covers`
+    /// -- deliberately its own relation, not `Documents`: that relation's
+    /// existing sole consumer (`agentops-docgen::sectioned::documenting_summary`)
+    /// assumes every `Documents` edge's source is a `Definition` node whose
+    /// `content` is a one-liner explanation, and would misread a
+    /// `DocSection`'s much longer flattened text the same way.
+    DocSection,
 }
 
 impl NodeKind {
@@ -40,6 +53,7 @@ impl NodeKind {
             NodeKind::Decision => "decision",
             NodeKind::Definition => "definition",
             NodeKind::Note => "note",
+            NodeKind::DocSection => "doc_section",
         }
     }
 
@@ -50,6 +64,7 @@ impl NodeKind {
             "decision" => NodeKind::Decision,
             "definition" => NodeKind::Definition,
             "note" => NodeKind::Note,
+            "doc_section" => NodeKind::DocSection,
             _ => NodeKind::Symbol,
         }
     }
@@ -109,7 +124,35 @@ pub enum EdgeRelation {
     /// tree-sitter parsed the file, word-boundary text matching as a
     /// fallback where it didn't) — not real call-graph analysis, and never
     /// cross-file. See `agentops_scanner::resolve_same_file_symbol_references`.
+    ///
+    /// **Plastic, like `Affects` (Initiative 1, CLS-inspired retrieval
+    /// plan) — no longer purely deterministic-and-replaced.** Earlier in
+    /// this codebase's history, every `References` edge was deleted and
+    /// recreated at `weight: 1.0` on every scan that touched its source
+    /// symbol, on the reasoning that a same-file reference is a
+    /// deterministic structural fact with no "relevance" to accumulate.
+    /// That's been superseded: a reference re-confirmed on a later rescan
+    /// now reinforces its existing edge (`reinforce_edge`, same as a
+    /// repeat-matched `Affects` edge) instead of resetting to `1.0`, and a
+    /// reference whose target genuinely disappeared is pruned via
+    /// `delete_edge` rather than the whole per-symbol set being wiped and
+    /// rebuilt. See `agentops-mcp::scan::persist`'s References block and
+    /// `REFERENCES_EDGE_HALF_LIFE_DAYS` (its own half-life, not
+    /// `AFFECTS_EDGE_HALF_LIFE_DAYS` — same per-relation-semantics
+    /// convention as everything else on this enum, not an oversight).
     References,
+    /// A `NodeKind::DocSection` covers a `Symbol`/`File` it documents —
+    /// directed **from the section to the covered node** (Initiative 2,
+    /// CLS-inspired retrieval plan). Deliberately its own relation, not
+    /// `Documents`: `Documents`' sole existing consumer
+    /// (`agentops-docgen::sectioned::documenting_summary`) assumes every
+    /// `Documents` edge's source is a `Definition` node whose `content` is a
+    /// one-liner explanation, and would misread a `DocSection`'s much
+    /// longer flattened section text the same way if this reused it.
+    /// `search_gist_then_detail` (`agentops-retrieval`) walks a matched
+    /// section's outgoing `Covers` edges to scope its second, detail-tier
+    /// search pass.
+    Covers,
 }
 
 impl EdgeRelation {
@@ -119,6 +162,7 @@ impl EdgeRelation {
             EdgeRelation::Documents => "documents",
             EdgeRelation::Affects => "affects",
             EdgeRelation::References => "references",
+            EdgeRelation::Covers => "covers",
         }
     }
 
@@ -127,6 +171,7 @@ impl EdgeRelation {
             "documents" => EdgeRelation::Documents,
             "affects" => EdgeRelation::Affects,
             "references" => EdgeRelation::References,
+            "covers" => EdgeRelation::Covers,
             _ => EdgeRelation::DependsOn,
         }
     }
@@ -166,6 +211,14 @@ pub struct Node {
     /// (dashboard, MCP tools, docgen, prompts) so the demotion is never a
     /// silent, unexplained downranking.
     pub curation_reason: Option<String>,
+    /// When this node was last inserted or updated (Initiative 3,
+    /// CLS-inspired retrieval plan) -- feeds `search_hybrid`'s recency
+    /// ranking via the same `effective_weight`/`age_days` decay already
+    /// used for edge plasticity. `Option` because `PostgresGraphStore`
+    /// doesn't populate it yet (see `schema.sql`'s own note on why) and
+    /// deliberately returns `None` rather than a wrong/stale value —
+    /// `None` makes recency ranking a no-op there, not a crash or a lie.
+    pub last_touched_at: Option<String>,
 }
 
 /// A single Core Modules grouping for the Documentation Viewer -- either
@@ -204,13 +257,14 @@ pub struct Edge {
     pub dst_id: i64,
     pub relation: EdgeRelation,
     /// Starts at `1.0`, bumped by `reinforce_edge` each time the same
-    /// `(note, symbol)` pair is re-matched (e.g. on every rescan) — see
-    /// `effective_weight` for how this decays with age at read time.
-    /// `DependsOn` edges are fully replaced every scan (via
-    /// `delete_edges_from` and a fresh `add_edge`), so their weight is
-    /// always freshly `1.0` — that's correct, not a bug: a dependency edge
-    /// is a deterministic structural fact, not something that should
-    /// accumulate "relevance."
+    /// `(note, symbol)` pair (`Affects`) or the same same-file reference
+    /// (`References`, Initiative 1) is re-matched/re-confirmed (e.g. on
+    /// every rescan) — see `effective_weight`/`effective_edge_weight` for
+    /// how this decays with age at read time. `DependsOn` edges are fully
+    /// replaced every scan (via `delete_edges_from` and a fresh
+    /// `add_edge`), so their weight is always freshly `1.0` — that's
+    /// correct, not a bug: a file-level dependency is a deterministic
+    /// structural fact, not something that should accumulate "relevance."
     pub weight: f64,
     pub updated_at: String,
 }
@@ -219,12 +273,49 @@ pub struct Edge {
 /// over — a deliberate first-pass constant, not configurable yet.
 pub const AFFECTS_EDGE_HALF_LIFE_DAYS: f64 = 30.0;
 
+/// Half-life, in days, a `References` edge's weight decays over (Initiative
+/// 1, CLS-inspired retrieval plan) — deliberately longer than `Affects`'
+/// 30 days: a same-file symbol reference is a passively-reconfirmed
+/// structural fact re-observed by every rescan that still finds it, not a
+/// deliberate human action the way manually re-adding a note is, so it
+/// shouldn't decay to irrelevance on the same timescale.
+pub const REFERENCES_EDGE_HALF_LIFE_DAYS: f64 = 90.0;
+
 /// Decay is a pure function applied at read time, not a stored/background
 /// value — sidesteps needing any scheduler/background-job infrastructure
 /// (none exists in this project) for something that only matters when an
-/// edge is actually being read/ranked.
+/// edge is actually being read/ranked. Defaults to `Affects`' half-life —
+/// existing callers (`note_score`, `rank_notes_by_weight`) only ever rank
+/// `Affects` edges, so this signature stays unchanged; a caller that must
+/// handle a mix of relations (e.g. `agentops-retrieval`'s Personalized
+/// PageRank, which spreads activation over both `Affects` and
+/// `References`) should use `effective_edge_weight` instead, which picks
+/// the right half-life per edge.
 pub fn effective_weight(weight: f64, age_days: f64) -> f64 {
-    weight * 0.5_f64.powf(age_days / AFFECTS_EDGE_HALF_LIFE_DAYS)
+    effective_weight_with_half_life(weight, age_days, AFFECTS_EDGE_HALF_LIFE_DAYS)
+}
+
+/// Same decay curve as `effective_weight`, but with an explicit half-life
+/// rather than always assuming `Affects`' 30 days.
+pub fn effective_weight_with_half_life(weight: f64, age_days: f64, half_life_days: f64) -> f64 {
+    weight * 0.5_f64.powf(age_days / half_life_days)
+}
+
+/// Applies the correct half-life for `edge.relation` -- the single place
+/// that knows which `*_HALF_LIFE_DAYS` constant governs which relation, so
+/// a caller ranking/spreading over a mix of edge relations doesn't have to
+/// duplicate that mapping itself.
+pub fn effective_edge_weight(edge: &Edge) -> f64 {
+    let half_life = match edge.relation {
+        EdgeRelation::References => REFERENCES_EDGE_HALF_LIFE_DAYS,
+        // `Covers` edges are fully replaced on every doc regeneration (like
+        // `DependsOn`), not reinforced -- there's no "repeat confirmation"
+        // signal to decay, so the specific half-life picked here is moot in
+        // practice; bucketed with the other non-`References` relations for
+        // an exhaustive match rather than inventing an unused third constant.
+        EdgeRelation::DependsOn | EdgeRelation::Documents | EdgeRelation::Affects | EdgeRelation::Covers => AFFECTS_EDGE_HALF_LIFE_DAYS,
+    };
+    effective_weight_with_half_life(edge.weight, age_days(&edge.updated_at), half_life)
 }
 
 /// Parses an `Edge.updated_at`/`Node`-adjacent timestamp string into "days
@@ -498,6 +589,15 @@ pub trait GraphStore {
     fn edges_to(&self, repo: &str, dst_id: i64) -> Result<Vec<Edge>>;
     fn all_edges(&self, repo: &str) -> Result<Vec<Edge>>;
     fn delete_edges_from(&self, repo: &str, src_id: i64, relation: EdgeRelation) -> Result<()>;
+    /// Deletes exactly one edge by id -- unlike `delete_edges_from`'s bulk
+    /// "every edge of this relation from this source" semantics, needed for
+    /// selective pruning where some edges from the same source must survive
+    /// (reinforced) while others are dropped in the same pass (a
+    /// `References` edge whose target reference disappeared this scan --
+    /// see `agentops-mcp::scan::persist`, Initiative 1 of the CLS-inspired
+    /// retrieval plan). A no-op, not an error, if `edge_id` doesn't exist or
+    /// belongs to a different repo.
+    fn delete_edge(&self, repo: &str, edge_id: i64) -> Result<()>;
     /// Bumps `edge_id`'s weight (capped), always. Bumps `updated_at` to now
     /// only when `bump_confirmed_at` is true — called instead of `add_edge`
     /// when `connect_many` finds the target edge already exists, so repeat
@@ -531,6 +631,15 @@ pub trait GraphStore {
     /// insert into the vector table" precedent, just as its own method
     /// rather than folded into `add_node`.
     fn set_embedding(&self, repo: &str, node_id: i64, embedding: &[f32]) -> Result<()>;
+    /// Reads back `node_id`'s raw embedding, if it has one -- `None` covers
+    /// both "node doesn't exist in this repo" and "exists but was never
+    /// embedded", the same way `search_similar` already treats an
+    /// unembedded node as simply absent from KNN results rather than an
+    /// error. Needed by `agentops-embeddings-train` (Initiative 5,
+    /// CLS-inspired retrieval plan) for hard-negative mining and
+    /// query-time re-ranking, where a raw vector is needed for a
+    /// *specific* node id rather than a KNN search's already-ranked list.
+    fn get_embedding(&self, repo: &str, node_id: i64) -> Result<Option<Vec<f32>>>;
     /// KNN search — nearest first, `distance` as the score (lower = closer).
     /// `kind`, if given, restricts results to one `NodeKind` (e.g. only
     /// `Gotcha`/`Decision` for a "what do we already know" search, vs. only
@@ -660,6 +769,128 @@ pub fn note_score(store: &dyn GraphStore, repo: &str, node: &Node) -> Result<f64
     Ok(raw * prominence_rank_multiplier(node.prominence))
 }
 
+/// Which direction(s) to follow edges in `bounded_neighborhood`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TraversalDirection {
+    Outgoing,
+    Incoming,
+    Both,
+}
+
+/// Result of `bounded_neighborhood`: every visited node paired with its BFS
+/// depth from the nearest seed (`0` for a seed itself), every edge between
+/// two visited nodes that matched the relation/direction filter, and
+/// whether `cap` was hit before the frontier was exhausted.
+#[derive(Debug)]
+pub struct BoundedNeighborhood {
+    pub nodes: Vec<(Node, u32)>,
+    pub edges: Vec<Edge>,
+    pub truncated: bool,
+}
+
+/// The traversal parameters for `bounded_neighborhood`, grouped into one
+/// struct rather than passed positionally -- with `store`/`repo` this would
+/// otherwise be an 8-argument function, and several of these (`direction`,
+/// `max_depth`, `cap`) are the same `bool`/`u32`/`usize` shape, exactly the
+/// kind of call site that's easy to transpose by accident with plain
+/// positional args.
+pub struct NeighborhoodQuery<'a> {
+    pub seed_ids: &'a [i64],
+    pub relations: &'a [EdgeRelation],
+    pub direction: TraversalDirection,
+    pub max_depth: u32,
+    /// Empty = no filter.
+    pub kind_filter: &'a [NodeKind],
+    pub cap: usize,
+}
+
+/// BFS out from one or more seed nodes, following only `query.relations` in
+/// `query.direction`, capped at `query.cap` total nodes (seeds included)
+/// and `query.max_depth` hops. Extracted from
+/// `agentops-api::subgraph::build_subgraph`'s original single-seed BFS so
+/// there is exactly one bounded-traversal implementation shared by that
+/// endpoint and `agentops-retrieval`'s Personalized PageRank (Initiative 0
+/// of the CLS-inspired retrieval plan) — a second, separate
+/// frontier-expansion loop in `agentops-retrieval` would duplicate real,
+/// already-tested logic. Pays exactly one `edges_from`/`edges_to` call per
+/// visited node regardless of caller — the same cost discipline
+/// `build_subgraph`'s own `NODE_CAP` was already built to enforce against
+/// `PostgresGraphStore`'s per-node blocking round trip, now shared instead
+/// of being at risk of a second, uncapped caller reintroducing it.
+///
+/// `query.kind_filter` (empty = no filter) excludes a node *and* any edge
+/// touching it from the result, and — like `build_subgraph`'s original
+/// behavior — a filtered-out node is never expanded from either, since it
+/// never enters `next_frontier`.
+pub fn bounded_neighborhood(store: &dyn GraphStore, repo: &str, query: NeighborhoodQuery) -> Result<BoundedNeighborhood> {
+    let NeighborhoodQuery { seed_ids, relations, direction, max_depth, kind_filter, cap } = query;
+    use std::collections::HashSet;
+
+    let mut visited_node_ids: HashSet<i64> = HashSet::new();
+    let mut visited_edge_ids: HashSet<i64> = HashSet::new();
+    let mut nodes_out: Vec<(Node, u32)> = Vec::new();
+    let mut edges_out: Vec<Edge> = Vec::new();
+    let mut frontier: Vec<i64> = Vec::new();
+    let mut truncated = false;
+
+    for &seed_id in seed_ids {
+        if visited_node_ids.contains(&seed_id) {
+            continue;
+        }
+        let Some(seed) = store.get_node(repo, seed_id)? else { continue };
+        visited_node_ids.insert(seed_id);
+        nodes_out.push((seed, 0));
+        frontier.push(seed_id);
+    }
+
+    for hop in 1..=max_depth {
+        if frontier.is_empty() || nodes_out.len() >= cap {
+            break;
+        }
+        let mut next_frontier: Vec<i64> = Vec::new();
+
+        for node_id in &frontier {
+            let mut candidates: Vec<(Edge, i64)> = Vec::new();
+            match direction {
+                TraversalDirection::Outgoing => candidates.extend(store.edges_from(repo, *node_id)?.into_iter().map(|e| { let dst = e.dst_id; (e, dst) })),
+                TraversalDirection::Incoming => candidates.extend(store.edges_to(repo, *node_id)?.into_iter().map(|e| { let src = e.src_id; (e, src) })),
+                TraversalDirection::Both => {
+                    candidates.extend(store.edges_from(repo, *node_id)?.into_iter().map(|e| { let dst = e.dst_id; (e, dst) }));
+                    candidates.extend(store.edges_to(repo, *node_id)?.into_iter().map(|e| { let src = e.src_id; (e, src) }));
+                }
+            }
+
+            for (edge, other_id) in candidates {
+                if !relations.contains(&edge.relation) {
+                    continue;
+                }
+                let Some(other) = store.get_node(repo, other_id)? else { continue };
+                if !kind_filter.is_empty() && !kind_filter.contains(&other.kind) {
+                    continue;
+                }
+
+                let is_new_node = !visited_node_ids.contains(&other_id);
+                if is_new_node {
+                    if nodes_out.len() >= cap {
+                        truncated = true;
+                        continue;
+                    }
+                    visited_node_ids.insert(other_id);
+                    nodes_out.push((other, hop));
+                    next_frontier.push(other_id);
+                }
+                if visited_edge_ids.insert(edge.id) {
+                    edges_out.push(edge);
+                }
+            }
+        }
+
+        frontier = next_frontier;
+    }
+
+    Ok(BoundedNeighborhood { nodes: nodes_out, edges: edges_out, truncated })
+}
+
 /// Natural-key upsert: finds an existing node by `(repo, kind, path, name,
 /// container)` and updates it in place (id-preserving) if found, else
 /// inserts a new one. A free function rather than a trait method, since
@@ -702,8 +933,20 @@ mod tests {
         // a real variant would silently mislabel it as DependsOn instead of
         // failing loudly, so this test exists specifically to catch that
         // one-line omission class of bug.
-        for relation in [EdgeRelation::DependsOn, EdgeRelation::Documents, EdgeRelation::Affects, EdgeRelation::References] {
+        for relation in [EdgeRelation::DependsOn, EdgeRelation::Documents, EdgeRelation::Affects, EdgeRelation::References, EdgeRelation::Covers] {
             assert_eq!(EdgeRelation::from_db_str(relation.as_db_str()), relation);
+        }
+    }
+
+    /// `NodeKind::from_db_str` has the identical catch-all-fallback shape as
+    /// `EdgeRelation::from_db_str` above (`_ => Symbol`) but, until this
+    /// test, had no equivalent round-trip guard -- a pre-existing gap
+    /// (audit finding E, CLS-inspired retrieval plan), not one introduced
+    /// by adding `DocSection`.
+    #[test]
+    fn node_kind_db_str_round_trips_for_every_variant() {
+        for kind in [NodeKind::Symbol, NodeKind::File, NodeKind::Gotcha, NodeKind::Decision, NodeKind::Definition, NodeKind::Note, NodeKind::DocSection] {
+            assert_eq!(NodeKind::from_db_str(kind.as_db_str()), kind);
         }
     }
 
@@ -716,6 +959,24 @@ mod tests {
     fn effective_weight_halves_at_exactly_one_half_life() {
         let decayed = effective_weight(4.0, AFFECTS_EDGE_HALF_LIFE_DAYS);
         assert!((decayed - 2.0).abs() < 1e-9, "expected ~2.0, got {decayed}");
+    }
+
+    #[test]
+    fn effective_edge_weight_uses_the_references_half_life_for_references_edges() {
+        // At Affects' 30-day half-life, weight 4.0 would already be halved
+        // to 2.0 (see the test above) -- References' longer 90-day
+        // half-life must decay far less over the same age.
+        let edge = Edge { id: 1, repo: "demo".into(), src_id: 1, dst_id: 2, relation: EdgeRelation::References, weight: 4.0, updated_at: String::new() };
+        let decayed = effective_weight_with_half_life(edge.weight, AFFECTS_EDGE_HALF_LIFE_DAYS, REFERENCES_EDGE_HALF_LIFE_DAYS);
+        assert!(decayed > 2.0, "References' longer half-life must decay less than Affects' over the same age, got {decayed}");
+    }
+
+    #[test]
+    fn effective_edge_weight_matches_effective_weight_for_an_affects_edge() {
+        let edge = Edge { id: 1, repo: "demo".into(), src_id: 1, dst_id: 2, relation: EdgeRelation::Affects, weight: 3.0, updated_at: format_unix_for_test(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()) };
+        let via_dispatch = effective_edge_weight(&edge);
+        let via_direct = effective_weight(edge.weight, age_days(&edge.updated_at));
+        assert!((via_dispatch - via_direct).abs() < 1e-9, "an Affects edge must decay identically through either function: {via_dispatch} vs {via_direct}");
     }
 
     #[test]
@@ -744,6 +1005,60 @@ mod tests {
     #[test]
     fn age_days_of_unparseable_timestamp_is_treated_as_fully_decayed() {
         assert_eq!(age_days("not a timestamp"), f64::MAX);
+    }
+
+    fn test_symbol(store: &dyn GraphStore, repo: &str, name: &str) -> i64 {
+        store
+            .add_node(NewNode { kind: NodeKind::Symbol, repo: repo.into(), path: Some(format!("{name}.py")), name: Some(name.into()), container: None, start_line: Some(1), end_line: Some(2), content: Some(name.into()) })
+            .unwrap()
+    }
+
+    /// `bounded_neighborhood` accepts multiple seeds -- new behavior not
+    /// exercised by `agentops-api::subgraph::build_subgraph`'s single-seed
+    /// callers, since that's the whole reason it was extracted as a shared
+    /// primitive for Personalized PageRank's multi-seed activation.
+    #[test]
+    fn bounded_neighborhood_starts_from_every_seed_in_disjoint_components() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = test_symbol(&store, "repo-a", "a");
+        let b = test_symbol(&store, "repo-a", "b");
+        let c = test_symbol(&store, "repo-a", "c");
+        let d = test_symbol(&store, "repo-a", "d");
+        store.add_edge("repo-a", a, b, EdgeRelation::DependsOn).unwrap();
+        store.add_edge("repo-a", c, d, EdgeRelation::DependsOn).unwrap();
+
+        let result = bounded_neighborhood(&store, "repo-a", NeighborhoodQuery { seed_ids: &[a, c], relations: &[EdgeRelation::DependsOn], direction: TraversalDirection::Outgoing, max_depth: 2, kind_filter: &[], cap: 150 }).unwrap();
+        let ids: std::collections::HashSet<i64> = result.nodes.iter().map(|(n, _)| n.id).collect();
+        assert_eq!(ids, std::collections::HashSet::from([a, b, c, d]), "both disjoint components must be reached, one per seed");
+        assert!(!result.truncated);
+    }
+
+    #[test]
+    fn bounded_neighborhood_deduplicates_a_seed_listed_twice() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = test_symbol(&store, "repo-a", "a");
+
+        let result = bounded_neighborhood(&store, "repo-a", NeighborhoodQuery { seed_ids: &[a, a], relations: &[EdgeRelation::DependsOn], direction: TraversalDirection::Both, max_depth: 2, kind_filter: &[], cap: 150 }).unwrap();
+        assert_eq!(result.nodes.len(), 1, "a duplicate seed id must not produce a duplicate node entry");
+    }
+
+    #[test]
+    fn bounded_neighborhood_respects_cap_across_multiple_seeds() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let hub_a = test_symbol(&store, "repo-a", "hub_a");
+        let hub_b = test_symbol(&store, "repo-a", "hub_b");
+        for i in 0..10 {
+            let leaf = test_symbol(&store, "repo-a", &format!("leaf_a{i}"));
+            store.add_edge("repo-a", hub_a, leaf, EdgeRelation::DependsOn).unwrap();
+        }
+        for i in 0..10 {
+            let leaf = test_symbol(&store, "repo-a", &format!("leaf_b{i}"));
+            store.add_edge("repo-a", hub_b, leaf, EdgeRelation::DependsOn).unwrap();
+        }
+
+        let result = bounded_neighborhood(&store, "repo-a", NeighborhoodQuery { seed_ids: &[hub_a, hub_b], relations: &[EdgeRelation::DependsOn], direction: TraversalDirection::Outgoing, max_depth: 2, kind_filter: &[], cap: 5 }).unwrap();
+        assert_eq!(result.nodes.len(), 5, "the shared cap must bound the total across every seed's expansion combined");
+        assert!(result.truncated);
     }
 
     /// A tiny, dependency-free formatter for these tests only — mirrors

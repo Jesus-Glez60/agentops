@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use agentops_graph::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence};
+use agentops_graph::{bounded_neighborhood, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NeighborhoodQuery, TraversalDirection};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
@@ -75,12 +75,6 @@ pub struct SubgraphResponse {
     pub truncated: bool,
 }
 
-enum Direction {
-    Outgoing,
-    Incoming,
-    Both,
-}
-
 /// Maps a mode name to which edge relations it follows and in which
 /// direction(s) -- `None` for an unrecognized mode (caller 400s).
 ///
@@ -88,12 +82,12 @@ enum Direction {
 /// direction-relative modes, not just `local` -- it's a symbol-granularity
 /// flavor of "depends on," so "what does this depend on"/"what depends on
 /// this" should reflect it the same way file-level `DependsOn` already does.
-fn mode_filter(mode: &str) -> Option<(Vec<EdgeRelation>, Direction)> {
+fn mode_filter(mode: &str) -> Option<(Vec<EdgeRelation>, TraversalDirection)> {
     match mode {
-        "local" => Some((vec![EdgeRelation::DependsOn, EdgeRelation::Documents, EdgeRelation::Affects, EdgeRelation::References], Direction::Both)),
-        "dep_chain" => Some((vec![EdgeRelation::DependsOn, EdgeRelation::References], Direction::Outgoing)),
-        "impact" => Some((vec![EdgeRelation::DependsOn, EdgeRelation::References], Direction::Incoming)),
-        "knowledge" => Some((vec![EdgeRelation::Affects], Direction::Both)),
+        "local" => Some((vec![EdgeRelation::DependsOn, EdgeRelation::Documents, EdgeRelation::Affects, EdgeRelation::References], TraversalDirection::Both)),
+        "dep_chain" => Some((vec![EdgeRelation::DependsOn, EdgeRelation::References], TraversalDirection::Outgoing)),
+        "impact" => Some((vec![EdgeRelation::DependsOn, EdgeRelation::References], TraversalDirection::Incoming)),
+        "knowledge" => Some((vec![EdgeRelation::Affects], TraversalDirection::Both)),
         _ => None,
     }
 }
@@ -108,64 +102,30 @@ fn node_to_subgraph_node(node: Node, depth: u32) -> SubgraphNode {
 /// result. A `kind_filter` mismatch excludes both the node *and* any edge
 /// touching it, never a dangling edge reference. Returns `Ok(None)` if
 /// `mode` is unrecognized or the seed node doesn't exist.
+///
+/// A thin wrapper over `agentops_graph::bounded_neighborhood` -- the actual
+/// traversal now lives there, shared with `agentops-retrieval`'s
+/// Personalized PageRank expansion, so this function's only job is mapping
+/// `mode` to a relation/direction filter and converting the shared
+/// `(Node, depth)`/`Edge` shape into this endpoint's own
+/// `SubgraphNode`/`SubgraphEdge` response types (with their UI-facing
+/// relation labels).
 pub(crate) fn build_subgraph(store: &dyn GraphStore, repo: &str, seed_id: i64, mode: &str, depth: u32, kind_filter: &[NodeKind]) -> anyhow::Result<Option<SubgraphResponse>> {
     let Some((relations, direction)) = mode_filter(mode) else { return Ok(None) };
-    let Some(seed) = store.get_node(repo, seed_id)? else { return Ok(None) };
-
-    let mut visited_node_ids: HashSet<i64> = HashSet::from([seed_id]);
-    let mut visited_edge_ids: HashSet<i64> = HashSet::new();
-    let mut nodes_out: Vec<SubgraphNode> = vec![node_to_subgraph_node(seed, 0)];
-    let mut edges_out: Vec<SubgraphEdge> = Vec::new();
-    let mut frontier: Vec<i64> = vec![seed_id];
-    let mut truncated = false;
-
-    for hop in 1..=depth {
-        if frontier.is_empty() || nodes_out.len() >= NODE_CAP {
-            break;
-        }
-        let mut next_frontier: Vec<i64> = Vec::new();
-
-        for node_id in &frontier {
-            let mut candidates: Vec<(Edge, i64)> = Vec::new();
-            match direction {
-                Direction::Outgoing => candidates.extend(store.edges_from(repo, *node_id)?.into_iter().map(|e| { let dst = e.dst_id; (e, dst) })),
-                Direction::Incoming => candidates.extend(store.edges_to(repo, *node_id)?.into_iter().map(|e| { let src = e.src_id; (e, src) })),
-                Direction::Both => {
-                    candidates.extend(store.edges_from(repo, *node_id)?.into_iter().map(|e| { let dst = e.dst_id; (e, dst) }));
-                    candidates.extend(store.edges_to(repo, *node_id)?.into_iter().map(|e| { let src = e.src_id; (e, src) }));
-                }
-            }
-
-            for (edge, other_id) in candidates {
-                if !relations.contains(&edge.relation) {
-                    continue;
-                }
-                let Some(other) = store.get_node(repo, other_id)? else { continue };
-                if !kind_filter.is_empty() && !kind_filter.contains(&other.kind) {
-                    continue;
-                }
-
-                let is_new_node = !visited_node_ids.contains(&other_id);
-                if is_new_node {
-                    if nodes_out.len() >= NODE_CAP {
-                        truncated = true;
-                        continue;
-                    }
-                    visited_node_ids.insert(other_id);
-                    nodes_out.push(node_to_subgraph_node(other, hop));
-                    next_frontier.push(other_id);
-                }
-                if visited_edge_ids.insert(edge.id) {
-                    let label = crate::search::relation_label(edge.relation, false);
-                    edges_out.push(SubgraphEdge { id: edge.id, src_id: edge.src_id, dst_id: edge.dst_id, relation: edge.relation, label });
-                }
-            }
-        }
-
-        frontier = next_frontier;
+    if store.get_node(repo, seed_id)?.is_none() {
+        return Ok(None);
     }
 
-    Ok(Some(SubgraphResponse { seed_id, mode: mode.to_string(), depth, nodes: nodes_out, edges: edges_out, truncated }))
+    let neighborhood = bounded_neighborhood(store, repo, NeighborhoodQuery { seed_ids: &[seed_id], relations: &relations, direction, max_depth: depth, kind_filter, cap: NODE_CAP })?;
+
+    let nodes_out: Vec<SubgraphNode> = neighborhood.nodes.into_iter().map(|(node, hop)| node_to_subgraph_node(node, hop)).collect();
+    let edges_out: Vec<SubgraphEdge> = neighborhood
+        .edges
+        .into_iter()
+        .map(|e| SubgraphEdge { id: e.id, src_id: e.src_id, dst_id: e.dst_id, relation: e.relation, label: crate::search::relation_label(e.relation, false) })
+        .collect();
+
+    Ok(Some(SubgraphResponse { seed_id, mode: mode.to_string(), depth, nodes: nodes_out, edges: edges_out, truncated: neighborhood.truncated }))
 }
 
 /// `GET /repos/{name}/nodes/{id}/graph` -- path resolution mirrors
@@ -291,6 +251,49 @@ pub async fn repo_graph_json(State(state): State<AppState>, AxumPath(repo_name):
     match result {
         Ok(Ok(Some(graph))) => (StatusCode::OK, Json(serde_json::to_value(graph).unwrap())),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+/// `POST /repos/{name}/edges/{id}/reinforce` -- the Hebbian co-activation
+/// call site (Initiative 1, CLS-inspired retrieval plan): a caller (the
+/// Knowledge Graph UI, on an explicit click-through to a neighbor reached
+/// via a graph edge, or a future `explain_symbol` acting on a
+/// `pattern_complete`-surfaced neighbor) reinforces the specific edge it
+/// traversed. Deliberately a dedicated endpoint rather than an implicit
+/// side effect of `GET /repos/{name}/nodes/{id}` (the node-detail fetch) --
+/// that endpoint is read-only and gets called on every incidental detail-
+/// panel open, which is not the same thing as a caller signaling "this
+/// specific traversal mattered."
+///
+/// `bump_confirmed_at: true` -- unlike the automatic every-scan reference
+/// rematch in `agentops-mcp::scan::persist` (which passes `false`, a blind
+/// passive re-observation), a call to this endpoint is a real, explicit
+/// action, the same "human/agent-initiated reinforcement" category
+/// `reinforce_edge`'s own doc comment already describes for `add_note`.
+pub async fn reinforce_edge_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>) -> (StatusCode, Json<Value>) {
+    let manifest_path = state.manifest_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<()>> {
+        let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
+        let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
+        let path = PathBuf::from(&entry.path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let store = agentops_mcp::open_store(&path)?;
+
+        if !store.all_edges(&repo_name)?.iter().any(|e| e.id == id) {
+            return Ok(None);
+        }
+        store.reinforce_edge(&repo_name, id, true)?;
+        Ok(Some(()))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(()))) => (StatusCode::OK, Json(json!({ "id": id }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such edge" }))),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
     }
@@ -601,6 +604,11 @@ mod tests {
     fn repo_graph_includes_every_node_and_edge_unfiltered() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, store) = scanned_repo(&manifest_path(), dir.path());
+        // `scanned_repo`'s initial scan already indexes an "overview"
+        // DocSection node (Initiative 2) even for an empty repo -- part of
+        // what "unfiltered" now genuinely includes, not noise to work
+        // around.
+        let overview_ids: HashSet<i64> = store.nodes_by_kind(&repo, NodeKind::DocSection).unwrap().into_iter().map(|n| n.id).collect();
         let a = symbol(store.as_ref(), &repo, "a");
         let b = symbol(store.as_ref(), &repo, "b");
         let f = file(store.as_ref(), &repo, "f.py");
@@ -610,7 +618,7 @@ mod tests {
 
         let graph = build_repo_graph(store.as_ref(), &repo, &[]).unwrap();
         let ids: HashSet<i64> = graph.nodes.iter().map(|n| n.id).collect();
-        assert_eq!(ids, HashSet::from([a, b, f, g]));
+        assert_eq!(ids, overview_ids.into_iter().chain([a, b, f, g]).collect::<HashSet<_>>());
         assert_eq!(graph.edges.len(), 2);
         assert!(!graph.truncated);
     }
@@ -633,22 +641,30 @@ mod tests {
     fn repo_graph_is_never_truncated_even_past_the_bfs_node_cap() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, store) = scanned_repo(&manifest_path(), dir.path());
+        // The initial scan's own "overview" DocSection (Initiative 2) is
+        // one more real, unfiltered node -- kind-filter it out here since
+        // this test's whole point is the *symbol* cap behavior.
         for i in 0..(NODE_CAP + 5) {
             symbol(store.as_ref(), &repo, &format!("s{i}"));
         }
 
-        let graph = build_repo_graph(store.as_ref(), &repo, &[]).unwrap();
+        let graph = build_repo_graph(store.as_ref(), &repo, &[NodeKind::Symbol]).unwrap();
         assert_eq!(graph.nodes.len(), NODE_CAP + 5, "unlike build_subgraph's BFS, the whole-repo view has no cap");
         assert!(!graph.truncated);
     }
 
     #[test]
-    fn repo_graph_on_an_empty_repo_returns_nothing_and_is_not_truncated() {
+    fn repo_graph_on_an_empty_repo_has_only_its_generated_overview_section_and_is_not_truncated() {
         let dir = tempfile::tempdir().unwrap();
         let (repo, store) = scanned_repo(&manifest_path(), dir.path());
         let graph = build_repo_graph(store.as_ref(), &repo, &[]).unwrap();
-        assert!(graph.nodes.is_empty());
-        assert!(graph.edges.is_empty());
+        // Even a repo with no files/symbols/notes gets one "overview"
+        // DocSection indexed as a real graph node (Initiative 2) -- no
+        // longer literally zero nodes, and that's correct: docgen's own
+        // build_doc_page always includes an overview section unconditionally.
+        assert_eq!(graph.nodes.len(), 1);
+        assert_eq!(graph.nodes[0].kind, NodeKind::DocSection);
+        assert!(graph.edges.is_empty(), "an overview section with no SymbolTable/KnowledgeCallout blocks covers nothing, so no Covers edges either");
         assert!(!graph.truncated);
     }
 
@@ -703,5 +719,58 @@ mod tests {
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["edges"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn reinforce_edge_bumps_its_weight_over_http() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let manifest = manifest_path();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, store) = scanned_repo(&manifest, dir.path());
+        let a = symbol(store.as_ref(), &repo, "a");
+        let b = symbol(store.as_ref(), &repo, "b");
+        let edge_id = store.add_edge(&repo, a, b, EdgeRelation::References).unwrap();
+        drop(store);
+
+        let app = test_app(manifest);
+        let req = Request::builder().method("POST").uri(format!("/repos/{repo}/edges/{edge_id}/reinforce")).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let store = agentops_mcp::open_store(dir.path()).unwrap();
+        let edge = store.edges_from(&repo, a).unwrap().into_iter().find(|e| e.id == edge_id).unwrap();
+        assert_eq!(edge.weight, 1.5);
+    }
+
+    #[tokio::test]
+    async fn reinforce_edge_unknown_id_404s_over_http() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let manifest = manifest_path();
+        let dir = tempfile::tempdir().unwrap();
+        let (repo, store) = scanned_repo(&manifest, dir.path());
+        drop(store);
+
+        let app = test_app(manifest);
+        let req = Request::builder().method("POST").uri(format!("/repos/{repo}/edges/999999/reinforce")).body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reinforce_edge_unknown_repo_404s_over_http() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = test_app(manifest_path());
+        let req = Request::builder().method("POST").uri("/repos/nope/edges/1/reinforce").body(Body::empty()).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

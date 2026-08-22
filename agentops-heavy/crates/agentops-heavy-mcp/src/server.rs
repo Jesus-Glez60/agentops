@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_includes_all_four_tools() {
+    async fn tools_list_includes_all_five_tools() {
         let Some(mut index) = test_index() else { return };
         let resp = handle_message(&mut index, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#).await.unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
@@ -86,6 +86,7 @@ mod tests {
         assert!(names.contains(&"semantic_index"));
         assert!(names.contains(&"search_docs"));
         assert!(names.contains(&"index_docs"));
+        assert!(names.contains(&"consolidate_model"));
     }
 
     #[tokio::test]

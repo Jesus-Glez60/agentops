@@ -25,6 +25,8 @@ agentops-llm = { path = "../agentops-llm" }
 agentops-embeddings = { path = "../agentops-embeddings" }
 agentops-graph-pg = { path = "../agentops-graph-pg" }
 agentops-retrieval = { path = "../agentops-retrieval" }
+agentops-embeddings-train = { path = "../agentops-embeddings-train" }
+candle-core = "0.8"
 notify-debouncer-full.workspace = true
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
 docbrain-ingest = { path = "../../../docbrain-core/crates/docbrain-ingest" }
