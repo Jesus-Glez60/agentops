@@ -164,7 +164,7 @@ impl SeenDeliveries {
 
     /// Returns `true` if this is the first time `delivery_id` has been
     /// seen (caller should proceed), `false` if it's a repeat.
-    fn record_if_new(&self, delivery_id: &str) -> bool {
+    pub fn record_if_new(&self, delivery_id: &str) -> bool {
         let mut guard = self.set.lock().unwrap();
         if guard.0.contains(delivery_id) {
             return false;

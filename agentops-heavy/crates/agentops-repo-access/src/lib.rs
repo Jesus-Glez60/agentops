@@ -26,6 +26,7 @@ use ssh_key::rand_core::OsRng;
 use ssh_key::{Algorithm, LineEnding, PrivateKey};
 use zeroize::Zeroize;
 
+pub mod indexing_store;
 pub mod secrets;
 pub mod store;
 use secrets::SecretsProvider;
@@ -180,6 +181,39 @@ fn getrandom_bytes(buf: &mut [u8]) {
 /// would accept a MITM's key just as readily as the real one.
 pub fn clone_repo(remote_url: &str, dest: &Path, key: &UnlockedKey, known_hosts_content: &str) -> Result<()> {
     run_git_with_key(&["clone", remote_url, &dest.to_string_lossy()], key, known_hosts_content)
+}
+
+/// Clones an `https://` `remote_url` into `dest` using a short-lived
+/// GitHub App installation token as the credential -- the GitHub App
+/// connection path's equivalent of `clone_repo`, with no private key to
+/// custody at all (the whole point of the App path over SSH deploy keys).
+/// `installation_token` is embedded directly in the URL
+/// (`https://x-access-token:{token}@github.com/...`, GitHub's own
+/// documented way to authenticate a git-over-HTTPS operation with an
+/// installation token) rather than passed as a header, since `git` itself
+/// is the one making the request, not this process. The token is
+/// short-lived (about an hour) and never written to disk or logged here --
+/// only interpolated into the one `git clone` invocation's argument list,
+/// same "don't custody longer than the moment it's needed" posture as
+/// `UnlockedKey`, just without needing a file/zeroize step since there's no
+/// persistent key material to clean up afterward.
+pub fn clone_repo_https(remote_url: &str, dest: &Path, installation_token: &str) -> Result<()> {
+    let Some(without_scheme) = remote_url.strip_prefix("https://") else {
+        bail!("clone_repo_https expects an https:// URL, got {remote_url:?}");
+    };
+    let authed_url = format!("https://x-access-token:{installation_token}@{without_scheme}");
+    let output = Command::new("git").args(["clone", &authed_url, &dest.to_string_lossy()]).output().context("spawning git")?;
+    if !output.status.success() {
+        // Modern git redacts credentials embedded in a URL when it echoes
+        // that URL back in its own error output (prints `***` in place of
+        // the token) -- not independently verified against every git
+        // version this might run under, so callers logging this error
+        // should still treat it as install-token-shaped and avoid
+        // persisting it anywhere long-lived, same caution as any other
+        // short-lived credential.
+        bail!("git clone failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
 }
 
 /// Fetches into an already-cloned repo at `repo_path`.

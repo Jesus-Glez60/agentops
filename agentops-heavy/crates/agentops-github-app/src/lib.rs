@@ -91,6 +91,73 @@ pub fn install_url(app_slug: &str) -> String {
     format!("https://github.com/apps/{app_slug}/installations/new")
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct InstallationRepo {
+    pub full_name: String,
+    pub clone_url: String,
+    pub default_branch: String,
+    /// `None` for a repo GitHub hasn't detected a primary language for yet
+    /// (e.g. brand new, or non-code content).
+    pub language: Option<String>,
+    /// Kilobytes, per GitHub's own `size` field.
+    pub size: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallationRepositoriesPage {
+    repositories: Vec<InstallationRepo>,
+}
+
+/// GitHub caps this endpoint's `per_page` at 100 — this cap is on top of
+/// that, a defensive page-count limit (10 pages = up to 1000 repos) of the
+/// same shape `docbrain-ingest::changelog::sync_github_releases` already
+/// applies to unbounded release pagination on a different endpoint: an org
+/// with more installed repos than this exists, but no reasonable connect
+/// flow needs to enumerate all of them in one request, and GitHub itself
+/// has been observed to reject sufficiently deep pagination outright rather
+/// than paginate forever.
+const MAX_INSTALLATION_REPO_PAGES: u32 = 10;
+
+/// Lists every repository `installation_token` (from
+/// [`get_installation_token`]) can access, per GitHub's `GET
+/// /installation/repositories` — paginated at `per_page=100`, stopping
+/// early (keeping whatever was already fetched) if a page past the first
+/// fails, rather than treating a failure deep into pagination as fatal for
+/// the whole request. A first-page failure still propagates — that's a
+/// genuinely unexpected condition, not a depth-cap edge case.
+pub async fn list_installation_repos(client: &reqwest::Client, installation_token: &str) -> Result<Vec<InstallationRepo>> {
+    let mut all = Vec::new();
+    for page in 1..=MAX_INSTALLATION_REPO_PAGES {
+        let url = format!("https://api.github.com/installation/repositories?per_page=100&page={page}");
+        let response = client
+            .get(&url)
+            .bearer_auth(installation_token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "agentops-heavy")
+            .send()
+            .await
+            .context("requesting installation repositories")?;
+
+        if !response.status().is_success() {
+            if page > 1 {
+                break;
+            }
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("GitHub installation-repositories request failed ({status}): {body}");
+        }
+
+        let parsed: InstallationRepositoriesPage = response.json().await.context("parsing installation repositories response")?;
+        let got = parsed.repositories.len();
+        all.extend(parsed.repositories);
+        if got < 100 {
+            break;
+        }
+    }
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +259,94 @@ mod tests {
         assert!(response.status().is_success());
         let token: InstallationToken = response.json().await.unwrap();
         assert_eq!(token.token, "ghs_faketoken");
+    }
+
+    /// `list_installation_repos` hardcodes `api.github.com` (intentional,
+    /// same reasoning as `get_installation_token`'s own test) — exercise
+    /// the identical request-building/pagination/response-parsing logic
+    /// directly against the mock server instead.
+    async fn list_installation_repos_against(server_uri: &str, installation_token: &str) -> Result<Vec<InstallationRepo>> {
+        let mut all = Vec::new();
+        for page in 1..=MAX_INSTALLATION_REPO_PAGES {
+            let url = format!("{server_uri}/installation/repositories?per_page=100&page={page}");
+            let client = reqwest::Client::new();
+            let response = client
+                .get(&url)
+                .bearer_auth(installation_token)
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "agentops-heavy")
+                .send()
+                .await?;
+            if !response.status().is_success() {
+                if page > 1 {
+                    break;
+                }
+                anyhow::bail!("request failed: {}", response.status());
+            }
+            let parsed: InstallationRepositoriesPage = response.json().await?;
+            let got = parsed.repositories.len();
+            all.extend(parsed.repositories);
+            if got < 100 {
+                break;
+            }
+        }
+        Ok(all)
+    }
+
+    #[tokio::test]
+    async fn list_installation_repos_parses_a_single_page_matching_githubs_documented_shape() {
+        use wiremock::matchers::{header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/installation/repositories"))
+            .and(query_param("page", "1"))
+            .and(header("Accept", "application/vnd.github+json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 2,
+                "repository_selection": "selected",
+                "repositories": [
+                    { "full_name": "acme-corp/widgets", "clone_url": "https://github.com/acme-corp/widgets.git", "default_branch": "main", "language": "TypeScript", "size": 1234 },
+                    { "full_name": "acme-corp/gizmos", "clone_url": "https://github.com/acme-corp/gizmos.git", "default_branch": "main", "language": null, "size": 42 },
+                ],
+            })))
+            .mount(&server)
+            .await;
+
+        let repos = list_installation_repos_against(&server.uri(), "ghs_faketoken").await.unwrap();
+        assert_eq!(repos.len(), 2);
+        assert_eq!(repos[0].full_name, "acme-corp/widgets");
+        assert_eq!(repos[1].language, None);
+    }
+
+    #[tokio::test]
+    async fn list_installation_repos_stops_paginating_once_a_short_page_comes_back() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Exactly one page mounted -- if the pagination loop incorrectly
+        // kept requesting page 2 (instead of stopping because page 1
+        // returned fewer than 100 results), this mock would 404 and the
+        // test would fail via the non-first-page-error-is-non-fatal path
+        // silently swallowing a bug rather than catching it, so assert the
+        // exact repo count instead of just "no error".
+        Mock::given(method("GET"))
+            .and(path("/installation/repositories"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "total_count": 1,
+                "repository_selection": "all",
+                "repositories": [
+                    { "full_name": "acme-corp/one-repo", "clone_url": "https://github.com/acme-corp/one-repo.git", "default_branch": "main", "language": "Rust", "size": 10 },
+                ],
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let repos = list_installation_repos_against(&server.uri(), "ghs_faketoken").await.unwrap();
+        assert_eq!(repos.len(), 1);
     }
 }

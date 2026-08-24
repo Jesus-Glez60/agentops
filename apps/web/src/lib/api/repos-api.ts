@@ -72,3 +72,91 @@ export function parseRepoStatus(status: string): ParsedRepoStatus {
   const reason = status.startsWith("failed: ") ? status.slice("failed: ".length) : status;
   return { kind: "failed", reason };
 }
+
+// --- GitHub App install flow -----------------------------------------
+
+export function getGithubAppInstallUrl(): Promise<{ install_url: string }> {
+  return heavyFetch("/repos/github-app/install-url");
+}
+
+export interface InstallationRepo {
+  full_name: string;
+  clone_url: string;
+  default_branch: string;
+  language: string | null;
+  size: number;
+}
+
+export function getInstallationRepos(installationId: string): Promise<{ repositories: InstallationRepo[] }> {
+  return heavyFetch(`/repos/github-app/installations/${encodeURIComponent(installationId)}/repos`);
+}
+
+export interface ConnectFromInstallationResponse {
+  connections: { connection: RepoConnection; job_id: string | null }[];
+}
+
+export function connectFromInstallation(installationId: string, repoFullNames: string[]): Promise<ConnectFromInstallationResponse> {
+  return heavyFetch(`/repos/github-app/installations/${encodeURIComponent(installationId)}/connect`, {
+    method: "POST",
+    body: JSON.stringify({ repo_full_names: repoFullNames }),
+  });
+}
+
+// --- Indexing progress --------------------------------------------------
+
+/** The 9 stages in the exact fixed order the backend always creates them in (`STAGE_ORDER` in `indexing_store.rs`) -- mirrored here as display labels for the wizard's progress screen. */
+export const INDEXING_STAGE_LABELS: Record<string, string> = {
+  connection_verified: "Connection verified",
+  repository_cloned: "Repository cloned",
+  files_discovered: "Files discovered",
+  symbols_extracted: "Symbols extracted",
+  dependencies_mapped: "Dependencies mapped",
+  knowledge_nodes_created: "Knowledge nodes created",
+  embeddings_generated: "Embeddings generated",
+  documentation_generated: "Documentation generated",
+  index_ready: "Index ready",
+};
+
+export interface IndexingStage {
+  stage: string;
+  seq: number;
+  status: "pending" | "active" | "done" | "failed";
+  progress_current: number | null;
+  progress_total: number | null;
+  error: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface IndexingJobSummary {
+  id: string;
+  kind: "initial" | "reindex";
+  status: "running" | "succeeded" | "failed";
+  current_stage: string | null;
+  created_at: string;
+  finished_at: string | null;
+}
+
+export interface IndexingStatusResponse {
+  job: IndexingJobSummary;
+  stages: IndexingStage[];
+  overall_percent: number;
+}
+
+export function startIndexing(connectionId: string, kind?: "initial" | "reindex"): Promise<{ job_id: string }> {
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/index`, { method: "POST", body: JSON.stringify(kind ? { kind } : {}) });
+}
+
+export function getIndexingStatus(connectionId: string, jobId?: string): Promise<IndexingStatusResponse> {
+  const q = jobId ? `?job_id=${encodeURIComponent(jobId)}` : "";
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/index/status${q}`);
+}
+
+export function retryIndexing(connectionId: string, jobId: string): Promise<{ job_id: string }> {
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/index/retry?job_id=${encodeURIComponent(jobId)}`, { method: "POST" });
+}
+
+/** SSH-method connections only -- 404s for a GitHub App connection (nothing to regenerate). */
+export function regenerateDeployKey(connectionId: string): Promise<{ connection: RepoConnection }> {
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/regenerate-key`, { method: "POST" });
+}

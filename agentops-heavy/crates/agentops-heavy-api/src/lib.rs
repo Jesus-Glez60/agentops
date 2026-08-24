@@ -49,6 +49,8 @@ use agentops_security::api_key::verify_api_key;
 use agentops_teams::TeamStore;
 
 mod accounts_integrations;
+mod github_app_routes;
+mod indexing;
 mod linear_webhook;
 mod team;
 pub use accounts_integrations::build_accounts_integrations_router;
@@ -79,6 +81,24 @@ pub struct AppState {
     /// see `require_api_key_or_session`'s doc comment.
     accounts: Option<Arc<Mutex<AccountStore>>>,
     teams: Option<Arc<Mutex<TeamStore>>>,
+    /// Live progress tracking for the clone -> scan -> embed -> docgen
+    /// pipeline -- see `indexing.rs`'s module doc comment for why this is a
+    /// separate table from both the `tasks` project-task tracker and
+    /// `scan_history`.
+    indexing: Arc<Mutex<agentops_repo_access::indexing_store::IndexingStore>>,
+    /// Root directory each indexing job clones a connection's remote into,
+    /// one subdirectory per `<tenant>/<connection_id>` -- see
+    /// `indexing::checkout_path`'s doc comment for why the directory name
+    /// is derived from `connection_id` rather than anything canonicalized
+    /// from a not-yet-existing path.
+    repo_checkouts_dir: std::path::PathBuf,
+    /// `Some` once a real GitHub App is registered for this deployment
+    /// (App id, private key, webhook secret all present) -- the
+    /// installation-listing/connect-from-installation/webhook routes 404
+    /// or reject with a clear message when this is `None`, same posture as
+    /// `github_app_slug` for the install-url endpoint (a deployment without
+    /// these env vars still boots normally, GitHub App just isn't usable).
+    github_app_config: Option<github_app_routes::GitHubAppConfig>,
 }
 
 pub fn build_router(
@@ -90,6 +110,9 @@ pub fn build_router(
     docbrain_db_dir: std::path::PathBuf,
     accounts: Option<AccountStore>,
     teams: Option<TeamStore>,
+    indexing: agentops_repo_access::indexing_store::IndexingStore,
+    repo_checkouts_dir: std::path::PathBuf,
+    github_app_config: Option<github_app_routes::GitHubAppConfig>,
 ) -> Router {
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
@@ -100,12 +123,22 @@ pub fn build_router(
         docbrain_db_dir,
         accounts: accounts.map(|a| Arc::new(Mutex::new(a))),
         teams: teams.map(|t| Arc::new(Mutex::new(t))),
+        indexing: Arc::new(Mutex::new(indexing)),
+        repo_checkouts_dir,
+        github_app_config,
     };
     Router::new()
         .route("/repos/connect", post(connect_repo))
         .route("/repos", get(list_repos))
         .route("/repos/{id}/verify", post(verify_repo))
+        .route("/repos/{id}/index", post(indexing::start_indexing))
+        .route("/repos/{id}/index/status", get(indexing::indexing_status))
+        .route("/repos/{id}/index/retry", post(indexing::retry_indexing))
+        .route("/repos/{id}/regenerate-key", post(regenerate_key))
         .route("/repos/github-app/install-url", get(github_app_install_url))
+        .route("/repos/github-app/callback", get(github_app_routes::github_app_callback))
+        .route("/repos/github-app/installations/{id}/repos", get(github_app_routes::list_installation_repos_handler))
+        .route("/repos/github-app/installations/{id}/connect", post(github_app_routes::connect_from_installation))
         .route("/search/index", post(search_index_handler))
         .route("/search", get(search_query_handler))
         .route("/docs/search/index", post(docs_search_index_handler))
@@ -210,6 +243,33 @@ fn default_teams_db_path() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".agentops").join("teams.sqlite")
 }
 
+/// `~/.agentops/repo-checkouts/` -- where indexing jobs actually clone a
+/// connection's remote into a working tree before scanning it.
+fn default_repo_checkouts_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    std::path::PathBuf::from(home).join(".agentops").join("repo-checkouts")
+}
+
+/// Reads `AGENTOPS_GITHUB_APP_ID`, `AGENTOPS_GITHUB_APP_PRIVATE_KEY` (a raw
+/// PEM string) or `AGENTOPS_GITHUB_APP_PRIVATE_KEY_PATH` (a file containing
+/// one, easier to manage than a multi-line PEM crammed into an env var),
+/// and `AGENTOPS_GITHUB_WEBHOOK_SECRET` -- same family as the existing
+/// `AGENTOPS_GITHUB_APP_SLUG`. All three must be present for GitHub App
+/// support to be enabled; a partially-configured deployment (e.g. someone
+/// set the App id but forgot the webhook secret) is treated the same as
+/// fully unconfigured, not a half-working state, so a config mistake fails
+/// obviously (routes 404/503) rather than partially working in a confusing
+/// way.
+fn load_github_app_config() -> Option<github_app_routes::GitHubAppConfig> {
+    let app_id: u64 = std::env::var("AGENTOPS_GITHUB_APP_ID").ok()?.parse().ok()?;
+    let private_key_pem = match std::env::var("AGENTOPS_GITHUB_APP_PRIVATE_KEY") {
+        Ok(pem) => pem,
+        Err(_) => std::fs::read_to_string(std::env::var("AGENTOPS_GITHUB_APP_PRIVATE_KEY_PATH").ok()?).ok()?,
+    };
+    let webhook_secret = std::env::var("AGENTOPS_GITHUB_WEBHOOK_SECRET").ok()?;
+    Some(github_app_routes::GitHubAppConfig { app_id, private_key_pem, webhook_secret })
+}
+
 /// Resolves a `LinearConfig` for `tenant` — **vault only, deliberately no
 /// env-var fallback.** Env-var-sourced credentials were an intentional
 /// bootstrap-era convenience (Phase 6/7's own live testing used
@@ -249,6 +309,10 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     let store = ConnectionStore::open(db_path)?;
     let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(agentops_repo_access::secrets::EnvSecretsProvider::from_env()?);
     let github_app_slug = std::env::var("AGENTOPS_GITHUB_APP_SLUG").ok();
+    let github_app_config = load_github_app_config();
+    if github_app_config.is_none() {
+        println!("AGENTOPS_GITHUB_APP_ID/PRIVATE_KEY/WEBHOOK_SECRET not fully set — GitHub App installation/webhook routes disabled for this deployment.");
+    }
     let api_key_hash = std::env::var("AGENTOPS_HEAVY_API_KEY_HASH").ok();
     let auth_status = if api_key_hash.is_some() { "API key required" } else { "UNAUTHENTICATED (set AGENTOPS_HEAVY_API_KEY_HASH to require a key)" };
 
@@ -280,7 +344,43 @@ pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
     let accounts_for_repos = agentops_accounts::AccountStore::open(&accounts_db_path)?;
     let teams_for_repos = agentops_teams::TeamStore::open(&teams_db_path)?;
 
-    let mut app = build_router(store, secrets.clone(), github_app_slug, api_key_hash, search_index, docbrain_db_dir.clone(), Some(accounts_for_repos), Some(teams_for_repos));
+    // Same primary `db_path` file as `ConnectionStore` (not its own
+    // `AGENTOPS_*_DB` env var) -- `ConnectionStore::open(db_path)` above
+    // already establishes that this specific subsystem shares the primary
+    // file rather than following Accounts/Teams/Integrations/Modules' own
+    // per-subsystem file convention.
+    let indexing_store = agentops_repo_access::indexing_store::IndexingStore::open(db_path)?;
+    let repo_checkouts_dir = std::env::var("AGENTOPS_REPO_CHECKOUTS_DIR").map(std::path::PathBuf::from).unwrap_or_else(|_| default_repo_checkouts_dir());
+    std::fs::create_dir_all(&repo_checkouts_dir)?;
+
+    // Independent second connections to the same primary db file, for the
+    // public `/webhooks/github` receiver -- same "own connection, not a
+    // shared AppState handle" precedent `LinearModuleState` already
+    // established (`linear_webhook.rs`'s doc comment), since `build_router`
+    // doesn't expose the `AppState` it constructs internally.
+    let webhook_deps = indexing::IndexingDeps {
+        indexing: Arc::new(Mutex::new(agentops_repo_access::indexing_store::IndexingStore::open(db_path)?)),
+        connections: Arc::new(Mutex::new(ConnectionStore::open(db_path)?)),
+        secrets: secrets.clone(),
+        search_index: search_index.clone(),
+        repo_checkouts_dir: repo_checkouts_dir.clone(),
+        github_app_config: github_app_config.clone(),
+    };
+
+    let mut app = build_router(
+        store,
+        secrets.clone(),
+        github_app_slug,
+        api_key_hash,
+        search_index,
+        docbrain_db_dir.clone(),
+        Some(accounts_for_repos),
+        Some(teams_for_repos),
+        indexing_store,
+        repo_checkouts_dir,
+        github_app_config.clone(),
+    );
+    app = github_app_routes::merge_github_webhook_route(app, webhook_deps, github_app_config);
 
     // Phase 7: accounts + the generic integrations vault. Phase 6c: the
     // generic per-tenant module-enrollment store (Linear auto-kickoff is
@@ -543,17 +643,43 @@ async fn verify_repo(State(state): State<AppState>, user: Option<axum::Extension
 
     let result = verify_ssh_connection(state.secrets.as_ref(), &tenant, &id, encrypted_key, &connection.repo_url);
 
-    let store = state.store.lock().unwrap();
-    match &result {
+    let outcome = {
+        let store = state.store.lock().unwrap();
+        match &result {
+            Ok(()) => {
+                let _ = store.set_status(&tenant, &id, ConnectionStatus::Active);
+                Ok(())
+            }
+            Err(e) => {
+                let reason = e.to_string();
+                let _ = store.set_status(&tenant, &id, ConnectionStatus::Failed(reason.clone()));
+                Err(reason)
+            }
+        }
+    };
+
+    match outcome {
         Ok(()) => {
-            let _ = store.set_status(&tenant, &id, ConnectionStatus::Active);
-            (StatusCode::OK, Json(json!({ "status": "active" })))
+            // The key check above is a throwaway clone into a scratch temp
+            // dir, discarded either way -- the job below does its own,
+            // separate real clone into the job's working tree. A known,
+            // deliberate simplification vs. reusing that first clone as the
+            // job's own checkout (which would save one clone): kept simple
+            // for this pass, flagged rather than silently accepted as
+            // optimal.
+            let job_id = match indexing::create_and_spawn_job(&state.indexing_deps(), tenant.clone(), connection.clone(), agentops_repo_access::indexing_store::JobKind::Initial) {
+                Ok(id) => Some(id),
+                Err(e) => {
+                    // Verification itself succeeded -- don't fail the whole
+                    // request over the indexing job failing to even start;
+                    // report it, let the caller retry indexing separately.
+                    eprintln!("verify_repo: connection {tenant}/{id} verified but failed to start indexing job: {e}");
+                    None
+                }
+            };
+            (StatusCode::OK, Json(json!({ "status": "active", "job_id": job_id })))
         }
-        Err(e) => {
-            let reason = e.to_string();
-            let _ = store.set_status(&tenant, &id, ConnectionStatus::Failed(reason.clone()));
-            (StatusCode::OK, Json(json!({ "status": "failed", "reason": reason })))
-        }
+        Err(reason) => (StatusCode::OK, Json(json!({ "status": "failed", "reason": reason }))),
     }
 }
 
@@ -567,6 +693,41 @@ fn verify_ssh_connection(secrets: &dyn SecretsProvider, tenant: &str, repo_id: &
     let result = agentops_repo_access::clone_repo(repo_url, &dest, &unlocked, agentops_repo_access::GITHUB_KNOWN_HOSTS);
     let _ = std::fs::remove_dir_all(&dest);
     result
+}
+
+/// `POST /repos/{id}/regenerate-key` -- the failure screen's "Regenerate
+/// deploy key" action. SSH-only: 404s for a GitHub App connection (nothing
+/// to regenerate, there's no key custodied on our side for that method).
+async fn regenerate_key(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, q.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
+        return e;
+    }
+
+    let connection = {
+        let store = state.store.lock().unwrap();
+        match store.get_connection(&tenant, &id) {
+            Ok(Some(c)) => c,
+            Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such connection for this tenant" }))),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        }
+    };
+    if connection.method != agentops_repo_access::store::ConnectionMethod::Ssh {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "not an SSH-method connection -- nothing to regenerate" })));
+    }
+
+    let keypair = match agentops_repo_access::generate_deploy_keypair_for_repo(state.secrets.as_ref(), &tenant, &id) {
+        Ok(k) => k,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("generating deploy key: {e}") }))),
+    };
+    let store = state.store.lock().unwrap();
+    match store.replace_ssh_keypair(&tenant, &id, &keypair) {
+        Ok(connection) => (StatusCode::OK, Json(json!({ "connection": ConnectionView::from(connection) }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
 }
 
 async fn github_app_install_url(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
@@ -797,6 +958,10 @@ mod tests {
         (store, secrets)
     }
 
+    fn test_indexing_store() -> agentops_repo_access::indexing_store::IndexingStore {
+        agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap()
+    }
+
     async fn body_json(response: axum::response::Response) -> Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
@@ -845,7 +1010,7 @@ mod tests {
     #[tokio::test]
     async fn health_check_ok() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -857,7 +1022,7 @@ mod tests {
     #[tokio::test]
     async fn api_key_path_is_unaffected_when_no_session_store_is_configured_and_still_requires_a_body_tenant() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let req = Request::builder()
             .method("POST")
             .uri("/repos/connect")
@@ -887,7 +1052,7 @@ mod tests {
             store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/own.git", &keypair).unwrap();
         }
 
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
 
         let spoofed = Request::builder().uri("/repos?tenant=other-tenant").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap();
         let resp = app.oneshot(spoofed).await.unwrap();
@@ -911,7 +1076,7 @@ mod tests {
         let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
         let (_, token) = signup(&accounts, "fresh@example.com");
         let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
 
         let list = app.clone().oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(list.status(), StatusCode::OK);
@@ -943,7 +1108,7 @@ mod tests {
         teams.add_member(&admin.tenant, viewer.id, "viewer").unwrap();
         accounts.switch_tenant(viewer.id, &admin.tenant).unwrap();
 
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
 
         let admin_view = app.clone().oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {admin_token}")).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(body_json(admin_view).await["can_connect"], true);
@@ -963,7 +1128,7 @@ mod tests {
         teams.add_member(&admin.tenant, viewer.id, "viewer").unwrap();
         accounts.switch_tenant(viewer.id, &admin.tenant).unwrap();
 
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
 
         let forbidden = app
             .clone()
@@ -1013,7 +1178,7 @@ mod tests {
         // explicitly denied access to this specific repo.
         teams.set_repo_override(&admin.tenant, dev.id, "widgets", false).unwrap();
 
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams));
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
 
         let admin_view = app.clone().oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {admin_token}")).body(Body::empty()).unwrap()).await.unwrap();
         let body = body_json(admin_view).await;
@@ -1028,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn connect_then_list_round_trips_over_http() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
 
         let connect_req = Request::builder()
             .method("POST")
@@ -1057,7 +1222,7 @@ mod tests {
     #[tokio::test]
     async fn list_never_leaks_across_tenants() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
 
         for (tenant, repo_id, url) in [("acme", "w", "url-a"), ("globex", "g", "url-b")] {
             let req = Request::builder()
@@ -1077,9 +1242,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn regenerate_key_issues_a_fresh_keypair_and_resets_status_to_pending() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let connect_req = Request::builder()
+            .method("POST")
+            .uri("/repos/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_id": "widgets", "repo_url": "ssh://git@127.0.0.1:1/nonexistent.git"}).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(connect_req).await.unwrap();
+        let original = body_json(resp).await;
+        let original_key = original["connection"]["public_key_openssh"].as_str().unwrap().to_string();
+
+        let regen_req = Request::builder().method("POST").uri("/repos/widgets/regenerate-key?tenant=acme").body(Body::empty()).unwrap();
+        let resp = app.oneshot(regen_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let new_key = body["connection"]["public_key_openssh"].as_str().unwrap();
+        assert_ne!(new_key, original_key, "regenerating must issue a genuinely fresh keypair, not echo the old one");
+        assert_eq!(body["connection"]["status"], "pending", "a regenerated key resets the connection to pending, mirroring a brand-new connect");
+    }
+
+    #[tokio::test]
     async fn verify_against_unreachable_host_marks_connection_failed() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
 
         let connect_req = Request::builder()
             .method("POST")
@@ -1101,10 +1290,92 @@ mod tests {
         assert!(body["connections"][0]["status"].as_str().unwrap().starts_with("failed"));
     }
 
+    /// A real local bare git repo (no SSH server needed -- git treats a
+    /// plain filesystem path as a local clone and never invokes
+    /// `GIT_SSH_COMMAND` for it), used to drive the full connect -> verify
+    /// -> index pipeline end to end against real `git`/`agentops_scanner`/
+    /// `agentops_mcp::persist` calls, not mocks.
+    fn init_bare_repo_with_one_commit() -> PathBuf {
+        let bare = std::env::temp_dir().join(format!("agentops-test-bare-{}", uuid_like()));
+        let scratch = std::env::temp_dir().join(format!("agentops-test-scratch-{}", uuid_like()));
+        std::process::Command::new("git").args(["init", "--bare", "-q"]).arg(&bare).status().unwrap();
+        std::process::Command::new("git").args(["clone", "-q"]).arg(&bare).arg(&scratch).status().unwrap();
+        std::fs::write(scratch.join("README.md"), "# widgets\n").unwrap();
+        std::process::Command::new("git").args(["-C"]).arg(&scratch).args(["add", "."]).status().unwrap();
+        std::process::Command::new("git").args(["-C"]).arg(&scratch).args(["-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "-q", "-m", "init"]).status().unwrap();
+        std::process::Command::new("git").args(["-C"]).arg(&scratch).args(["push", "-q", "origin", "HEAD:refs/heads/main"]).status().unwrap();
+        let _ = std::fs::remove_dir_all(&scratch);
+        bare
+    }
+
+    fn uuid_like() -> String {
+        let mut bytes = [0u8; 8];
+        getrandom::fill(&mut bytes).unwrap();
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[tokio::test]
+    async fn verify_triggers_indexing_and_the_job_reaches_succeeded_over_http() {
+        let bare_repo = init_bare_repo_with_one_commit();
+        let checkouts_dir = std::env::temp_dir().join(format!("agentops-test-checkouts-{}", uuid_like()));
+
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), checkouts_dir.clone(), None);
+
+        let connect_req = Request::builder()
+            .method("POST")
+            .uri("/repos/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_id": "widgets", "repo_url": bare_repo.to_string_lossy()}).to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(connect_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let verify_req = Request::builder().method("POST").uri("/repos/widgets/verify?tenant=acme").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(verify_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let verify_body = body_json(resp).await;
+        assert_eq!(verify_body["status"], "active");
+        assert!(verify_body["job_id"].is_string(), "verify must kick off an indexing job, not just flip the connection to active");
+
+        // The job runs on a detached `tokio::spawn`'d task -- poll the real
+        // status endpoint (the same way the frontend will) rather than
+        // reaching into orchestration internals, which are private to this
+        // module.
+        let mut final_status = String::new();
+        for _ in 0..100 {
+            let status_req = Request::builder().uri("/repos/widgets/index/status?tenant=acme").body(Body::empty()).unwrap();
+            let resp = app.clone().oneshot(status_req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            final_status = body["job"]["status"].as_str().unwrap().to_string();
+            if final_status != "running" {
+                if final_status != "succeeded" {
+                    panic!("indexing job did not succeed: {}", serde_json::to_string_pretty(&body).unwrap());
+                }
+                assert_eq!(body["overall_percent"], 100);
+                let stages = body["stages"].as_array().unwrap();
+                assert_eq!(stages.len(), 9);
+                for stage in stages {
+                    assert_eq!(stage["status"], "done", "stage {:?} should be done: {stage:?}", stage["stage"]);
+                }
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert_eq!(final_status, "succeeded", "indexing job against a real local repo must reach succeeded");
+
+        assert!(checkouts_dir.join("acme").join("widgets").join("README.md").exists(), "the job must actually clone into its checkout dir");
+        assert!(checkouts_dir.join("acme").join("widgets").join("repo-map.md").exists(), "the docgen stage must actually write repo-map.md");
+
+        let _ = std::fs::remove_dir_all(&bare_repo);
+        let _ = std::fs::remove_dir_all(&checkouts_dir);
+    }
+
     #[tokio::test]
     async fn install_url_404s_when_no_app_is_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
@@ -1112,7 +1383,7 @@ mod tests {
     #[tokio::test]
     async fn install_url_returns_the_configured_slug() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
@@ -1123,7 +1394,7 @@ mod tests {
     async fn missing_api_key_is_rejected_when_one_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let resp = app.oneshot(Request::builder().uri("/repos?tenant=acme").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
@@ -1132,7 +1403,7 @@ mod tests {
     async fn health_check_bypasses_auth_even_when_a_key_is_required() {
         let (store, secrets) = test_state();
         let (_, hash) = agentops_security::api_key::generate_api_key().unwrap();
-        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, Some(hash), None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let resp = app.oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
     }
@@ -1140,7 +1411,7 @@ mod tests {
     #[tokio::test]
     async fn search_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let resp = app.oneshot(Request::builder().uri("/search?path=/tmp/x&q=hello").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1148,7 +1419,7 @@ mod tests {
     #[tokio::test]
     async fn search_index_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let req = Request::builder()
             .method("POST")
             .uri("/search/index")
@@ -1162,7 +1433,7 @@ mod tests {
     #[tokio::test]
     async fn docs_search_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let resp = app.oneshot(Request::builder().uri("/docs/search?slug=next&q=hello").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -1170,7 +1441,7 @@ mod tests {
     #[tokio::test]
     async fn docs_search_index_returns_503_when_not_configured() {
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
         let req = Request::builder()
             .method("POST")
             .uri("/docs/search/index")
@@ -1221,7 +1492,7 @@ mod tests {
         let search_index = Some(Arc::new(AsyncMutex::new(index)));
 
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, search_index, docbrain_db_dir, None, None);
+        let app = build_router(store, secrets, None, None, search_index, docbrain_db_dir, None, None, test_indexing_store(), std::env::temp_dir(), None);
 
         let index_req = Request::builder()
             .method("POST")
@@ -1288,7 +1559,7 @@ mod tests {
         let search_index = Some(Arc::new(AsyncMutex::new(index)));
 
         let (store, secrets) = test_state();
-        let app = build_router(store, secrets, None, None, search_index, PathBuf::from("unused-docbrain-dir"), None, None);
+        let app = build_router(store, secrets, None, None, search_index, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
 
         let index_req = Request::builder()
             .method("POST")

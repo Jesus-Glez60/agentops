@@ -78,6 +78,11 @@ pub struct RepoConnection {
     /// `Some` only for `ConnectionMethod::Ssh` — already encrypted, safe to
     /// persist, but never rendered to a UI or logged.
     pub encrypted_private_key_openssh: Option<String>,
+    /// `Some` only for `ConnectionMethod::GitHubApp` — the installation
+    /// this connection was created from, joined against
+    /// `indexing_store::GitHubAppInstallation` to resolve which tenant the
+    /// connection belongs to.
+    pub installation_id: Option<String>,
     pub status: ConnectionStatus,
     pub created_at: String,
 }
@@ -106,6 +111,7 @@ impl ConnectionStore {
                 method                      TEXT NOT NULL,
                 public_key_openssh          TEXT,
                 encrypted_private_key_openssh TEXT,
+                installation_id             TEXT,
                 status                      TEXT NOT NULL,
                 created_at                  TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (tenant, id)
@@ -115,6 +121,12 @@ impl ConnectionStore {
         .context("creating repo_connections table")?;
         conn.execute("CREATE INDEX IF NOT EXISTS idx_repo_connections_tenant ON repo_connections(tenant)", [])
             .context("creating tenant index")?;
+        // `ALTER TABLE ... ADD COLUMN` is a no-op error (not silently
+        // ignored) against a table that already has the column -- this
+        // covers a database file created before `installation_id` existed,
+        // matching `CREATE TABLE IF NOT EXISTS`'s own "don't error on an
+        // already-migrated file" posture for genuinely new deployments.
+        let _ = conn.execute("ALTER TABLE repo_connections ADD COLUMN installation_id TEXT", []);
         Ok(Self { conn })
     }
 
@@ -141,10 +153,53 @@ impl ConnectionStore {
         self.get_connection(tenant, id)?.context("just-inserted connection not found — this is a store bug")
     }
 
+    /// Records a new GitHub-App-backed connection. Unlike SSH, there's no
+    /// private key to custody and no separate verify step -- the
+    /// installation-token exchange the caller already performed (to list
+    /// the installation's repos in the first place) is itself proof the
+    /// App has real access, so this starts `Active` immediately rather than
+    /// `Pending`.
+    pub fn create_github_app_connection(&self, tenant: &str, id: &str, repo_url: &str, installation_id: &str) -> Result<RepoConnection> {
+        self.conn
+            .execute(
+                "INSERT INTO repo_connections (id, tenant, repo_url, method, installation_id, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, tenant, repo_url, ConnectionMethod::GitHubApp.as_str(), installation_id, ConnectionStatus::Active.as_db_string()],
+            )
+            .context("inserting github app repo connection")?;
+        self.get_connection(tenant, id)?.context("just-inserted connection not found — this is a store bug")
+    }
+
+    /// Overwrites an SSH connection's keypair in place (status reset to
+    /// `Pending`, same as a brand-new connection) -- the failure screen's
+    /// "Regenerate deploy key" action, for when the previously-issued key
+    /// was removed or rotated out from under an already-connected repo.
+    pub fn replace_ssh_keypair(&self, tenant: &str, id: &str, keypair: &crate::DeployKeypair) -> Result<RepoConnection> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE repo_connections SET public_key_openssh = ?1, encrypted_private_key_openssh = ?2, status = ?3
+                 WHERE tenant = ?4 AND id = ?5 AND method = ?6",
+                rusqlite::params![
+                    keypair.public_key_openssh,
+                    keypair.encrypted_private_key_openssh,
+                    ConnectionStatus::Pending.as_db_string(),
+                    tenant,
+                    id,
+                    ConnectionMethod::Ssh.as_str(),
+                ],
+            )
+            .context("replacing ssh keypair")?;
+        if updated == 0 {
+            anyhow::bail!("no SSH connection {id:?} for tenant {tenant:?} — refusing a silent no-op update");
+        }
+        self.get_connection(tenant, id)?.context("just-updated connection not found — this is a store bug")
+    }
+
     pub fn get_connection(&self, tenant: &str, id: &str) -> Result<Option<RepoConnection>> {
         self.conn
             .query_row(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, status, created_at
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at
                  FROM repo_connections WHERE tenant = ?1 AND id = ?2",
                 rusqlite::params![tenant, id],
                 row_to_connection,
@@ -158,12 +213,30 @@ impl ConnectionStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, status, created_at
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at
                  FROM repo_connections WHERE tenant = ?1 ORDER BY created_at DESC",
             )
             .context("preparing list query")?;
         let rows = stmt.query_map([tenant], row_to_connection).context("querying repo connections")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("reading repo connection rows")
+    }
+
+    /// Every connection created from a given GitHub App installation --
+    /// used by the webhook receiver's `installation`(deleted)/
+    /// `installation_repositories`(removed) handling to find which
+    /// connections to mark failed, without the tenant needing to be known
+    /// up front (the caller resolves it from `tenant_for_installation`
+    /// first, then calls this).
+    pub fn connections_for_installation(&self, tenant: &str, installation_id: &str) -> Result<Vec<RepoConnection>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at
+                 FROM repo_connections WHERE tenant = ?1 AND installation_id = ?2",
+            )
+            .context("preparing installation connections query")?;
+        let rows = stmt.query_map(rusqlite::params![tenant, installation_id], row_to_connection).context("querying installation connections")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("reading installation connection rows")
     }
 
     pub fn set_status(&self, tenant: &str, id: &str, status: ConnectionStatus) -> Result<()> {
@@ -192,7 +265,7 @@ impl ConnectionStore {
 
 fn row_to_connection(row: &rusqlite::Row) -> rusqlite::Result<RepoConnection> {
     let method_str: String = row.get(3)?;
-    let status_str: String = row.get(6)?;
+    let status_str: String = row.get(7)?;
     Ok(RepoConnection {
         id: row.get(0)?,
         tenant: row.get(1)?,
@@ -200,8 +273,9 @@ fn row_to_connection(row: &rusqlite::Row) -> rusqlite::Result<RepoConnection> {
         method: ConnectionMethod::from_str(&method_str).map_err(|e| rusqlite::Error::FromSqlConversionFailure(3, rusqlite::types::Type::Text, e.into()))?,
         public_key_openssh: row.get(4)?,
         encrypted_private_key_openssh: row.get(5)?,
+        installation_id: row.get(6)?,
         status: ConnectionStatus::from_db_string(&status_str),
-        created_at: row.get(7)?,
+        created_at: row.get(8)?,
     })
 }
 
@@ -218,6 +292,45 @@ mod tests {
     fn test_keypair(tenant: &str, id: &str) -> crate::DeployKeypair {
         let provider = EnvSecretsProvider::from_hex(&"11".repeat(32)).unwrap();
         generate_deploy_keypair_for_repo(&provider, tenant, id).unwrap()
+    }
+
+    /// Regression test for the exact class of bug
+    /// `create-table-if-not-exists-does-not-migrate-existing-sqlite-schemas.md`
+    /// already documents against `agentops-accounts`: build a
+    /// pre-`installation_id`-column table by hand (bypassing
+    /// `from_connection`'s own `CREATE TABLE`), then confirm `ConnectionStore::open`
+    /// against that same file still works afterward.
+    #[test]
+    fn opening_a_pre_installation_id_column_database_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pre-migration.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute(
+                "CREATE TABLE repo_connections (
+                    id TEXT NOT NULL, tenant TEXT NOT NULL, repo_url TEXT NOT NULL, method TEXT NOT NULL,
+                    public_key_openssh TEXT, encrypted_private_key_openssh TEXT, status TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')), PRIMARY KEY (tenant, id)
+                )",
+                [],
+            )
+            .unwrap();
+            let keypair = test_keypair("acme", "old-repo");
+            conn.execute(
+                "INSERT INTO repo_connections (id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, status)
+                 VALUES ('old-repo', 'acme', 'git@github.com:acme/old.git', 'ssh', ?1, ?2, 'pending')",
+                rusqlite::params![keypair.public_key_openssh, keypair.encrypted_private_key_openssh],
+            )
+            .unwrap();
+        }
+
+        let store = ConnectionStore::open(&path).unwrap();
+        let pre_existing = store.get_connection("acme", "old-repo").unwrap().unwrap();
+        assert_eq!(pre_existing.installation_id, None, "a pre-migration row must read back with a null installation_id, not error");
+
+        let new_keypair = test_keypair("acme", "new-repo");
+        let created = store.create_ssh_connection("acme", "new-repo", "git@github.com:acme/new.git", &new_keypair).unwrap();
+        assert_eq!(created.installation_id, None);
     }
 
     #[test]

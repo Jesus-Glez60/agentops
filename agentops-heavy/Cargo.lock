@@ -146,6 +146,7 @@ name = "agentops-heavy-api"
 version = "0.1.0"
 dependencies = [
  "agentops-accounts",
+ "agentops-docgen",
  "agentops-github-app",
  "agentops-graph",
  "agentops-heavy-consolidate",
@@ -156,6 +157,7 @@ dependencies = [
  "agentops-llm",
  "agentops-mcp",
  "agentops-repo-access",
+ "agentops-scanner",
  "agentops-security",
  "agentops-teams",
  "anyhow",
@@ -164,6 +166,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "http-body-util",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "sha2 0.11.0",

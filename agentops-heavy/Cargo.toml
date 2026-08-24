@@ -58,6 +58,13 @@ agentops-security = { path = "../agentops-core/crates/agentops-security" }
 # merge the two workspaces or their license postures).
 agentops-graph = { path = "../agentops-core/crates/agentops-graph" }
 
+# Repository Connection & Management indexing orchestration: the same
+# scan/docgen primitives `agentops-cli install` already drives locally,
+# called directly as a library instead of shelling out — same
+# cross-workspace path-dependency reasoning as agentops-graph above.
+agentops-scanner = { path = "../agentops-core/crates/agentops-scanner" }
+agentops-docgen = { path = "../agentops-core/crates/agentops-docgen" }
+
 # docbrain's light-tier, tenant-scoped doc store — same cross-workspace
 # path-dependency pattern as agentops-graph above, so the paid semantic
 # search tier can index real doc_nodes content without docbrain-core itself

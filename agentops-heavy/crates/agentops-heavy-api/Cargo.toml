@@ -22,6 +22,8 @@ agentops-heavy-consolidate = { path = "../agentops-heavy-consolidate" }
 agentops-graph.workspace = true
 docbrain-graph.workspace = true
 agentops-mcp.workspace = true
+agentops-scanner.workspace = true
+agentops-docgen.workspace = true
 agentops-linear.workspace = true
 agentops-llm.workspace = true
 hmac.workspace = true
@@ -31,6 +33,7 @@ agentops-accounts.workspace = true
 agentops-teams.workspace = true
 agentops-integrations.workspace = true
 agentops-integration-modules.workspace = true
+reqwest.workspace = true
 # agentops-license deliberately not a dependency this pass — 1.0 has no
 # payment gate at all (see this crate's module doc comment).
 
