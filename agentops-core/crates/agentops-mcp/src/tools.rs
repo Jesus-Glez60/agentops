@@ -69,7 +69,13 @@ fn tool_specs() -> Vec<ToolSpec> {
             handler: tool_get_symbol,
         },
         ToolSpec {
-            name: "get_changelog",
+            // Renamed from `get_changelog` (a stale name, always a
+            // mismatch with this tool's actual "recent scans" behavior) —
+            // also resolves a real name collision with `docbrain-mcp`'s
+            // own `get_changelog` tool (library version-to-version
+            // changelog entries, an unrelated concept) once both tool
+            // tables are merged into one dispatcher.
+            name: "list_scans",
             description: "Lists recent scans for a repo, most recent first.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
@@ -220,7 +226,14 @@ fn tool_specs() -> Vec<ToolSpec> {
             handler: tool_generate_docs,
         },
         ToolSpec {
-            name: "semantic_search",
+            // Renamed from `semantic_search` — collides with
+            // `agentops-heavy-mcp`'s own `semantic_search` tool (a
+            // genuinely different backend: Qdrant-backed, requires
+            // `semantic_index` to have run first) once both tool tables
+            // are merged into one dispatcher. Heavy's keeps the shorter
+            // name, consistent with the REST-layer precedent (heavy's
+            // meaning wins the clean path on a collision).
+            name: "local_semantic_search",
             description: "Dense-vector search over whatever symbols/gotchas/decisions/notes have been embedded (see scan_repo/add_note/ingest_notes's with_embeddings flag) — complements get_symbol's exact-name lookup with 'find something like this' search. Only returns hits among nodes that were actually embedded; nothing is embedded by default. Set mode to 'hybrid' to fuse in lexical (keyword/BM25) and exact-name-match signals too — no embedding required for a node to be found via those signals, and a literal function-name query reliably surfaces it even when nothing was ever embedded. With mode 'hybrid', set graph_expand to also spread activation from the fused top hits across Affects/References edges (Personalized PageRank) so graph-connected results can outrank a purely textual/semantic match — off by default. Set mode to 'gist_then_detail' for two-tier retrieval: first matches the repo's generated documentation sections (the compressed 'gist' of a module/repo), then searches only the symbols/gotchas/decisions those matched sections actually cover — sharper results for a broad/module-level query, at the cost of ignoring kind filtering and anything outside a matched section's coverage (falls back to an unscoped search if no section matches).",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
@@ -1015,7 +1028,7 @@ mod tests {
         let gotcha = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().next().unwrap();
         store.set_curation(&repo, gotcha.id, agentops_graph::NodeProminence::Reduced, Some("narrow edge case")).unwrap();
 
-        let result = call_tool(AccessMode::Full, "semantic_search", &json!({ "path": path, "query": "verify_token workaround", "kind": "gotcha" })).unwrap();
+        let result = call_tool(AccessMode::Full, "local_semantic_search", &json!({ "path": path, "query": "verify_token workaround", "kind": "gotcha" })).unwrap();
         let text = &result.content[0].text;
         assert!(text.contains("⚠ reduced prominence — narrow edge case"), "{text}");
     }
@@ -1118,10 +1131,10 @@ mod tests {
 
         call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": false })).unwrap();
 
-        let dense_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature" })).unwrap();
+        let dense_result = call_tool(AccessMode::Advisor, "local_semantic_search", &json!({ "path": path, "query": "verify_token_signature" })).unwrap();
         assert!(dense_result.content[0].text.contains("No matches"), "dense-only search finds nothing since nothing was embedded: {:?}", dense_result.content);
 
-        let hybrid_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid" })).unwrap();
+        let hybrid_result = call_tool(AccessMode::Advisor, "local_semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid" })).unwrap();
         assert!(!hybrid_result.is_error, "{:?}", hybrid_result.content);
         assert!(hybrid_result.content[0].text.contains("verify_token_signature"), "{:?}", hybrid_result.content);
         assert!(hybrid_result.content[0].text.contains("exact"), "the exact signal must be the one that found it: {:?}", hybrid_result.content);
@@ -1222,7 +1235,7 @@ mod tests {
 
         call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": true })).unwrap();
 
-        let result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "repository overview symbols indexed", "mode": "gist_then_detail" })).unwrap();
+        let result = call_tool(AccessMode::Advisor, "local_semantic_search", &json!({ "path": path, "query": "repository overview symbols indexed", "mode": "gist_then_detail" })).unwrap();
         assert!(!result.is_error, "{:?}", result.content);
         assert!(!result.content[0].text.contains("No matches"), "the indexed overview section must be findable: {:?}", result.content);
     }
@@ -1242,8 +1255,8 @@ mod tests {
         let path = dir.path().to_string_lossy().to_string();
         call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": false })).unwrap();
 
-        let default_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid" })).unwrap();
-        let expanded_result = call_tool(AccessMode::Advisor, "semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid", "graph_expand": true })).unwrap();
+        let default_result = call_tool(AccessMode::Advisor, "local_semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid" })).unwrap();
+        let expanded_result = call_tool(AccessMode::Advisor, "local_semantic_search", &json!({ "path": path, "query": "verify_token_signature", "mode": "hybrid", "graph_expand": true })).unwrap();
         assert!(!expanded_result.is_error, "{:?}", expanded_result.content);
         assert!(expanded_result.content[0].text.contains("verify_token_signature"), "{:?}", expanded_result.content);
         assert!(expanded_result.content[0].text.contains("score 0.0328"), "the fused score itself must be unaffected by graph_expand: {:?}", expanded_result.content);

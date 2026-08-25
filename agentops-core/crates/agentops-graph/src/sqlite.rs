@@ -214,7 +214,7 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     // Phase 4 (1.0 roadmap): lexical (BM25) search signal, redesigned
     // against this rebuild's actual architecture rather than the vault's
     // original tantivy-based spec (written when dense search was still a
-    // separate heavy-tier/Qdrant concern) — SQLite already ships FTS5 in
+    // separate Qdrant-based concern) — SQLite already ships FTS5 in
     // the `bundled` build this workspace already uses, so a second
     // on-disk index with its own sync mechanism (tantivy) would just be
     // reinventing what FTS5's *external content* mode already gives for

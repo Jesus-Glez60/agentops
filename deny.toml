@@ -20,6 +20,16 @@ ignore = [
     # available upstream. Not a vulnerability, just unmaintained — revisit when
     # tokenizers moves off it or a fork appears.
     "RUSTSEC-2024-0436",
+    # rsa (transitive via jsonwebtoken -> agentops-github-app, RS256 JWT
+    # signing for GitHub App auth) has a known, currently unpatched timing
+    # side-channel (RUSTSEC-2023-0071, the "Marvin Attack") in its PKCS#1v1.5
+    # implementation. GitHub's App auth flow requires RS256 — there's no
+    # alternative algorithm to switch to, and no fixed rsa release exists yet.
+    # The exposure here is signing our own JWTs locally with our own private
+    # key (not running as a signing oracle an external attacker can query
+    # repeatedly), which narrows but doesn't eliminate the theoretical risk.
+    # Revisit when RustCrypto ships a constant-time fix.
+    "RUSTSEC-2023-0071",
 ]
 
 [licenses]

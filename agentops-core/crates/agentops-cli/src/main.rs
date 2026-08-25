@@ -170,7 +170,10 @@ enum Command {
         #[arg(long, value_enum, default_value_t = AccessModeArg::Advisor)]
         access_mode: AccessModeArg,
     },
-    /// Run the REST API server.
+    /// Run the merged REST API server — agentops-api, docbrain-api, and
+    /// agentops-heavy-api's routes on one port (see the `agentops-server`
+    /// crate). Replaces the former separate `serve-api`/`docbrain-serve-api`
+    /// split now that there's one open-core, no price gate.
     ServeApi {
         #[arg(long, value_enum, default_value_t = AccessModeArg::Advisor)]
         access_mode: AccessModeArg,
@@ -179,13 +182,6 @@ enum Command {
     },
     /// Run the docbrain stdio MCP server (library docs/changelogs).
     DocbrainServe {
-        #[arg(long)]
-        db: Option<PathBuf>,
-    },
-    /// Run the docbrain REST API server.
-    DocbrainServeApi {
-        #[arg(long, default_value = "127.0.0.1:8421")]
-        addr: String,
         #[arg(long)]
         db: Option<PathBuf>,
     },
@@ -396,11 +392,19 @@ fn main() -> Result<()> {
             agentops_mcp::watch_and_rescan(&path, with_embeddings)
         }
         Command::Serve { access_mode } => agentops_mcp::run_stdio(access_mode.into()),
-        Command::ServeApi { access_mode, addr } => tokio::runtime::Runtime::new()?.block_on(agentops_api::run(&addr, access_mode.into())),
-        Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(docbrain_mcp::default_db_path)),
-        Command::DocbrainServeApi { addr, db } => {
-            tokio::runtime::Runtime::new()?.block_on(docbrain_api::run(&addr, &db.unwrap_or_else(docbrain_mcp::default_db_path)))
+        Command::ServeApi { access_mode, addr } => {
+            // SAFETY: single-threaded at this point in `main`, before the
+            // tokio runtime (and thus any concurrent access to the
+            // environment) starts — `agentops_server::run` reads these same
+            // two vars, so setting them here is how CLI flags get threaded
+            // into a function whose contract is "reads env, no params".
+            unsafe {
+                std::env::set_var("AGENTOPS_ADDR", &addr);
+                std::env::set_var("AGENTOPS_ACCESS_MODE", if matches!(access_mode, AccessModeArg::Full) { "full" } else { "advisor" });
+            }
+            tokio::runtime::Runtime::new()?.block_on(agentops_server::run())
         }
+        Command::DocbrainServe { db } => docbrain_mcp::run_stdio(&db.unwrap_or_else(docbrain_mcp::default_db_path)),
         Command::SyncDocs { path, db, no_interactive } => sync_docs(&path, db.as_deref(), no_interactive),
         Command::ApiKey { action: ApiKeyAction::Generate } => api_key_generate(),
         Command::Task { action } => match action {

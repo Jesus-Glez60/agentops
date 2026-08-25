@@ -2,11 +2,10 @@
 //! multi-repo Postgres database — the "hypothetical future shared/
 //! multi-tenant adapter" `agentops-graph`'s own module doc comment already
 //! named as the reason repo-scoping is required on every trait method.
-//! Part of `agentops-core`, not a paid heavy-tier gate — the same "no
-//! tiering" decision docbrain made for itself, extended to codebrain (see
-//! the plan). Schema: `schema.sql` in this crate's root, a structural
-//! mirror of `SqliteGraphStore`'s current schema, not a port of `main`'s
-//! stale `agentops-heavy` one.
+//! Part of `agentops-core`, available in every deployment. Schema:
+//! `schema.sql` in this crate's root, a structural mirror of
+//! `SqliteGraphStore`'s current schema, not a port of `main`'s stale
+//! `agentops-heavy` one.
 //!
 //! **Sync bridge**: `GraphStore`'s trait methods are all synchronous
 //! (matching `SqliteGraphStore`'s `rusqlite` calls), but `tokio-postgres`

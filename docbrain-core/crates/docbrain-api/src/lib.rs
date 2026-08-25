@@ -25,8 +25,6 @@ use docbrain_graph::{DocbrainStore, SqliteDocbrainStore};
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
-use agentops_security::api_key::verify_api_key;
-
 #[derive(Clone)]
 struct AppState {
     store: Arc<Mutex<SqliteDocbrainStore>>,
@@ -43,6 +41,14 @@ struct AppState {
 /// `api_key_hash`, if set, requires every request except `/health` to
 /// present a matching `Authorization: Bearer <key>` header.
 pub fn build_router(store: SqliteDocbrainStore, db_path: PathBuf, api_key_hash: Option<String>) -> Router {
+    build_router_without_health(store, db_path, api_key_hash).merge(health_router())
+}
+
+/// Same as [`build_router`] minus the `/health` route — for composing this
+/// service's routes into a larger process (e.g. the merged `agentops-server`
+/// binary) that mounts its own single shared `/health` instead of one copy
+/// per merged service (`Router::merge` panics on a duplicate route).
+pub fn build_router_without_health(store: SqliteDocbrainStore, db_path: PathBuf, api_key_hash: Option<String>) -> Router {
     let state = AppState { store: Arc::new(Mutex::new(store)), db_path, api_key_hash };
     Router::new()
         .route("/tools", get(list_tools_handler))
@@ -50,33 +56,48 @@ pub fn build_router(store: SqliteDocbrainStore, db_path: PathBuf, api_key_hash: 
         .route("/libraries", get(list_libraries_json))
         .route("/libraries/{slug}", get(get_library_json))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
-        .route("/health", get(health))
         .with_state(state)
         // Permissive CORS: identity/authorization rides on the
         // Authorization header (checked above), not on request origin.
         .layer(CorsLayer::permissive())
 }
 
+/// Same as [`build_router_without_health`] minus `/tools`/`/tools/{name}` —
+/// `agentops-api` registers the same two paths for its own tool table, so a
+/// process composing both (e.g. `agentops-server`) can only mount one of
+/// them as-is; the other needs a merged dispatcher covering both tool
+/// tables, not yet built (tracked for the MCP-server-merge follow-up). Until
+/// then, the merged process keeps `agentops-api`'s `/tools` and mounts this
+/// variant instead of [`build_router_without_health`]; `/libraries` is
+/// unaffected either way.
+pub fn build_router_without_health_and_tools(store: SqliteDocbrainStore, db_path: PathBuf, api_key_hash: Option<String>) -> Router {
+    let state = AppState { store: Arc::new(Mutex::new(store)), db_path, api_key_hash };
+    Router::new()
+        .route("/libraries", get(list_libraries_json))
+        .route("/libraries/{slug}", get(get_library_json))
+        .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
+        .with_state(state)
+        .layer(CorsLayer::permissive())
+}
+
+fn health_router() -> Router {
+    Router::new().route("/health", get(health)).layer(CorsLayer::permissive())
+}
+
 async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(expected_hash) = &state.api_key_hash else {
-        return next.run(req).await;
-    };
-
-    let provided = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-
-    match provided {
-        Some(raw) if verify_api_key(raw, expected_hash).is_ok() => next.run(req).await,
-        _ => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid API key" }))).into_response(),
+    match agentops_security::api_key::check_bearer_api_key(req.headers(), state.api_key_hash.as_deref()) {
+        Ok(()) => next.run(req).await,
+        Err((status, body)) => (status, body).into_response(),
     }
 }
 
 /// Binds `addr` and serves until the process is killed. If
-/// `DOCBRAIN_API_KEY_HASH` is set in the environment, every request except
+/// `AGENTOPS_API_KEY_HASH` is set in the environment, every request except
 /// `/health` requires a matching `Authorization: Bearer <key>` header.
 pub async fn run(addr: &str, db_path: &Path) -> anyhow::Result<()> {
     let store = SqliteDocbrainStore::open(db_path)?;
-    let api_key_hash = std::env::var("DOCBRAIN_API_KEY_HASH").ok();
-    let auth_status = if api_key_hash.is_some() { "API key required" } else { "UNAUTHENTICATED (set DOCBRAIN_API_KEY_HASH to require a key)" };
+    let api_key_hash = std::env::var("AGENTOPS_API_KEY_HASH").ok();
+    let auth_status = if api_key_hash.is_some() { "API key required" } else { "UNAUTHENTICATED (set AGENTOPS_API_KEY_HASH to require a key)" };
     let app = build_router(store, db_path.to_path_buf(), api_key_hash);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("docbrain-api listening on {addr} (auth: {auth_status})");

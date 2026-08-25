@@ -1,0 +1,23 @@
+[package]
+name = "agentops-mcp-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agentops-mcp-server"
+path = "src/main.rs"
+
+[lib]
+name = "agentops_mcp_server"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+agentops-mcp = { path = "../agentops-mcp" }
+agentops-heavy-embeddings = { path = "../agentops-heavy-embeddings" }
+agentops-heavy-mcp = { path = "../agentops-heavy-mcp" }
+docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
+docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }

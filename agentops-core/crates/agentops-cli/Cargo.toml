@@ -20,13 +20,12 @@ agentops-llm = { path = "../agentops-llm" }
 agentops-linear = { path = "../agentops-linear" }
 agentops-security = { path = "../agentops-security" }
 agentops-mcp = { path = "../agentops-mcp" }
-agentops-api = { path = "../agentops-api" }
+agentops-server = { path = "../agentops-server" }
 agentops-embeddings = { path = "../agentops-embeddings" }
 agentops-retrieval = { path = "../agentops-retrieval" }
 agentops-manifest = { path = "../agentops-manifest" }
 agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }
 docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
-docbrain-api = { path = "../../../docbrain-core/crates/docbrain-api" }
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
 docbrain-ingest = { path = "../../../docbrain-core/crates/docbrain-ingest" }
 dialoguer.workspace = true

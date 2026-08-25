@@ -1,4 +1,4 @@
-//! `GET /repos`, `POST /repos/{name}/rescan`, `GET /activity` — the
+//! `GET /scans`, `POST /repos/{name}/rescan`, `GET /activity` — the
 //! dashboard's repo-intelligence data, composed entirely from
 //! already-existing primitives (`agentops-manifest`'s local scan registry +
 //! `agentops-graph`'s per-repo store). Scoped to **local repos only** — no
@@ -119,9 +119,9 @@ pub fn read_branch(repo_path: &Path) -> Option<String> {
 
 /// Every manifest entry whose store actually opened, paired with its
 /// resolved repo name -- the shared core of `GET /activity` and `GET
-/// /search`, both of which only care about repos with real, queryable data
-/// and silently skip everything else (unlike `GET /repos`, which must show
-/// a `path_missing` row rather than hide the gap, so it keeps its own
+/// /local-search`, both of which only care about repos with real, queryable
+/// data and silently skip everything else (unlike `GET /scans`, which must
+/// show a `path_missing` row rather than hide the gap, so it keeps its own
 /// per-entry logic in `summarize_repo`).
 pub(crate) fn open_scanned_repos(entries: &[ManifestEntry]) -> Vec<(String, Box<dyn GraphStore>)> {
     entries
@@ -158,7 +158,7 @@ fn summarize_repo(entry: &ManifestEntry) -> RepoSummary {
     let store = match agentops_mcp::open_store(&path) {
         Ok(store) => store,
         Err(e) => {
-            eprintln!("GET /repos: could not open graph store for {:?}: {e:#}", entry.path);
+            eprintln!("GET /scans: could not open graph store for {:?}: {e:#}", entry.path);
             return RepoSummary { name, path: entry.path.clone(), branch, last_scanned_at: entry.last_scanned_at, counts: None, path_missing: true };
         }
     };
@@ -387,7 +387,7 @@ mod tests {
         agentops_manifest::record_scan_at(&manifest_path, dir.path()).unwrap();
 
         let app = test_app(manifest_path);
-        let resp = app.oneshot(Request::builder().uri("/repos").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/scans").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let repos = body["repos"].as_array().unwrap();
@@ -405,7 +405,7 @@ mod tests {
         agentops_manifest::record_scan_at(&manifest_path, dir.path()).unwrap();
 
         let app = test_app(manifest_path);
-        let resp = app.oneshot(Request::builder().uri("/repos").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/scans").body(Body::empty()).unwrap()).await.unwrap();
         let body = body_json(resp).await;
         let repos = body["repos"].as_array().unwrap();
         assert_eq!(repos[0]["counts"]["files"], 1);
@@ -425,7 +425,7 @@ mod tests {
         agentops_manifest::record_scan_at(&manifest_path, &deleted_path).unwrap();
 
         let app = test_app(manifest_path);
-        let resp = app.oneshot(Request::builder().uri("/repos").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/scans").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "one bad path must not fail the entire request");
         let body = body_json(resp).await;
         let repos = body["repos"].as_array().unwrap();
@@ -580,7 +580,7 @@ mod tests {
         store.set_curation(&name, gotcha.id, NodeProminence::Reduced, Some("niche")).unwrap();
 
         let app = test_app(manifest_path);
-        let resp = app.oneshot(Request::builder().uri("/repos").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/scans").body(Body::empty()).unwrap()).await.unwrap();
         let body = body_json(resp).await;
         let counts = &body["repos"][0]["counts"];
         assert_eq!(counts["gotchas"], 1, "the honest total must still count a curated gotcha: {counts:?}");

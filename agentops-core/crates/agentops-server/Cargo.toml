@@ -1,0 +1,24 @@
+[package]
+name = "agentops-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_server"
+
+[[bin]]
+name = "agentops-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+axum.workspace = true
+agentops-mcp = { path = "../agentops-mcp" }
+agentops-manifest = { path = "../agentops-manifest" }
+agentops-api = { path = "../agentops-api" }
+agentops-heavy-api = { path = "../agentops-heavy-api" }
+docbrain-api = { path = "../../../docbrain-core/crates/docbrain-api" }
+docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
+docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }

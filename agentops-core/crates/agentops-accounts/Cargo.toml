@@ -1,0 +1,27 @@
+[package]
+name = "agentops-accounts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_accounts"
+
+[dependencies]
+anyhow.workspace = true
+rusqlite.workspace = true
+argon2.workspace = true
+agentops-security = { path = "../agentops-security" }
+agentops-repo-access = { path = "../agentops-repo-access" }
+getrandom.workspace = true
+aes-gcm.workspace = true
+zeroize.workspace = true
+totp-rs = { version = "5", features = ["gen_secret", "otpauth", "qr"] }
+# argon2/password-hash pull in rand_core 0.6 for `OsRng` but don't enable
+# its "getrandom" feature themselves -- without this, `OsRng` is compiled
+# out and `hash_password` fails to build. Not exposed via
+# `[workspace.dependencies]` since no other crate needs this exact pin.
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+tempfile = "3"

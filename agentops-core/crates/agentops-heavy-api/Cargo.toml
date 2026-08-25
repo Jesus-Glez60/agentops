@@ -1,0 +1,46 @@
+[package]
+name = "agentops-heavy-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_heavy_api"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tower-http.workspace = true
+agentops-security = { path = "../agentops-security" }
+agentops-repo-access = { path = "../agentops-repo-access" }
+agentops-github-app = { path = "../agentops-github-app" }
+agentops-heavy-embeddings = { path = "../agentops-heavy-embeddings" }
+agentops-heavy-consolidate = { path = "../agentops-heavy-consolidate" }
+agentops-heavy-mcp = { path = "../agentops-heavy-mcp" }
+agentops-graph = { path = "../agentops-graph" }
+docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
+agentops-mcp = { path = "../agentops-mcp" }
+agentops-scanner = { path = "../agentops-scanner" }
+agentops-docgen = { path = "../agentops-docgen" }
+agentops-linear = { path = "../agentops-linear" }
+agentops-llm = { path = "../agentops-llm" }
+hmac.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
+agentops-accounts = { path = "../agentops-accounts" }
+agentops-teams = { path = "../agentops-teams" }
+agentops-integrations = { path = "../agentops-integrations" }
+agentops-integration-modules = { path = "../agentops-integration-modules" }
+
+[dev-dependencies]
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+wiremock.workspace = true
+# Only to compute a valid TOTP code in tests, from the `secret` a
+# `/auth/2fa/enroll` response returns -- production code never constructs
+# a `TOTP` directly in this crate, that stays inside agentops-accounts.
+totp-rs = { version = "5", features = ["gen_secret", "otpauth"] }

@@ -42,6 +42,26 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Shared body of the `require_api_key` Axum middleware every REST service
+/// in this workspace used to hand-roll independently (`agentops-api`,
+/// `docbrain-api`, `agentops-heavy-api` — byte-for-byte identical). Each
+/// service's own middleware still exists as a thin wrapper (since its
+/// `AppState` shape differs and `axum::middleware::from_fn_with_state`
+/// needs a concrete state type), but the actual header-parsing/verify/
+/// error-body logic now lives in exactly one place. `expected_hash: None`
+/// means auth is disabled for this deployment (all requests pass) — the
+/// same semantics every caller already had.
+pub fn check_bearer_api_key(headers: &axum::http::HeaderMap, expected_hash: Option<&str>) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    let Some(expected_hash) = expected_hash else {
+        return Ok(());
+    };
+    let provided = headers.get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
+    match provided {
+        Some(raw) if verify_api_key(raw, expected_hash).is_ok() => Ok(()),
+        _ => Err((axum::http::StatusCode::UNAUTHORIZED, axum::Json(serde_json::json!({ "error": "missing or invalid API key" })))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

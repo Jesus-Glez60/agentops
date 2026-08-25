@@ -29,8 +29,19 @@ struct Manifest {
 /// (e.g. `agentops-api`'s `run()`, choosing between this and an env-var
 /// override) doesn't have to duplicate the `$HOME`-joining logic.
 pub fn default_manifest_path() -> PathBuf {
+    agentops_data_dir().join("manifest.json")
+}
+
+/// `AGENTOPS_DATA_DIR` (default `~/.agentops`) — the single directory every
+/// service's own per-subsystem `AGENTOPS_*_DB`/`*_DIR` var defaults under,
+/// so a self-hosted deployment only needs to set one path to relocate all
+/// of them at once; each individual var still overrides its own default.
+fn agentops_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("AGENTOPS_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentops").join("manifest.json")
+    PathBuf::from(home).join(".agentops")
 }
 
 fn load(manifest_file: &Path) -> Result<Manifest> {

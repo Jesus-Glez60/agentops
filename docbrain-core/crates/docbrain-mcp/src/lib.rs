@@ -14,14 +14,29 @@ use std::path::{Path, PathBuf};
 
 use docbrain_graph::SqliteDocbrainStore;
 
-/// The default docbrain store location — `~/.agentops/docbrain.db`. One
+/// The docbrain store location — `AGENTOPS_DOCBRAIN_DB` if set, else
+/// `$AGENTOPS_DATA_DIR/docbrain.db` (default `~/.agentops/docbrain.db`). One
 /// canonical definition, called by this crate's own binary, `docbrain-api`,
-/// and `agentops-cli`'s `docbrain-serve`/`docbrain-serve-api` passthrough
-/// commands, rather than each of them keeping its own private copy (two of
-/// which already existed independently before this one was added).
+/// `agentops-mcp-server`/`agentops-server`, and `agentops-cli`'s
+/// `docbrain-serve`/`docbrain-serve-api` passthrough commands, rather than
+/// each of them keeping its own private copy (two of which already existed
+/// independently before this one was added). This is the single-tenant,
+/// CLI-facing store — distinct from `agentops-heavy-api`'s per-tenant
+/// `docbrain-tenants/` directory (`DOCBRAIN_DB_DIR`), which has its own
+/// default under the same `AGENTOPS_DATA_DIR`.
 pub fn default_db_path() -> PathBuf {
+    if let Ok(path) = std::env::var("AGENTOPS_DOCBRAIN_DB") {
+        return PathBuf::from(path);
+    }
+    agentops_data_dir().join("docbrain.db")
+}
+
+fn agentops_data_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("AGENTOPS_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentops").join("docbrain.db")
+    PathBuf::from(home).join(".agentops")
 }
 
 /// Runs the server over stdin/stdout until stdin closes, backed by a

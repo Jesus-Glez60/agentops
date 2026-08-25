@@ -25,8 +25,6 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
-use agentops_security::api_key::verify_api_key;
-
 mod docs;
 mod repos;
 mod search;
@@ -47,14 +45,27 @@ pub(crate) struct AppState {
 }
 
 /// `api_key_hash`, if set, requires every request except `/health` to
-/// present a matching `Authorization: Bearer <key>` header.
+/// present a matching `Authorization: Bearer <key>` header. Local scan
+/// registry listing lives at `/scans` and code search at `/local-search` —
+/// deliberately not `/repos`/`/search` (the paths a merged multi-service
+/// process gives to the hosted-connections/semantic-search endpoints of the
+/// same name), so a process composing this router alongside others has no
+/// path collision to resolve.
 pub fn build_router(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf) -> Router {
+    build_router_without_health(mode, api_key_hash, manifest_path).merge(health_router())
+}
+
+/// Same as [`build_router`] minus the `/health` route — for composing this
+/// service's routes into a larger process (e.g. the merged `agentops-server`
+/// binary) that mounts its own single shared `/health` instead of one copy
+/// per merged service (`Router::merge` panics on a duplicate route).
+pub fn build_router_without_health(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf) -> Router {
     let state = AppState { mode, api_key_hash, manifest_path };
     Router::new()
         .route("/tools", get(list_tools_handler))
         .route("/tools/{name}", post(call_tool_handler))
         .route("/nodes", get(list_nodes_json))
-        .route("/repos", get(repos::list_repos_json))
+        .route("/scans", get(repos::list_repos_json))
         .route("/repos/{name}/rescan", post(repos::rescan_repo_json))
         .route("/repos/{name}/nodes/{id}", get(search::node_detail_json))
         .route("/repos/{name}/nodes/{id}/curation", post(search::set_curation_json))
@@ -63,24 +74,21 @@ pub fn build_router(mode: AccessMode, api_key_hash: Option<String>, manifest_pat
         .route("/repos/{name}/edges/{id}/reinforce", post(subgraph::reinforce_edge_json))
         .route("/repos/{name}/docs", get(docs::docs_json))
         .route("/activity", get(repos::activity_json))
-        .route("/search", get(search::search_json))
+        .route("/local-search", get(search::search_json))
         .route("/gotchas", get(repos::gotchas_json))
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
-        .route("/health", get(health))
         .with_state(state)
         .layer(CorsLayer::permissive())
 }
 
+fn health_router() -> Router {
+    Router::new().route("/health", get(health)).layer(CorsLayer::permissive())
+}
+
 async fn require_api_key(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let Some(expected_hash) = &state.api_key_hash else {
-        return next.run(req).await;
-    };
-
-    let provided = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer "));
-
-    match provided {
-        Some(raw) if verify_api_key(raw, expected_hash).is_ok() => next.run(req).await,
-        _ => (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid API key" }))).into_response(),
+    match agentops_security::api_key::check_bearer_api_key(req.headers(), state.api_key_hash.as_deref()) {
+        Ok(()) => next.run(req).await,
+        Err((status, body)) => (status, body).into_response(),
     }
 }
 

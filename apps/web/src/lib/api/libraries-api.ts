@@ -1,11 +1,14 @@
 // Typed client for docbrain-api's /libraries routes. Types mirror
 // docbrain-graph's Library/RepoLibraryUsage response shapes exactly; see
 // docbrain-core/crates/docbrain-graph/src/lib.rs for the Rust source of
-// truth. A separate base URL from agentops-api.ts -- docbrain-api is its
-// own server/port, not a route on agentops-api.
+// truth. Same base URL/port as agentops-api.ts now (the merged
+// agentops-server process) -- docbrain-api's routes are nested under
+// /docbrain there (its own /tools/{name} would otherwise collide with
+// agentops-api's at the same path; see agentops-server's lib.rs doc
+// comment), so every path below is prefixed accordingly.
 import { apiFetch } from "@/lib/api/fetcher";
 
-const DOCBRAIN_API_URL = process.env.NEXT_PUBLIC_DOCBRAIN_API_URL ?? "http://127.0.0.1:8421";
+const AGENTOPS_API_URL = process.env.NEXT_PUBLIC_AGENTOPS_API_URL ?? "http://127.0.0.1:8420";
 
 export const LIBRARIES_SWR_KEY = "/libraries";
 
@@ -45,12 +48,12 @@ export interface LibraryDetail {
 }
 
 export async function getLibraries(): Promise<Library[]> {
-  const { libraries } = await apiFetch<{ libraries: Library[] }>(DOCBRAIN_API_URL, "/libraries");
+  const { libraries } = await apiFetch<{ libraries: Library[] }>(AGENTOPS_API_URL, "/docbrain/libraries");
   return libraries;
 }
 
 export async function getLibrary(slug: string): Promise<LibraryDetail> {
-  return apiFetch<LibraryDetail>(DOCBRAIN_API_URL, `/libraries/${encodeURIComponent(slug)}`);
+  return apiFetch<LibraryDetail>(AGENTOPS_API_URL, `/docbrain/libraries/${encodeURIComponent(slug)}`);
 }
 
 interface ToolResult {
@@ -59,7 +62,7 @@ interface ToolResult {
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<{ isError: boolean; text: string }> {
-  const result = await apiFetch<ToolResult>(DOCBRAIN_API_URL, `/tools/${name}`, { method: "POST", body: JSON.stringify(args) });
+  const result = await apiFetch<ToolResult>(AGENTOPS_API_URL, `/docbrain/tools/${name}`, { method: "POST", body: JSON.stringify(args) });
   return { isError: result.isError, text: result.content[0]?.text ?? "" };
 }
 

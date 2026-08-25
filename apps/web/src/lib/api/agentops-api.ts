@@ -45,7 +45,7 @@ export interface ActivityEvent {
 }
 
 export async function getRepos(): Promise<RepoSummary[]> {
-  const { repos } = await apiFetch<{ repos: RepoSummary[] }>(AGENTOPS_API_URL, "/repos");
+  const { repos } = await apiFetch<{ repos: RepoSummary[] }>(AGENTOPS_API_URL, "/scans");
   return repos;
 }
 
@@ -123,7 +123,7 @@ export async function search(query: string, options: SearchOptions = {}): Promis
   if (options.kinds?.length) params.set("kind", options.kinds.map((k) => k.toLowerCase()).join(","));
   if (options.topK) params.set("top_k", String(options.topK));
 
-  const { results } = await apiFetch<{ results: SearchResult[] }>(AGENTOPS_API_URL, `/search?${params.toString()}`);
+  const { results } = await apiFetch<{ results: SearchResult[] }>(AGENTOPS_API_URL, `/local-search?${params.toString()}`);
   return results;
 }
 

@@ -1,0 +1,18 @@
+[package]
+name = "agentops-heavy-embeddings"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_heavy_embeddings"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+fastembed.workspace = true
+qdrant-client.workspace = true
+agentops-graph = { path = "../agentops-graph" }
+docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }

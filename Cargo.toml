@@ -23,6 +23,18 @@ members = [
     "docbrain-core/crates/docbrain-graph",
     "docbrain-core/crates/docbrain-mcp",
     "docbrain-core/crates/docbrain-api",
+    "agentops-core/crates/agentops-repo-access",
+    "agentops-core/crates/agentops-github-app",
+    "agentops-core/crates/agentops-heavy-api",
+    "agentops-core/crates/agentops-heavy-embeddings",
+    "agentops-core/crates/agentops-heavy-mcp",
+    "agentops-core/crates/agentops-accounts",
+    "agentops-core/crates/agentops-teams",
+    "agentops-core/crates/agentops-integrations",
+    "agentops-core/crates/agentops-integration-modules",
+    "agentops-core/crates/agentops-heavy-consolidate",
+    "agentops-core/crates/agentops-server",
+    "agentops-core/crates/agentops-mcp-server",
 ]
 
 [workspace.package]
@@ -36,7 +48,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "net", "sync"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
 petgraph = "0.6"
@@ -66,10 +78,9 @@ sha2 = "0.11"
 getrandom = "0.4"
 subtle = "2"
 
-# --- agentops-graph-pg: optional Postgres GraphStore backend, part of core
-# (not a paid heavy-tier gate — see the plan's "no tiering" extension from
-# docbrain to codebrain). A store adapter talking to a real Postgres server
-# at runtime is expected here, unlike agentops-scanner's zero-egress rule.
+# --- agentops-graph-pg: optional Postgres GraphStore backend, part of core.
+# A store adapter talking to a real Postgres server at runtime is expected
+# here, unlike agentops-scanner's zero-egress rule.
 tokio-postgres = "0.7"
 deadpool-postgres = "0.14"
 pgvector = { version = "0.4", features = ["postgres"] }
@@ -84,3 +95,29 @@ sqlite-vec = "0.1"
 # variants resolve without `reqwest`/`native-tls` at all (verified via `cargo
 # tree`), so no ban exception is needed — deny.toml's ban stays unconditional.
 fastembed = { version = "5", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-rustls-tls"] }
+
+# --- hosted repo access, accounts/teams, semantic search, local model
+# consolidation: merged in from the former agentops-heavy workspace. ---
+ed25519-dalek = { version = "3.0", features = ["rand_core"] }
+base64 = "0.22"
+ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "rand_core", "getrandom"] }
+zeroize = "1"
+hmac = "0.13"
+tower-http = { version = "0.6", features = ["cors"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["use_pem", "rust_crypto"] }
+rsa = "0.9"
+wiremock = "0.6"
+# `download_snapshots` is a *default* feature that pulls in `reqwest`
+# purely for downloading Qdrant snapshot files over HTTP — a feature this
+# codebase never calls (no snapshot/restore workflow anywhere). Disabled to
+# keep `reqwest` out of the graph entirely (see deny.toml's ban); `serde` is
+# kept since `agentops-heavy-embeddings` relies on qdrant-client's typed
+# `Payload`/`Value` (de)serialization.
+qdrant-client = { version = "1.18", default-features = false, features = ["serde"] }
+argon2 = "0.5"
+aes-gcm = "0.10"
+candle-core = "0.8"
+candle-nn = "0.8"
+candle-transformers = "0.8"
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
+tokenizers = "0.22"

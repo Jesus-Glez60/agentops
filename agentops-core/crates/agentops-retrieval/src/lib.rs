@@ -7,14 +7,14 @@
 //!
 //! Redesigned from scratch against this rebuild's actual architecture, not
 //! ported from the vault's original spec: that spec assumed a separate
-//! heavy-tier/Qdrant dense index and a new tantivy-backed lexical crate,
-//! written before this session's own earlier passes moved dense search into
+//! Qdrant-based dense index and a new tantivy-backed lexical crate, written
+//! before this session's own earlier passes moved dense search into
 //! `agentops-core` (`agentops-embeddings` + `GraphStore::search_similar`,
 //! sqlite-vec/pgvector) and there was no reason left to introduce a second
 //! external index for lexical search either — see `search_lexical`'s own
 //! doc comment on `GraphStore` for why FTS5/`tsvector` (database-native,
 //! auto-kept-in-sync) won over a tantivy port. No cross-encoder rerank step
-//! exists in `agentops-core` today (that stayed heavy-tier/Qdrant-only, in
+//! exists in `agentops-core` today (that stayed Qdrant-only, in
 //! `agentops-heavy-embeddings`) — this crate's fusion *is* the ranking
 //! signal for core's hybrid search, not a pre-rerank candidate pool.
 

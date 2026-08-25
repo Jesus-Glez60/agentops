@@ -13,12 +13,12 @@ describe("agentops-api client", () => {
     vi.unstubAllGlobals();
   });
 
-  it("getRepos hits GET /repos and unwraps the repos array", async () => {
+  it("getRepos hits GET /scans and unwraps the repos array", async () => {
     fetchMock.mockResolvedValue({ ok: true, json: async () => ({ repos: [{ name: "agentops" }] }) });
     const repos = await getRepos();
     expect(repos).toEqual([{ name: "agentops" }]);
     const [url] = fetchMock.mock.calls[0];
-    expect(String(url)).toContain("/repos");
+    expect(String(url)).toContain("/scans");
   });
 
   it("rescanRepo POSTs to /repos/{name}/rescan and URL-encodes the name", async () => {
@@ -40,12 +40,12 @@ describe("agentops-api client", () => {
     await expect(getRepos()).rejects.toThrow("boom");
   });
 
-  it("search hits GET /search with the query and unwraps the results array", async () => {
+  it("search hits GET /local-search with the query and unwraps the results array", async () => {
     fetchMock.mockResolvedValue({ ok: true, json: async () => ({ results: [{ repo: "agentops", id: 1 }] }) });
     const results = await search("token refresh");
     expect(results).toEqual([{ repo: "agentops", id: 1 }]);
     const [url] = fetchMock.mock.calls[0];
-    expect(String(url)).toContain("/search?q=token+refresh");
+    expect(String(url)).toContain("/local-search?q=token+refresh");
   });
 
   it("search encodes repos/kinds/topK into the query string", async () => {

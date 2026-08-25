@@ -1,4 +1,4 @@
-//! `GET /search`, `GET /repos/{name}/nodes/{id}` — real dense semantic
+//! `GET /local-search`, `GET /repos/{name}/nodes/{id}` — real dense semantic
 //! search + the search page's detail-panel endpoint. Composes
 //! `agentops-embeddings`/`agentops-graph` primitives that already exist;
 //! no new search logic, no `GraphStore` trait changes.
@@ -360,7 +360,7 @@ mod tests {
         scan_with_embeddings(&manifest_path, dir_b.path());
 
         let app = test_app(manifest_path);
-        let resp = app.oneshot(Request::builder().uri("/search?q=refreshing+a+user%27s+session+token").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/local-search?q=refreshing+a+user%27s+session+token").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         let results = body["results"].as_array().unwrap();
@@ -387,14 +387,14 @@ mod tests {
         let app = test_app(manifest_path);
 
         // Confirm the real similarity before curating.
-        let resp = app.clone().oneshot(Request::builder().uri("/search?q=refreshing+a+user%27s+session+token").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.clone().oneshot(Request::builder().uri("/local-search?q=refreshing+a+user%27s+session+token").body(Body::empty()).unwrap()).await.unwrap();
         let body = body_json(resp).await;
         let before = body["results"].as_array().unwrap().iter().find(|r| r["id"] == symbol.id).unwrap()["similarity"].as_f64().unwrap();
 
         let curation_resp = app.clone().oneshot(curation_request(format!("/repos/{name}/nodes/{}/curation", symbol.id), "reduced", Some("niche"))).await.unwrap();
         assert_eq!(curation_resp.status(), StatusCode::OK);
 
-        let resp = app.oneshot(Request::builder().uri("/search?q=refreshing+a+user%27s+session+token").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/local-search?q=refreshing+a+user%27s+session+token").body(Body::empty()).unwrap()).await.unwrap();
         let body = body_json(resp).await;
         let results = body["results"].as_array().unwrap();
         let hit = results.iter().find(|r| r["id"] == symbol.id).expect("curation must never hide a hit");
@@ -416,7 +416,7 @@ mod tests {
 
         let symbol_only = app
             .clone()
-            .oneshot(Request::builder().uri(format!("/search?q=token+rotation&repos={name}&kind=symbol")).body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(format!("/local-search?q=token+rotation&repos={name}&kind=symbol")).body(Body::empty()).unwrap())
             .await
             .unwrap();
         let symbol_body = body_json(symbol_only).await;
@@ -425,7 +425,7 @@ mod tests {
         assert!(symbol_results.iter().all(|r| r["kind"] == "Symbol"), "kind=symbol must exclude every other kind: {symbol_results:?}");
 
         let gotcha_only = app
-            .oneshot(Request::builder().uri(format!("/search?q=token+rotation&repos={name}&kind=gotcha")).body(Body::empty()).unwrap())
+            .oneshot(Request::builder().uri(format!("/local-search?q=token+rotation&repos={name}&kind=gotcha")).body(Body::empty()).unwrap())
             .await
             .unwrap();
         let gotcha_body = body_json(gotcha_only).await;
@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn search_rejects_an_unrecognized_kind() {
         let app = test_app(manifest_path());
-        let resp = app.oneshot(Request::builder().uri("/search?q=x&kind=not-a-real-kind").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/local-search?q=x&kind=not-a-real-kind").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
@@ -454,7 +454,7 @@ mod tests {
         agentops_manifest::record_scan_at(&manifest_path, unscanned_dir.path()).unwrap();
 
         let app = test_app(manifest_path);
-        let resp = app.oneshot(Request::builder().uri("/search?q=refreshing+a+session+token").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/local-search?q=refreshing+a+session+token").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK, "an unscanned repo alongside a real one must not fail the whole search");
         let body = body_json(resp).await;
         assert!(!body["results"].as_array().unwrap().is_empty());

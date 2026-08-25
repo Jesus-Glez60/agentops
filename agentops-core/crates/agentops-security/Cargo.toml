@@ -10,7 +10,9 @@ name = "agentops_security"
 [dependencies]
 anyhow.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 regex.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 subtle.workspace = true
+axum.workspace = true
