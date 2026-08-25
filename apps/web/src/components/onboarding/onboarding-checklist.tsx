@@ -16,7 +16,7 @@ import { toast } from "sonner";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
 import type { SessionUser } from "@/lib/auth/types";
 import { getTeam, renameOrg, TEAM_SWR_KEY } from "@/lib/api/team-api";
-import { updateProfile, completeOnboarding } from "@/lib/api/profile-api";
+import { updateProfile, completeOnboarding, createApiKey } from "@/lib/api/profile-api";
 import { InviteMemberDialog } from "@/components/team/invite-member-dialog";
 import { CopyButton } from "@/components/shared/copy-button";
 import { Button } from "@/components/ui/button";
@@ -68,6 +68,12 @@ export function OnboardingChecklist({ user, origin }: { user: SessionUser; origi
   // almost always implies shared hosting), never inferred silently.
   const [connectMode, setConnectMode] = useState<"local" | "remote" | null>(null);
   const effectiveConnectMode = connectMode ?? (team && team.member_count > 1 ? "remote" : "local");
+  // Generated inline rather than sending the user to Settings -> API Keys
+  // and back -- that round trip is exactly the kind of friction this
+  // checklist is designed to avoid for a step that's already interrupting
+  // their first login.
+  const [remoteApiKey, setRemoteApiKey] = useState<string | null>(null);
+  const [generatingKey, setGeneratingKey] = useState(false);
 
   function toggle(item: string) {
     setExpanded((cur) => (cur === item ? null : item));
@@ -109,6 +115,18 @@ export function OnboardingChecklist({ user, origin }: { user: SessionUser; origi
       toast.error(err instanceof Error ? err.message : "Couldn't update your profile. Please try again.");
     } finally {
       setSavingProfile(false);
+    }
+  }
+
+  async function generateRemoteApiKey() {
+    setGeneratingKey(true);
+    try {
+      const created = await createApiKey("Coding tool");
+      setRemoteApiKey(created.key);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't generate an API key. Please try again.");
+    } finally {
+      setGeneratingKey(false);
     }
   }
 
@@ -196,14 +214,21 @@ export function OnboardingChecklist({ user, origin }: { user: SessionUser; origi
                     <CopyButton value={CONNECT_COMMAND} />
                   </div>
                 </>
+              ) : remoteApiKey === null ? (
+                <>
+                  <p className="text-body text-ink-400">Generates a personal API key so your coding tool can authenticate to this server.</p>
+                  <Button size="sm" disabled={generatingKey} onClick={generateRemoteApiKey}>
+                    {generatingKey ? "Generating…" : "Generate API key"}
+                  </Button>
+                </>
               ) : (
                 <>
                   <p className="text-body text-ink-400">
-                    Generate a personal API key from <span className="font-medium text-ink-200">Settings → API Keys</span>, then from your own machine, in your project repo, run:
+                    Copy this now — it won&apos;t be shown again. From your own machine, in your project repo, run:
                   </p>
                   <div className="flex items-center gap-2">
-                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{`${CONNECT_COMMAND} --remote ${origin}`}</code>
-                    <CopyButton value={`${CONNECT_COMMAND} --remote ${origin}`} />
+                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{`export AGENTOPS_API_KEY=${remoteApiKey} && ${CONNECT_COMMAND} --remote ${origin} --api-key ${remoteApiKey}`}</code>
+                    <CopyButton value={`export AGENTOPS_API_KEY=${remoteApiKey} && ${CONNECT_COMMAND} --remote ${origin} --api-key ${remoteApiKey}`} />
                   </div>
                 </>
               )}
