@@ -1,0 +1,1638 @@
+openapi: 3.0.3
+info:
+  title: AgentOps API
+  version: "0.1.0"
+  description: |
+    REST API for the merged `agentops-server` process — composes routes from
+    `agentops-api`, `docbrain-api` (nested under `/docbrain`), and
+    `agentops-heavy-api` (accounts/auth, team management, repository
+    connection/indexing, search, and webhooks) onto one Axum router, one
+    port.
+
+    Three auth models coexist depending on the route group:
+
+    - **Session auth** (`sessionAuth`): a Bearer token from `POST /auth/login`
+      or `POST /auth/signup`, used by the web UI and anything acting as a
+      specific user.
+    - **API key auth** (`apiKeyAuth`): a Bearer token from `agentops api-key
+      generate` / `POST /auth/api-keys`, used by CLI/MCP/service callers.
+    - **Webhook signature** (no Bearer token): `/webhooks/*` routes verify an
+      HMAC signature header instead — see each route's description.
+
+    Most `/repos/*` and `/search/*` routes accept *either* a session or an
+    API key (`sessionOrApiKey`); the tenant resolves from the session if
+    present, else from a `tenant`/`org` request field.
+  license:
+    name: MIT OR Apache-2.0
+    url: https://github.com/Jesus-Glez60/agentops/blob/main/LICENSE-MIT
+servers:
+  - url: http://127.0.0.1:8420
+    description: Default local bind address (AGENTOPS_ADDR) — change to whatever host/reverse-proxy this instance is actually deployed behind.
+
+tags:
+  - name: Health
+  - name: Auth
+    description: Signup, login, sessions, API keys, 2FA, profile, first-run infra config.
+  - name: Team
+    description: Org/role/member/invite management, repo-access matrix, audit log.
+  - name: Integrations
+    description: Per-user and org-wide third-party credential vault.
+  - name: Repositories
+    description: Connecting, verifying, and indexing repos (SSH or GitHub App).
+  - name: Search & Graph
+    description: Code-graph nodes/edges, semantic + docs search, curation.
+  - name: Tools
+    description: MCP tool-calling over REST (agentops-api's and docbrain-api's tool tables).
+  - name: Libraries
+    description: docbrain's tracked third-party libraries.
+  - name: Webhooks
+    description: GitHub App and Linear inbound webhooks (HMAC-verified, no Bearer auth).
+  - name: Linear
+    description: Session-authed Linear task sync, separate from the Linear webhook.
+
+security:
+  - {}
+
+paths:
+  # ---------------------------------------------------------------------
+  # Health
+  # ---------------------------------------------------------------------
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness check
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  # ---------------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------------
+  /auth/bootstrap-status:
+    get:
+      tags: [Auth]
+      summary: Whether this instance has any account yet, and whether signup is open
+      description: Unauthenticated — lets the frontend default to the Signup tab on a fresh instance and hide it once gated.
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  has_accounts: { type: boolean }
+                  signup_open: { type: boolean }
+
+  /bootstrap/config:
+    post:
+      tags: [Auth]
+      summary: Write first-run infra config (.env) — first-run only
+      description: |
+        Unauthenticated (there's no session yet on a brand-new instance), but
+        deliberately first-run only: 403s once any account already exists,
+        so an anonymous caller can't rewrite a running instance's secrets.
+        Writes `.env` in the server process's working directory; the caller
+        must restart the process for it to take effect (no hot-reload).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BootstrapConfig" }
+      responses:
+        "200":
+          description: Config written
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+        "400":
+          description: Validation errors
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  errors: { type: array, items: { type: string } }
+        "403":
+          description: Instance already has an account — infra config must be edited by hand from here on
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/signup:
+    post:
+      tags: [Auth]
+      summary: Create an account
+      description: |
+        Always mints a brand-new tenant for the new user. Once
+        `AGENTOPS_SIGNUP_MODE=first-user-only` (the default for self-host
+        deployments) and any account already exists, this requires a valid
+        `invite_token` — see `POST /invites/accept` for how an invited user
+        actually joins the inviting org afterward (signup alone never
+        redeems the invite).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SignupRequest" }
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "400":
+          description: Validation error, or invalid/expired invite token
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "403":
+          description: This instance requires an invite to sign up
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in with email/password
+      description: If the account has 2FA enabled, returns a 202 challenge instead of a session — complete it via `POST /auth/login/2fa`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        "200":
+          description: Logged in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "202":
+          description: 2FA required
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  two_factor_required: { type: boolean }
+                  challenge_token: { type: string }
+        "401":
+          description: Invalid email or password
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/login/2fa:
+    post:
+      tags: [Auth]
+      summary: Complete a 2FA login challenge
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [challenge_token, code]
+              properties:
+                challenge_token: { type: string }
+                code: { type: string }
+      responses:
+        "200":
+          description: Logged in
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AuthResponse" }
+        "401":
+          description: Invalid or expired challenge/code
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the presented session
+      security: [{ sessionAuth: [] }]
+      responses:
+        "204": { description: Logged out }
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Get the current user
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserView" }
+    patch:
+      tags: [Auth]
+      summary: Update profile fields
+      description: Every field optional — omitted means "leave unchanged".
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                first_name: { type: string }
+                last_name: { type: string }
+                handle: { type: string }
+                bio: { type: string }
+                location: { type: string }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserView" }
+        "400":
+          description: Validation error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/me/preferences:
+    patch:
+      tags: [Auth]
+      summary: Update display preferences
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                theme_pref: { type: string }
+                default_search_scope: { type: string }
+                show_gotcha_callouts: { type: boolean }
+                graph_layout_algorithm: { type: string }
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserView" }
+
+  /auth/me/password:
+    post:
+      tags: [Auth]
+      summary: Change password
+      description: Revokes every other session on success — the request that proved it knows the new password doesn't lock itself out.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: { type: string }
+                new_password: { type: string }
+      responses:
+        "200":
+          description: Changed
+          content:
+            application/json:
+              schema: { type: object, properties: { updated: { type: boolean } } }
+        "400":
+          description: Wrong current password
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/sessions:
+    get:
+      tags: [Auth]
+      summary: List active sessions
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/SessionView" } }
+
+  /auth/sessions/revoke-others:
+    post:
+      tags: [Auth]
+      summary: Revoke every session except the current one
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, properties: { revoked: { type: integer } } }
+
+  /auth/sessions/{id}:
+    delete:
+      tags: [Auth]
+      summary: Revoke a specific session
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema: { type: object, properties: { revoked: { type: boolean } } }
+        "404": { description: No such session }
+
+  /auth/api-keys:
+    get:
+      tags: [Auth]
+      summary: List this user's API keys
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/ApiKeyView" } }
+    post:
+      tags: [Auth]
+      summary: Create a new API key
+      description: The raw key is returned exactly once, in this response — only its prefix is ever visible again.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/ApiKeyView"
+                  - type: object
+                    properties:
+                      key: { type: string, description: "Raw key, shown once" }
+
+  /auth/api-keys/{id}:
+    delete:
+      tags: [Auth]
+      summary: Revoke an API key
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200":
+          description: Revoked
+          content:
+            application/json:
+              schema: { type: object, properties: { revoked: { type: boolean } } }
+        "404": { description: No such key }
+
+  /auth/2fa/enroll:
+    post:
+      tags: [Auth]
+      summary: Begin 2FA enrollment
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: TOTP secret + QR code
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret: { type: string }
+                  otpauth_uri: { type: string }
+                  qr_data_uri: { type: string }
+
+  /auth/2fa/confirm:
+    post:
+      tags: [Auth]
+      summary: Confirm 2FA enrollment with a code
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties: { code: { type: string } }
+      responses:
+        "200":
+          description: 2FA enabled, one-time backup codes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backup_codes: { type: array, items: { type: string } }
+        "400":
+          description: Invalid code
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /auth/2fa/disable:
+    post:
+      tags: [Auth]
+      summary: Disable 2FA
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PasswordGatedRequest" }
+      responses:
+        "200":
+          description: Disabled
+          content:
+            application/json:
+              schema: { type: object, properties: { disabled: { type: boolean } } }
+
+  /auth/2fa/backup-codes/regenerate:
+    post:
+      tags: [Auth]
+      summary: Regenerate 2FA backup codes
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PasswordGatedRequest" }
+      responses:
+        "200":
+          description: New backup codes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backup_codes: { type: array, items: { type: string } }
+
+  # ---------------------------------------------------------------------
+  # Integrations
+  # ---------------------------------------------------------------------
+  /integrations:
+    get:
+      tags: [Integrations]
+      summary: List org-wide integration credentials (metadata only, never secrets)
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/CredentialView" } }
+
+  /integrations/{provider}:
+    post:
+      tags: [Integrations]
+      summary: Store/update an org-wide credential for a provider
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [auth_type, secret]
+              properties:
+                auth_type: { type: string }
+                secret: { type: string }
+                refresh_token: { type: string }
+                expires_at: { type: string, format: date-time }
+      responses:
+        "200":
+          description: Stored
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CredentialView" }
+    delete:
+      tags: [Integrations]
+      summary: Remove an org-wide credential
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Removed }
+
+  /integrations/{provider}/oauth/start:
+    get:
+      tags: [Integrations]
+      summary: Begin an OAuth flow for a provider (not yet implemented for any provider)
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      responses:
+        "501": { description: "Not implemented — use POST /integrations/{provider} with a raw credential instead" }
+
+  /integrations/{provider}/oauth/callback:
+    get:
+      tags: [Integrations]
+      summary: OAuth callback for a provider (not yet implemented for any provider)
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      responses:
+        "501": { description: Not implemented }
+
+  /integrations/me:
+    get:
+      tags: [Integrations]
+      summary: List this user's personal integration credentials
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/CredentialView" } }
+
+  /integrations/me/{provider}:
+    post:
+      tags: [Integrations]
+      summary: Store/update a personal credential for a provider
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Stored }
+    delete:
+      tags: [Integrations]
+      summary: Remove a personal credential
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Removed }
+
+  # ---------------------------------------------------------------------
+  # Team
+  # ---------------------------------------------------------------------
+  /team:
+    get:
+      tags: [Team]
+      summary: Get org summary (name, member count, caller's role/owner status)
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: { type: string }
+                  name: { type: string }
+                  member_count: { type: integer }
+                  role: { type: string }
+                  is_owner: { type: boolean }
+
+  /team/members:
+    get:
+      tags: [Team]
+      summary: List org members
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/MemberView" } }
+
+  /team/members/{user_id}:
+    patch:
+      tags: [Team]
+      summary: Change a member's role and/or status
+      description: Demoting/removing another active admin requires being the Owner; the org can never end up with zero active admins.
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                role: { type: string }
+                status: { type: string }
+      responses:
+        "200": { description: Updated }
+        "404": { description: No such member }
+        "409": { description: Would leave the org with zero active admins }
+    delete:
+      tags: [Team]
+      summary: Remove a member
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Removed }
+        "404": { description: No such member }
+
+  /team/roles:
+    get:
+      tags: [Team]
+      summary: List the fixed role matrix, live per-role counts, and custom roles
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  roles: { type: array, items: { type: object } }
+                  matrix: { type: array, items: { type: object } }
+                  custom_roles: { type: array, items: { type: object } }
+    post:
+      tags: [Team]
+      summary: Create a custom role cloned from a fixed one
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [label, cloned_from, capabilities]
+              properties:
+                label: { type: string }
+                cloned_from: { type: string }
+                capabilities: { type: array, items: { type: string } }
+      responses:
+        "201": { description: Created }
+        "400": { description: Invalid label or unknown capability key }
+
+  /team/roles/custom/{role_key}:
+    patch:
+      tags: [Team]
+      summary: Update a custom role's capabilities
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: role_key, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [capabilities]
+              properties:
+                capabilities: { type: array, items: { type: string } }
+      responses:
+        "200": { description: Updated }
+        "404": { description: No such custom role }
+    delete:
+      tags: [Team]
+      summary: Delete a custom role
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: role_key, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Deleted }
+        "409": { description: Still held by at least one member }
+
+  /team/transfer-ownership:
+    post:
+      tags: [Team]
+      summary: Transfer org ownership to another active admin
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [to_user_id]
+              properties: { to_user_id: { type: integer } }
+      responses:
+        "200": { description: Transferred }
+        "400": { description: Target must be an active admin }
+        "403": { description: Only the current Owner can do this }
+
+  /team/delete-organization:
+    post:
+      tags: [Team]
+      summary: Owner-only, irreversible cascade delete of the organization
+      description: Deletes every repo connection, credential, docbrain data, and team row for the tenant except the audit log.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm_tenant]
+              properties:
+                confirm_tenant: { type: string, description: Must exactly match the caller's own tenant — type-to-confirm safety check. }
+      responses:
+        "200": { description: Deleted; response includes the caller's new (freshly-minted) tenant }
+        "403": { description: Only the Owner can do this }
+
+  /team/invites:
+    get:
+      tags: [Team]
+      summary: List pending invites
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/InviteView" } }
+    post:
+      tags: [Team]
+      summary: Create an invite
+      description: No email is sent — the response includes the raw token so the caller can build a copyable `/invite/{token}` link.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, role]
+              properties:
+                email: { type: string, format: email }
+                role: { type: string }
+                note: { type: string }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/InviteView"
+                  - type: object
+                    properties:
+                      token: { type: string }
+
+  /team/invites/{id}/resend:
+    post:
+      tags: [Team]
+      summary: Resend an invite (returns the same or a refreshed token)
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: OK }
+        "404": { description: No such pending invite }
+
+  /team/invites/{id}:
+    delete:
+      tags: [Team]
+      summary: Revoke a pending invite
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses:
+        "200": { description: Revoked }
+        "404": { description: No such pending invite }
+
+  /team/repo-access:
+    get:
+      tags: [Team]
+      summary: Get the per-member, per-repo access matrix
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repos: { type: array, items: { type: object } }
+                  members: { type: array, items: { type: object } }
+                  access: { type: array, items: { type: object } }
+    put:
+      tags: [Team]
+      summary: Save repo-access overrides
+      description: Only member/viewer rows are override-editable; a diff for an admin or billing row is silently ignored.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [changes]
+              properties:
+                changes:
+                  type: array
+                  items:
+                    type: object
+                    required: [user_id, repo_id, allowed]
+                    properties:
+                      user_id: { type: integer }
+                      repo_id: { type: string }
+                      allowed: { type: boolean }
+      responses:
+        "200": { description: Saved }
+
+  /team/audit-log:
+    get:
+      tags: [Team]
+      summary: List org audit log entries
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: since, in: query, schema: { type: string, format: date-time } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { type: object } }
+
+  /invites/accept:
+    post:
+      tags: [Team]
+      summary: Accept an invite and switch the caller's active tenant
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties: { token: { type: string } }
+      responses:
+        "200":
+          description: Joined
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: { type: string }
+                  role: { type: string }
+        "400": { description: Invalid or expired invite }
+
+  /invites/{token}:
+    get:
+      tags: [Team]
+      summary: Preview an invite before signing in
+      description: Public — the token itself is the secret. Used by the unauthenticated invite landing page.
+      security: []
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tenant: { type: string }
+                  org_name: { type: string }
+                  email: { type: string }
+                  role: { type: string }
+        "404": { description: Invalid or expired invite }
+
+  # ---------------------------------------------------------------------
+  # Repositories
+  # ---------------------------------------------------------------------
+  /repos/connect:
+    post:
+      tags: [Repositories]
+      summary: Connect a repo via SSH deploy key
+      description: Generates a keypair and returns the public half — add it as a read-only Deploy Key on the repo, then verify.
+      security: [{ sessionOrApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo_id, repo_url]
+              properties:
+                tenant: { type: string, description: Required on the API-key path; ignored on the session path (derived from the session). }
+                repo_id: { type: string }
+                repo_url: { type: string }
+      responses:
+        "201":
+          description: Connection created (pending verification)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  connection: { $ref: "#/components/schemas/ConnectionView" }
+                  instructions: { type: string }
+        "409": { description: Already connected }
+
+  /repos:
+    get:
+      tags: [Repositories]
+      summary: List connected repos
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/ConnectionView" } }
+
+  /repos/{id}/verify:
+    post:
+      tags: [Repositories]
+      summary: Verify a repo connection (attempts a real fetch)
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: "Active, or marked Failed with a reason" }
+
+  /repos/{id}/index:
+    post:
+      tags: [Repositories]
+      summary: Start (or queue) indexing for a connected repo
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "202": { description: Indexing started }
+
+  /repos/{id}/index/status:
+    get:
+      tags: [Repositories]
+      summary: Poll indexing job status
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Job status }
+
+  /repos/{id}/index/retry:
+    post:
+      tags: [Repositories]
+      summary: Retry a failed indexing job
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "202": { description: Retry started }
+
+  /repos/{id}/regenerate-key:
+    post:
+      tags: [Repositories]
+      summary: Regenerate the SSH deploy keypair for a connection
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: New keypair; status reset to pending }
+
+  /repos/github-app/install-url:
+    get:
+      tags: [Repositories]
+      summary: Get the GitHub App installation URL
+      security: [{ sessionOrApiKey: [] }]
+      responses:
+        "200": { description: OK }
+        "501": { description: No GitHub App configured for this deployment }
+
+  /repos/github-app/callback:
+    get:
+      tags: [Repositories]
+      summary: GitHub App installation OAuth callback
+      security: []
+      responses:
+        "302": { description: Redirects back into the app }
+
+  /repos/github-app/installations/{id}/repos:
+    get:
+      tags: [Repositories]
+      summary: List repos available under a GitHub App installation
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /repos/github-app/installations/{id}/connect:
+    post:
+      tags: [Repositories]
+      summary: Connect a repo from a GitHub App installation (no SSH key needed)
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                repo_full_name: { type: string }
+      responses:
+        "201": { description: Connected }
+
+  # ---------------------------------------------------------------------
+  # Search & Graph
+  # ---------------------------------------------------------------------
+  /search/index:
+    post:
+      tags: [Search & Graph]
+      summary: Embed and index a scanned repo's graph for semantic search
+      description: Requires Qdrant to be configured (AGENTOPS_QDRANT_URL) — 503s otherwise.
+      security: [{ sessionOrApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties: { path: { type: string } }
+      responses:
+        "200":
+          description: Indexed
+          content:
+            application/json:
+              schema: { type: object, properties: { indexed: { type: integer } } }
+        "503": { description: Search not configured for this deployment }
+
+  /search:
+    get:
+      tags: [Search & Graph]
+      summary: Semantic search over an indexed repo
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: path, in: query, required: true, schema: { type: string } }
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: top_k, in: query, schema: { type: integer, default: 5 } }
+      responses:
+        "200":
+          description: Results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        score: { type: number }
+                        kind: { type: string }
+                        name: { type: string }
+                        path: { type: string }
+                        text: { type: string }
+        "503": { description: Search not configured for this deployment }
+
+  /docs/search/index:
+    post:
+      tags: [Search & Graph]
+      summary: Embed and index docbrain doc content for a library slug
+      security: [{ sessionOrApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [slug]
+              properties:
+                slug: { type: string }
+                org: { type: string, description: Which tenant's docbrain store to read from. }
+      responses:
+        "200":
+          description: Indexed
+          content:
+            application/json:
+              schema: { type: object, properties: { indexed: { type: integer } } }
+        "503": { description: Search not configured for this deployment }
+
+  /docs/search:
+    get:
+      tags: [Search & Graph]
+      summary: Semantic search scoped to docbrain doc content
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: slug, in: query, required: true, schema: { type: string } }
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: top_k, in: query, schema: { type: integer, default: 5 } }
+      responses:
+        "200":
+          description: Results
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        score: { type: number }
+                        slug: { type: string }
+                        topic: { type: string }
+                        version: { type: string }
+                        text: { type: string }
+        "503": { description: Search not configured for this deployment }
+
+  /consolidate/model:
+    post:
+      tags: [Search & Graph]
+      summary: Locally consolidate/fine-tune a small model on a repo's curated notes
+      security: [{ sessionOrApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [path]
+              properties: { path: { type: string } }
+      responses:
+        "200":
+          description: Consolidation result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  attempted: { type: boolean }
+                  promoted: { type: boolean }
+                  examples_used: { type: integer }
+                  candidate_score: { type: number }
+                  baseline_score: { type: number }
+
+  /nodes:
+    get:
+      tags: [Search & Graph]
+      summary: List graph nodes
+      security: [{ apiKeyAuth: [] }]
+      responses:
+        "200": { description: OK, content: { application/json: { schema: { type: array, items: { type: object } } } } }
+
+  /scans:
+    get:
+      tags: [Search & Graph]
+      summary: List scanned repos (same data as `agentops repos`)
+      security: [{ apiKeyAuth: [] }]
+      responses:
+        "200": { description: OK }
+
+  /repos/{name}/rescan:
+    post:
+      tags: [Search & Graph]
+      summary: Re-scan a repo by name
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Rescanned }
+
+  /repos/{name}/nodes/{id}:
+    get:
+      tags: [Search & Graph]
+      summary: Get a graph node's detail
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { description: No such node }
+
+  /repos/{name}/nodes/{id}/curation:
+    post:
+      tags: [Search & Graph]
+      summary: Set a Gotcha/Decision node's curation state (bucket, reason, prominence)
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200": { description: Updated }
+
+  /repos/{name}/nodes/{id}/graph:
+    get:
+      tags: [Search & Graph]
+      summary: Get a node's local subgraph (neighbors within N hops)
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /repos/{name}/graph:
+    get:
+      tags: [Search & Graph]
+      summary: Get the whole-repo graph view
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /repos/{name}/edges/{id}/reinforce:
+    post:
+      tags: [Search & Graph]
+      summary: Reinforce a Hebbian References edge (recency/co-access weighting)
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Reinforced }
+
+  /repos/{name}/docs:
+    get:
+      tags: [Search & Graph]
+      summary: Get generated documentation for a repo
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /activity:
+    get:
+      tags: [Search & Graph]
+      summary: Recent scan/note/curation activity across repos
+      security: [{ apiKeyAuth: [] }]
+      responses:
+        "200": { description: OK }
+
+  /local-search:
+    get:
+      tags: [Search & Graph]
+      summary: Hybrid (dense + lexical + graph-expanded) local search
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: q, in: query, required: true, schema: { type: string } }
+        - { name: path, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /gotchas:
+    get:
+      tags: [Search & Graph]
+      summary: List Gotcha nodes across repos, for the curation dashboard
+      security: [{ apiKeyAuth: [] }]
+      responses:
+        "200": { description: OK }
+
+  # ---------------------------------------------------------------------
+  # Tools (MCP-over-REST)
+  # ---------------------------------------------------------------------
+  /tools:
+    get:
+      tags: [Tools]
+      summary: List agentops-api's MCP-style tool table
+      security: [{ apiKeyAuth: [] }]
+      responses:
+        "200": { description: OK }
+
+  /tools/{name}:
+    post:
+      tags: [Tools]
+      summary: Call a tool by name (agentops-api's table)
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, description: "Tool-specific arguments — see GET /tools for each tool's input schema." }
+      responses:
+        "200": { description: Tool result }
+
+  /docbrain/tools:
+    get:
+      tags: [Tools]
+      summary: List docbrain-api's MCP-style tool table
+      security: [{ apiKeyAuth: [] }]
+      responses:
+        "200": { description: OK }
+
+  /docbrain/tools/{name}:
+    post:
+      tags: [Tools]
+      summary: Call a docbrain tool by name (e.g. register_library, scrape_library, search_docs)
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object, description: "Tool-specific arguments — see GET /docbrain/tools for each tool's input schema." }
+      responses:
+        "200": { description: Tool result }
+
+  # ---------------------------------------------------------------------
+  # Libraries (docbrain)
+  # ---------------------------------------------------------------------
+  /docbrain/libraries:
+    get:
+      tags: [Libraries]
+      summary: List libraries with real ingested (scraped) content
+      description: Registered-but-never-scraped libraries (e.g. auto-discovered from a manifest) are filtered out here — use the `list_libraries` MCP tool for the full registry.
+      security: [{ apiKeyAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  libraries: { type: array, items: { $ref: "#/components/schemas/LibraryView" } }
+
+  /docbrain/libraries/{slug}:
+    get:
+      tags: [Libraries]
+      summary: Get a library's detail, including where it's used
+      security: [{ apiKeyAuth: [] }]
+      parameters:
+        - { name: slug, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  library: { $ref: "#/components/schemas/LibraryView" }
+                  used_in: { type: array, items: { type: object } }
+        "404": { description: No such library }
+
+  # ---------------------------------------------------------------------
+  # Webhooks
+  # ---------------------------------------------------------------------
+  /webhooks/github:
+    post:
+      tags: [Webhooks]
+      summary: GitHub App webhook receiver
+      description: No Bearer auth — verified via the `X-Hub-Signature-256` HMAC header instead. 501s if no GitHub App is configured for this deployment.
+      security: []
+      responses:
+        "200": { description: Processed }
+        "401": { description: Invalid signature }
+        "501": { description: No GitHub App configured }
+
+  /webhooks/linear:
+    post:
+      tags: [Webhooks]
+      summary: Linear webhook receiver
+      description: No Bearer auth — HMAC-signature verified instead.
+      security: []
+      responses:
+        "200": { description: Processed }
+        "401": { description: Invalid signature }
+
+  /linear/auto-kickoff:
+    get:
+      tags: [Linear]
+      summary: List Linear auto-kickoff enrollments
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200": { description: OK }
+    post:
+      tags: [Linear]
+      summary: Enroll a Linear team in auto-kickoff (auto-creating an agentops task per new Linear issue)
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200": { description: Enrolled }
+        "503": { description: Linear webhook not configured for this deployment }
+
+  /linear/auto-kickoff/{team_id}:
+    delete:
+      tags: [Linear]
+      summary: Disable auto-kickoff for a Linear team
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: team_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Disabled }
+
+  /linear/tasks/{task_id}/push-status:
+    post:
+      tags: [Linear]
+      summary: Push an agentops task's status to its linked Linear issue
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: task_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Pushed }
+
+  /linear/tasks/{task_id}/summarize:
+    post:
+      tags: [Linear]
+      summary: Post an LLM-generated summary of a task's activity to its Linear issue
+      security: [{ sessionAuth: [] }]
+      parameters:
+        - { name: task_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Posted }
+
+components:
+  securitySchemes:
+    sessionAuth:
+      type: http
+      scheme: bearer
+      description: Session token from POST /auth/login or POST /auth/signup.
+    apiKeyAuth:
+      type: http
+      scheme: bearer
+      description: API key from `agentops api-key generate` or POST /auth/api-keys.
+    sessionOrApiKey:
+      type: http
+      scheme: bearer
+      description: Either a session token or an API key — tenant resolves from the session if present, else from a request field.
+
+  schemas:
+    ErrorResponse:
+      type: object
+      properties:
+        error: { type: string }
+
+    BootstrapConfig:
+      type: object
+      required: [secrets_master_key]
+      properties:
+        secrets_master_key: { type: string, description: "64 hex chars (32 bytes) — generate with `openssl rand -hex 32`." }
+        database_url: { type: string, description: "postgres:// connection string for the code-graph store; omit for SQLite." }
+        addr: { type: string, example: "0.0.0.0:8420" }
+        access_mode: { type: string, enum: [advisor, full] }
+        signup_mode: { type: string, enum: [open, first-user-only] }
+        anthropic_api_key: { type: string }
+        linear_api_key: { type: string }
+        github_app_id: { type: string }
+        github_app_private_key: { type: string }
+        github_webhook_secret: { type: string }
+        qdrant_url: { type: string }
+
+    SignupRequest:
+      type: object
+      required: [email, password, first_name, last_name]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+        first_name: { type: string }
+        last_name: { type: string }
+        invite_token: { type: string, description: "Proves this signup is invite-driven; required once AGENTOPS_SIGNUP_MODE=first-user-only and an account already exists. Does not itself join the inviting org — see POST /invites/accept." }
+
+    UserView:
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string }
+        first_name: { type: string }
+        last_name: { type: string }
+        tenant: { type: string }
+        avatar_url: { type: string, nullable: true }
+        handle: { type: string, nullable: true }
+        bio: { type: string }
+        location: { type: string }
+        theme_pref: { type: string }
+        default_search_scope: { type: string }
+        show_gotcha_callouts: { type: boolean }
+        graph_layout_algorithm: { type: string }
+        two_factor_enabled: { type: boolean }
+
+    AuthResponse:
+      type: object
+      properties:
+        user: { $ref: "#/components/schemas/UserView" }
+        session_token: { type: string }
+
+    SessionView:
+      type: object
+      properties:
+        id: { type: integer }
+        user_agent: { type: string }
+        ip_address: { type: string }
+        created_at: { type: string, format: date-time }
+        last_seen_at: { type: string, format: date-time }
+        is_current: { type: boolean }
+
+    ApiKeyView:
+      type: object
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        key_prefix: { type: string }
+        last_used_at: { type: string, format: date-time, nullable: true }
+        created_at: { type: string, format: date-time }
+
+    PasswordGatedRequest:
+      type: object
+      required: [password]
+      properties:
+        password: { type: string }
+
+    CredentialView:
+      type: object
+      properties:
+        provider: { type: string }
+        auth_type: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    MemberView:
+      type: object
+      properties:
+        user_id: { type: integer }
+        email: { type: string }
+        first_name: { type: string }
+        last_name: { type: string }
+        avatar_url: { type: string, nullable: true }
+        role: { type: string }
+        status: { type: string }
+        joined_at: { type: string, format: date-time }
+        is_you: { type: boolean }
+
+    InviteView:
+      type: object
+      properties:
+        id: { type: integer }
+        email: { type: string }
+        role: { type: string }
+        note: { type: string, nullable: true }
+        status: { type: string }
+        created_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
+
+    ConnectionView:
+      type: object
+      description: The only shape a repo connection is ever serialized as — no encrypted-key field exists on this type.
+      properties:
+        id: { type: string }
+        tenant: { type: string }
+        repo_url: { type: string }
+        method: { type: string, enum: [ssh, github_app] }
+        public_key_openssh: { type: string, nullable: true }
+        status: { type: string, description: "\"pending\", \"active\", or \"failed: <reason>\"." }
+        created_at: { type: string, format: date-time }
+
+    LibraryView:
+      type: object
+      properties:
+        id: { type: integer }
+        slug: { type: string }
+        name: { type: string }
+        description: { type: string, nullable: true }
+        github_repo: { type: string, nullable: true }
+        docs_url: { type: string, nullable: true }
+        versions: { type: array, items: { type: string } }
+        doc_snapshots: { type: integer }
+        changelog_versions: { type: integer }
+        total_nodes: { type: integer }
+        last_indexed_at: { type: string, format: date-time, nullable: true }
+        used_in_count: { type: integer }

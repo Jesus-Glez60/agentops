@@ -28,7 +28,7 @@ use std::path::PathBuf;
 
 use agentops_mcp::AccessMode;
 use axum::Router;
-use docbrain_graph::SqliteDocbrainStore;
+use docbrain_graph::{DocbrainStore, SqliteDocbrainStore};
 
 /// Reads every env var this merged server needs, builds the composed
 /// `Router`, binds `AGENTOPS_ADDR` (default `127.0.0.1:8420`), and serves
@@ -47,6 +47,22 @@ pub async fn run() -> anyhow::Result<()> {
 
     let docbrain_db_path = docbrain_mcp::default_db_path();
     let docbrain_store = SqliteDocbrainStore::open(&docbrain_db_path)?;
+    // Registers agentops itself as a known docbrain library on every boot,
+    // so `docbrain list_libraries`/`get_library slug=agentops` work with no
+    // manual registration step -- `add_library` is an upsert-by-slug (see
+    // `docbrain-graph`'s `add_library_is_idempotent_by_slug` test), so this
+    // is safe to call unconditionally rather than needing an existence
+    // check first. This only registers metadata; it deliberately does NOT
+    // trigger a `scrape_library` (that's a separate, explicit step a user
+    // or their agent runs once — same onboarding as any other library —
+    // rather than unconditional network egress on every server start).
+    docbrain_store.add_library(
+        "agentops",
+        "AgentOps",
+        Some("Scans your repos into a knowledge graph, layers hybrid semantic search and curated gotchas/decisions on top, and exposes all of it to AI coding agents over MCP."),
+        Some("https://github.com/Jesus-Glez60/agentops"),
+        Some("https://github.com/Jesus-Glez60/agentops#readme"),
+    )?;
     // Nested under /docbrain (not merged at the top level) since its
     // /tools/{name} would otherwise collide with agentops-api's — see this
     // module's doc comment.

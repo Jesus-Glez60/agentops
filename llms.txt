@@ -1,0 +1,33 @@
+# AgentOps
+
+> Turns a codebase into a knowledge graph AI coding agents can query — scanning, hybrid search, curated gotchas/decisions, and 35 MCP tools, all self-hosted as a single open-core product (one Rust server, one Next.js frontend, no price gate).
+
+AgentOps scans a repo into a persistent graph of files/symbols/dependencies, layers hybrid dense+lexical search on top, and adds a curated Gotchas/Decisions notes system for tribal knowledge. All of it is exposed to AI coding agents over MCP (35 tools across three servers) and to humans via a REST API and web UI. `docbrain`, a bundled subsystem, does the same scan-and-search treatment for third-party library documentation — including AgentOps's own docs, registered as a library automatically on first boot.
+
+Self-hosting needs exactly one required value (`AGENTOPS_SECRETS_MASTER_KEY`) and supports Docker, a classic binary install, PM2, or Kubernetes.
+
+## Docs
+
+- [README](README.md): features, quick start for all four deployment methods, CLI reference, architecture overview.
+- [OpenAPI spec](docs/openapi.yaml): full REST API reference, ~90 routes across auth, team, repos, search, graph, docbrain, and webhooks.
+- [Rendered API docs](docs/index.html): browsable version of the OpenAPI spec.
+- [llms-full.txt](llms-full.txt): the full plain-text content of this project's docs in one file, for loading complete context in a single request.
+- [repo-map.md](repo-map.md): a generated architecture/centrality map of the codebase, produced by AgentOps scanning itself.
+
+## Deployment
+
+- [Dockerfile](Dockerfile) / [docker-compose.yml](docker-compose.yml): single-image Docker deployment.
+- [install.sh](install.sh): classic terminal installer — downloads binaries, hands off to `agentops init`.
+- [ecosystem.config.js](ecosystem.config.js): PM2 deployment (server + web UI as two managed processes).
+- [deploy/k8s/](deploy/k8s/): raw Kubernetes manifests (Deployment, Service, Ingress, PVC, optional Postgres StatefulSet).
+- [.env.example](.env.example): every configuration variable, with the one required value called out.
+
+## CLI
+
+- `agentops install|status|repos|forget|docgen|changelog|note|ingest-notes|search|explain|watch` — scan a repo into the graph and work with it.
+- `agentops serve|serve-api|docbrain-serve` — run the stdio MCP server, the REST API server, or the docbrain MCP server.
+- `agentops sync-docs|api-key|task|init` — dependency doc auto-registration, API key generation, native task management, first-run setup wizard.
+
+## Optional
+
+- [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE): dual-licensed, MIT OR Apache-2.0.

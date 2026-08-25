@@ -1,0 +1,93 @@
+# AgentOps
+
+> Turns a codebase into a knowledge graph AI coding agents can query — scanning, hybrid search, curated gotchas/decisions, and 35 MCP tools, all self-hosted as a single open-core product (one Rust server, one Next.js frontend, no price gate).
+
+This file concatenates AgentOps's full documentation in one place so an agent can load complete context in a single fetch. See [llms.txt](llms.txt) for the linked, unexpanded index.
+
+---
+
+## README
+
+AgentOps scans a repository into a persistent knowledge graph — files, symbols, dependencies, and how they relate — instead of leaving an AI coding agent to re-derive context from scratch every session. On top of that graph it layers hybrid search (dense embeddings + lexical/BM25 + exact-name matching, personalized-PageRank graph expansion), a curated Gotchas/Decisions notes system for the tribal knowledge that never makes it into code comments, and CLS-inspired local consolidation that can fine-tune a small model on a repo's own curated notes.
+
+All of it is exposed to AI coding agents (Claude Code, Cursor, and anything else that speaks MCP) via 35 MCP tools across three servers, plus a REST API and a web UI for humans — team management, a repo connection wizard, an interactive graph viewer, and a library/docs tracker (docbrain) that does the same scan-and-search treatment for your dependencies' documentation.
+
+It's a single open-core product: one Rust server process, one Next.js frontend, no price gate, minimal required config (one env var to self-host).
+
+### Features
+
+- Knowledge graph & search — AST-aware scanning (Python, JS/TS, Go, Rust, C++, C#), dependency graph, hybrid semantic + lexical search, interactive graph viewer.
+- Gotchas & decisions — a curation workflow for the "why," not just the "what," matched to the symbols they're about and surfaced to agents automatically.
+- MCP tools for AI agents — 35 tools across three MCP servers (repo scanning/notes/search, semantic search/consolidation, library docs/changelogs).
+- Library & docs tracking (docbrain) — registers your dependencies, scrapes their docs, and makes them searchable the same way your own code is.
+- Team management — org/roles/invites/audit log, self-hosted, no external identity provider required.
+- Local model consolidation — fine-tunes a small model on a repo's own curated notes, entirely locally.
+
+### Quick start
+
+Four ways to self-host. Every method needs exactly one required value: AGENTOPS_SECRETS_MASTER_KEY (generate with `openssl rand -hex 32`).
+
+**Docker (recommended)**: `cp .env.example .env` (fill in the master key), then `docker compose up`. Single image, both the API (:8420) and the web UI (:3000). Add `--profile postgres` for a bundled Postgres code-graph store; SQLite is the default.
+
+**Classic (binary + terminal wizard)**: `curl -fsSL https://raw.githubusercontent.com/Jesus-Glez60/agentops/main/install.sh | sh` then `agentops init`. Downloads the platform binary and web build, walks through setup, starts both processes.
+
+**PM2**: `cargo build --release --bin agentops-server`, `(cd apps/web && npm ci && npm run build)`, `pm2 start ecosystem.config.js`. Visit `/setup` on first run to configure infra without touching `.env` by hand.
+
+**Kubernetes**: raw manifests (Deployment/Service/Ingress/PVC, optional Postgres StatefulSet) at deploy/k8s/ — copy secret.yaml.example to secret.yaml and fill in the master key first.
+
+Whichever method, the first visitor to `/login` sets up the org (they become Owner automatically); every deployment defaults to invite-only signup after that.
+
+### CLI reference
+
+- `install` — Scan a repo into the graph and generate AGENTS.md.
+- `status` — Show what's currently scanned for a repo.
+- `repos` — List every repo `agentops install` has ever run against on this machine.
+- `forget` — Remove a repo from the manifest (graph data untouched).
+- `docgen` — Generate an onboarding/engineering doc (repo-map.md) from a scanned repo.
+- `changelog` — What changed in a repo's code/notes across scans.
+- `note` — Add a gotcha/decision/knowledge note, symbol-matched into the graph.
+- `ingest-notes` — Recursively ingest a notes folder into a repo's graph.
+- `search` — Dense-vector search over embedded symbols/gotchas/decisions/notes.
+- `explain` — Generate an LLM explanation of a symbol and record it as a Definition node.
+- `watch` — Watch a repo and auto-rescan on file changes.
+- `serve` — Run the stdio MCP server.
+- `serve-api` — Run the merged REST API server.
+- `docbrain-serve` — Run the docbrain stdio MCP server (library docs/changelogs).
+- `sync-docs` — Scan a repo's dependencies and auto-register any docbrain doesn't know about.
+- `api-key` — Generate a new API key for the REST API's optional auth.
+- `task` — Manage native tasks (create/list/update-status/activity/summarize/sync-linear).
+- `init` — Interactive first-run setup wizard for a classic terminal deployment.
+
+### Architecture
+
+One Rust workspace (agentops-core/crates/*, docbrain-core/crates/*) building a merged REST/MCP server (agentops-server) plus a stdio MCP binary (agentops-mcp-server) and a CLI (agentops), and one Next.js frontend (apps/web). repo-map.md is a generated architecture map, produced by AgentOps scanning its own codebase.
+
+AgentOps registers itself as a docbrain library on first boot — run the `scrape_library` MCP tool (or CLI) with `slug: agentops` once, then `search_docs`/`get_docs` work against AgentOps's own docs the same way they would for any dependency.
+
+### License
+
+Dual-licensed under MIT or Apache 2.0, at your option.
+
+---
+
+## REST API summary
+
+Full detail in docs/openapi.yaml / docs/index.html. The merged server (agentops-server, default bind 127.0.0.1:8420) exposes ~90 route/method combinations across 8 groups:
+
+- **Auth & sessions** (session token, mostly public for signup/login): POST /auth/signup, POST /auth/login, POST /auth/login/2fa, GET /auth/bootstrap-status, GET/PATCH /auth/me, GET /auth/sessions, POST /auth/sessions/revoke-others, DELETE /auth/sessions/{id}, GET/POST /auth/api-keys, DELETE /auth/api-keys/{id}, POST /auth/2fa/enroll|confirm|disable, POST /auth/2fa/backup-codes/regenerate, POST /auth/logout, POST /bootstrap/config (infra config, first-run only).
+- **Team management** (session): GET /team, GET /team/members, GET/POST /team/roles, PATCH/DELETE /team/roles/custom/{key}, PATCH/DELETE /team/members/{id}, POST /team/transfer-ownership, POST /team/delete-organization, GET/POST /team/invites, POST /team/invites/{id}/resend, DELETE /team/invites/{id}, GET/PUT /team/repo-access, GET /team/audit-log, POST /invites/accept, GET /invites/{token} (public preview).
+- **Integrations** (session): GET /integrations, POST/DELETE /integrations/{provider}, GET /integrations/{provider}/oauth/start|callback, GET /integrations/me, POST/DELETE /integrations/me/{provider}.
+- **Repositories & indexing** (session-or-api-key): POST /repos/connect, GET /repos, POST /repos/{id}/verify, POST /repos/{id}/index, GET /repos/{id}/index/status, POST /repos/{id}/index/retry, POST /repos/{id}/regenerate-key, GET /repos/github-app/install-url|callback|installations/{id}/repos, POST /repos/github-app/installations/{id}/connect.
+- **Search & graph** (api-key, or session-or-api-key): GET /local-search, POST /search/index, GET /search, POST /docs/search/index, GET /docs/search, GET /nodes, GET /scans, POST /repos/{name}/rescan, GET /repos/{name}/nodes/{id}, POST /repos/{name}/nodes/{id}/curation, GET /repos/{name}/nodes/{id}/graph, GET /repos/{name}/graph, POST /repos/{name}/edges/{id}/reinforce, GET /repos/{name}/docs, GET /activity, GET /gotchas.
+- **Tools (MCP-over-REST)** (api-key): GET /tools, POST /tools/{name} (agentops-api); GET /docbrain/tools, POST /docbrain/tools/{name} (docbrain-api).
+- **Libraries (docbrain)** (api-key): GET /docbrain/libraries, GET /docbrain/libraries/{slug}.
+- **Webhooks** (HMAC-signature verified, no Bearer auth): POST /webhooks/github, POST /webhooks/linear. Linear task sync (session): GET/POST /linear/auto-kickoff, DELETE /linear/auto-kickoff/{team_id}, POST /linear/tasks/{task_id}/push-status|summarize.
+- **Health**: GET /health (no auth).
+
+## MCP tools summary
+
+35 tools across three MCP servers (stdio, run via `agentops serve` / `agentops docbrain-serve`, or the merged `agentops-mcp-server` binary):
+
+- **agentops-mcp** (18 tools): status, list_gotchas, get_symbol, list_scans, scan_repo, add_note, ingest_notes, explain_symbol, related_context, get_session, end_session, create_task, list_tasks, update_task_status, get_task_activity, init_agents_md, generate_docs, local_semantic_search.
+- **agentops-heavy-mcp** (5 tools): semantic_search, semantic_index, search_docs_indexed, index_docs_indexed, consolidate_model.
+- **docbrain-mcp** (12 tools): list_libraries, get_library, discover_library, register_library, scrape_library, sync_changelogs, get_docs, search_docs, get_code_examples, get_changelog, list_changelog, get_job_status.
