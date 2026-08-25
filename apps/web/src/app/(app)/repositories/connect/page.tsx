@@ -3,7 +3,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { toast } from "sonner";
-import { ArrowLeft, Cloud, GitBranch, Key, ShieldCheck } from "lucide-react";
+import { ArrowLeft, Cloud, FolderSearch, GitBranch, Key, ShieldCheck } from "lucide-react";
 import { getGithubAppInstallUrl } from "@/lib/api/repos-api";
 import { StepIndicator } from "@/components/repositories/connect-wizard/step-indicator";
 import { Button } from "@/components/ui/button";
@@ -116,6 +116,18 @@ export default function ChooseConnectionMethodPage() {
           {selected === "github-app" ? (continuing ? "Redirecting…" : "Continue with GitHub App") : "Continue with SSH deploy key"}
         </Button>
       </div>
+
+      {/* Deliberately not a third card above -- that's a select-then-Continue
+          radio group keyed to two actions ("install app" / "generate key"),
+          neither of which fits a local-only repo. This goes straight to its
+          own page instead. */}
+      <Link href="/repositories/connect/local" className="mt-8 flex items-start gap-3 rounded-md border border-border-strong px-4 py-3.5 text-section hover:border-ink-500">
+        <FolderSearch className="mt-0.5 size-4 shrink-0 text-ink-400" />
+        <div>
+          <p className="font-medium text-ink-200">Have a repo on your own machine?</p>
+          <p className="text-ink-400">Point us at a local folder and we&apos;ll tell you the right command to run — including repos that aren&apos;t pushed anywhere.</p>
+        </div>
+      </Link>
     </div>
   );
 }

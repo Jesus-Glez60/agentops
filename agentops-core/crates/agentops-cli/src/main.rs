@@ -821,6 +821,19 @@ struct RepoConnectionSummary {
 /// needs no manual picking; falls back to an interactive list when there's
 /// no match (a fresh clone under a different remote URL, a repo connected
 /// via GitHub App rather than SSH, etc.).
+/// `None` covers both "not a git repo" and "no `origin` remote configured"
+/// -- indistinguishable from here, and both mean the same thing to the
+/// caller (nothing to auto-match against).
+fn git_remote_url(path: &Path) -> Option<String> {
+    std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+}
+
 fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool) -> Result<String> {
     let mut response = ureq::get(format!("{server_url}/repos"))
         .header("Authorization", &format!("Bearer {api_key}"))
@@ -844,13 +857,7 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
         anyhow::bail!("no repos are connected to your organization yet — connect one from the web app first (Repositories -> Connect a repository), then run this again");
     }
 
-    let git_remote = std::process::Command::new("git")
-        .args(["remote", "get-url", "origin"])
-        .current_dir(path)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let git_remote = git_remote_url(path);
 
     if let Some(remote) = &git_remote {
         if let Some(matched) = connections.iter().find(|c| &c.repo_url == remote) {
@@ -863,7 +870,33 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
         anyhow::bail!("couldn't auto-match this checkout's git remote to a connected repo, and --yes was set — run again without --yes to pick one interactively");
     }
 
-    println!("Couldn't auto-match this checkout's git remote to a connected repo.");
+    // "No remote at all" and "remote present but unmatched" are different
+    // situations needing different advice -- a repo with no remote is
+    // never going to auto-match no matter which directory you're in
+    // (that's the local-only case the web app's own /repositories/connect/local
+    // page gives the same advice for), while an unmatched remote often
+    // just means the command was run from the wrong directory, which the
+    // "check a different path" prompt below can actually fix.
+    match &git_remote {
+        None => println!("This checkout has no git remote at all. If it's meant to stay local-only, run `agentops install`/`agentops connect` (without --remote) instead — otherwise pick the right connected repo below, or point at a different local path."),
+        Some(remote) => println!("This checkout's git remote ({remote}) doesn't match any of your connected repos."),
+    }
+
+    if dialoguer::Confirm::new().with_prompt("Check a different local path instead?").default(false).interact()? {
+        let path_str: String = dialoguer::Input::new().with_prompt("Path to check").interact_text()?;
+        let other_path = Path::new(&path_str);
+        match git_remote_url(other_path) {
+            Some(remote) => match connections.iter().find(|c| c.repo_url == remote) {
+                Some(matched) => {
+                    println!("Matched {}'s git remote ({remote}) to the connected repo {:?}.", other_path.display(), matched.id);
+                    return Ok(matched.id.clone());
+                }
+                None => println!("That path's remote ({remote}) doesn't match any connected repo either."),
+            },
+            None => println!("No git remote found at that path either."),
+        }
+    }
+
     let labels: Vec<String> = connections.iter().map(|c| format!("{} ({})", c.repo_url, c.id)).collect();
     let selected = dialoguer::Select::new().with_prompt("Which connected repo is this?").items(&labels).interact()?;
     Ok(connections[selected].id.clone())

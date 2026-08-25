@@ -23,7 +23,22 @@ export default function SelectGithubAppReposPage() {
   useEffect(() => {
     if (!installationId) return;
     getInstallationRepos(installationId)
-      .then((res) => setRepos(res.repositories))
+      .then((res) => {
+        setRepos(res.repositories);
+        // Set by `/repositories/connect/local` before redirecting into
+        // GitHub's OAuth install flow -- a URL query param wouldn't survive
+        // that external round-trip without new backend plumbing to forward
+        // it through the callback, but sessionStorage does (same tab, same
+        // origin). Read once and clear, so it doesn't linger for an
+        // unrelated future visit to this page.
+        const target = sessionStorage.getItem("agentops:local-connect:target-repo");
+        if (target) {
+          sessionStorage.removeItem("agentops:local-connect:target-repo");
+          if (res.repositories.some((r) => r.full_name === target)) {
+            setSelected(new Set([target]));
+          }
+        }
+      })
       .catch((err) => setLoadError(err instanceof Error ? err.message : "Couldn't load repositories for this installation."));
   }, [installationId]);
 

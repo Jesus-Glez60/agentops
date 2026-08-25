@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { toast } from "sonner";
 import { ArrowLeft, Clock, Copy, Check, ShieldCheck } from "lucide-react";
@@ -18,7 +18,11 @@ function repoIdFromUrl(url: string): string {
 
 export default function SshDeployKeyPage() {
   const router = useRouter();
-  const [repoUrl, setRepoUrl] = useState("");
+  // `?repo_url=` -- set by `/repositories/connect/local` when it detects a
+  // remote on a locally-picked folder that isn't connected yet, so the user
+  // doesn't have to retype a URL the app already found for them.
+  const searchParams = useSearchParams();
+  const [repoUrl, setRepoUrl] = useState(() => searchParams.get("repo_url") ?? "");
   const [connecting, setConnecting] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [result, setResult] = useState<ConnectRepoResponse | null>(null);
