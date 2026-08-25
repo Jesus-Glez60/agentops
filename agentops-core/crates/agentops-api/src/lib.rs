@@ -115,13 +115,28 @@ async fn list_tools_handler(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "tools": agentops_mcp::list_tools(state.mode) }))
 }
 
+/// `spawn_blocking` -- required, not just a performance nicety.
+/// `agentops-graph-pg`'s own doc comment documents that `GraphStore` calls
+/// (which most `agentops_mcp` tools make via `open_store`) `block_on` an
+/// internally-owned Tokio runtime when `AGENTOPS_DATABASE_URL` is set, and
+/// that an async caller "must never call from inside an already-running
+/// Tokio runtime directly (nested `block_on` panics)". This handler is
+/// exactly that async caller. Confirmed live: calling this route
+/// unwrapped against a real Postgres-backed deployment panics the worker
+/// thread with "Cannot start a runtime from within a runtime" and drops
+/// the connection with an empty reply, no error body at all -- caught
+/// testing the new `/mcp` route (`agentops-heavy-api::mcp_http`) against
+/// `thedamnserver`, which surfaced that this pre-existing route had the
+/// identical bug, just never exercised against Postgres before.
 async fn call_tool_handler(State(state): State<AppState>, AxumPath(name): AxumPath<String>, body: Option<Json<Value>>) -> (StatusCode, Json<Value>) {
     let empty = json!({});
     let args = body.map(|Json(v)| v).unwrap_or(empty);
 
-    match agentops_mcp::call_tool(state.mode, &name, &args) {
-        Ok(result) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())),
-        Err(refusal) => (StatusCode::NOT_FOUND, Json(json!({ "error": refusal }))),
+    let result = tokio::task::spawn_blocking(move || agentops_mcp::call_tool(state.mode, &name, &args)).await;
+    match result {
+        Ok(Ok(result)) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())),
+        Ok(Err(refusal)) => (StatusCode::NOT_FOUND, Json(json!({ "error": refusal }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("tool call panicked: {e}") }))),
     }
 }
 

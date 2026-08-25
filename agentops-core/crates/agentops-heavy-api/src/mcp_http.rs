@@ -96,9 +96,18 @@ async fn handle_tools_call(state: &AppState, caller: &McpCaller, id: Value, para
         }
     }
 
-    let result = match agentops_mcp::call_tool(state.mode, name, &arguments) {
-        Ok(result) => serde_json::to_value(result).unwrap(),
-        Err(refusal) => json!({ "content": [{ "type": "text", "text": refusal }], "isError": true }),
+    // `spawn_blocking` -- required, not just a performance nicety. See
+    // this module's doc comment note on `agentops_mcp::call_tool`; a real
+    // panic ("Cannot start a runtime from within a runtime") caught live
+    // against a Postgres-backed deployment is what surfaced this, here and
+    // in `agentops-api`'s pre-existing `/tools/{name}` route.
+    let mode = state.mode;
+    let name = name.to_string();
+    let call_result = tokio::task::spawn_blocking(move || agentops_mcp::call_tool(mode, &name, &arguments)).await;
+    let result = match call_result {
+        Ok(Ok(result)) => serde_json::to_value(result).unwrap(),
+        Ok(Err(refusal)) => json!({ "content": [{ "type": "text", "text": refusal }], "isError": true }),
+        Err(e) => json!({ "content": [{ "type": "text", "text": format!("tool call panicked: {e}") }], "isError": true }),
     };
     ok(id, result)
 }
