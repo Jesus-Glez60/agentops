@@ -85,7 +85,7 @@ impl AppState {
 /// without ever needing to canonicalize a not-yet-existing path up front
 /// (whose fallback behavior -- the raw path string -- is exactly the
 /// raw-path-vs-canonicalized-name mismatch a prior live-tested bug hit).
-fn checkout_path(repo_checkouts_dir: &std::path::Path, tenant: &str, connection_id: &str) -> PathBuf {
+pub(crate) fn checkout_path(repo_checkouts_dir: &std::path::Path, tenant: &str, connection_id: &str) -> PathBuf {
     repo_checkouts_dir.join(tenant).join(connection_id)
 }
 

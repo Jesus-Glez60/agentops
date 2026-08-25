@@ -47,6 +47,7 @@ mod accounts_integrations;
 mod github_app_routes;
 mod indexing;
 mod linear_webhook;
+mod mcp_http;
 mod team;
 pub use accounts_integrations::build_accounts_integrations_router;
 pub use linear_webhook::{AutoKickoffTeamConfig, SeenDeliveries};
@@ -94,6 +95,15 @@ pub struct AppState {
     /// `github_app_slug` for the install-url endpoint (a deployment without
     /// these env vars still boots normally, GitHub App just isn't usable).
     github_app_config: Option<github_app_routes::GitHubAppConfig>,
+    /// Access mode for `/mcp`'s `agentops_mcp` tool table (Advisor/Full) --
+    /// read from `AGENTOPS_ACCESS_MODE`, same env var and default
+    /// (Advisor) `agentops-api`/`agentops-mcp-server` already use. Not
+    /// threaded through this crate's public `build_router*` constructor
+    /// signatures (already at the `too_many_arguments` limit) -- read
+    /// directly in `build_router_with_tools_flag`, matching `build_full_
+    /// router`'s own established pattern of reading its env vars itself
+    /// rather than requiring every caller to pass them through.
+    mode: agentops_mcp::AccessMode,
 }
 
 pub fn build_router(
@@ -151,6 +161,10 @@ fn build_router_with_tools_flag(
     github_app_config: Option<github_app_routes::GitHubAppConfig>,
     include_tools: bool,
 ) -> Router {
+    let mode = match std::env::var("AGENTOPS_ACCESS_MODE").as_deref() {
+        Ok("full") => agentops_mcp::AccessMode::Full,
+        _ => agentops_mcp::AccessMode::Advisor,
+    };
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         secrets,
@@ -163,6 +177,7 @@ fn build_router_with_tools_flag(
         indexing: Arc::new(Mutex::new(indexing)),
         repo_checkouts_dir,
         github_app_config,
+        mode,
     };
     let mut router = Router::new()
         .route("/repos/connect", post(connect_repo))
@@ -184,10 +199,19 @@ fn build_router_with_tools_flag(
     if include_tools {
         router = router.route("/tools", get(heavy_tools_list_handler)).route("/tools/{name}", post(heavy_tools_call_handler));
     }
-    router
-        .layer(middleware::from_fn_with_state(state.clone(), require_api_key_or_session))
-        .with_state(state)
-        .layer(CorsLayer::permissive())
+    let router = router.layer(middleware::from_fn_with_state(state.clone(), require_api_key_or_session)).with_state(state.clone());
+
+    // `/mcp` deliberately isn't part of the router above -- it needs its
+    // own auth layer (`require_mcp_auth`, session or per-user API key
+    // only, never the instance-wide key -- see that fn's doc comment), not
+    // the blanket `require_api_key_or_session` every other route here
+    // gets. Building and merging it separately, each already
+    // `.with_state(...)`'d before the merge, avoids double-layering (both
+    // auth checks running on every `/mcp` request) that a single shared
+    // `.layer()` call over everything would cause.
+    let mcp_router = Router::new().route("/mcp", post(mcp_http::mcp_handler)).layer(middleware::from_fn_with_state(state.clone(), require_mcp_auth)).with_state(state);
+
+    router.merge(mcp_router).layer(CorsLayer::permissive())
 }
 
 /// Standalone `/health` — split out of [`build_router`] so a merged
@@ -198,22 +222,39 @@ fn health_router() -> Router {
     Router::new().route("/health", get(health)).layer(CorsLayer::permissive())
 }
 
-/// Session-first, API-key-fallback: if `accounts` is configured and the
-/// bearer token verifies as a live session, a `User` extension is
-/// inserted and the request proceeds on the **session path** (handlers
-/// below branch on `Option<Extension<User>>`'s presence to pick tenant
-/// derivation and capability gating). Otherwise falls through to the
-/// original API-key check unchanged -- byte-for-byte the same behavior
-/// this router always had when `accounts` is `None` (the deployment truly
-/// has no session concept, e.g. a bare `agentops-heavy-api` invocation not
-/// wired to `run()`'s full stack) or when the bearer token simply isn't a
-/// valid session token (a real API key, or garbage either way ends up
+/// Session-first, then a per-user API key, then instance-wide-key
+/// fallback: if `accounts` is configured and the bearer token verifies as
+/// a live session, a `User` extension is inserted and the request
+/// proceeds on the **session path** (handlers below branch on
+/// `Option<Extension<User>>`'s presence to pick tenant derivation and
+/// capability gating). A personal API key (`POST /auth/api-keys`, the same
+/// ones `agentops connect --remote` uses) is checked next and, if valid,
+/// behaves identically to a session -- same tenant derivation, same
+/// capability checks, nothing extra granted -- rather than falling all the
+/// way through to the unscoped instance-wide key. Otherwise falls through
+/// to the original API-key check unchanged -- byte-for-byte the same
+/// behavior this router always had when `accounts` is `None` (the
+/// deployment truly has no session concept, e.g. a bare
+/// `agentops-heavy-api` invocation not wired to `run()`'s full stack) or
+/// when the bearer token simply isn't a valid session token or personal
+/// key (a real instance-wide key, or garbage either way ends up
 /// re-checked against `verify_api_key` exactly as before).
 async fn require_api_key_or_session(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     if let Some(accounts) = &state.accounts {
         if let Some(token) = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) {
             let verified = { accounts.lock().unwrap().verify_session(token) };
             if let Ok(user) = verified {
+                req.extensions_mut().insert(user);
+                return next.run(req).await;
+            }
+            // Scoped block so the `MutexGuard` (not `Send`) never crosses
+            // the `.await` below -- same reasoning as `require_mcp_auth`'s
+            // doc comment.
+            let key_user = {
+                let accounts = accounts.lock().unwrap();
+                accounts.verify_user_api_key(token).ok().flatten().and_then(|(user_id, _tenant)| accounts.get_user_by_id(user_id).ok().flatten())
+            };
+            if let Some(user) = key_user {
                 req.extensions_mut().insert(user);
                 return next.run(req).await;
             }
@@ -227,6 +268,63 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
         Ok(()) => next.run(req).await,
         Err((status, body)) => (status, body).into_response(),
     }
+}
+
+/// The caller's resolved tenant for a `/mcp` request -- deliberately just
+/// this one field, not the full `User` `require_api_key_or_session` inserts
+/// for every other route in this crate. `/mcp`'s handlers only ever need a
+/// tenant to scope `ConnectionStore` lookups; keeping this separate from
+/// `User` also keeps a personal API key's reach scoped to exactly this
+/// route rather than silently working against every other
+/// `require_api_key_or_session`-gated route (repo connect, GitHub App
+/// installs, etc.) -- a personal key minted for "connect my coding tool"
+/// shouldn't double as a general account/repo-management credential.
+#[derive(Clone)]
+pub(crate) struct McpCaller {
+    pub(crate) tenant: String,
+}
+
+/// Session-first, then a per-user API key -- **not** the instance-wide
+/// `AGENTOPS_API_KEY_HASH` (unlike `require_api_key_or_session` above).
+/// That key carries no tenant, and `/mcp`'s whole safety property rests on
+/// resolving a tool call's `path` against the caller's own tenant's
+/// connections -- there's no safe fallback for a caller with no tenant at
+/// all short of trusting a client-supplied literal path, which is exactly
+/// what this route exists to avoid for a network-reachable endpoint (see
+/// `mcp_http`'s module doc comment).
+async fn require_mcp_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    let Some(token) = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) else {
+        return unauthorized();
+    };
+    // Resolved in a plain sync fn, never a `MutexGuard` anywhere in this
+    // `async fn`'s own body -- `std::sync::MutexGuard` isn't `Send`, and
+    // `middleware::from_fn_with_state` requires the whole future this
+    // function produces to be `Send`. The guard here is always dropped
+    // before any `.await` regardless (both branches return early), but
+    // rustc's async state-machine transform doesn't reliably prove that on
+    // its own; moving the lookup out of the `async fn` sidesteps the
+    // question entirely instead of fighting the borrow checker over it.
+    let Some(caller) = resolve_mcp_caller(&state, token) else {
+        return unauthorized();
+    };
+    req.extensions_mut().insert(caller);
+    next.run(req).await
+}
+
+fn resolve_mcp_caller(state: &AppState, token: &str) -> Option<McpCaller> {
+    let accounts = state.accounts.as_ref()?;
+    let accounts = accounts.lock().unwrap();
+    if let Ok(user) = accounts.verify_session(token) {
+        return Some(McpCaller { tenant: user.tenant });
+    }
+    if let Ok(Some((_user_id, tenant))) = accounts.verify_user_api_key(token) {
+        return Some(McpCaller { tenant });
+    }
+    None
+}
+
+fn unauthorized() -> Response {
+    (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid credentials" }))).into_response()
 }
 
 /// Session path: server-derived tenant from the verified `User`, ignoring
@@ -1157,6 +1255,32 @@ mod tests {
 
     /// Regression test for a real bug caught via live testing: a brand-new
     /// signup who has never touched `/team/*` has no membership row yet,
+    /// A personal API key (`create_user_api_key`, the ones `agentops
+    /// connect --remote` uses) must behave exactly like that same user's
+    /// session on `/repos*` -- this is what lets the CLI's remote flow
+    /// call `GET /repos` to auto-match a connection without ever needing
+    /// a session cookie, while still being properly tenant-scoped rather
+    /// than falling through to the unscoped instance-wide key.
+    #[tokio::test]
+    async fn a_personal_api_key_behaves_like_that_users_session_on_repos() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&accounts, "dev@example.com");
+        let (_, raw_key) = accounts.create_user_api_key(user.id, "Laptop").unwrap();
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "widgets").unwrap();
+            store.create_ssh_connection(&user.tenant, "widgets", "git@github.com:acme/widgets.git", &keypair).unwrap();
+        }
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
+
+        let resp = app.oneshot(Request::builder().uri("/repos").header("authorization", format!("Bearer {raw_key}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["connections"].as_array().unwrap().len(), 1, "no ?tenant= query param needed -- resolved from the key, like a session");
+        assert_eq!(body["connections"][0]["repo_url"], "git@github.com:acme/widgets.git");
+    }
+
     /// so `has_capability` (correctly, in isolation) fails closed --
     /// without `require_session_capability` also running
     /// `teams.ensure_membership` first, such a user was universally 403'd
@@ -1697,5 +1821,120 @@ mod tests {
 
     fn urlencoding_path(s: &str) -> String {
         s.replace('/', "%2F")
+    }
+
+    fn mcp_request(method: &str, params: Value, id: i64) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_a_request_with_no_credentials() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+        let resp = app.oneshot(mcp_request("initialize", json!({}), 1)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mcp_rejects_the_instance_wide_api_key_since_it_carries_no_tenant() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, Some(agentops_security::api_key::hash_api_key("instance-key")), None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+        let mut req = mcp_request("initialize", json!({}), 1);
+        req.headers_mut().insert("authorization", "Bearer instance-key".parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "the instance-wide key has no tenant, so it must not grant /mcp access");
+    }
+
+    #[tokio::test]
+    async fn mcp_initialize_and_tools_list_work_with_a_valid_session() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (_, token) = signup(&accounts, "dev@example.com");
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("initialize", json!({}), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["serverInfo"]["name"], "agentops-heavy-api");
+
+        let mut req = mcp_request("tools/list", json!({}), 2);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        let names: Vec<&str> = body["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"status"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_accepts_a_per_user_api_key_and_a_notification_gets_202_with_no_body() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&accounts, "dev@example.com");
+        let (_, raw_key) = accounts.create_user_api_key(user.id, "Laptop").unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("tools/list", json!({}), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {raw_key}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A notification (no `id`) gets 202 + empty body, not a JSON-RPC
+        // response -- there's nothing to reply to.
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {raw_key}"))
+            .body(Body::from(json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }).to_string()))
+            .unwrap();
+        req.headers_mut().insert("authorization", format!("Bearer {raw_key}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_resolves_path_to_the_callers_own_connection_and_rejects_someone_elses() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "own-repo").unwrap();
+            store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/own.git", &keypair).unwrap();
+        }
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), "other-tenant", "their-repo").unwrap();
+            store.create_ssh_connection("other-tenant", "their-repo", "git@github.com:other/other.git", &keypair).unwrap();
+        }
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        // A connection belonging to a different tenant must be refused,
+        // never treated as a literal filesystem path.
+        let mut req = mcp_request("tools/call", json!({ "name": "status", "arguments": { "path": "their-repo" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], true);
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("not a repo connection"), "{body:?}");
+
+        // The caller's own connection resolves past the tenant check --
+        // `status` on a never-scanned repo succeeds gracefully ("no scans
+        // recorded yet"), it doesn't error, so this is the right signal
+        // that resolution reached the tool at all rather than being
+        // refused at the tenant-ownership check.
+        let mut req = mcp_request("tools/call", json!({ "name": "status", "arguments": { "path": "own-repo" } }), 2);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no scans recorded yet"), "{body:?}");
     }
 }

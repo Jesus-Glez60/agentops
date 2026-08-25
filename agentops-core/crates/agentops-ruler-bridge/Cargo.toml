@@ -11,6 +11,7 @@ name = "agentops_ruler_bridge"
 anyhow.workspace = true
 tokio.workspace = true
 include_dir = "0.7"
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -57,6 +57,7 @@ Whichever method, the first visitor to `/login` sets up the org (they become Own
 - `api-key` — Generate a new API key for the REST API's optional auth.
 - `task` — Manage native tasks (create/list/update-status/activity/summarize/sync-linear).
 - `init` — Interactive first-run setup wizard for a classic terminal deployment.
+- `connect` — Connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, or any other Ruler-supported agent): registers agentops's MCP server (`.mcp.json`, `.cursor/mcp.json`, `config.toml`, `settings.json` depending on the tool) and distributes AGENTS.md/skills, via Ruler. Re-runnable to add another tool later.
 
 ### Architecture
 

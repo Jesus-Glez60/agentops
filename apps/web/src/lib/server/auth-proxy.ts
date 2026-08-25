@@ -31,7 +31,7 @@ export async function proxyCredentialsAuth(req: NextRequest, backendPath: "/auth
       return NextResponse.json(data, { status: 202 });
     }
     const response = NextResponse.json({ user: data.user }, { status: successStatus });
-    setSessionCookie(response, data.session_token);
+    setSessionCookie(response, data.session_token, req);
     return response;
   } catch (err) {
     if (err instanceof HeavyApiError) {
@@ -51,7 +51,7 @@ export async function proxyLogin2fa(req: NextRequest): Promise<NextResponse> {
   try {
     const data = await heavyApiFetch<AuthResponse>("/auth/login/2fa", { method: "POST", body: JSON.stringify(body) });
     const response = NextResponse.json({ user: data.user }, { status: 200 });
-    setSessionCookie(response, data.session_token);
+    setSessionCookie(response, data.session_token, req);
     return response;
   } catch (err) {
     if (err instanceof HeavyApiError) {

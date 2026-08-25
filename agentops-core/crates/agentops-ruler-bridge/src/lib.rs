@@ -128,6 +128,51 @@ pub fn preflight_check_npx() -> Result<()> {
     }
 }
 
+/// Confirms `agentops-mcp-server` is on `PATH` before writing `.ruler/mcp.json`
+/// that references it — otherwise every agent Ruler fans that config out to
+/// (Claude Code's `.mcp.json`, Cursor's `.cursor/mcp.json`, etc.) ends up
+/// pointing at a command that doesn't exist, failing silently until someone
+/// actually tries to use an agentops tool from inside their coding agent.
+/// Ships alongside `agentops`/`agentops-server` via `install.sh`/cargo-dist
+/// on a classic install, or `cargo build --release --bin agentops-mcp-server`
+/// from a source checkout — this just confirms one of those actually happened.
+pub fn preflight_check_mcp_server_binary() -> Result<()> {
+    let status = Command::new("agentops-mcp-server").arg("--help").output();
+    match status {
+        Ok(_) => Ok(()),
+        Err(_) => bail!(
+            "agentops-mcp-server not found on PATH — it ships alongside the `agentops` binary \
+             (via install.sh, or `cargo build --release --bin agentops-mcp-server` from a source checkout). \
+             Install it and re-run, or skip MCP registration and just distribute instructions with --no-ruler."
+        ),
+    }
+}
+
+/// Writes `.ruler/mcp.json` registering `agentops-mcp-server` (the merged
+/// stdio server — all 35 tools across agentops-mcp/agentops-heavy-mcp/
+/// docbrain-mcp, not the narrower 18-tool `agentops serve`) so Ruler's own
+/// MCP-propagation feature fans it out to each target agent's native format
+/// (`.mcp.json` for Claude Code, `.cursor/mcp.json` for Cursor, `config.toml`
+/// for Codex CLI, `settings.json` for Gemini CLI — verified against each
+/// vendor's own docs, not assumed). Overwrites on every call, same as
+/// `build_ruler_dir`'s other generated files — this isn't a hand-editable
+/// file in the way `ruler.toml` is.
+pub fn write_mcp_config(target_repo: &Path, access_mode: &str) -> Result<()> {
+    let ruler_dir = ruler_dir_path(target_repo);
+    std::fs::create_dir_all(&ruler_dir)?;
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "agentops": {
+                "command": "agentops-mcp-server",
+                "env": { "AGENTOPS_ACCESS_MODE": access_mode }
+            }
+        }
+    });
+    std::fs::write(ruler_dir.join("mcp.json"), serde_json::to_string_pretty(&config)?)?;
+    Ok(())
+}
+
 /// Invokes the pinned Ruler version's `apply` command against `target_repo`'s
 /// `.ruler/` directory. Returns combined stdout+stderr for the caller to print.
 pub fn apply(target_repo: &Path, agent_ids: &[&str], dry_run: bool) -> Result<String> {
@@ -199,6 +244,17 @@ mod tests {
         // missing-skills bug.
         assert!(dir.path().join(".ruler/skills").is_dir());
         assert_eq!(std::fs::read_dir(dir.path().join(".ruler/skills")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn write_mcp_config_registers_agentops_mcp_server_with_the_requested_access_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mcp_config(dir.path(), "full").unwrap();
+
+        let raw = std::fs::read_to_string(dir.path().join(".ruler/mcp.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["mcpServers"]["agentops"]["command"], "agentops-mcp-server");
+        assert_eq!(parsed["mcpServers"]["agentops"]["env"]["AGENTOPS_ACCESS_MODE"], "full");
     }
 
     #[test]

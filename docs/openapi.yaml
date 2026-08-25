@@ -326,6 +326,19 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
 
+  /auth/me/complete-onboarding:
+    post:
+      tags: [Auth]
+      summary: Mark the /welcome onboarding checklist done
+      description: Idempotent — safe to call more than once (e.g. re-clicking "Continue to dashboard").
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/UserView" }
+
   /auth/sessions:
     get:
       tags: [Auth]
@@ -619,6 +632,28 @@ paths:
                   member_count: { type: integer }
                   role: { type: string }
                   is_owner: { type: boolean }
+    patch:
+      tags: [Team]
+      summary: Rename the organization
+      description: Owner-only — used by the /welcome onboarding checklist's workspace-setup item.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string }
+      responses:
+        "200":
+          description: Renamed
+          content:
+            application/json:
+              schema: { type: object, properties: { name: { type: string } } }
+        "400": { description: Name is required }
+        "403": { description: Only the Owner can do this }
 
   /team/members:
     get:
@@ -1374,6 +1409,32 @@ paths:
       responses:
         "200": { description: Tool result }
 
+  /mcp:
+    post:
+      tags: [Tools]
+      summary: Remote MCP transport (Streamable HTTP, stateless mode) for a server-hosted instance
+      description: |
+        The network-reachable counterpart to the stdio `agentops-mcp-server` binary — what `agentops connect --remote <server-url>` points a team member's coding tool at instead of a local stdio server. Speaks plain MCP JSON-RPC 2.0 (`initialize`, `tools/list`, `tools/call`) over a single endpoint, one JSON response per POST (no SSE upgrade — this server has no server-initiated push). Only exposes `agentops-mcp`'s tool set (scan/notes/local search) — each tool takes its own `path` argument, which here must name a connected repo (its `RepoConnection` id or `repo_url`, from `GET /repos`) belonging to the caller's tenant, never a literal filesystem path. A JSON-RPC *notification* (no `id`) gets `202 Accepted` with no body.
+      security: [{ sessionOrPersonalApiKey: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [jsonrpc, method]
+              properties:
+                jsonrpc: { type: string, enum: ["2.0"] }
+                id: { description: "Omit for a notification (gets 202, no response body)." }
+                method: { type: string, enum: [initialize, tools/list, tools/call] }
+                params:
+                  type: object
+                  description: "For tools/call: { name: string, arguments: { path: <repo connection id or URL>, ... } }"
+      responses:
+        "200": { description: "JSON-RPC response (result or error)" }
+        "202": { description: "Notification accepted, no body" }
+        "401": { description: "Missing/invalid session or personal API key — the instance-wide key is not accepted here" }
+
   # ---------------------------------------------------------------------
   # Libraries (docbrain)
   # ---------------------------------------------------------------------
@@ -1495,6 +1556,10 @@ components:
       type: http
       scheme: bearer
       description: Either a session token or an API key — tenant resolves from the session if present, else from a request field.
+    sessionOrPersonalApiKey:
+      type: http
+      scheme: bearer
+      description: A session token or a personal API key (POST /auth/api-keys, the ones `agentops connect --remote` uses) — tenant always resolves from the credential itself. Deliberately does *not* accept the instance-wide key from AGENTOPS_API_KEY_HASH, which carries no tenant.
 
   schemas:
     ErrorResponse:
@@ -1545,6 +1610,7 @@ components:
         show_gotcha_callouts: { type: boolean }
         graph_layout_algorithm: { type: string }
         two_factor_enabled: { type: boolean }
+        onboarding_completed: { type: boolean }
 
     AuthResponse:
       type: object

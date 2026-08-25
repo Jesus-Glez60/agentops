@@ -32,6 +32,11 @@ export function getTeam(): Promise<TeamInfo> {
   return heavyFetch<TeamInfo>(TEAM_SWR_KEY);
 }
 
+/** Owner-only -- naming the org, used by the `/welcome` onboarding checklist's workspace-setup item. */
+export function renameOrg(name: string): Promise<{ name: string }> {
+  return heavyFetch<{ name: string }>("/team", { method: "PATCH", body: JSON.stringify({ name }) });
+}
+
 export const TEAM_MEMBERS_SWR_KEY = "/team/members";
 
 export type MemberRole = "admin" | "member" | "viewer" | "billing";

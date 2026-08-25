@@ -59,6 +59,20 @@ Raw manifests (Deployment/Service/Ingress/PVC, optional Postgres StatefulSet) at
 
 Whichever method, the first visitor to `/login` sets up the org (they become Owner automatically); every deployment defaults to invite-only signup after that.
 
+### Connect your coding tool
+
+Separately from the server deployment above — this runs on your own machine, against your own repo:
+
+```sh
+cd your-project
+agentops install    # scan the repo into the graph, generate AGENTS.md
+agentops connect    # register agentops's MCP server + distribute AGENTS.md/skills to Claude Code, Cursor, Codex CLI, Gemini CLI, or others
+```
+
+`agentops connect` is re-runnable any time you want to add another tool. It uses [Ruler](https://github.com/intellectronica/ruler) under the hood, so it also supports every agent Ruler does (Copilot, Windsurf, Aider, Zed, and more) via `--agents <id>` even if not offered in the interactive prompt.
+
+**Connecting to a shared server instead of a local one**: if your team runs agentops on a shared server rather than everyone self-hosting solo, run `agentops connect --remote <server-url>` instead — it points your coding tool at that instance's MCP endpoint (authenticated with a personal API key from Settings → API Keys) rather than scanning a fresh local copy, since the repo is already indexed server-side. If you omit `--remote` and run the command interactively, it asks which case you're in before doing anything.
+
 ## CLI reference
 
 `agentops --help` for full flag detail — one line each here:
@@ -83,6 +97,7 @@ Whichever method, the first visitor to `/login` sets up the org (they become Own
 | `api-key` | Generate a new API key for the REST API's optional auth. |
 | `task` | Manage native tasks (create/list/update-status/activity/summarize/sync-linear). |
 | `init` | Interactive first-run setup wizard for a classic terminal deployment. |
+| `connect` | Connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, ...) — registers agentops's MCP server and distributes AGENTS.md/skills. |
 
 ## Architecture
 

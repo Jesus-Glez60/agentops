@@ -27,6 +27,7 @@ Self-hosting needs exactly one required value (`AGENTOPS_SECRETS_MASTER_KEY`) an
 - `agentops install|status|repos|forget|docgen|changelog|note|ingest-notes|search|explain|watch` — scan a repo into the graph and work with it.
 - `agentops serve|serve-api|docbrain-serve` — run the stdio MCP server, the REST API server, or the docbrain MCP server.
 - `agentops sync-docs|api-key|task|init` — dependency doc auto-registration, API key generation, native task management, first-run setup wizard.
+- `agentops connect [--remote <server-url>]` — connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, or any other Ruler-supported agent) by registering agentops's MCP server and distributing AGENTS.md/skills. Without `--remote`, registers a local stdio server against a locally-scanned repo (solo self-host). With `--remote`, points at a server-hosted instance's `/mcp` endpoint instead (authenticated with a personal API key), for team members connecting to a shared deployment.
 
 ## Optional
 

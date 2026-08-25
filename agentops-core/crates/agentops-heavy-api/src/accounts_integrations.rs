@@ -56,6 +56,7 @@ pub fn build_accounts_integrations_router(accounts: AccountStore, credentials: C
         .route("/auth/me", get(me).patch(update_me))
         .route("/auth/me/preferences", patch(update_me_preferences))
         .route("/auth/me/password", post(update_me_password))
+        .route("/auth/me/complete-onboarding", post(complete_onboarding))
         .route("/auth/sessions", get(list_sessions))
         .route("/auth/sessions/revoke-others", post(revoke_other_sessions))
         .route("/auth/sessions/{id}", axum::routing::delete(revoke_session_by_id))
@@ -162,6 +163,7 @@ struct UserView {
     show_gotcha_callouts: bool,
     graph_layout_algorithm: String,
     two_factor_enabled: bool,
+    onboarding_completed: bool,
 }
 
 /// Not a plain `From<User>` -- 2FA status lives in a separate table
@@ -172,6 +174,7 @@ struct UserView {
 /// panicking a response over a display field if it ever were.
 fn user_view(accounts: &AccountStore, u: User) -> UserView {
     let two_factor_enabled = accounts.has_2fa_enabled(u.id).unwrap_or(false);
+    let onboarding_completed = u.onboarding_completed_at.is_some();
     UserView {
         id: u.id,
         email: u.email,
@@ -187,6 +190,7 @@ fn user_view(accounts: &AccountStore, u: User) -> UserView {
         show_gotcha_callouts: u.show_gotcha_callouts,
         graph_layout_algorithm: u.graph_layout_algorithm,
         two_factor_enabled,
+        onboarding_completed,
     }
 }
 
@@ -378,6 +382,18 @@ struct UpdateMePreferencesRequest {
     default_search_scope: Option<String>,
     show_gotcha_callouts: Option<bool>,
     graph_layout_algorithm: Option<String>,
+}
+
+/// Marks the `/welcome` checklist done -- idempotent, callable from any
+/// item's own completion or the persistent "Continue to dashboard" button,
+/// per that page's "never block the escape hatch" design (see the
+/// onboarding plan's UX research section).
+async fn complete_onboarding(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>) -> (StatusCode, Json<serde_json::Value>) {
+    let accounts = state.accounts.lock().unwrap();
+    match accounts.mark_onboarding_complete(user.id) {
+        Ok(updated) => (StatusCode::OK, Json(serde_json::to_value(user_view(&accounts, updated)).unwrap())),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
 }
 
 async fn update_me_preferences(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<UpdateMePreferencesRequest>) -> (StatusCode, Json<serde_json::Value>) {
@@ -1502,6 +1518,21 @@ mod tests {
         let body = body_json(response).await;
         assert_eq!(body["show_gotcha_callouts"], false);
         assert_eq!(body["theme_pref"], "dark", "fields not sent in the PATCH must be untouched");
+    }
+
+    #[tokio::test]
+    async fn post_auth_me_complete_onboarding_flips_the_flag() {
+        let app = test_router();
+        let signup_response =
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
+        let signup_body = body_json(signup_response).await;
+        assert_eq!(signup_body["user"]["onboarding_completed"], false, "not complete right after signup");
+        let token = signup_body["session_token"].as_str().unwrap().to_string();
+
+        let response = app.oneshot(HttpRequest::post("/auth/me/complete-onboarding").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["onboarding_completed"], true);
     }
 
     #[tokio::test]

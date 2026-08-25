@@ -34,6 +34,13 @@ dialoguer.workspace = true
 # so this stays scoped to the one binary that needs it rather than becoming
 # a workspace-wide dependency.
 dotenvy = "0.15"
+# For `agentops connect --remote` -- same blocking client + version already
+# used by agentops-github-app/agentops-llm/agentops-linear, not a new
+# choice for this workspace.
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+ureq = { version = "3", features = ["json"] }
 
 # (`docgen` command goes through agentops-mcp::generate_docs, no direct
 # agentops-docgen dep needed here.)

@@ -49,6 +49,11 @@ pub struct User {
     pub default_search_scope: String,
     pub show_gotcha_callouts: bool,
     pub graph_layout_algorithm: String,
+    /// `None` until the user reaches `/welcome` and clicks through the
+    /// onboarding checklist's "Continue to dashboard" (see
+    /// `mark_onboarding_complete`) -- gates `(app)/layout.tsx`'s redirect,
+    /// not a plan/feature flag.
+    pub onboarding_completed_at: Option<String>,
 }
 
 /// Fields a user can edit about themselves on the Account tab -- `None`
@@ -134,7 +139,8 @@ const SCHEMA: &str = "
         theme_pref              TEXT NOT NULL DEFAULT 'dark',
         default_search_scope    TEXT NOT NULL DEFAULT 'all',
         show_gotcha_callouts    INTEGER NOT NULL DEFAULT 1,
-        graph_layout_algorithm  TEXT NOT NULL DEFAULT 'force'
+        graph_layout_algorithm  TEXT NOT NULL DEFAULT 'force',
+        onboarding_completed_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant);
     CREATE TABLE IF NOT EXISTS sessions (
@@ -190,9 +196,10 @@ const SESSION_LIFETIME_DAYS: i64 = 30;
 /// Column list shared by every query that constructs a full `User` — kept
 /// as one constant so `user_from_row`'s fixed positional `row.get(N)`
 /// calls can never drift out of sync with what was actually selected.
-const USER_COLUMNS: &str = "id, email, first_name, last_name, tenant, created_at, avatar_url, bio, location, handle, theme_pref, default_search_scope, show_gotcha_callouts, graph_layout_algorithm";
+const USER_COLUMNS: &str =
+    "id, email, first_name, last_name, tenant, created_at, avatar_url, bio, location, handle, theme_pref, default_search_scope, show_gotcha_callouts, graph_layout_algorithm, onboarding_completed_at";
 /// Same columns, `u.`-prefixed for the `sessions JOIN users` query.
-const USER_COLUMNS_JOINED: &str = "u.id, u.email, u.first_name, u.last_name, u.tenant, u.created_at, u.avatar_url, u.bio, u.location, u.handle, u.theme_pref, u.default_search_scope, u.show_gotcha_callouts, u.graph_layout_algorithm";
+const USER_COLUMNS_JOINED: &str = "u.id, u.email, u.first_name, u.last_name, u.tenant, u.created_at, u.avatar_url, u.bio, u.location, u.handle, u.theme_pref, u.default_search_scope, u.show_gotcha_callouts, u.graph_layout_algorithm, u.onboarding_completed_at";
 
 fn user_from_row(row: &rusqlite::Row) -> rusqlite::Result<User> {
     Ok(User {
@@ -210,6 +217,7 @@ fn user_from_row(row: &rusqlite::Row) -> rusqlite::Result<User> {
         default_search_scope: row.get(11)?,
         show_gotcha_callouts: row.get::<_, i64>(12)? != 0,
         graph_layout_algorithm: row.get(13)?,
+        onboarding_completed_at: row.get(14)?,
     })
 }
 
@@ -281,7 +289,7 @@ impl AccountStore {
     pub fn verify_credentials(&self, email: &str, password: &str) -> Result<User> {
         let row: Option<(User, String)> = self
             .conn
-            .query_row(&format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"), [email], |r| Ok((user_from_row(r)?, r.get(14)?)))
+            .query_row(&format!("SELECT {USER_COLUMNS}, password_hash FROM users WHERE email = ?1"), [email], |r| Ok((user_from_row(r)?, r.get(15)?)))
             .optional()?;
         let Some((user, password_hash)) = row else {
             anyhow::bail!("invalid email or password");
@@ -320,7 +328,7 @@ impl AccountStore {
             .query_row(
                 &format!("SELECT {USER_COLUMNS_JOINED}, s.expires_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token_hash = ?1"),
                 [&hash],
-                |r| Ok((user_from_row(r)?, r.get(14)?)),
+                |r| Ok((user_from_row(r)?, r.get(15)?)),
             )
             .optional()?;
         let Some((user, expires_at)) = row else {
@@ -422,6 +430,28 @@ impl AccountStore {
     pub fn revoke_user_api_key(&self, user_id: i64, key_id: i64) -> Result<bool> {
         let affected = self.conn.execute("UPDATE user_api_keys SET revoked_at = datetime('now') WHERE id = ?1 AND user_id = ?2 AND revoked_at IS NULL", rusqlite::params![key_id, user_id])?;
         Ok(affected > 0)
+    }
+
+    /// Resolves a raw personal API key (as presented in a remote MCP client's
+    /// `Authorization: Bearer` header) to the owning user's id + tenant --
+    /// the per-user counterpart to the single instance-wide
+    /// `AGENTOPS_API_KEY_HASH` check in `agentops-security`. `key_hash` is
+    /// `UNIQUE`, so this is a plain indexed equality lookup, not a
+    /// secret-vs-fixed-value comparison guarded by response timing the way
+    /// the instance-wide check needs `ConstantTimeEq` for -- there's nothing
+    /// to leak by timing an indexed miss vs hit here. Bumps `last_used_at`
+    /// as a side effect, same as any other credential-verifying call in
+    /// this store.
+    pub fn verify_user_api_key(&self, raw_key: &str) -> Result<Option<(i64, String)>> {
+        let hash = hash_api_key(raw_key);
+        let row: Option<(i64, i64)> = self
+            .conn
+            .query_row("SELECT id, user_id FROM user_api_keys WHERE key_hash = ?1 AND revoked_at IS NULL", [&hash], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        let Some((key_id, user_id)) = row else { return Ok(None) };
+        self.conn.execute("UPDATE user_api_keys SET last_used_at = datetime('now') WHERE id = ?1", [key_id])?;
+        let tenant: String = self.conn.query_row("SELECT tenant FROM users WHERE id = ?1", [user_id], |r| r.get(0))?;
+        Ok(Some((user_id, tenant)))
     }
 
     /// `true` once `confirm_2fa_enrollment` has succeeded -- a row that
@@ -597,7 +627,7 @@ impl AccountStore {
         Ok(())
     }
 
-    fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
+    pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
         self.conn.query_row(&format!("SELECT {USER_COLUMNS} FROM users WHERE id = ?1"), [id], user_from_row).optional().map_err(anyhow::Error::from)
     }
 
@@ -651,6 +681,15 @@ impl AccountStore {
             rusqlite::params![update.theme_pref, update.default_search_scope, update.show_gotcha_callouts.map(|b| b as i64), update.graph_layout_algorithm, user_id],
         )?;
         self.get_user_by_id(user_id)?.context("user vanished during preferences update")
+    }
+
+    /// Sets `onboarding_completed_at` to now — idempotent (a second call
+    /// just overwrites the timestamp, not an error), matching the /welcome
+    /// checklist's "Continue to dashboard" being clickable at any point,
+    /// not just once.
+    pub fn mark_onboarding_complete(&self, user_id: i64) -> Result<User> {
+        self.conn.execute("UPDATE users SET onboarding_completed_at = CURRENT_TIMESTAMP WHERE id = ?1", [user_id])?;
+        self.get_user_by_id(user_id)?.context("user vanished during onboarding completion")
     }
 }
 
@@ -707,6 +746,7 @@ fn migrate_add_profile_columns(conn: &Connection) -> Result<()> {
         ("default_search_scope", "ALTER TABLE users ADD COLUMN default_search_scope TEXT NOT NULL DEFAULT 'all'"),
         ("show_gotcha_callouts", "ALTER TABLE users ADD COLUMN show_gotcha_callouts INTEGER NOT NULL DEFAULT 1"),
         ("graph_layout_algorithm", "ALTER TABLE users ADD COLUMN graph_layout_algorithm TEXT NOT NULL DEFAULT 'force'"),
+        ("onboarding_completed_at", "ALTER TABLE users ADD COLUMN onboarding_completed_at TEXT"),
     ];
     for (column, ddl) in additions {
         if !existing_columns.contains(*column) {
@@ -779,7 +819,8 @@ fn migrate_relax_tenant_uniqueness(conn: &Connection) -> Result<()> {
                 theme_pref              TEXT NOT NULL DEFAULT 'dark',
                 default_search_scope    TEXT NOT NULL DEFAULT 'all',
                 show_gotcha_callouts    INTEGER NOT NULL DEFAULT 1,
-                graph_layout_algorithm  TEXT NOT NULL DEFAULT 'force'
+                graph_layout_algorithm  TEXT NOT NULL DEFAULT 'force',
+                onboarding_completed_at TEXT
             );
             INSERT INTO users_new ({USER_COLUMNS}, password_hash)
                 SELECT {USER_COLUMNS}, password_hash FROM users;
@@ -1115,6 +1156,7 @@ mod tests {
         assert_eq!(legacy.theme_pref, "dark");
         assert!(legacy.show_gotcha_callouts);
         assert_eq!(legacy.avatar_url, None, "avatar_url has no sane default, so it stays nullable");
+        assert_eq!(legacy.onboarding_completed_at, None, "onboarding_completed_at has no sane default either -- pre-existing rows haven't done it, and shouldn't be assumed to have");
 
         let legacy_session_last_seen: String = store.conn.query_row("SELECT last_seen_at FROM sessions WHERE token_hash = 'legacy-hash'", [], |r| r.get(0)).unwrap();
         assert_eq!(legacy_session_last_seen, "2024-01-01 00:00:00", "pre-existing sessions backfill last_seen_at from created_at, not an empty string");
@@ -1146,7 +1188,8 @@ mod tests {
                 theme_pref              TEXT NOT NULL DEFAULT 'dark',
                 default_search_scope    TEXT NOT NULL DEFAULT 'all',
                 show_gotcha_callouts    INTEGER NOT NULL DEFAULT 1,
-                graph_layout_algorithm  TEXT NOT NULL DEFAULT 'force'
+                graph_layout_algorithm  TEXT NOT NULL DEFAULT 'force',
+                onboarding_completed_at TEXT
             );
             CREATE TABLE sessions (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1222,6 +1265,19 @@ mod tests {
     }
 
     #[test]
+    fn mark_onboarding_complete_sets_the_timestamp_and_is_idempotent() {
+        let store = AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
+        assert_eq!(user.onboarding_completed_at, None, "not set until explicitly completed");
+
+        let updated = store.mark_onboarding_complete(user.id).unwrap();
+        assert!(updated.onboarding_completed_at.is_some());
+
+        // Calling it again (e.g. re-clicking "Continue to dashboard") must not error.
+        store.mark_onboarding_complete(user.id).unwrap();
+    }
+
+    #[test]
     fn change_password_then_login_works_with_the_new_password_only() {
         let store = AccountStore::open_in_memory().unwrap();
         let (user, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
@@ -1256,6 +1312,22 @@ mod tests {
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].key_prefix, info.key_prefix);
         assert!(!format!("{keys:?}").contains(&raw), "the raw key must never be retrievable again after creation");
+    }
+
+    #[test]
+    fn verify_user_api_key_resolves_to_the_owning_user_and_tenant_and_rejects_revoked_or_unknown_keys() {
+        let store = AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
+        let (info, raw) = store.create_user_api_key(user.id, "Laptop").unwrap();
+
+        let (resolved_user_id, resolved_tenant) = store.verify_user_api_key(&raw).unwrap().expect("valid key must resolve");
+        assert_eq!(resolved_user_id, user.id);
+        assert_eq!(resolved_tenant, user.tenant);
+
+        assert!(store.verify_user_api_key("ao_not-a-real-key").unwrap().is_none());
+
+        store.revoke_user_api_key(user.id, info.id).unwrap();
+        assert!(store.verify_user_api_key(&raw).unwrap().is_none(), "a revoked key must stop resolving");
     }
 
     #[test]

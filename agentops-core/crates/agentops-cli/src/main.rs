@@ -225,6 +225,38 @@ enum Command {
         #[arg(long, default_value = ".")]
         path: PathBuf,
     },
+    /// Connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, or
+    /// any other Ruler-supported agent) to this repo — registers agentops's
+    /// MCP server and distributes AGENTS.md/skills, without a full re-scan.
+    /// Re-runnable any time you want to add another tool.
+    Connect {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Comma-separated agent ids (e.g. claude,cursor,codex,gemini-cli) —
+        /// skips the interactive multi-select prompt.
+        #[arg(long, value_delimiter = ',')]
+        agents: Vec<String>,
+        #[arg(long, value_enum, default_value_t = AccessModeArg::Advisor)]
+        access_mode: AccessModeArg,
+        /// Skip all prompts — requires --agents to be set (and --api-key,
+        /// if --remote is also set).
+        #[arg(long)]
+        yes: bool,
+        /// Point your coding tool at a server-hosted agentops instance
+        /// instead of registering a local stdio MCP server — for team
+        /// members connecting their own machine to a shared deployment
+        /// (e.g. https://agentops.example.com). Omit this for a solo
+        /// self-hosted setup where the CLI and server are the same
+        /// machine — that keeps today's local/stdio behavior unchanged.
+        /// If omitted and the command is interactive, you're asked which
+        /// case this is before anything else happens.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Personal API key for --remote (generate one from Settings ->
+        /// API Keys in the web app). Prompted for interactively if omitted.
+        #[arg(long)]
+        api_key: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -440,6 +472,7 @@ fn main() -> Result<()> {
             TaskAction::SyncLinear { path, limit, push, status_name } => task_sync_linear(&path, limit, push, status_name.as_deref()),
         },
         Command::Init { yes, path } => init(yes, &path),
+        Command::Connect { path, agents, access_mode, yes, remote, api_key } => connect(&path, agents, access_mode, yes, remote, api_key),
     }
 }
 
@@ -486,6 +519,7 @@ fn init(yes: bool, path: &Path) -> Result<()> {
     let env_path = path.join(".env");
     std::fs::write(&env_path, config.to_env_file()).with_context(|| format!("writing {}", env_path.display()))?;
     println!("\nWrote {}", env_path.display());
+    println!("Tip: from your project repo (not this directory), run `agentops connect` to hook up Claude Code, Cursor, Codex CLI, Gemini CLI, or another coding tool.");
 
     let start_now = yes || dialoguer::Confirm::new().with_prompt("Start AgentOps now?").default(true).interact().unwrap_or(false);
     if !start_now {
@@ -578,18 +612,384 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embedding
 
     if !no_ruler {
         let agents_md_content = std::fs::read_to_string(&init_result.agents_md_path).context("re-reading AGENTS.md for Ruler distribution")?;
-        if let Err(e) = agentops_ruler_bridge::build_ruler_dir(path, &agents_md_content) {
-            println!("WARNING: failed to build .ruler/ (skipping prompt-pack distribution): {e}");
-        } else {
-            let agent_ids: Vec<&str> = agents.iter().map(String::as_str).collect();
-            match agentops_ruler_bridge::apply(path, &agent_ids, false) {
-                Ok(output) => println!("Distributed prompt pack via Ruler to {}:\n{output}", agent_ids.join(", ")),
-                Err(e) => println!("WARNING: `ruler apply` failed (prompt pack still built at .ruler/, scan/AGENTS.md unaffected): {e}"),
+        distribute_via_ruler(path, &agents_md_content, agents, "advisor");
+    }
+
+    Ok(())
+}
+
+/// Shared by `install()` and `connect()`: builds `.ruler/` (rules/skills) +
+/// `.ruler/mcp.json` (MCP server registration) and runs `ruler apply` for
+/// the given agent ids. Every failure here is a warning, not a hard error —
+/// matches `install()`'s existing posture that a scan/AGENTS.md write should
+/// never be undone by an optional downstream distribution step failing.
+///
+/// **Remote-mode durability, not just a one-time write**: if
+/// `.context/agentops-remote.json` exists (written by `connect_remote` the
+/// first time `--remote` was used for this repo), this fn skips writing
+/// `.ruler/mcp.json`'s stdio entry entirely and, after `ruler apply` runs
+/// for `AGENTS.md`/prompt-pack distribution, re-runs the native remote-MCP
+/// writer as its own last step. Without this, any *later* call to this fn
+/// from a plain `agentops install` re-scan (which also calls this,
+/// unconditionally, for any reason) would silently revert a team member's
+/// coding tool back to the local/stdio entry the next time `ruler apply`
+/// regenerates their native config files — a real bug caught auditing this
+/// feature's first draft, not a hypothetical.
+fn distribute_via_ruler(path: &Path, agents_md_content: &str, agent_ids: &[String], access_mode: &str) {
+    if let Err(e) = agentops_ruler_bridge::build_ruler_dir(path, agents_md_content) {
+        println!("WARNING: failed to build .ruler/ (skipping prompt-pack and MCP distribution): {e}");
+        return;
+    }
+
+    let remote_marker = read_remote_marker(path);
+    if remote_marker.is_none() {
+        if let Err(e) = agentops_ruler_bridge::write_mcp_config(path, access_mode) {
+            println!("WARNING: failed to write .ruler/mcp.json (skipping MCP registration, prompt pack still distributed): {e}");
+        }
+    }
+
+    let agent_ids_ref: Vec<&str> = agent_ids.iter().map(String::as_str).collect();
+    match agentops_ruler_bridge::apply(path, &agent_ids_ref, false) {
+        Ok(output) => println!("Distributed prompt pack + MCP config via Ruler to {}:\n{output}", agent_ids_ref.join(", ")),
+        Err(e) => println!("WARNING: `ruler apply` failed (prompt pack still built at .ruler/, scan/AGENTS.md unaffected): {e}"),
+    }
+
+    if let Some(marker) = remote_marker {
+        write_remote_mcp_entries(path, agent_ids, &marker.server_url);
+    }
+}
+
+/// Where each named agent's MCP config actually lands, for the closing
+/// summary — matches each vendor's own current docs (fetched directly while
+/// planning this, not assumed): Claude Code's `.mcp.json`, Cursor's
+/// `.cursor/mcp.json`, Codex CLI's `.codex/config.toml`, Gemini CLI's
+/// `.gemini/settings.json`. Anything else Ruler supports but isn't in this
+/// table just gets a generic "check its docs" line.
+fn mcp_config_location(agent_id: &str) -> Option<&'static str> {
+    match agent_id {
+        "claude" => Some(".mcp.json"),
+        "cursor" => Some(".cursor/mcp.json"),
+        "codex" => Some(".codex/config.toml"),
+        "gemini-cli" => Some(".gemini/settings.json"),
+        _ => None,
+    }
+}
+
+/// Shared by `connect()`'s local and remote flows -- the "which coding
+/// tool(s)" prompt/flags are identical either way, only what happens next
+/// differs.
+fn select_agents(mut agents: Vec<String>, yes: bool) -> Result<Vec<String>> {
+    if !agents.is_empty() {
+        return Ok(agents);
+    }
+    if yes {
+        anyhow::bail!("--yes requires --agents to also be set (nothing to connect non-interactively otherwise)");
+    }
+    let named = ["claude", "cursor", "codex", "gemini-cli"];
+    let labels = ["Claude Code", "Cursor", "Codex CLI", "Gemini CLI"];
+    let defaults = [true, true, false, false];
+    let selected = dialoguer::MultiSelect::new().with_prompt("Which coding tool(s) do you want to connect? (space to toggle, enter to confirm)").items(&labels).defaults(&defaults).interact()?;
+    agents.extend(selected.into_iter().map(|i| named[i].to_string()));
+
+    while dialoguer::Confirm::new().with_prompt("Add another agent id (any Ruler-supported id not listed above)?").default(false).interact()? {
+        let id: String = dialoguer::Input::new().with_prompt("Agent id").interact_text()?;
+        if !id.trim().is_empty() {
+            agents.push(id.trim().to_string());
+        }
+    }
+    Ok(agents)
+}
+
+fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>) -> Result<()> {
+    // Whether to use local/stdio vs. remote/HTTP is not inferable from
+    // anything about this invocation on its own (a solo dev can self-host
+    // on their own separate personal server too) -- ask directly rather
+    // than guessing, unless `--remote` already answers it or `--yes` opts
+    // out of every prompt (defaulting to local, today's behavior, since a
+    // non-interactive caller must opt into remote explicitly via the flag).
+    let remote_url = match &remote {
+        Some(url) => Some(url.trim().trim_end_matches('/').to_string()),
+        None if yes => None,
+        None => {
+            let choice = dialoguer::Select::new()
+                .with_prompt("Is agentops running on this machine, or on a separate server you'll connect to?")
+                .items(&["This machine (local)", "A separate server (remote)"])
+                .default(0)
+                .interact()?;
+            if choice == 1 {
+                let url: String = dialoguer::Input::new().with_prompt("Server URL (e.g. http://192.168.1.10:3000 or https://agentops.example.com)").interact_text()?;
+                Some(url.trim().trim_end_matches('/').to_string())
+            } else {
+                None
             }
+        }
+    };
+
+    if let Some(server_url) = remote_url {
+        let agents = select_agents(agents, yes)?;
+        if agents.is_empty() {
+            println!("No agents selected — nothing to do.");
+            return Ok(());
+        }
+        return connect_remote(path, &server_url, api_key, &agents, yes);
+    }
+
+    let agents = select_agents(agents, yes)?;
+    if agents.is_empty() {
+        println!("No agents selected — nothing to do.");
+        return Ok(());
+    }
+
+    agentops_ruler_bridge::preflight_check_npx()?;
+    agentops_ruler_bridge::preflight_check_mcp_server_binary()?;
+
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let already_scanned = agentops_manifest::list_scanned_repos()?.iter().any(|e| Path::new(&e.path) == canonical);
+    if !already_scanned {
+        println!("This repo hasn't been scanned yet — MCP tools need a populated graph (.context/graph.db) to return anything useful.");
+        let run_install = yes || dialoguer::Confirm::new().with_prompt("Run a scan now (`agentops install`-equivalent)?").default(true).interact()?;
+        if run_install {
+            install(path, None, false, false, true, &[])?; // no_ruler: true -- this function handles Ruler distribution itself, right after
+        } else {
+            println!("Continuing without scanning — MCP tools will return little until you run `agentops install`.");
+        }
+    }
+
+    let agents_md_path = path.join("AGENTS.md");
+    let agents_md_content = if agents_md_path.exists() {
+        std::fs::read_to_string(&agents_md_path).context("reading existing AGENTS.md")?
+    } else {
+        let init_result = agentops_mcp::init_agents_md(path, None).context("writing AGENTS.md")?;
+        println!("Wrote {}", init_result.agents_md_path.display());
+        std::fs::read_to_string(&init_result.agents_md_path)?
+    };
+
+    let access_mode_str = if matches!(access_mode, AccessModeArg::Full) { "full" } else { "advisor" };
+    distribute_via_ruler(path, &agents_md_content, &agents, access_mode_str);
+
+    println!("\nConnected: {}", agents.join(", "));
+    for agent_id in &agents {
+        match mcp_config_location(agent_id) {
+            Some(loc) => println!("  {agent_id}: {loc} — restart {agent_id} to pick up the new MCP server."),
+            None => println!("  {agent_id}: check its docs for where Ruler wrote its MCP config."),
         }
     }
 
     Ok(())
+}
+
+/// `.context/agentops-remote.json` -- persists a repo's "coding tools here
+/// point at this remote server" choice across future `agentops install`/
+/// `connect` runs that don't pass `--remote` again (e.g. re-scanning, or
+/// adding another agent later). Lives in `.context/` alongside
+/// `graph.db` -- a per-repo, not-meant-for-git-history directory this
+/// codebase already uses for exactly this kind of local machine state,
+/// deliberately not `.ruler/` (whose own files are Ruler-managed/
+/// overwritten-on-every-`apply`, the opposite of what a marker needs).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RemoteMcpMarker {
+    server_url: String,
+    connection_id: String,
+}
+
+fn remote_marker_path(path: &Path) -> PathBuf {
+    path.join(".context").join("agentops-remote.json")
+}
+
+fn read_remote_marker(path: &Path) -> Option<RemoteMcpMarker> {
+    let content = std::fs::read_to_string(remote_marker_path(path)).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn write_remote_marker(path: &Path, server_url: &str, connection_id: &str) -> Result<()> {
+    let marker_path = remote_marker_path(path);
+    if let Some(parent) = marker_path.parent() {
+        std::fs::create_dir_all(parent).context("creating .context/")?;
+    }
+    let marker = RemoteMcpMarker { server_url: server_url.to_string(), connection_id: connection_id.to_string() };
+    std::fs::write(&marker_path, serde_json::to_string_pretty(&marker)?).with_context(|| format!("writing {}", marker_path.display()))
+}
+
+#[derive(serde::Deserialize)]
+struct RepoConnectionSummary {
+    id: String,
+    repo_url: String,
+}
+
+/// Auto-matches this checkout's `git remote get-url origin` against the
+/// caller's tenant's connected repos (`GET /repos`) so the common case
+/// needs no manual picking; falls back to an interactive list when there's
+/// no match (a fresh clone under a different remote URL, a repo connected
+/// via GitHub App rather than SSH, etc.).
+fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool) -> Result<String> {
+    let mut response = ureq::get(format!("{server_url}/repos"))
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .context("calling GET /repos")?;
+    let status = response.status();
+    if status.as_u16() == 401 {
+        anyhow::bail!("the server rejected this API key (401) — generate a fresh one from Settings -> API Keys in the web app");
+    }
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        anyhow::bail!("GET /repos returned {status}: {body}");
+    }
+    let body: serde_json::Value = response.body_mut().read_json().context("parsing GET /repos response")?;
+    let connections: Vec<RepoConnectionSummary> = body.get("connections").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+
+    if connections.is_empty() {
+        anyhow::bail!("no repos are connected to your organization yet — connect one from the web app first (Repositories -> Connect a repository), then run this again");
+    }
+
+    let git_remote = std::process::Command::new("git")
+        .args(["remote", "get-url", "origin"])
+        .current_dir(path)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    if let Some(remote) = &git_remote {
+        if let Some(matched) = connections.iter().find(|c| &c.repo_url == remote) {
+            println!("Matched this checkout's git remote ({remote}) to the connected repo {:?}.", matched.id);
+            return Ok(matched.id.clone());
+        }
+    }
+
+    if yes {
+        anyhow::bail!("couldn't auto-match this checkout's git remote to a connected repo, and --yes was set — run again without --yes to pick one interactively");
+    }
+
+    println!("Couldn't auto-match this checkout's git remote to a connected repo.");
+    let labels: Vec<String> = connections.iter().map(|c| format!("{} ({})", c.repo_url, c.id)).collect();
+    let selected = dialoguer::Select::new().with_prompt("Which connected repo is this?").items(&labels).interact()?;
+    Ok(connections[selected].id.clone())
+}
+
+fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents: &[String], yes: bool) -> Result<()> {
+    let api_key = match api_key {
+        Some(k) => k,
+        None if yes => anyhow::bail!("--remote requires --api-key when --yes is set (nothing to prompt for non-interactively)"),
+        None => {
+            println!("Generate a personal API key from Settings -> API Keys in the web app, then paste it below (or pass --api-key next time).");
+            dialoguer::Password::new().with_prompt("API key").interact()?
+        }
+    };
+
+    let connection_id = resolve_connection_id(path, server_url, &api_key, yes)?;
+
+    let agents_md_path = path.join("AGENTS.md");
+    let agents_md_content = if agents_md_path.exists() {
+        std::fs::read_to_string(&agents_md_path).context("reading existing AGENTS.md")?
+    } else {
+        let init_result = agentops_mcp::init_agents_md(path, None).context("writing AGENTS.md")?;
+        println!("Wrote {}", init_result.agents_md_path.display());
+        std::fs::read_to_string(&init_result.agents_md_path)?
+    };
+
+    // Written before `distribute_via_ruler` runs -- that fn checks for
+    // this marker to skip the stdio `.ruler/mcp.json` entry and re-apply
+    // the remote native entries as its own last step, every time it runs
+    // from here on (not just this one call). See its doc comment.
+    write_remote_marker(path, server_url, &connection_id)?;
+    distribute_via_ruler(path, &agents_md_content, agents, "advisor");
+
+    println!("\nConnected to {server_url} (repo: {connection_id}).");
+    println!("Export your API key locally before using your coding tool: export AGENTOPS_API_KEY={api_key}");
+    for agent_id in agents {
+        match mcp_config_location(agent_id) {
+            Some(loc) => println!("  {agent_id}: {loc} — restart {agent_id} to pick up the new MCP server."),
+            None => println!("  {agent_id}: not a recognized agent id for a remote entry — check its docs for how to register a Streamable HTTP MCP server manually."),
+        }
+    }
+    Ok(())
+}
+
+/// Writes/refreshes the `"agentops"` entry directly in each target agent's
+/// own native MCP config file, deliberately bypassing Ruler for this one
+/// entry: each of the four vendors uses a genuinely different remote-MCP
+/// schema (Claude Code needs an explicit `"type":"http"`; Cursor doesn't;
+/// Codex CLI uses a separate `bearer_token_env_var` key, not string
+/// interpolation; Gemini CLI's header env-var substitution isn't confirmed
+/// by its own docs) -- verified against each vendor's own current docs
+/// individually, matching this codebase's established "verify empirically,
+/// don't assume" convention, rather than trusting a single generic entry
+/// translated by a pinned, unverified-for-this-case Ruler version to get
+/// all four right. Read-modify-write: any *other* MCP server already
+/// configured in these files is preserved untouched. Any agent id outside
+/// this table (Ruler-supported but not one of the four with a known
+/// remote schema) is skipped with a note in `connect_remote`'s own
+/// closing summary -- its prompt-pack distribution via Ruler still works,
+/// just not an automatic remote MCP entry.
+fn write_remote_mcp_entries(path: &Path, agent_ids: &[String], server_url: &str) {
+    let url = format!("{server_url}/mcp");
+    for agent_id in agent_ids {
+        let Some(rel_path) = mcp_config_location(agent_id) else { continue };
+        let config_path = path.join(rel_path);
+        let result = if agent_id == "codex" { write_codex_remote_entry(&config_path, &url) } else { write_json_mcp_remote_entry(agent_id, &config_path, &url) };
+        if let Err(e) = result {
+            println!("WARNING: failed to write a remote MCP entry to {}: {e}", config_path.display());
+        }
+    }
+}
+
+/// Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`), and Gemini CLI
+/// (`.gemini/settings.json`) all use the same `{"mcpServers": {...}}` JSON
+/// shape, differing only in the per-agent fields set here -- see this
+/// module's `write_remote_mcp_entries` doc comment for the schema sources.
+fn write_json_mcp_remote_entry(agent_id: &str, config_path: &Path, url: &str) -> Result<()> {
+    let mut root: serde_json::Value = if config_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let entry = match agent_id {
+        "claude" => serde_json::json!({ "type": "http", "url": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
+        "gemini-cli" => serde_json::json!({ "httpUrl": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
+        _ => serde_json::json!({ "url": url, "headers": { "Authorization": "Bearer ${env:AGENTOPS_API_KEY}" } }), // cursor
+    };
+    let root_obj = root.as_object_mut().expect("just normalized to an object above");
+    let servers = root_obj.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
+    if !servers.is_object() {
+        *servers = serde_json::json!({});
+    }
+    servers.as_object_mut().expect("just normalized to an object above").insert("agentops".to_string(), entry);
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(config_path, serde_json::to_string_pretty(&root)?).with_context(|| format!("writing {}", config_path.display()))
+}
+
+/// Codex CLI's `.codex/config.toml` reads the bearer token from a *named
+/// env var* (`bearer_token_env_var`), not string interpolation inside
+/// `url`/headers the way the other three do — see `write_remote_mcp_
+/// entries`'s doc comment.
+fn write_codex_remote_entry(config_path: &Path, url: &str) -> Result<()> {
+    let mut root: toml::Value = if config_path.exists() {
+        std::fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?.parse().unwrap_or_else(|_| toml::Value::Table(Default::default()))
+    } else {
+        toml::Value::Table(Default::default())
+    };
+    let table = root.as_table_mut().ok_or_else(|| anyhow::anyhow!("{} is not a TOML table at its root", config_path.display()))?;
+    let mcp_servers = table.entry("mcp_servers".to_string()).or_insert_with(|| toml::Value::Table(Default::default()));
+    let mcp_servers_table = mcp_servers.as_table_mut().ok_or_else(|| anyhow::anyhow!("mcp_servers is not a table in {}", config_path.display()))?;
+
+    let mut entry = toml::value::Table::new();
+    entry.insert("url".to_string(), toml::Value::String(url.to_string()));
+    entry.insert("bearer_token_env_var".to_string(), toml::Value::String("AGENTOPS_API_KEY".to_string()));
+    mcp_servers_table.insert("agentops".to_string(), toml::Value::Table(entry));
+
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(config_path, toml::to_string_pretty(&root)?).with_context(|| format!("writing {}", config_path.display()))
 }
 
 fn repos() -> Result<()> {

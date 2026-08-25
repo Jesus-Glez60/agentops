@@ -17,6 +17,7 @@ export interface SessionUser {
   show_gotcha_callouts: boolean;
   graph_layout_algorithm: string;
   two_factor_enabled: boolean;
+  onboarding_completed: boolean;
 }
 
 export interface AuthResponse {

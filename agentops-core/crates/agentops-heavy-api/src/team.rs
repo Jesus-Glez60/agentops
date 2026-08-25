@@ -42,7 +42,7 @@ pub fn build_team_router(accounts: AccountStore, teams: TeamStore, repos: Connec
     };
 
     Router::new()
-        .route("/team", get(get_team))
+        .route("/team", get(get_team).patch(rename_team))
         .route("/team/members", get(list_members))
         .route("/team/roles", get(list_roles))
         .route("/team/roles/custom", post(create_custom_role))
@@ -94,6 +94,34 @@ async fn get_team(State(state): State<TeamState>, axum::Extension(user): axum::E
     let role = members.iter().find(|m| m.user_id == user.id).map(|m| m.role.clone()).unwrap_or_default();
     let is_owner = teams.owner_user_id(&user.tenant).unwrap_or(None) == Some(user.id);
     (StatusCode::OK, Json(json!({ "tenant": user.tenant, "name": name, "member_count": members.len(), "role": role, "is_owner": is_owner })))
+}
+
+#[derive(Deserialize)]
+struct RenameTeamRequest {
+    name: String,
+}
+
+/// Owner-only -- naming the org is an identity-level decision, same
+/// posture as `transfer_ownership`/`delete_organization`. In practice this
+/// is only ever called from the `/welcome` onboarding checklist's
+/// workspace-setup item, which itself only renders for the Owner, but the
+/// backend enforces it independently rather than trusting the frontend.
+async fn rename_team(State(state): State<TeamState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<RenameTeamRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let teams = state.teams.lock().unwrap();
+    if let Err(e) = teams.ensure_membership(&user.tenant, user.id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    if let Err(err) = require_owner(&teams, &user.tenant, user.id) {
+        return err;
+    }
+    let name = req.name.trim();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "name is required" })));
+    }
+    match teams.rename_organization(&user.tenant, name) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "name": name }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
 }
 
 #[derive(Serialize)]
@@ -1086,6 +1114,48 @@ mod tests {
                     .body(Body::from(format!(r#"{{"confirm_tenant":{:?}}}"#, owner.tenant)))
                     .unwrap(),
             )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn owner_can_rename_the_organization() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (_owner, owner_token) = signup_user(&accounts, "owner@example.com");
+        let teams = TeamStore::open_in_memory().unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        // Backfills Owner via the same lazy `ensure_membership` path every other test here relies on.
+        let _ = app.clone().oneshot(HttpRequest::get("/team").header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap()).await.unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(HttpRequest::patch("/team").header("authorization", format!("Bearer {owner_token}")).header("content-type", "application/json").body(Body::from(r#"{"name":"Ada's Workspace"}"#)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let get_response = app.oneshot(HttpRequest::get("/team").header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        let body = body_json(get_response).await;
+        assert_eq!(body["name"], "Ada's Workspace");
+    }
+
+    #[tokio::test]
+    async fn non_owner_admin_cannot_rename_the_organization() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup_user(&accounts, "owner@example.com");
+        let (admin2, admin2_token) = signup_user(&accounts, "admin2@example.com");
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&owner.tenant, admin2.id, "admin").unwrap();
+        accounts.switch_tenant(admin2.id, &owner.tenant).unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        let _ = app.clone().oneshot(HttpRequest::get("/team").header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap()).await.unwrap();
+
+        let response = app
+            .oneshot(HttpRequest::patch("/team").header("authorization", format!("Bearer {admin2_token}")).header("content-type", "application/json").body(Body::from(r#"{"name":"Hostile takeover"}"#)).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);

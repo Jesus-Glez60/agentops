@@ -49,6 +49,11 @@ export function updatePreferences(update: PreferencesUpdateInput): Promise<Sessi
   return heavyFetch<SessionUser>("/auth/me/preferences", { method: "PATCH", body: JSON.stringify(update) });
 }
 
+/** Marks the `/welcome` checklist done -- idempotent, safe to call from any item's completion or the persistent "Continue to dashboard" button. */
+export function completeOnboarding(): Promise<SessionUser> {
+  return heavyFetch<SessionUser>("/auth/me/complete-onboarding", { method: "POST" });
+}
+
 /** On success, revokes every session but the one that made this call -- the caller should expect other tabs/devices to be signed out. */
 export function changePassword(currentPassword: string, newPassword: string): Promise<void> {
   return heavyFetch<void>("/auth/me/password", { method: "POST", body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }) });
