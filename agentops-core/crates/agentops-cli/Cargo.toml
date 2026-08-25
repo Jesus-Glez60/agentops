@@ -29,6 +29,11 @@ docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
 docbrain-ingest = { path = "../../../docbrain-core/crates/docbrain-ingest" }
 dialoguer.workspace = true
+# `.env` loading for `agentops init`/`agentops serve-api` -- no other crate
+# in the workspace reads `.env` (everything else is bare `std::env::var`),
+# so this stays scoped to the one binary that needs it rather than becoming
+# a workspace-wide dependency.
+dotenvy = "0.15"
 
 # (`docgen` command goes through agentops-mcp::generate_docs, no direct
 # agentops-docgen dep needed here.)

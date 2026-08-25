@@ -34,6 +34,7 @@ agentops-accounts = { path = "../agentops-accounts" }
 agentops-teams = { path = "../agentops-teams" }
 agentops-integrations = { path = "../agentops-integrations" }
 agentops-integration-modules = { path = "../agentops-integration-modules" }
+agentops-manifest = { path = "../agentops-manifest" }
 
 [dev-dependencies]
 tempfile = "3"

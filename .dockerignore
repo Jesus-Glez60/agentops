@@ -1,0 +1,7 @@
+target
+apps/web/node_modules
+apps/web/.next
+.git
+.agentops
+.env
+*.env.local

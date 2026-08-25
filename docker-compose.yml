@@ -1,0 +1,31 @@
+# Single-service by default (SQLite-only, no external DB needed) -- run
+# `docker compose --profile postgres up` to also start a bundled Postgres
+# for the code-graph store (agentops-graph-pg), and set AGENTOPS_DATABASE_URL
+# accordingly in .env. Either way this is the one file a self-host user
+# needs to download and run: `docker compose up`.
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+      - "8420:8420"
+    env_file:
+      - .env
+    volumes:
+      - agentops-data:/root/.agentops
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: agentops
+      POSTGRES_PASSWORD: agentops
+      POSTGRES_DB: agentops
+    volumes:
+      - agentops-postgres:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  agentops-data:
+  agentops-postgres:

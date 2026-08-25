@@ -18,7 +18,7 @@ import { PasswordRequirementsList } from "@/components/auth/password-requirement
 // toast on submit attempt instead of per-field red text, since those are
 // simple presence/shape checks a user fixes once, not something they need
 // to watch update character-by-character.
-export function SignupForm({ redirectTo }: { redirectTo: string }) {
+export function SignupForm({ redirectTo, inviteToken }: { redirectTo: string; inviteToken?: string }) {
   const router = useRouter();
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
@@ -52,7 +52,11 @@ export function SignupForm({ redirectTo }: { redirectTo: string }) {
 
     setPending(true);
     try {
-      await signupWithPassword(firstName.trim(), lastName.trim(), email, password);
+      if (inviteToken) {
+        await signupWithPassword(firstName.trim(), lastName.trim(), email, password, inviteToken);
+      } else {
+        await signupWithPassword(firstName.trim(), lastName.trim(), email, password);
+      }
       router.push(redirectTo);
       router.refresh();
     } catch (err) {

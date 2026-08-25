@@ -1,0 +1,57 @@
+# One image, both processes (pm2-runtime + ecosystem.config.js -- see the
+# repo-root Dockerfile). replicas: 1 is load-bearing with the default
+# SQLite backend; only raise it once AGENTOPS_DATABASE_URL points at
+# Postgres (see postgres-statefulset.yaml).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agentops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentops
+  template:
+    metadata:
+      labels:
+        app: agentops
+    spec:
+      containers:
+        - name: agentops
+          image: agentops:latest
+          ports:
+            - name: web
+              containerPort: 3000
+            - name: api
+              containerPort: 8420
+          env:
+            - name: AGENTOPS_SECRETS_MASTER_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: agentops-secrets
+                  key: AGENTOPS_SECRETS_MASTER_KEY
+            - name: AGENTOPS_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: agentops-secrets
+                  key: AGENTOPS_DATABASE_URL
+                  optional: true
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: api
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /root/.agentops
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: agentops-data

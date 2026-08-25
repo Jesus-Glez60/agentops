@@ -67,6 +67,8 @@ pub fn build_accounts_integrations_router(accounts: AccountStore, credentials: C
         .route("/auth/2fa/backup-codes/regenerate", post(regenerate_backup_codes))
         .route("/auth/logout", post(logout))
         .layer(middleware::from_fn_with_state(state.clone(), require_session))
+        .route("/auth/bootstrap-status", get(bootstrap_status))
+        .route("/bootstrap/config", post(bootstrap_config))
         .route("/auth/signup", post(signup))
         .route("/auth/login", post(login))
         .route("/auth/login/2fa", post(login_2fa))
@@ -111,6 +113,31 @@ struct SignupRequest {
     password: String,
     first_name: String,
     last_name: String,
+    /// Redeems a pending invite in the same request as account creation —
+    /// required once `AGENTOPS_SIGNUP_MODE=first-user-only` (the default)
+    /// and an account already exists on this instance. See `signup()`.
+    #[serde(default)]
+    invite_token: Option<String>,
+}
+
+/// `open` (any request creates a brand-new tenant, unlimited -- the
+/// existing/default behavior, preserved for anyone already running this
+/// way) or `first-user-only` (once any account exists on this instance,
+/// further signup requires a valid `invite_token`) -- see `signup()`. The
+/// three self-host deployment wizards (Docker/PM2/classic) write
+/// `AGENTOPS_SIGNUP_MODE=first-user-only` into the `.env` they generate,
+/// rather than this function defaulting to it, so existing/hosted
+/// deployments that never opted in keep today's always-open behavior.
+fn signup_mode() -> String {
+    std::env::var("AGENTOPS_SIGNUP_MODE").unwrap_or_else(|_| "open".to_string())
+}
+
+/// Pure gating decision, factored out of `signup()` so it's unit-testable
+/// without mutating the process-global `AGENTOPS_SIGNUP_MODE` env var (which
+/// would race every other concurrently-running test that also calls
+/// `signup()`).
+fn signup_allowed(mode: &str, has_accounts: bool, has_invite_token: bool) -> bool {
+    mode != "first-user-only" || !has_accounts || has_invite_token
 }
 
 #[derive(Deserialize)]
@@ -169,6 +196,45 @@ struct AuthResponse {
     session_token: String,
 }
 
+/// Unauthenticated -- lets the frontend steer first-run UX (default to the
+/// Signup tab on an empty instance; hide it once `signup_open` is false and
+/// no invite token is present) without needing a session first.
+async fn bootstrap_status(State(state): State<AccountsState>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.accounts.lock().unwrap().any_account_exists() {
+        Ok(has_accounts) => {
+            let signup_open = !has_accounts || signup_mode() == "open";
+            (StatusCode::OK, Json(json!({ "has_accounts": has_accounts, "signup_open": signup_open })))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// Unauthenticated by design (there's no session to have yet on a brand
+/// new instance) but deliberately **first-run only**: once any account
+/// exists, this 403s rather than letting an anonymous network caller
+/// rewrite a running instance's master key/DB credentials. Writes `.env`
+/// in the server process's current directory (the same file both the PM2
+/// `ecosystem.config.js` and a later `agentops serve-api` invocation read
+/// from — see the Method 2/3 deployment docs); the frontend tells the user
+/// to restart (`pm2 restart ecosystem.config.js`) since there's no
+/// hot-reload of env-derived config.
+async fn bootstrap_config(State(state): State<AccountsState>, Json(config): Json<agentops_manifest::BootstrapConfig>) -> (StatusCode, Json<serde_json::Value>) {
+    match state.accounts.lock().unwrap().any_account_exists() {
+        Ok(true) => return (StatusCode::FORBIDDEN, Json(json!({ "error": "this instance is already set up; edit .env by hand and restart to change infra config" }))),
+        Ok(false) => {}
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+
+    if let Err(errors) = config.validate() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "errors": errors })));
+    }
+
+    match std::fs::write(".env", config.to_env_file()) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("writing .env: {e}") }))),
+    }
+}
+
 async fn signup(State(state): State<AccountsState>, headers: axum::http::HeaderMap, Json(req): Json<SignupRequest>) -> (StatusCode, Json<serde_json::Value>) {
     let first_name = req.first_name.trim();
     let last_name = req.last_name.trim();
@@ -176,16 +242,44 @@ async fn signup(State(state): State<AccountsState>, headers: axum::http::HeaderM
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "first_name and last_name are required" })));
     }
 
-    let result = { state.accounts.lock().unwrap().signup(NewAccount { email: &req.email, password: &req.password, first_name, last_name }) };
-    match result {
-        Ok((user, session_token)) => {
-            let (user_agent, ip_address) = request_metadata(&headers);
-            let accounts = state.accounts.lock().unwrap();
-            let _ = accounts.record_session_metadata(&session_token, &user_agent, &ip_address);
-            (StatusCode::CREATED, Json(serde_json::to_value(AuthResponse { user: user_view(&accounts, user), session_token }).unwrap()))
-        }
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+    let has_accounts = match state.accounts.lock().unwrap().any_account_exists() {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    // `invite_token` only has to be *presented* here to prove this signup
+    // is invite-driven -- `preview_invite` is read-only (unlike
+    // `accept_invite`, it never marks the invite consumed), because the
+    // actual join happens later: the existing `/invite/{token}` page
+    // (`InviteLandingClient`) already redirects a signed-out visitor to
+    // `/login?from=/invite/{token}`, and once they're signed in (from this
+    // very signup) it calls the real `POST /invites/accept` itself. Calling
+    // `accept_invite` here too would burn the token twice and make that
+    // follow-up call fail.
+    let invite_is_valid = match &req.invite_token {
+        Some(token) => state.teams.lock().unwrap().preview_invite(token).map(|p| p.is_some()),
+        None => Ok(false),
+    };
+    let invite_is_valid = match invite_is_valid {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    if req.invite_token.is_some() && !invite_is_valid {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid or expired invite" })));
     }
+    if !signup_allowed(&signup_mode(), has_accounts, invite_is_valid) {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "this instance requires an invite to sign up" })));
+    }
+
+    let result = { state.accounts.lock().unwrap().signup(NewAccount { email: &req.email, password: &req.password, first_name, last_name }) };
+    let (user, session_token) = match result {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+    };
+
+    let (user_agent, ip_address) = request_metadata(&headers);
+    let accounts = state.accounts.lock().unwrap();
+    let _ = accounts.record_session_metadata(&session_token, &user_agent, &ip_address);
+    (StatusCode::CREATED, Json(serde_json::to_value(AuthResponse { user: user_view(&accounts, user), session_token }).unwrap()))
 }
 
 /// **2FA branch point.** Credentials alone used to be enough to issue a
@@ -677,6 +771,103 @@ mod tests {
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
         let bytes = response.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_status_flips_has_accounts_true_after_the_first_signup() {
+        let app = test_router();
+
+        let before = app.clone().oneshot(HttpRequest::get("/auth/bootstrap-status").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(before.status(), StatusCode::OK);
+        let before_body = body_json(before).await;
+        assert_eq!(before_body["has_accounts"], false);
+        assert_eq!(before_body["signup_open"], true);
+
+        app.clone()
+            .oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap())
+            .await
+            .unwrap();
+
+        let after = app.oneshot(HttpRequest::get("/auth/bootstrap-status").body(Body::empty()).unwrap()).await.unwrap();
+        let after_body = body_json(after).await;
+        assert_eq!(after_body["has_accounts"], true);
+    }
+
+    #[tokio::test]
+    async fn signup_with_an_invalid_invite_token_is_rejected() {
+        let app = test_router();
+
+        let response = app
+            .oneshot(
+                HttpRequest::post("/auth/signup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace","invite_token":"ao_not-a-real-token"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn signup_allowed_matches_the_documented_gating_rules() {
+        // open mode: always allowed, with or without accounts/invite.
+        assert!(signup_allowed("open", true, false));
+        assert!(signup_allowed("open", false, false));
+        // first-user-only: fine until an account exists, then requires an
+        // invite token.
+        assert!(signup_allowed("first-user-only", false, false));
+        assert!(!signup_allowed("first-user-only", true, false));
+        assert!(signup_allowed("first-user-only", true, true));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_config_rejects_invalid_config_with_the_validation_errors() {
+        let app = test_router();
+        let response = app
+            .oneshot(HttpRequest::post("/bootstrap/config").header("content-type", "application/json").body(Body::from(r#"{"secrets_master_key":"too-short"}"#)).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert!(body["errors"].as_array().unwrap().iter().any(|e| e.as_str().unwrap().contains("secrets_master_key")));
+    }
+
+    #[tokio::test]
+    async fn bootstrap_config_is_rejected_once_an_account_already_exists() {
+        let app = test_router();
+        app.clone()
+            .oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap())
+            .await
+            .unwrap();
+
+        let key = "ab".repeat(32);
+        let response = app
+            .oneshot(HttpRequest::post("/bootstrap/config").header("content-type", "application/json").body(Body::from(format!(r#"{{"secrets_master_key":"{key}"}}"#))).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn a_valid_invite_token_is_accepted_as_proof_but_never_consumed_by_signup_itself() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let credentials = CredentialStore::open_in_memory().unwrap();
+        let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap());
+        let teams = TeamStore::open_in_memory().unwrap();
+        let (_, raw_token) = teams.create_invite("tenant-a", "dev@example.com", "member", None, 1).unwrap();
+        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams);
+
+        let response = app
+            .oneshot(
+                HttpRequest::post("/auth/signup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace","invite_token":"{raw_token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED, "a valid invite token must let signup through");
     }
 
     #[tokio::test]

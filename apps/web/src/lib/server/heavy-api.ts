@@ -13,7 +13,12 @@
 // here a second time.
 import { httpFetchJson, HttpError } from "@/lib/http-fetch";
 
-const HEAVY_API_URL = process.env.AGENTOPS_HEAVY_API_URL ?? "http://127.0.0.1:8420";
+// Exported so a caller that needs the raw (non-JSON-error-flattening)
+// response body -- e.g. bootstrap/config/route.ts, which forwards a
+// structured `{ errors: [...] }` validation payload the generic
+// `httpFetchJson` error path would otherwise collapse to one string --
+// can build the same URL without duplicating the env-var/default logic.
+export const HEAVY_API_URL = process.env.AGENTOPS_HEAVY_API_URL ?? "http://127.0.0.1:8420";
 
 export { HttpError as HeavyApiError };
 

@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+pub mod bootstrap;
+pub use bootstrap::BootstrapConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManifestEntry {
     pub path: String,

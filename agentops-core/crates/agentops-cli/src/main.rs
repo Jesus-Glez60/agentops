@@ -209,6 +209,22 @@ enum Command {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// Interactive first-run setup wizard for a classic (non-Docker,
+    /// non-PM2) terminal deployment — collects the same config a Docker
+    /// `.env` or the PM2 `/setup` page would, writes `.env` to the current
+    /// directory, and optionally starts the app. Infra config only: this
+    /// never creates an account itself (see `BootstrapConfig`'s doc comment
+    /// on why org/user setup stays a browser step through `/login`).
+    Init {
+        /// Skip all prompts and accept every default (generated master
+        /// key, SQLite-only, default addr, `first-user-only` signup mode) —
+        /// for scripted/CI use.
+        #[arg(long)]
+        yes: bool,
+        /// Write `.env` here instead of the current directory.
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -370,6 +386,13 @@ impl From<SearchKindArg> for NodeKind {
 /// genuinely async build their own runtime right where they're used
 /// instead, the same pattern `PostgresGraphStore` itself already relies on.
 fn main() -> Result<()> {
+    // Only this binary loads `.env` (see the Cargo.toml comment on the
+    // `dotenvy` dep) -- picks up whatever `agentops init` just wrote, or a
+    // hand-written `.env` in the cwd. Missing file is fine (`.ok()`);
+    // vars already set in the real environment always win, since dotenvy
+    // never overwrites an existing var.
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -416,6 +439,105 @@ fn main() -> Result<()> {
             TaskAction::Summarize { path, id } => task_summarize(&path, id),
             TaskAction::SyncLinear { path, limit, push, status_name } => task_sync_linear(&path, limit, push, status_name.as_deref()),
         },
+        Command::Init { yes, path } => init(yes, &path),
+    }
+}
+
+fn init(yes: bool, path: &Path) -> Result<()> {
+    use agentops_manifest::BootstrapConfig;
+
+    println!("agentops init — sets up a classic (non-Docker, non-PM2) deployment.\n");
+
+    let config = if yes {
+        BootstrapConfig { secrets_master_key: agentops_manifest::bootstrap::generate_master_key()?, signup_mode: Some("first-user-only".to_string()), ..Default::default() }
+    } else {
+        let generate = dialoguer::Confirm::new().with_prompt("Generate a new AGENTOPS_SECRETS_MASTER_KEY?").default(true).interact()?;
+        let secrets_master_key = if generate {
+            let key = agentops_manifest::bootstrap::generate_master_key()?;
+            println!("  generated: {key}");
+            key
+        } else {
+            dialoguer::Password::new().with_prompt("AGENTOPS_SECRETS_MASTER_KEY (64 hex chars)").interact()?
+        };
+
+        let addr: String = dialoguer::Input::new().with_prompt("Bind address").default("127.0.0.1:8420".to_string()).interact_text()?;
+
+        let use_postgres = dialoguer::Confirm::new().with_prompt("Use Postgres for the code-graph store? (No = local SQLite per repo)").default(false).interact()?;
+        let database_url = if use_postgres { Some(dialoguer::Input::<String>::new().with_prompt("Postgres connection string").interact_text()?) } else { None };
+
+        let open_signup = dialoguer::Confirm::new().with_prompt("Allow open signup after the first account? (No = invite-only, recommended for self-host)").default(false).interact()?;
+
+        BootstrapConfig {
+            secrets_master_key,
+            addr: Some(addr),
+            database_url,
+            signup_mode: Some(if open_signup { "open".to_string() } else { "first-user-only".to_string() }),
+            ..Default::default()
+        }
+    };
+
+    if let Err(errors) = config.validate() {
+        for e in &errors {
+            eprintln!("error: {e}");
+        }
+        anyhow::bail!("invalid configuration, see errors above");
+    }
+
+    let env_path = path.join(".env");
+    std::fs::write(&env_path, config.to_env_file()).with_context(|| format!("writing {}", env_path.display()))?;
+    println!("\nWrote {}", env_path.display());
+
+    let start_now = yes || dialoguer::Confirm::new().with_prompt("Start AgentOps now?").default(true).interact().unwrap_or(false);
+    if !start_now {
+        println!("Run `agentops serve-api` (from {}) when you're ready.", path.display());
+        return Ok(());
+    }
+
+    // `main()`'s `dotenvy::dotenv().ok()` already ran before this `.env`
+    // existed, so it never picked up what we just wrote -- apply the same
+    // values to this process's environment directly instead of relying on
+    // a reload. SAFETY: single-threaded here, before the tokio runtime
+    // starts, same pattern `Command::ServeApi` already uses.
+    unsafe {
+        std::env::set_var("AGENTOPS_SECRETS_MASTER_KEY", &config.secrets_master_key);
+        if let Some(addr) = &config.addr {
+            std::env::set_var("AGENTOPS_ADDR", addr);
+        }
+        if let Some(db_url) = &config.database_url {
+            std::env::set_var("AGENTOPS_DATABASE_URL", db_url);
+        }
+        if let Some(mode) = &config.signup_mode {
+            std::env::set_var("AGENTOPS_SIGNUP_MODE", mode);
+        }
+    }
+    println!("Starting agentops-server...");
+    start_web_frontend_if_present(path);
+    tokio::runtime::Runtime::new()?.block_on(agentops_server::run())
+}
+
+/// Best-effort: the frontend's standalone build only exists once a release
+/// artifact (`agentops-web-standalone.tar.gz`) has been downloaded and
+/// extracted, or a developer has run `npm run build` locally — neither is
+/// guaranteed at `agentops init` time, so this looks in the couple of
+/// places it could be and silently skips otherwise rather than failing the
+/// whole command over an optional piece.
+fn start_web_frontend_if_present(path: &Path) {
+    // Three layouts: `install.sh`'s AGENTOPS_INSTALL_DIR/web (independent
+    // of cwd, since a user typically doesn't run `agentops init` from
+    // inside ~/.agentops), a `web/` dir next to `.env` (--path pointed
+    // straight at an install dir), and a source checkout's own build
+    // output (developer running from the repo).
+    // Matches install.sh's AGENTOPS_INSTALL_DIR override / $HOME/.agentops default.
+    let install_dir = std::env::var("AGENTOPS_INSTALL_DIR").ok().map(PathBuf::from).or_else(|| std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(".agentops")));
+    let install_dir_web = install_dir.map(|d| d.join("web/server.js"));
+    let candidates = [install_dir_web, Some(path.join("web/server.js")), Some(path.join("apps/web/.next/standalone/server.js"))];
+    let Some(server_js) = candidates.into_iter().flatten().find(|p| p.exists()) else {
+        println!("(no bundled frontend found next to .env — run the web app separately if you want the UI)");
+        return;
+    };
+    println!("Starting web frontend from {}...", server_js.display());
+    if let Err(e) = std::process::Command::new("node").arg(&server_js).spawn() {
+        eprintln!("warning: failed to start web frontend ({e}) — run it separately");
     }
 }
 

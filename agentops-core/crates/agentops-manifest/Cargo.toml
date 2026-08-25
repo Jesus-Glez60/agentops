@@ -11,6 +11,8 @@ name = "agentops_manifest"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+agentops-security = { path = "../agentops-security" }
+agentops-repo-access = { path = "../agentops-repo-access" }
 
 [dev-dependencies]
 tempfile = "3"

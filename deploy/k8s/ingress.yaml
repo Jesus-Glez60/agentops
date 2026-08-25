@@ -1,0 +1,31 @@
+# Routes the browser-facing web UI publicly. The REST/MCP API (port 8420)
+# is intentionally NOT routed here by default -- the frontend reaches it
+# over localhost inside the same pod/container (see AGENTOPS_HEAVY_API_URL
+# in the Dockerfile), so it doesn't need external routing unless you also
+# want direct API-key-authed access from outside the cluster. Uncomment
+# the second rule below for that.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: agentops
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: "50m"
+spec:
+  rules:
+    - host: agentops.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: agentops
+                port:
+                  name: web
+          # - path: /api-external
+          #   pathType: Prefix
+          #   backend:
+          #     service:
+          #       name: agentops
+          #       port:
+          #         name: api

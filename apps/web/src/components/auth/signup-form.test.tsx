@@ -107,6 +107,15 @@ describe("SignupForm", () => {
     expect(toastError).not.toHaveBeenCalled();
   });
 
+  it("passes the invite token through to signupWithPassword when present", async () => {
+    signupWithPassword.mockResolvedValue({ id: 1, email: "new@example.com", first_name: "Ada", last_name: "Lovelace", tenant: "abc" });
+    render(<SignupForm redirectTo="/invite/tok123" inviteToken="tok123" />);
+    fillValidForm();
+    fireEvent.click(screen.getByRole("button", { name: "Sign up" }));
+
+    await waitFor(() => expect(signupWithPassword).toHaveBeenCalledWith("Ada", "Lovelace", "new@example.com", "correct horse", "tok123"));
+  });
+
   it("disables the submit button while the request is pending", async () => {
     let resolveSignup!: (value: { id: number; email: string; first_name: string; last_name: string; tenant: string }) => void;
     signupWithPassword.mockReturnValue(new Promise((resolve) => (resolveSignup = resolve)));

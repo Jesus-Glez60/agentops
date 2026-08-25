@@ -230,6 +230,14 @@ impl AccountStore {
         Ok(Self { conn })
     }
 
+    /// Whether any user has ever signed up on this instance — used to
+    /// gate open signup after the first account exists (see
+    /// `AGENTOPS_SIGNUP_MODE`) and to steer first-run UX to the signup tab.
+    pub fn any_account_exists(&self) -> Result<bool> {
+        let count: i64 = self.conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
+        Ok(count > 0)
+    }
+
     /// Creates a new user + an immediately-valid session — errors if
     /// `email` is already registered.
     pub fn signup(&self, new_account: NewAccount) -> Result<(User, String)> {
@@ -926,6 +934,14 @@ mod tests {
 
     fn test_secrets() -> agentops_repo_access::secrets::EnvSecretsProvider {
         agentops_repo_access::secrets::EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap()
+    }
+
+    #[test]
+    fn any_account_exists_flips_true_after_the_first_signup() {
+        let store = AccountStore::open_in_memory().unwrap();
+        assert!(!store.any_account_exists().unwrap());
+        signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
+        assert!(store.any_account_exists().unwrap());
     }
 
     #[test]

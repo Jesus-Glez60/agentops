@@ -1,0 +1,52 @@
+# Optional -- mirrors docker-compose.yml's `postgres` profile for users who
+# want in-cluster Postgres for the code-graph store rather than an external
+# managed DB. If applied, point AGENTOPS_DATABASE_URL (in secret.yaml) at
+# postgres://agentops:agentops@agentops-postgres:5432/agentops.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: agentops-postgres
+spec:
+  serviceName: agentops-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agentops-postgres
+  template:
+    metadata:
+      labels:
+        app: agentops-postgres
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg16
+          env:
+            - name: POSTGRES_USER
+              value: agentops
+            - name: POSTGRES_PASSWORD
+              value: agentops
+            - name: POSTGRES_DB
+              value: agentops
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agentops-postgres
+spec:
+  selector:
+    app: agentops-postgres
+  ports:
+    - port: 5432

@@ -16,6 +16,16 @@ pub fn generate_api_key() -> Result<(String, String)> {
     Ok((raw, hash))
 }
 
+/// Generates a fresh `AGENTOPS_SECRETS_MASTER_KEY` — 32 random bytes as 64
+/// hex chars, no prefix (unlike [`generate_api_key`]'s `ao_`-prefixed raw
+/// key), matching exactly what `openssl rand -hex 32` produces and what
+/// `EnvSecretsProvider::from_hex` expects.
+pub fn generate_master_key() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).context("generating random master key bytes")?;
+    Ok(hex_encode(&bytes))
+}
+
 /// Constant-time check that `raw` hashes to `expected_hash` — timing-safe
 /// so a byte-by-byte comparison can't leak how much of the key was guessed
 /// correctly.
@@ -83,5 +93,17 @@ mod tests {
         let (raw1, _) = generate_api_key().unwrap();
         let (raw2, _) = generate_api_key().unwrap();
         assert_ne!(raw1, raw2);
+    }
+
+    #[test]
+    fn generated_master_key_is_64_hex_chars_with_no_prefix() {
+        let key = generate_master_key().unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn two_generated_master_keys_are_different() {
+        assert_ne!(generate_master_key().unwrap(), generate_master_key().unwrap());
     }
 }

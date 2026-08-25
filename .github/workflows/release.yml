@@ -1,0 +1,105 @@
+# Method 3 (classic terminal deployment): builds agentops/agentops-server/
+# agentops-mcp-server for each platform and publishes them to a GitHub
+# Release, plus a Next.js standalone frontend tarball (Method 3's
+# "automate the frontend too" requirement -- see install.sh, which
+# downloads and extracts both).
+#
+# Each target builds on a runner whose OS actually matches it (no
+# cross-compilation) -- deliberate given a real, empirically-confirmed
+# constraint: `ort` (ONNX Runtime, via fastembed) downloads a prebuilt
+# library at build time that needs GCC 13+'s libstdc++ ABI (verified while
+# building the Method 1 Docker image -- Debian bookworm's GCC 12 fails to
+# link, trixie's GCC 14 works). ubuntu-24.04 ships GCC 13, which is why
+# it's pinned below rather than ubuntu-latest/22.04.
+#
+# This hand-written workflow targets the same platform list as
+# [workspace.metadata.dist] in the root Cargo.toml; running `cargo dist
+# init` (once the `cargo-dist` tool is available) would regenerate an
+# equivalent, cargo-dist-maintained version of this file with its own
+# installer-generation logic -- not done here since that requires
+# installing and running the tool interactively.
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-binaries:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release --bin agentops --bin agentops-server --bin agentops-mcp-server
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          tar -czf dist/agentops-${{ matrix.target }}.tar.gz -C target/release agentops agentops-server agentops-mcp-server
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          mkdir dist
+          Compress-Archive -Path target/release/agentops.exe,target/release/agentops-server.exe,target/release/agentops-mcp-server.exe -DestinationPath dist/agentops-${{ matrix.target }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentops-${{ matrix.target }}
+          path: dist/*
+
+  build-frontend:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - working-directory: apps/web
+        run: |
+          npm ci
+          npm run build
+      - name: Package standalone build
+        working-directory: apps/web
+        run: |
+          mkdir -p ../../dist/web
+          cp -r .next/standalone/. ../../dist/web/
+          cp -r .next/static ../../dist/web/.next/static
+          cp -r public ../../dist/web/public
+          tar -czf ../../dist/agentops-web-standalone.tar.gz -C ../../dist/web .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agentops-web-standalone
+          path: dist/agentops-web-standalone.tar.gz
+
+  release:
+    needs: [build-binaries, build-frontend]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f -exec cp {} release/ \;
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true

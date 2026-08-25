@@ -39,8 +39,9 @@ export async function completeLogin2fa(challengeToken: string, code: string): Pr
   return data.user as SessionUser;
 }
 
-export async function signupWithPassword(firstName: string, lastName: string, email: string, password: string): Promise<SessionUser> {
-  const data = await postAuth("/api/auth/signup", { first_name: firstName, last_name: lastName, email, password });
+/** `inviteToken` proves this signup is invite-driven, letting it through once `AGENTOPS_SIGNUP_MODE=first-user-only` and an account already exists on this instance — it does NOT itself join the inviting org; the invite page's own `POST /invites/accept` call (after this redirects back there) does that. */
+export async function signupWithPassword(firstName: string, lastName: string, email: string, password: string, inviteToken?: string): Promise<SessionUser> {
+  const data = await postAuth("/api/auth/signup", { first_name: firstName, last_name: lastName, email, password, ...(inviteToken ? { invite_token: inviteToken } : {}) });
   return data.user as SessionUser;
 }
 
