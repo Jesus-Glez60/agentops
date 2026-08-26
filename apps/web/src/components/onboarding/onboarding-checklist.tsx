@@ -11,7 +11,6 @@
 // by (app)/layout.tsx's redirect, not by anything in here.
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import Link from "next/link";
 import useSWR from "swr";
 import { toast } from "sonner";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
@@ -131,6 +130,24 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
     }
   }
 
+  /** Any other `(app)/*` page -- e.g. Repositories -- redirects straight
+   * back here if `onboarding_completed` is still false, the same gate that
+   * protects `/welcome` itself. Caught live: clicking "Connect a
+   * repository" bounced back to a freshly-reset `/welcome` instead of
+   * actually navigating, wiping in-progress state. Marking onboarding done
+   * first (same call `finish()` makes) is the fix -- the user has
+   * genuinely seen this page and is actively choosing to go do a real task
+   * elsewhere, exactly the same "I'm done here" signal as the main button. */
+  async function navigateWithinApp(href: string) {
+    try {
+      await completeOnboarding();
+    } catch {
+      // Non-fatal, same reasoning as finish() -- worst case they land back
+      // on /welcome instead of `href`, not stuck anywhere.
+    }
+    router.push(href);
+  }
+
   return (
     <main className="flex min-h-screen items-center justify-center bg-canvas p-4">
       <Card className="w-full max-w-lg">
@@ -194,8 +211,8 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
               ) : repos && repos.connections.length === 0 ? (
                 <>
                   <p className="text-body text-ink-400">You&apos;ll need at least one connected repository before your coding tool has anything to reach. This is fully web-based — no CLI needed.</p>
-                  <Button size="sm" asChild>
-                    <Link href="/repositories/connect">Connect a repository</Link>
+                  <Button size="sm" onClick={() => navigateWithinApp("/repositories/connect")}>
+                    Connect a repository
                   </Button>
                   <p className="text-body text-ink-500">Once that&apos;s done, come back here to generate an API key and get the connect command.</p>
                 </>
