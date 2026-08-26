@@ -238,7 +238,23 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
     // a normal side effect of `persist()` -- no separate code needed to
     // keep that table populated.
     start_stage!(STAGE_ORDER[3]);
-    let summary = match agentops_mcp::scan::persist(&local_path, &report, false) {
+    // `spawn_blocking` -- required, not just a performance nicety.
+    // `agentops-graph-pg`'s own doc comment documents that `GraphStore`
+    // calls (which `persist()` makes, transitively) `block_on` an
+    // internally-owned Tokio runtime when `AGENTOPS_DATABASE_URL` is set,
+    // and that an async caller must wrap them in `spawn_blocking` or hit a
+    // nested-runtime panic. This `async fn` (already running inside a
+    // `tokio::spawn`'d task) is exactly that async caller -- caught live,
+    // twice, against a real Postgres-backed deployment: the panic aborts
+    // this task with no `Err` ever returned, so `indexing_jobs` is left at
+    // `status = 'running'` forever with no failure recorded, looking
+    // exactly like a hang.
+    let local_path_for_blocking = local_path.clone();
+    let persist_result = match tokio::task::spawn_blocking(move || agentops_mcp::scan::persist(&local_path_for_blocking, &report, false)).await {
+        Ok(v) => v,
+        Err(e) => fail_and_return!(STAGE_ORDER[3], format!("scan task panicked: {e}")),
+    };
+    let summary = match persist_result {
         Ok(s) => s,
         Err(e) => fail_and_return!(STAGE_ORDER[3], format!("persisting scan: {e}")),
     };
