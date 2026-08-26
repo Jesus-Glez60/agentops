@@ -18,12 +18,11 @@ import { Check, ChevronDown, ChevronRight } from "lucide-react";
 import type { SessionUser } from "@/lib/auth/types";
 import { getTeam, renameOrg, TEAM_SWR_KEY } from "@/lib/api/team-api";
 import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
-import { updateProfile, completeOnboarding, createApiKey } from "@/lib/api/profile-api";
+import { completeOnboarding, createApiKey } from "@/lib/api/profile-api";
 import { InviteMemberDialog } from "@/components/team/invite-member-dialog";
 import { CopyButton } from "@/components/shared/copy-button";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
@@ -60,12 +59,6 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
   const [workspaceMode, setWorkspaceMode] = useState<"solo" | "team" | null>(null);
   const [orgName, setOrgName] = useState("");
   const [savingOrg, setSavingOrg] = useState(false);
-
-  const [profileDone, setProfileDone] = useState(false);
-  const [handle, setHandle] = useState(user.handle ?? "");
-  const [location, setLocation] = useState(user.location);
-  const [bio, setBio] = useState(user.bio);
-  const [savingProfile, setSavingProfile] = useState(false);
 
   const [connectDone, setConnectDone] = useState(false);
   // Whether agentops runs on this device or on a separate server isn't
@@ -110,19 +103,6 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
       toast.error(err instanceof Error ? err.message : "Couldn't save that name. Please try again.");
     } finally {
       setSavingOrg(false);
-    }
-  }
-
-  async function saveProfile() {
-    setSavingProfile(true);
-    try {
-      await updateProfile({ handle: handle.trim(), location: location.trim(), bio: bio.trim() });
-      setProfileDone(true);
-      toast.success("Profile updated");
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Couldn't update your profile. Please try again.");
-    } finally {
-      setSavingProfile(false);
     }
   }
 
@@ -192,17 +172,6 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
               )}
             </ChecklistItem>
           )}
-
-          <ChecklistItem title="Complete your profile" done={profileDone} expanded={expanded === "profile"} onToggle={() => toggle("profile")}>
-            <div className="space-y-3">
-              <Input value={handle} onChange={(e) => setHandle(e.target.value)} placeholder="Handle" disabled={savingProfile} />
-              <Input value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Location" disabled={savingProfile} />
-              <Textarea value={bio} onChange={(e) => setBio(e.target.value)} placeholder="A short bio" rows={2} disabled={savingProfile} />
-              <Button size="sm" disabled={savingProfile} onClick={saveProfile}>
-                {savingProfile ? "Saving…" : "Save"}
-              </Button>
-            </div>
-          </ChecklistItem>
 
           <ChecklistItem title="Connect your coding tool" done={connectDone} expanded={expanded === "connect"} onToggle={() => toggle("connect")}>
             <div className="space-y-3">
