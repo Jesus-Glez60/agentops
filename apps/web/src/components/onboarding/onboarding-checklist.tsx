@@ -11,11 +11,13 @@
 // by (app)/layout.tsx's redirect, not by anything in here.
 import { useState } from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import useSWR from "swr";
 import { toast } from "sonner";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
 import type { SessionUser } from "@/lib/auth/types";
 import { getTeam, renameOrg, TEAM_SWR_KEY } from "@/lib/api/team-api";
+import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { updateProfile, completeOnboarding, createApiKey } from "@/lib/api/profile-api";
 import { InviteMemberDialog } from "@/components/team/invite-member-dialog";
 import { CopyButton } from "@/components/shared/copy-button";
@@ -45,6 +47,12 @@ function ChecklistItem({ title, done, expanded, onToggle, children }: { title: s
 export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: SessionUser; apiUrl: string; apiUrlIsGuessed: boolean }) {
   const router = useRouter();
   const { data: team } = useSWR(TEAM_SWR_KEY, getTeam); // also triggers the ensure_membership Owner backfill as a side effect
+  // Only relevant for the remote path below -- `agentops connect --remote`
+  // needs a server-side connection to point at, but local/stdio mode scans
+  // the repo directly and never touches this at all. Caught live: a
+  // freshly generated key + the exact shown command fails with "no repos
+  // are connected to your organization yet" when this step gets skipped.
+  const { data: repos } = useSWR(REPOS_SWR_KEY, getRepos);
   const [expanded, setExpanded] = useState<string | null>("workspace");
   const [finishing, setFinishing] = useState(false);
 
@@ -213,6 +221,14 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
                     <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{CONNECT_COMMAND}</code>
                     <CopyButton value={CONNECT_COMMAND} />
                   </div>
+                </>
+              ) : repos && repos.connections.length === 0 ? (
+                <>
+                  <p className="text-body text-ink-400">You&apos;ll need at least one connected repository before your coding tool has anything to reach. This is fully web-based — no CLI needed.</p>
+                  <Button size="sm" asChild>
+                    <Link href="/repositories/connect">Connect a repository</Link>
+                  </Button>
+                  <p className="text-body text-ink-500">Once that&apos;s done, come back here to generate an API key and get the connect command.</p>
                 </>
               ) : remoteApiKey === null ? (
                 <>
