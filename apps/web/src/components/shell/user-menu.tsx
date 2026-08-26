@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { ChevronsUpDown, LogOut, UserRound, Users } from "lucide-react";
+import { ChevronsUpDown, LogOut, Plug, UserRound, Users } from "lucide-react";
 import { logout } from "@/lib/auth/client";
 import type { SessionUser } from "@/lib/auth/types";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
@@ -47,6 +47,15 @@ export function UserMenu({ user }: { user: SessionUser }) {
         <DropdownMenuItem onSelect={() => router.push("/settings")}>
           <Users className="size-4" />
           Team Settings
+        </DropdownMenuItem>
+        {/* /welcome never gates on onboarding_completed -- always safe to
+            revisit, it's the one place to regenerate an API key and get
+            the connect command again after the fact, not just on first
+            login. Caught live: there was no way back to this once past
+            onboarding. */}
+        <DropdownMenuItem onSelect={() => router.push("/welcome")}>
+          <Plug className="size-4" />
+          Connect a coding tool
         </DropdownMenuItem>
         <DropdownMenuSeparator />
         <DropdownMenuItem onSelect={handleLogout} disabled={loggingOut}>
