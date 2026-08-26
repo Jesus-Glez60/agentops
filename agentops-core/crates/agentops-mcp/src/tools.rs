@@ -279,7 +279,17 @@ pub fn call_tool(mode: AccessMode, name: &str, args: &Value) -> Result<CallToolR
 
     Ok(match (spec.handler)(args) {
         Ok(text) => CallToolResult::success(text),
-        Err(e) => CallToolResult::error(e.to_string()),
+        // `{e:#}` (anyhow's alternate Display), not `{e}` -- plain `{}`
+        // only shows the outermost error's own message, which for a
+        // `tokio_postgres::Error` wrapping `Kind::Db` is literally just
+        // the four-word string "db error" with no detail at all (that
+        // crate's own `Display` impl for the error *kind*, not the
+        // underlying `DbError` payload, which only surfaces via the
+        // `source()` chain). `{:#}` walks the whole chain, showing every
+        // `.context(...)` layer down to the real cause. Caught live: a
+        // genuine Postgres-side failure was completely invisible behind
+        // "db error" with nothing to actually debug from.
+        Err(e) => CallToolResult::error(format!("{e:#}")),
     })
 }
 
