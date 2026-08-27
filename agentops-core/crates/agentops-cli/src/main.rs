@@ -257,6 +257,32 @@ enum Command {
         #[arg(long)]
         api_key: Option<String>,
     },
+    /// One-off: copy one repo's entire local SQLite graph store into a
+    /// Postgres-backed `PostgresGraphStore` (e.g. a server-hosted
+    /// deployment). Not part of normal operation — `AGENTOPS_DATABASE_URL`
+    /// already selects Postgres for everyday use (see `agentops-mcp::store`);
+    /// this exists only to move a repo's history across backends once.
+    /// `node_versions` (bi-temporal symbol content history) is deliberately
+    /// NOT migrated: `GraphStore::snapshot_node_version` always stamps
+    /// `valid_from` as "now", so replaying old versions through it would
+    /// fabricate false timestamps rather than preserve real ones — the
+    /// current content already carries forward via each node's own `content`
+    /// field, and version history resumes fresh from the target's next scan.
+    MigrateGraph {
+        /// Path to the source SQLite graph.db file.
+        #[arg(long)]
+        from: PathBuf,
+        /// Destination Postgres connection string.
+        #[arg(long)]
+        to: String,
+        /// Repo key to migrate (must match what's in the source store).
+        #[arg(long)]
+        repo: String,
+        /// Delete this repo's existing data on the destination first,
+        /// instead of erroring out or attempting to merge into it.
+        #[arg(long)]
+        wipe_target: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -473,7 +499,132 @@ fn main() -> Result<()> {
         },
         Command::Init { yes, path } => init(yes, &path),
         Command::Connect { path, agents, access_mode, yes, remote, api_key } => connect(&path, agents, access_mode, yes, remote, api_key),
+        Command::MigrateGraph { from, to, repo, wipe_target } => migrate_graph(&from, &to, &repo, wipe_target),
     }
+}
+
+fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result<()> {
+    use agentops_graph::{NewNode, NewScanHistoryEntry, NewTask};
+    use std::collections::HashMap;
+
+    let src = agentops_graph::SqliteGraphStore::open(from).with_context(|| format!("opening source SQLite store at {}", from.display()))?;
+    let dst = agentops_graph_pg::PostgresGraphStore::connect(to).context("connecting to destination Postgres")?;
+
+    if wipe_target {
+        println!("Wiping existing repo={repo:?} data on destination...");
+        dst.wipe_repo(repo)?;
+    }
+
+    // --- nodes (+ embeddings) ---
+    let src_nodes = src.all_nodes(repo)?;
+    let mut node_id_map: HashMap<i64, i64> = HashMap::new();
+    for n in &src_nodes {
+        let new_id = dst.add_node(NewNode {
+            kind: n.kind,
+            repo: repo.to_string(),
+            path: n.path.clone(),
+            name: n.name.clone(),
+            container: n.container.clone(),
+            start_line: n.start_line,
+            end_line: n.end_line,
+            content: n.content.clone(),
+        })?;
+        node_id_map.insert(n.id, new_id);
+        if n.curated || matches!(n.prominence, agentops_graph::NodeProminence::Reduced) {
+            dst.set_curation(repo, new_id, n.prominence, n.curation_reason.as_deref())?;
+        }
+        if let Some(embedding) = src.get_embedding(repo, n.id)? {
+            dst.set_embedding(repo, new_id, &embedding)?;
+        }
+    }
+    println!("nodes: {} copied", src_nodes.len());
+
+    // --- edges ---
+    let src_edges = src.all_edges(repo)?;
+    let mut edges_copied = 0usize;
+    for e in &src_edges {
+        let (Some(&src_id), Some(&dst_id)) = (node_id_map.get(&e.src_id), node_id_map.get(&e.dst_id)) else {
+            eprintln!("  skipping edge #{}: endpoint node missing from this migration (already deleted upstream)", e.id);
+            continue;
+        };
+        dst.add_edge(repo, src_id, dst_id, e.relation)?;
+        edges_copied += 1;
+    }
+    println!("edges: {edges_copied} copied ({} skipped)", src_edges.len() - edges_copied);
+
+    // --- scan_history + entries ---
+    let scans = src.list_scans(repo)?;
+    for scan in &scans {
+        let entries = src.scan_entries(scan.id)?;
+        let new_entries: Vec<NewScanHistoryEntry> = entries
+            .iter()
+            .map(|e| NewScanHistoryEntry {
+                // Soft reference (not an FK) on both backends — remap when
+                // the node still exists in this migration, otherwise carry
+                // the old id through unchanged (matches the pre-existing
+                // "removed node" behavior: a dangling pointer is already the
+                // accepted/expected state for those rows).
+                node_id: node_id_map.get(&e.node_id).copied().unwrap_or(e.node_id),
+                kind: e.kind,
+                path: e.path.clone(),
+                name: e.name.clone(),
+                change: e.change,
+            })
+            .collect();
+        dst.record_scan(repo, &new_entries)?;
+    }
+    println!("scan_history: {} copied", scans.len());
+
+    // --- doc_page ---
+    if let Some((generated_at, content_json)) = src.get_doc_page(repo)? {
+        dst.save_doc_page(repo, &generated_at, &content_json)?;
+        println!("doc_page: copied");
+    }
+
+    // --- session_events (no node_id column — nothing to remap) ---
+    // `GraphStore` has no bulk "all sessions for repo" accessor, so pull
+    // distinct session ids directly out of tasks (the only other place a
+    // session_id shows up) is not viable either — sessions unlinked from any
+    // task aren't otherwise discoverable via the trait. This is a known,
+    // accepted gap: session activity is a supplementary cross-tool feed (6
+    // rows locally), not part of the core knowledge this migration exists
+    // to preserve.
+    println!("session_events: skipped (no bulk-read accessor on GraphStore; see comment)");
+
+    // --- tasks + task_links ---
+    let tasks = src.list_tasks(repo)?;
+    let mut task_id_map: HashMap<i64, i64> = HashMap::new();
+    for t in &tasks {
+        let new_id = dst.create_task(NewTask {
+            repo: repo.to_string(),
+            title: t.title.clone(),
+            description: t.description.clone(),
+            status: t.status,
+            priority: t.priority.clone(),
+            assignee: t.assignee.clone(),
+            external_source: t.external_source.clone(),
+            external_id: t.external_id.clone(),
+            session_id: t.session_id.clone(),
+        })?;
+        task_id_map.insert(t.id, new_id);
+    }
+    let mut links_copied = 0usize;
+    for t in &tasks {
+        let Some(&new_task_id) = task_id_map.get(&t.id) else { continue };
+        for link in src.task_links(t.id)? {
+            let new_node_id = node_id_map.get(&link.node_id).copied().unwrap_or(link.node_id);
+            dst.link_task(new_task_id, new_node_id, &link.relation)?;
+            links_copied += 1;
+        }
+    }
+    println!("tasks: {} copied ({links_copied} task_links)", tasks.len());
+
+    // --- repo_state (recomputed, not copied verbatim) ---
+    dst.refresh_repo_state(repo)?;
+    println!("repo_state: refreshed");
+
+    println!("\nmigrate-graph done: repo={repo:?} from={} to=<postgres>", from.display());
+    Ok(())
 }
 
 fn init(yes: bool, path: &Path) -> Result<()> {

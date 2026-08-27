@@ -51,6 +51,33 @@ impl PostgresGraphStore {
         })?;
         Ok(Self { rt, pool })
     }
+
+    /// Deletes every row scoped to `repo` across every table — `nodes`
+    /// (`edges` cascade automatically via the schema's `ON DELETE CASCADE`),
+    /// plus the soft-referenced tables that don't cascade (`node_versions`,
+    /// `task_links`, `scan_history_entries`) which would otherwise dangle
+    /// against ids a subsequent fresh load reuses. Inherent, not a
+    /// `GraphStore` trait method — this is a one-off wholesale-replace
+    /// operation (used by `agentops-cli`'s `migrate-graph --wipe-target`),
+    /// not a use case any normal caller needs.
+    pub fn wipe_repo(&self, repo: &str) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("DELETE FROM node_versions WHERE node_id IN (SELECT id FROM nodes WHERE repo = $1)", &[&repo]).await?;
+            client.execute("DELETE FROM task_links WHERE node_id IN (SELECT id FROM nodes WHERE repo = $1) OR task_id IN (SELECT id FROM tasks WHERE repo = $1)", &[&repo]).await?;
+            client.execute("DELETE FROM scan_history_entries WHERE scan_id IN (SELECT id FROM scan_history WHERE repo = $1)", &[&repo]).await?;
+            client.execute("DELETE FROM tasks WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM scan_history WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM doc_pages WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM repo_state WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM session_events WHERE repo = $1", &[&repo]).await?;
+            // Nodes last: edges cascade at the DB level, and the
+            // soft-referenced tables above are already cleared, so nothing
+            // left references these ids.
+            client.execute("DELETE FROM nodes WHERE repo = $1", &[&repo]).await?;
+            Ok(())
+        })
+    }
 }
 
 fn row_to_node(row: &tokio_postgres::Row) -> Node {
@@ -557,21 +584,28 @@ impl GraphStore for PostgresGraphStore {
         // `content_json`'s `DocPage.generated_at` field — see
         // `agentops-mcp`'s orchestration) rather than a fresh `now()` here,
         // so the DB column and the JSON blob's own field can never drift
-        // apart. `::timestamptz` parses the TEXT scan timestamp the same
-        // way `edges.updated_at`'s established `TIMESTAMPTZ` columns
-        // already accept SQLite-formatted text elsewhere in this crate.
+        // apart. `::timestamptz` parses the TEXT scan timestamp — but the
+        // parameter itself must still be sent as TEXT on the wire (an
+        // explicit `prepare_typed`, not left to the driver's own inference
+        // from the `::timestamptz` cast site, which describes the
+        // placeholder itself as `timestamptz` and then rejects a `&str`
+        // value outright with "cannot convert between the Rust type `&str`
+        // and the Postgres type `timestamptz`" — caught live via
+        // `migrate-graph`'s dry run, this path had never actually been
+        // exercised against Postgres before).
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            client
-                .execute(
+            let stmt = client
+                .prepare_typed(
                     "INSERT INTO doc_pages (repo, generated_at, content)
                      VALUES ($1, $2::timestamptz, $3)
                      ON CONFLICT (repo) DO UPDATE SET
                         generated_at = excluded.generated_at,
                         content = excluded.content",
-                    &[&repo, &generated_at, &content_json],
+                    &[tokio_postgres::types::Type::TEXT, tokio_postgres::types::Type::TEXT, tokio_postgres::types::Type::TEXT],
                 )
                 .await?;
+            client.execute(&stmt, &[&repo, &generated_at, &content_json]).await?;
             Ok(())
         })
     }
@@ -624,7 +658,11 @@ impl GraphStore for PostgresGraphStore {
                  WHERE node_id = $1 AND valid_from <= $2::timestamptz AND (valid_until IS NULL OR valid_until > $2::timestamptz) \
                  ORDER BY id DESC LIMIT 1"
             );
-            let row = client.query_opt(&sql, &[&node_id, &timestamp]).await?;
+            // Same `prepare_typed` fix as `save_doc_page`: the `::timestamptz`
+            // cast makes the driver describe $2 as `timestamptz`, which a
+            // `&str` value can't satisfy directly.
+            let stmt = client.prepare_typed(&sql, &[tokio_postgres::types::Type::INT8, tokio_postgres::types::Type::TEXT]).await?;
+            let row = client.query_opt(&stmt, &[&node_id, &timestamp]).await?;
             Ok(row.as_ref().map(row_to_node_version))
         })
     }

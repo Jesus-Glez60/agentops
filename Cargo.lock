@@ -96,6 +96,7 @@ version = "0.1.0"
 dependencies = [
  "agentops-embeddings",
  "agentops-graph",
+ "agentops-graph-pg",
  "agentops-linear",
  "agentops-llm",
  "agentops-manifest",

@@ -15,6 +15,7 @@ tokio.workspace = true
 
 agentops-scanner = { path = "../agentops-scanner" }
 agentops-graph = { path = "../agentops-graph" }
+agentops-graph-pg = { path = "../agentops-graph-pg" }
 agentops-notes = { path = "../agentops-notes" }
 agentops-llm = { path = "../agentops-llm" }
 agentops-linear = { path = "../agentops-linear" }
