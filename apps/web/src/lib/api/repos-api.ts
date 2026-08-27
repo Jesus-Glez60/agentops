@@ -49,6 +49,8 @@ export interface RepoConnection {
   counts?: RepoCounts | null;
   branch?: string | null;
   path_missing?: boolean;
+  /** User-selected branch override -- `null`/absent means "no override, index whatever the default branch is." Distinct from `branch` above (the live-read actual checked-out branch): this is the persisted intent. */
+  tracked_branch?: string | null;
 }
 
 export interface ReposResponse {
@@ -180,6 +182,16 @@ export function retryIndexing(connectionId: string, jobId: string): Promise<{ jo
 /** SSH-method connections only -- 404s for a GitHub App connection (nothing to regenerate). */
 export function regenerateDeployKey(connectionId: string): Promise<{ connection: RepoConnection }> {
   return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/regenerate-key`, { method: "POST" });
+}
+
+/** Every branch on the connection's remote -- SSH via `git ls-remote`, GitHub App via GitHub's REST API server-side (see `agentops-heavy-api::indexing::list_branches`). */
+export function listBranches(connectionId: string): Promise<string[]> {
+  return heavyFetch<{ branches: string[] }>(`/repos/${encodeURIComponent(connectionId)}/branches`).then((r) => r.branches);
+}
+
+/** Sets (or, with `null`, clears) the connection's tracked-branch override and immediately spawns a reindex job against it -- same response shape as `startIndexing`. */
+export function setBranch(connectionId: string, branch: string | null): Promise<{ job_id: string }> {
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/branch`, { method: "PATCH", body: JSON.stringify({ branch }) });
 }
 
 // --- Dashboard unification (Initiative 1) ---------------------------------

@@ -246,7 +246,39 @@ pub fn push_repo(repo_path: &Path, key: &UnlockedKey, known_hosts_content: &str,
     run_git_with_key(&args, key, known_hosts_content)
 }
 
+/// Lists every branch name on `remote_url` via `git ls-remote --heads` over
+/// SSH — the SSH-connection counterpart of
+/// `agentops_github_app::list_repo_branches`. No unauthenticated REST
+/// equivalent exists for an arbitrary self-hosted git remote, so this shells
+/// out rather than calling an API.
+pub fn list_remote_branches(remote_url: &str, key: &UnlockedKey, known_hosts_content: &str) -> Result<Vec<String>> {
+    let output = run_git_with_key_output(&["ls-remote", "--heads", remote_url], key, known_hosts_content)?;
+    Ok(parse_ls_remote_heads(&output))
+}
+
+fn parse_ls_remote_heads(output: &str) -> Vec<String> {
+    output.lines().filter_map(|line| line.split('\t').nth(1)).filter_map(|r| r.strip_prefix("refs/heads/")).map(String::from).collect()
+}
+
+/// Checks out `branch` in an already-cloned working copy at `repo_path`. No
+/// key/known_hosts needed — this runs entirely against the local working
+/// copy, after whichever authenticated clone already populated it. A normal
+/// `git clone` fetches every remote branch's ref, so this transparently
+/// creates the local tracking branch from `origin/<branch>` if one doesn't
+/// already exist.
+pub fn checkout_branch(repo_path: &Path, branch: &str) -> Result<()> {
+    let output = Command::new("git").args(["-C", &repo_path.to_string_lossy(), "checkout", branch]).output().context("spawning git checkout")?;
+    if !output.status.success() {
+        bail!("git checkout {branch:?} failed: {}", String::from_utf8_lossy(&output.stderr));
+    }
+    Ok(())
+}
+
 fn run_git_with_key(args: &[&str], key: &UnlockedKey, known_hosts_content: &str) -> Result<()> {
+    run_git_with_key_output(args, key, known_hosts_content).map(|_| ())
+}
+
+fn run_git_with_key_output(args: &[&str], key: &UnlockedKey, known_hosts_content: &str) -> Result<String> {
     let known_hosts_path = std::env::temp_dir().join(format!("agentops-known-hosts-{}", random_suffix()));
     std::fs::write(&known_hosts_path, known_hosts_content).context("writing temp known_hosts file")?;
     // Best-effort cleanup even on early return below via a scope guard would
@@ -266,7 +298,7 @@ fn run_git_with_key(args: &[&str], key: &UnlockedKey, known_hosts_content: &str)
     if !output.status.success() {
         bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&output.stderr));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 fn shell_quote(s: &str) -> String {
@@ -460,5 +492,67 @@ mod tests {
         assert!(result.is_err(), "pushing with no configured remote must error, not panic");
 
         let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// `list_remote_branches` against a real local bare repo -- same
+    /// local-path-remote trick as `push_repo_pushes_a_local_commit_to_its_bare_remote`
+    /// (bypasses `GIT_SSH_COMMAND` entirely, still exercises the real
+    /// `git ls-remote` subprocess and output parsing).
+    #[test]
+    fn list_remote_branches_lists_every_head_on_the_remote() {
+        let keypair = generate_deploy_keypair("test@agentops", b"pw").unwrap();
+        let unlocked = UnlockedKey::unlock(&keypair.encrypted_private_key_openssh, b"pw").unwrap();
+
+        let bare = std::env::temp_dir().join(format!("agentops-list-branches-bare-{}", random_suffix()));
+        let work = std::env::temp_dir().join(format!("agentops-list-branches-work-{}", random_suffix()));
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(Command::new("git").args(["init", "--bare", "-b", "main"]).arg(&bare).status().unwrap().success());
+        assert!(Command::new("git").args(["clone", &bare.to_string_lossy(), &work.to_string_lossy()]).status().unwrap().success());
+        std::fs::write(work.join("file.txt"), "hello").unwrap();
+        assert!(Command::new("git").current_dir(&work).args(["config", "user.email", "test@example.com"]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["config", "user.name", "test"]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["add", "."]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["commit", "-m", "initial"]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["checkout", "-b", "feature"]).status().unwrap().success());
+        push_repo(&work, &unlocked, GITHUB_KNOWN_HOSTS, Some("main")).unwrap();
+        push_repo(&work, &unlocked, GITHUB_KNOWN_HOSTS, Some("feature")).unwrap();
+
+        let branches = list_remote_branches(&bare.to_string_lossy(), &unlocked, GITHUB_KNOWN_HOSTS).unwrap();
+        assert!(branches.contains(&"main".to_string()), "expected main in {branches:?}");
+        assert!(branches.contains(&"feature".to_string()), "expected feature in {branches:?}");
+
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn checkout_branch_switches_head_to_the_target_branch() {
+        let keypair = generate_deploy_keypair("test@agentops", b"pw").unwrap();
+        let unlocked = UnlockedKey::unlock(&keypair.encrypted_private_key_openssh, b"pw").unwrap();
+
+        let bare = std::env::temp_dir().join(format!("agentops-checkout-bare-{}", random_suffix()));
+        let work = std::env::temp_dir().join(format!("agentops-checkout-work-{}", random_suffix()));
+        let clone_dest = std::env::temp_dir().join(format!("agentops-checkout-clone-{}", random_suffix()));
+        std::fs::create_dir_all(&bare).unwrap();
+        assert!(Command::new("git").args(["init", "--bare", "-b", "main"]).arg(&bare).status().unwrap().success());
+        assert!(Command::new("git").args(["clone", &bare.to_string_lossy(), &work.to_string_lossy()]).status().unwrap().success());
+        std::fs::write(work.join("file.txt"), "hello").unwrap();
+        assert!(Command::new("git").current_dir(&work).args(["config", "user.email", "test@example.com"]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["config", "user.name", "test"]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["add", "."]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["commit", "-m", "initial"]).status().unwrap().success());
+        assert!(Command::new("git").current_dir(&work).args(["checkout", "-b", "feature"]).status().unwrap().success());
+        push_repo(&work, &unlocked, GITHUB_KNOWN_HOSTS, Some("main")).unwrap();
+        push_repo(&work, &unlocked, GITHUB_KNOWN_HOSTS, Some("feature")).unwrap();
+
+        clone_repo(&bare.to_string_lossy(), &clone_dest, &unlocked, GITHUB_KNOWN_HOSTS).unwrap();
+        checkout_branch(&clone_dest, "feature").unwrap();
+
+        let head = Command::new("git").args(["-C", &clone_dest.to_string_lossy(), "rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), "feature");
+
+        let _ = std::fs::remove_dir_all(&bare);
+        let _ = std::fs::remove_dir_all(&work);
+        let _ = std::fs::remove_dir_all(&clone_dest);
     }
 }

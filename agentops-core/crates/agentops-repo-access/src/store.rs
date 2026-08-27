@@ -85,6 +85,12 @@ pub struct RepoConnection {
     pub installation_id: Option<String>,
     pub status: ConnectionStatus,
     pub created_at: String,
+    /// User-selected branch override for indexing -- `None` means "no
+    /// override, index whatever the clone's default branch is." Distinct
+    /// from the dashboard's separately live-read `branch` field (what's
+    /// actually checked out right now): this is the *intent*, that's the
+    /// *observed state*.
+    pub tracked_branch: Option<String>,
 }
 
 pub struct ConnectionStore {
@@ -127,6 +133,7 @@ impl ConnectionStore {
         // matching `CREATE TABLE IF NOT EXISTS`'s own "don't error on an
         // already-migrated file" posture for genuinely new deployments.
         let _ = conn.execute("ALTER TABLE repo_connections ADD COLUMN installation_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE repo_connections ADD COLUMN tracked_branch TEXT", []);
         Ok(Self { conn })
     }
 
@@ -199,7 +206,7 @@ impl ConnectionStore {
     pub fn get_connection(&self, tenant: &str, id: &str) -> Result<Option<RepoConnection>> {
         self.conn
             .query_row(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch
                  FROM repo_connections WHERE tenant = ?1 AND id = ?2",
                 rusqlite::params![tenant, id],
                 row_to_connection,
@@ -213,7 +220,7 @@ impl ConnectionStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch
                  FROM repo_connections WHERE tenant = ?1 ORDER BY created_at DESC",
             )
             .context("preparing list query")?;
@@ -231,7 +238,7 @@ impl ConnectionStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch
                  FROM repo_connections WHERE tenant = ?1 AND installation_id = ?2",
             )
             .context("preparing installation connections query")?;
@@ -247,6 +254,20 @@ impl ConnectionStore {
                 rusqlite::params![status.as_db_string(), tenant, id],
             )
             .context("updating repo connection status")?;
+        if updated == 0 {
+            anyhow::bail!("no connection {id:?} for tenant {tenant:?} — refusing a silent no-op update");
+        }
+        Ok(())
+    }
+
+    /// Sets (or, with `None`, clears) `id`'s indexing branch override. Purely
+    /// a persistence step — the caller is responsible for re-indexing
+    /// afterward if it wants the new branch actually checked out.
+    pub fn set_tracked_branch(&self, tenant: &str, id: &str, branch: Option<&str>) -> Result<()> {
+        let updated = self
+            .conn
+            .execute("UPDATE repo_connections SET tracked_branch = ?1 WHERE tenant = ?2 AND id = ?3", rusqlite::params![branch, tenant, id])
+            .context("updating repo connection tracked branch")?;
         if updated == 0 {
             anyhow::bail!("no connection {id:?} for tenant {tenant:?} — refusing a silent no-op update");
         }
@@ -276,6 +297,7 @@ fn row_to_connection(row: &rusqlite::Row) -> rusqlite::Result<RepoConnection> {
         installation_id: row.get(6)?,
         status: ConnectionStatus::from_db_string(&status_str),
         created_at: row.get(8)?,
+        tracked_branch: row.get(9)?,
     })
 }
 

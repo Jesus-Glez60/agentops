@@ -4,7 +4,7 @@ import { useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { ExternalLink, GitBranch, RefreshCw } from "lucide-react";
-import { getRepos, startIndexing, REPOS_SWR_KEY, parseRepoStatus, type RepoConnection } from "@/lib/api/repos-api";
+import { getRepos, startIndexing, listBranches, setBranch, REPOS_SWR_KEY, parseRepoStatus, type RepoConnection } from "@/lib/api/repos-api";
 import { repoHealth } from "@/lib/repo-health";
 import { HealthBadge } from "@/components/dashboard/health-badge";
 import { NodeCountBar } from "@/components/dashboard/node-count-bar";
@@ -12,6 +12,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+
+/** Sentinel for "no override" in the branch <Select> -- Radix disallows an empty-string item value, and `null` isn't a valid DOM value either. */
+const AUTO_BRANCH_VALUE = "__auto__";
 
 export function RepoTable() {
   const { data, isLoading } = useSWR(REPOS_SWR_KEY, getRepos);
@@ -22,6 +26,11 @@ export function RepoTable() {
   // it's always the implicit default cache.
   const { mutate } = useSWRConfig();
   const [reindexingIds, setReindexingIds] = useState<Set<string>>(new Set());
+  // Lazily-fetched, cached by connection id -- the branch list rarely
+  // changes mid-session, and re-fetching on every dropdown open would mean
+  // an extra round trip (SSH: `git ls-remote`; GitHub App: a GitHub API
+  // call) each time a user just wants to glance at the current selection.
+  const [branchOptions, setBranchOptions] = useState<Record<string, string[]>>({});
 
   // Fires a background reindex job (async, polled elsewhere) -- unlike the
   // retired manifest-based `rescanRepo`, this is not a synchronous
@@ -35,6 +44,38 @@ export function RepoTable() {
       mutate(REPOS_SWR_KEY);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Reindex failed. Please try again.");
+    } finally {
+      setReindexingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(repo.id);
+        return next;
+      });
+    }
+  }
+
+  async function handleBranchOpenChange(repo: RepoConnection, open: boolean) {
+    if (!open || branchOptions[repo.id]) return;
+    try {
+      const branches = await listBranches(repo.id);
+      setBranchOptions((prev) => ({ ...prev, [repo.id]: branches }));
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to load branches.");
+    }
+  }
+
+  // Picking a branch immediately triggers a reindex against it (same
+  // `create_and_spawn_job` call the reindex button uses server-side), so
+  // this reuses the exact same loading-set/toast/revalidate pattern as
+  // `handleReindex`.
+  async function handleBranchChange(repo: RepoConnection, value: string) {
+    const branch = value === AUTO_BRANCH_VALUE ? null : value;
+    setReindexingIds((prev) => new Set(prev).add(repo.id));
+    try {
+      await setBranch(repo.id, branch);
+      toast.success(branch ? `Switched to ${branch} — reindexing.` : "Reset to default branch — reindexing.");
+      mutate(REPOS_SWR_KEY);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Failed to switch branch. Please try again.");
     } finally {
       setReindexingIds((prev) => {
         const next = new Set(prev);
@@ -82,13 +123,34 @@ export function RepoTable() {
             {repos?.map((repo) => {
               const reindexing = reindexingIds.has(repo.id);
               const status = parseRepoStatus(repo.status);
+              const currentBranch = repo.tracked_branch ?? repo.branch ?? undefined;
+              // Always include the current branch as a renderable option,
+              // even before `listBranches` has loaded -- otherwise Radix's
+              // `SelectValue` has nothing to match `value` against and
+              // silently falls back to the placeholder, which would look
+              // like the branch column just went blank on every page load.
+              const branchList = branchOptions[repo.id] ?? (currentBranch ? [currentBranch] : []);
               return (
                 <TableRow key={repo.id}>
                   <TableCell>
                     <div className="font-medium text-ink-100">{repo.id}</div>
                     <div className="truncate text-mono-path text-ink-500">{repo.repo_url}</div>
                   </TableCell>
-                  <TableCell className="text-mono-code text-ink-300">{repo.branch ?? "—"}</TableCell>
+                  <TableCell className="text-mono-code text-ink-300">
+                    <Select value={currentBranch} onValueChange={(value) => handleBranchChange(repo, value)} onOpenChange={(open) => handleBranchOpenChange(repo, open)} disabled={reindexing}>
+                      <SelectTrigger size="sm" className="w-40">
+                        <SelectValue placeholder="—" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value={AUTO_BRANCH_VALUE}>Auto (default)</SelectItem>
+                        {branchList.map((b) => (
+                          <SelectItem key={b} value={b}>
+                            {b}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </TableCell>
                   <TableCell>{reindexing ? <HealthBadgeScanning /> : <HealthBadge status={repoHealth(repo)} />}</TableCell>
                   <TableCell>
                     {repo.counts ? (

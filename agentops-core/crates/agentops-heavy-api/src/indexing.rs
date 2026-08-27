@@ -178,6 +178,17 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
     // comment on why this is a second clone, not a reuse of verify_repo's
     // throwaway one).
     start_stage!(STAGE_ORDER[1]);
+    // `git clone` refuses to clone into an already-existing non-empty
+    // directory -- `checkout_path` is stable per (tenant, connection_id), so
+    // without this, every job after the very first one against a given
+    // connection (any ordinary reindex, not just a branch switch) would fail
+    // right here.
+    if local_path.exists() {
+        log!("removing existing checkout at {}", local_path.display());
+        if let Err(e) = std::fs::remove_dir_all(&local_path) {
+            fail_and_return!(STAGE_ORDER[1], format!("removing existing checkout: {e}"));
+        }
+    }
     log!("cloning {} into {}", connection.repo_url, local_path.display());
     if let Some(parent) = local_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
@@ -218,6 +229,12 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
         }
     }
     log!("clone complete");
+    if let Some(branch) = &connection.tracked_branch {
+        log!("checking out branch {branch:?}");
+        if let Err(e) = agentops_repo_access::checkout_branch(&local_path, branch) {
+            fail_and_return!(STAGE_ORDER[1], format!("checking out branch {branch:?}: {e}"));
+        }
+    }
     finish_stage!(STAGE_ORDER[1], None, None);
 
     // Stage 3: files discovered.
@@ -491,6 +508,118 @@ pub async fn retry_indexing(State(state): State<AppState>, user: Option<axum::Ex
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
         Ok(Some(_)) => {}
     }
+
+    match create_and_spawn_job(&state.indexing_deps(), tenant, connection, JobKind::Reindex) {
+        Ok(job_id) => (StatusCode::ACCEPTED, Json(json!({ "job_id": job_id }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct BranchesQuery {
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+/// `GET /repos/{id}/branches` -- lists every branch on the connection's
+/// remote, for the dashboard's branch picker. SSH connections go over
+/// `git ls-remote`; GitHub App connections call GitHub's REST API directly
+/// (faster, no clone needed) -- see `agentops_repo_access::list_remote_branches`
+/// and `agentops_github_app::list_repo_branches` respectively.
+pub async fn list_branches(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<BranchesQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, q.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_VIEW) {
+        return e;
+    }
+
+    let connection = {
+        let store = state.store.lock().unwrap();
+        match store.get_connection(&tenant, &id) {
+            Ok(Some(c)) => c,
+            Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such connection for this tenant" }))),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        }
+    };
+
+    let branches = match &connection.method {
+        agentops_repo_access::store::ConnectionMethod::Ssh => {
+            let Some(encrypted_key) = &connection.encrypted_private_key_openssh else {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "connection has no SSH key" })));
+            };
+            let unlocked = match agentops_repo_access::UnlockedKey::unlock_for_repo(state.secrets.as_ref(), &tenant, &connection.id, encrypted_key) {
+                Ok(k) => k,
+                Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("unlocking deploy key: {e}") }))),
+            };
+            agentops_repo_access::list_remote_branches(&connection.repo_url, &unlocked, agentops_repo_access::GITHUB_KNOWN_HOSTS)
+        }
+        agentops_repo_access::store::ConnectionMethod::GitHubApp => {
+            let Some(config) = &state.github_app_config else {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "no GitHub App is configured for this deployment" })));
+            };
+            let Some(installation_id) = &connection.installation_id else {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "connection has no installation id" })));
+            };
+            let installation_id: u64 = match installation_id.parse() {
+                Ok(v) => v,
+                Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": "connection's installation id is not numeric" }))),
+            };
+            let token = match crate::github_app_routes::fresh_installation_token(config, installation_id).await {
+                Ok(t) => t,
+                Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("minting installation token: {e}") }))),
+            };
+            // GitHub App connections' repo_url is always exactly
+            // `https://github.com/{owner}/{repo}.git` (see
+            // github_app_routes.rs's ConnectFromInstallationRequest handler).
+            let owner_repo = connection.repo_url.strip_prefix("https://github.com/").and_then(|s| s.strip_suffix(".git")).unwrap_or(&connection.repo_url);
+            agentops_github_app::list_repo_branches(&token, owner_repo)
+        }
+    };
+
+    match branches {
+        Ok(b) => (StatusCode::OK, Json(json!({ "branches": b }))),
+        Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetBranchRequest {
+    #[serde(default)]
+    tenant: Option<String>,
+    branch: Option<String>,
+}
+
+/// `PATCH /repos/{id}/branch` -- persists the tracked-branch override
+/// (`branch: null` clears it, back to "index whatever the clone's default
+/// branch is") and immediately spawns a reindex job against it, the same way
+/// picking a branch and the existing reindex button both end up at
+/// `create_and_spawn_job`.
+pub async fn set_branch(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Json(body): Json<SetBranchRequest>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, body.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_REINDEX) {
+        return e;
+    }
+
+    {
+        let store = state.store.lock().unwrap();
+        if let Err(e) = store.set_tracked_branch(&tenant, &id, body.branch.as_deref()) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+        }
+    }
+
+    let connection = {
+        let store = state.store.lock().unwrap();
+        match store.get_connection(&tenant, &id) {
+            Ok(Some(c)) => c,
+            Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such connection for this tenant" }))),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        }
+    };
 
     match create_and_spawn_job(&state.indexing_deps(), tenant, connection, JobKind::Reindex) {
         Ok(job_id) => (StatusCode::ACCEPTED, Json(json!({ "job_id": job_id }))),

@@ -30,7 +30,7 @@ use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -188,6 +188,8 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/index", post(indexing::start_indexing))
         .route("/repos/{id}/index/status", get(indexing::indexing_status))
         .route("/repos/{id}/index/retry", post(indexing::retry_indexing))
+        .route("/repos/{id}/branches", get(indexing::list_branches))
+        .route("/repos/{id}/branch", patch(indexing::set_branch))
         .route("/repos/{id}/regenerate-key", post(regenerate_key))
         .route("/repos/github-app/install-url", get(github_app_install_url))
         .route("/repos/github-app/callback", get(github_app_routes::github_app_callback))
@@ -602,6 +604,11 @@ struct ConnectionView {
     #[serde(skip_serializing_if = "Option::is_none")]
     branch: Option<String>,
     path_missing: bool,
+    /// User-selected branch override, straight off the stored row -- unlike
+    /// `branch` above (live-read, filled in separately by `list_repos`),
+    /// this is real persisted state so it's set directly here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracked_branch: Option<String>,
 }
 
 impl From<RepoConnection> for ConnectionView {
@@ -615,7 +622,19 @@ impl From<RepoConnection> for ConnectionView {
             agentops_repo_access::store::ConnectionMethod::Ssh => "ssh".to_string(),
             agentops_repo_access::store::ConnectionMethod::GitHubApp => "github_app".to_string(),
         };
-        ConnectionView { id: c.id, tenant: c.tenant, repo_url: c.repo_url, method, public_key_openssh: c.public_key_openssh, status, created_at: c.created_at, counts: None, branch: None, path_missing: false }
+        ConnectionView {
+            id: c.id,
+            tenant: c.tenant,
+            repo_url: c.repo_url,
+            method,
+            public_key_openssh: c.public_key_openssh,
+            status,
+            created_at: c.created_at,
+            counts: None,
+            branch: None,
+            path_missing: false,
+            tracked_branch: c.tracked_branch,
+        }
     }
 }
 

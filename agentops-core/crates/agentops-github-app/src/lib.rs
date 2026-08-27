@@ -160,6 +160,51 @@ pub fn list_installation_repos(installation_token: &str) -> Result<Vec<Installat
     Ok(all)
 }
 
+#[derive(Debug, Deserialize)]
+struct Branch {
+    name: String,
+}
+
+/// Lists every branch name in `owner_repo` (`"owner/repo"`), per GitHub's
+/// `GET /repos/{owner}/{repo}/branches` — unlike [`list_installation_repos`]'s
+/// endpoint, this one returns a bare JSON array, not a `{repositories: [...]}`
+/// wrapper, so there's no page-wrapper struct to deserialize into. Same
+/// pagination cap and early-break-on-a-later-page-failure posture as
+/// `list_installation_repos`.
+pub fn list_repo_branches(installation_token: &str, owner_repo: &str) -> Result<Vec<String>> {
+    let mut all = Vec::new();
+    for page in 1..=MAX_INSTALLATION_REPO_PAGES {
+        let url = format!("https://api.github.com/repos/{owner_repo}/branches?per_page=100&page={page}");
+        let mut response = ureq::get(&url)
+            .header("Authorization", &format!("Bearer {installation_token}"))
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "agentops-heavy")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call()
+            .context("requesting repo branches")?;
+
+        let status = response.status();
+        if !status.is_success() {
+            if page > 1 {
+                break;
+            }
+            let body = response.body_mut().read_to_string().unwrap_or_default();
+            anyhow::bail!("GitHub branches request failed ({status}): {body}");
+        }
+
+        let parsed: Vec<Branch> = response.body_mut().read_json().context("parsing branches response")?;
+        let got = parsed.len();
+        all.extend(parsed.into_iter().map(|b| b.name));
+        if got < 100 {
+            break;
+        }
+    }
+    Ok(all)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
