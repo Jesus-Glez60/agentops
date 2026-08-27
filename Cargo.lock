@@ -202,7 +202,9 @@ name = "agentops-heavy-api"
 version = "0.1.0"
 dependencies = [
  "agentops-accounts",
+ "agentops-api",
  "agentops-docgen",
+ "agentops-embeddings",
  "agentops-github-app",
  "agentops-graph",
  "agentops-heavy-consolidate",
@@ -479,7 +481,10 @@ dependencies = [
  "docbrain-api",
  "docbrain-graph",
  "docbrain-mcp",
+ "http-body-util",
+ "serde",
  "tokio",
+ "tower",
 ]
 
 [[package]]

@@ -834,6 +834,44 @@ fn git_remote_url(path: &Path) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// Reduces a git remote URL to its `owner/repo` path, dropping the host
+/// entirely -- so `git@github-personal:acme/widgets.git` (an SSH config
+/// alias pointing at github.com, e.g. via a `Host github-personal` block in
+/// `~/.ssh/config`) normalizes to the same thing as
+/// `git@github.com:acme/widgets.git`. Caught live: `resolve_connection_id`'s
+/// original exact-string match failed for exactly this case -- a real
+/// checkout using a custom SSH host alias never auto-matched its own
+/// server-recorded `repo_url`, even though it's unambiguously the same
+/// repo. Handles the three shapes git remotes actually come in:
+/// `scheme://[user@]host[:port]/path`, SCP-like `[user@]host:path`
+/// (`.git` suffix optional in either), and a bare path (already just
+/// `owner/repo`, nothing to strip). Returns `None` only for a string with
+/// no recognizable path segment at all.
+fn normalize_repo_path(url: &str) -> Option<String> {
+    let path = if let Some(idx) = url.find("://") {
+        // scheme://[user@]host[:port]/path -- everything after the first
+        // '/' following the scheme is the path; the host (and any userinfo/
+        // port) is exactly what this function exists to ignore.
+        let rest = &url[idx + 3..];
+        rest.split_once('/').map(|(_, p)| p)?
+    } else if let Some(idx) = url.find(':') {
+        // SCP-like `[user@]host:path` -- but a bare Windows-style drive
+        // path like `C:/repo` would also match this pattern; git remotes
+        // are never local Windows paths in practice for this codebase's
+        // deployment targets, so not special-cased here.
+        &url[idx + 1..]
+    } else {
+        url
+    };
+    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool) -> Result<String> {
     let mut response = ureq::get(format!("{server_url}/repos"))
         .header("Authorization", &format!("Bearer {api_key}"))
@@ -863,6 +901,17 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
         if let Some(matched) = connections.iter().find(|c| &c.repo_url == remote) {
             println!("Matched this checkout's git remote ({remote}) to the connected repo {:?}.", matched.id);
             return Ok(matched.id.clone());
+        }
+        // Fallback: same owner/repo path, different host -- covers a
+        // checkout's remote going through an SSH config alias
+        // (`git@my-alias:owner/repo.git`) that isn't literally
+        // `github.com`/`gitlab.com`/etc, which the exact-string match above
+        // can never satisfy no matter how correct the remote actually is.
+        if let Some(remote_path) = normalize_repo_path(remote) {
+            if let Some(matched) = connections.iter().find(|c| normalize_repo_path(&c.repo_url).as_deref() == Some(remote_path.as_str())) {
+                println!("Matched this checkout's git remote ({remote}) to the connected repo {:?} (via {remote_path}).", matched.id);
+                return Ok(matched.id.clone());
+            }
         }
     }
 
@@ -1429,5 +1478,35 @@ fn api_key_generate() -> Result<()> {
     println!("Hash (configure this on the server — AGENTOPS_API_KEY_HASH or DOCBRAIN_API_KEY_HASH):");
     println!("  {hash}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_repo_path;
+
+    #[test]
+    fn scp_like_and_https_forms_of_the_same_repo_normalize_identically() {
+        assert_eq!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("https://github.com/acme/widgets.git"));
+        assert_eq!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("https://github.com/acme/widgets"));
+    }
+
+    #[test]
+    fn an_ssh_config_alias_host_normalizes_the_same_as_the_real_host() {
+        // The exact bug caught live: a checkout's remote goes through a
+        // `Host github-personal` alias in ~/.ssh/config, but the server
+        // stores the connection's repo_url with the literal github.com host.
+        assert_eq!(normalize_repo_path("git@github-personal:acme/widgets.git"), normalize_repo_path("git@github.com:acme/widgets.git"));
+    }
+
+    #[test]
+    fn different_repos_never_normalize_the_same() {
+        assert_ne!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("git@github.com:acme/gadgets.git"));
+        assert_ne!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("git@github.com:other-org/widgets.git"));
+    }
+
+    #[test]
+    fn ssh_scheme_with_explicit_port_still_normalizes_correctly() {
+        assert_eq!(normalize_repo_path("ssh://git@github.com:22/acme/widgets.git"), normalize_repo_path("git@github.com:acme/widgets.git"));
+    }
 }
 
