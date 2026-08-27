@@ -55,18 +55,6 @@ CREATE INDEX IF NOT EXISTS idx_edges_repo_dst ON edges(repo, dst_id);
 ALTER TABLE edges ADD COLUMN IF NOT EXISTS weight DOUBLE PRECISION NOT NULL DEFAULT 1.0;
 ALTER TABLE edges ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
 
--- Widens the `relation` CHECK to admit `EdgeRelation::References` (same-file
--- symbol-to-symbol edges). `edges_relation_check` is Postgres's default
--- auto-generated name for the unnamed inline CHECK above (`<table>_<column>
--- _check`) -- this is the first time this codebase has ever widened a CHECK
--- constraint post-creation, so this exact name was verified against a real
--- Postgres instance rather than assumed (see agentops-graph-pg's tests).
--- `IF EXISTS`/re-`ADD` makes this idempotent across repeated migrations the
--- same way every other `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` in this
--- file already is.
-ALTER TABLE edges DROP CONSTRAINT IF EXISTS edges_relation_check;
-ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depends_on', 'documents', 'affects', 'references'));
-
 CREATE TABLE IF NOT EXISTS scan_history (
     id               BIGSERIAL PRIMARY KEY,
     repo             TEXT NOT NULL,
@@ -199,12 +187,31 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS prominence TEXT NOT NULL DEFAULT 'ful
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 
 -- Initiative 2 (CLS-inspired retrieval plan) adds NodeKind::DocSection and
--- EdgeRelation::Covers -- both CHECK constraints need widening, same
--- idempotent DROP CONSTRAINT IF EXISTS / re-ADD pattern already used above
--- for edges_relation_check's `references` addition. This is the first time
--- `nodes_kind_check` (Postgres's default auto-generated name for the
--- unnamed inline CHECK in the original CREATE TABLE, `<table>_<column>
--- _check`) has ever been widened post-creation.
+-- EdgeRelation::Covers -- both CHECK constraints need widening.
+-- `nodes_kind_check`/`edges_relation_check` are Postgres's default
+-- auto-generated names for the unnamed inline CHECKs in the original
+-- `CREATE TABLE` statements above (`<table>_<column>_check`).
+--
+-- `edges_relation_check` had an earlier intermediate DROP/re-ADD here too
+-- (widening 3 values -> 4, for `references`) -- **removed**, not just
+-- superseded, because it's actively dangerous to leave in a file that gets
+-- fully replayed via `batch_execute(SCHEMA)` on every single
+-- `PostgresGraphStore::connect()` call, not just once at first deploy. As
+-- soon as real `covers`-relation data exists (any repo with a
+-- `NodeKind::DocSection`), replaying that intermediate 4-value `ADD
+-- CONSTRAINT` re-validates every existing row against a list that no
+-- longer includes a value real rows now have, and fails outright --
+-- aborting the whole batch before ever reaching this final, correct
+-- statement. Caught live: every `/mcp` tool call against a populated
+-- Postgres-backed repo failed with "check constraint \"edges_relation_check\"
+-- ... is violated by some row", opening a fresh `PostgresGraphStore`
+-- (and therefore replaying this whole file) on every single call. The
+-- general lesson, not just this one constraint: a schema file replayed on
+-- every connection must only ever contain the *current target* shape for
+-- anything that isn't naturally idempotent against real data (unlike
+-- `ADD COLUMN IF NOT EXISTS`/`CREATE TABLE IF NOT EXISTS`, a `DROP
+-- CONSTRAINT` + narrower re-`ADD` pair is not safe to keep around once
+-- superseded) -- never a full literal migration history.
 ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_kind_check;
 ALTER TABLE nodes ADD CONSTRAINT nodes_kind_check CHECK (kind IN ('symbol', 'file', 'gotcha', 'decision', 'definition', 'note', 'doc_section'));
 
