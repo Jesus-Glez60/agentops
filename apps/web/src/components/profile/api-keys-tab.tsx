@@ -7,9 +7,8 @@ import { relativeTimeFromIsoString } from "@/lib/relative-time";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { CreateApiKeyDialog } from "@/components/profile/create-api-key-dialog";
-import { ConnectToolSection } from "@/components/profile/connect-tool-section";
 
-export function ApiKeysTab({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; apiUrlIsGuessed: boolean }) {
+export function ApiKeysTab() {
   const { data: keys, mutate, isLoading } = useSWR(API_KEYS_SWR_KEY, getApiKeys);
 
   async function handleRevoke(id: number) {
@@ -49,7 +48,6 @@ export function ApiKeysTab({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; apiUrl
         </CardContent>
       </Card>
       <p className="mt-3 text-section text-ink-500">API keys grant full read access to your indexed repositories. Never share them publicly.</p>
-      <ConnectToolSection apiUrl={apiUrl} apiUrlIsGuessed={apiUrlIsGuessed} />
     </div>
   );
 }

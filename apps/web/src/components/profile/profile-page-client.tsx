@@ -9,6 +9,7 @@ import { ProfileHero } from "@/components/profile/profile-hero";
 import { AccountTab } from "@/components/profile/account-tab";
 import { SecurityTab } from "@/components/profile/security-tab";
 import { ApiKeysTab } from "@/components/profile/api-keys-tab";
+import { ConnectToolSection } from "@/components/profile/connect-tool-section";
 import { PersonalIntegrationsTab } from "@/components/profile/personal-integrations-tab";
 import { EmptyState } from "@/components/shared/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -27,6 +28,7 @@ export function ProfilePageClient({ initialUser, apiUrl, apiUrlIsGuessed }: { in
           <TabsTrigger value="notifications">Notifications</TabsTrigger>
           <TabsTrigger value="team">Team &amp; Access</TabsTrigger>
           <TabsTrigger value="api-keys">API Keys</TabsTrigger>
+          <TabsTrigger value="coding-tools">Coding Tools</TabsTrigger>
           <TabsTrigger value="integrations">Integrations</TabsTrigger>
         </TabsList>
         <div className="flex-1 overflow-y-auto px-8 py-6">
@@ -43,7 +45,10 @@ export function ProfilePageClient({ initialUser, apiUrl, apiUrlIsGuessed }: { in
             <EmptyState icon={Users} title="Coming soon" description="Team membership and role management will land here." />
           </TabsContent>
           <TabsContent value="api-keys" className="mt-0">
-            <ApiKeysTab apiUrl={apiUrl} apiUrlIsGuessed={apiUrlIsGuessed} />
+            <ApiKeysTab />
+          </TabsContent>
+          <TabsContent value="coding-tools" className="mt-0">
+            <ConnectToolSection apiUrl={apiUrl} apiUrlIsGuessed={apiUrlIsGuessed} />
           </TabsContent>
           <TabsContent value="integrations" className="mt-0">
             <PersonalIntegrationsTab />

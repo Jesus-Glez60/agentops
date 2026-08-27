@@ -84,8 +84,31 @@ set -euo pipefail
 _agentops_connect() {{
   if ! command -v agentops >/dev/null 2>&1; then
     echo "agentops CLI not found -- installing..."
-    curl -fsSL {INSTALL_SCRIPT_URL} | sh
-    export PATH="$HOME/.agentops/bin:$PATH"
+    # Prefer building from a local agentops source checkout over the
+    # public GitHub download -- walks up from the current directory
+    # looking for agentops-core/crates/agentops-cli, the same monorepo
+    # layout this server itself is built from. Covers a self-hosted
+    # deployment whose source repo isn't publicly readable (install.sh's
+    # GitHub download 404s for anyone against a private repo, not just a
+    # misconfiguration), and is strictly faster/more trustworthy than a
+    # network download when the exact source is already sitting right
+    # there on disk.
+    _agentops_src=""
+    _dir="$PWD"
+    while [ "$_dir" != "/" ]; do
+      if [ -f "$_dir/agentops-core/crates/agentops-cli/Cargo.toml" ]; then
+        _agentops_src="$_dir"
+        break
+      fi
+      _dir="$(dirname "$_dir")"
+    done
+    if [ -n "$_agentops_src" ]; then
+      echo "Found a local agentops source checkout at $_agentops_src -- building from source (requires cargo)..."
+      (cd "$_agentops_src" && cargo install --path agentops-core/crates/agentops-cli --locked)
+    else
+      curl -fsSL {INSTALL_SCRIPT_URL} | sh
+      export PATH="$HOME/.agentops/bin:$PATH"
+    fi
   fi
   if [ -z "${{AGENTOPS_API_KEY:-}}" ]; then
     echo "error: set AGENTOPS_API_KEY first (Profile -> Connect a coding tool, or the onboarding checklist's \"Generate API key\")" >&2
@@ -186,5 +209,16 @@ mod tests {
         let truncated = &body[..body.len() / 2];
         let check = std::process::Command::new("sh").arg("-n").arg("-c").arg(truncated).output().unwrap();
         assert!(!check.status.success(), "a truncated download must fail to parse, not partially execute: {truncated}");
+    }
+
+    #[tokio::test]
+    async fn the_script_checks_for_a_local_source_checkout_before_downloading_from_github() {
+        let app = router();
+        let resp = app.oneshot(Request::builder().uri("/connect.sh").header("host", "example.com").body(Body::empty()).unwrap()).await.unwrap();
+        let body = body_text(resp).await;
+        assert!(body.contains("agentops-core/crates/agentops-cli/Cargo.toml"), "{body}");
+        assert!(body.contains("cargo install --path agentops-core/crates/agentops-cli"), "{body}");
+        let check = std::process::Command::new("sh").arg("-n").arg("-c").arg(&body).output().unwrap();
+        assert!(check.status.success(), "the full (untruncated) script must be valid shell: {}", String::from_utf8_lossy(&check.stderr));
     }
 }

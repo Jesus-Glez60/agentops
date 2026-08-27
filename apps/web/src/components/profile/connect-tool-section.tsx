@@ -1,11 +1,14 @@
 "use client";
 
-// Persistent "Connect a coding tool" home (Initiative 2) -- the same
-// tool-select + connect.sh command generation the onboarding checklist's
-// remote-connect step uses, so reconnecting or adding another tool later
-// doesn't require going back through /welcome. The user-menu's "Connect a
-// coding tool" link (which routes to /welcome) still works too; this is a
-// second, more discoverable home for the same action.
+// Persistent "Connect a coding tool" home (Initiative 2), rendered as its
+// own Profile tab -- the same tool-select + connect.sh command generation
+// the onboarding checklist's remote-connect step uses, so reconnecting,
+// adding another tool, or recovering from something going wrong during
+// onboarding never requires going back through /welcome and redoing the
+// whole checklist. The user-menu's "Connect a coding tool" link (which
+// routes to /welcome) still works too; this is a second, more discoverable
+// home for the same action -- caught live: there was no way to retry or add
+// tools short of re-onboarding.
 import { useState } from "react";
 import { toast } from "sonner";
 import { createApiKey } from "@/lib/api/profile-api";
@@ -34,7 +37,7 @@ export function ConnectToolSection({ apiUrl, apiUrlIsGuessed }: { apiUrl: string
   }
 
   return (
-    <Card className="mt-4 max-w-[900px]">
+    <Card className="max-w-[900px]">
       <CardHeader>
         <CardTitle>Connect a coding tool</CardTitle>
       </CardHeader>
