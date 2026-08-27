@@ -44,11 +44,13 @@ use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnect
 use agentops_teams::TeamStore;
 
 mod accounts_integrations;
+mod dashboard;
 mod github_app_routes;
 mod indexing;
 mod linear_webhook;
 mod mcp_http;
 mod team;
+mod tenant_repo;
 pub use accounts_integrations::build_accounts_integrations_router;
 pub use linear_webhook::{AutoKickoffTeamConfig, SeenDeliveries};
 pub use team::build_team_router;
@@ -195,21 +197,34 @@ fn build_router_with_tools_flag(
         .route("/search", get(search_query_handler))
         .route("/docs/search/index", post(docs_search_index_handler))
         .route("/docs/search", get(docs_search_query_handler))
-        .route("/consolidate/model", post(consolidate_model_handler));
+        .route("/consolidate/model", post(consolidate_model_handler))
+        // Dashboard unification (Initiative 1) -- tenant-scoped equivalents
+        // of agentops-api's single-operator dashboard routes, at the exact
+        // same paths. See `agentops_api::build_router_without_dashboard_routes`'s
+        // doc comment for why `agentops-server` must exclude those instead
+        // of mounting both.
+        .route("/activity", get(dashboard::activity_json))
+        .route("/local-search", get(dashboard::local_search_json))
+        .route("/gotchas", get(dashboard::gotchas_json))
+        .route("/repos/{id}/nodes/{node_id}", get(dashboard::node_detail_json))
+        .route("/repos/{id}/nodes/{node_id}/curation", post(dashboard::set_curation_json))
+        .route("/repos/{id}/nodes/{node_id}/graph", get(dashboard::subgraph_json))
+        .route("/repos/{id}/graph", get(dashboard::repo_graph_json))
+        .route("/repos/{id}/docs", get(dashboard::docs_json));
     if include_tools {
         router = router.route("/tools", get(heavy_tools_list_handler)).route("/tools/{name}", post(heavy_tools_call_handler));
     }
     let router = router.layer(middleware::from_fn_with_state(state.clone(), require_api_key_or_session)).with_state(state.clone());
 
     // `/mcp` deliberately isn't part of the router above -- it needs its
-    // own auth layer (`require_mcp_auth`, session or per-user API key
-    // only, never the instance-wide key -- see that fn's doc comment), not
-    // the blanket `require_api_key_or_session` every other route here
-    // gets. Building and merging it separately, each already
-    // `.with_state(...)`'d before the merge, avoids double-layering (both
-    // auth checks running on every `/mcp` request) that a single shared
-    // `.layer()` call over everything would cause.
-    let mcp_router = Router::new().route("/mcp", post(mcp_http::mcp_handler)).layer(middleware::from_fn_with_state(state.clone(), require_mcp_auth)).with_state(state);
+    // own auth layer (`tenant_repo::require_tenant_auth`, session or
+    // per-user API key only, never the instance-wide key -- see that fn's
+    // doc comment), not the blanket `require_api_key_or_session` every
+    // other route here gets. Building and merging it separately, each
+    // already `.with_state(...)`'d before the merge, avoids double-layering
+    // (both auth checks running on every `/mcp` request) that a single
+    // shared `.layer()` call over everything would cause.
+    let mcp_router = Router::new().route("/mcp", post(mcp_http::mcp_handler)).layer(middleware::from_fn_with_state(state.clone(), tenant_repo::require_tenant_auth)).with_state(state);
 
     router.merge(mcp_router).layer(CorsLayer::permissive())
 }
@@ -268,63 +283,6 @@ async fn require_api_key(State(state): State<AppState>, req: Request, next: Next
         Ok(()) => next.run(req).await,
         Err((status, body)) => (status, body).into_response(),
     }
-}
-
-/// The caller's resolved tenant for a `/mcp` request -- deliberately just
-/// this one field, not the full `User` `require_api_key_or_session` inserts
-/// for every other route in this crate. `/mcp`'s handlers only ever need a
-/// tenant to scope `ConnectionStore` lookups; keeping this separate from
-/// `User` also keeps a personal API key's reach scoped to exactly this
-/// route rather than silently working against every other
-/// `require_api_key_or_session`-gated route (repo connect, GitHub App
-/// installs, etc.) -- a personal key minted for "connect my coding tool"
-/// shouldn't double as a general account/repo-management credential.
-#[derive(Clone)]
-pub(crate) struct McpCaller {
-    pub(crate) tenant: String,
-}
-
-/// Session-first, then a per-user API key -- **not** the instance-wide
-/// `AGENTOPS_API_KEY_HASH` (unlike `require_api_key_or_session` above).
-/// That key carries no tenant, and `/mcp`'s whole safety property rests on
-/// resolving a tool call's `path` against the caller's own tenant's
-/// connections -- there's no safe fallback for a caller with no tenant at
-/// all short of trusting a client-supplied literal path, which is exactly
-/// what this route exists to avoid for a network-reachable endpoint (see
-/// `mcp_http`'s module doc comment).
-async fn require_mcp_auth(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
-    let Some(token) = req.headers().get(axum::http::header::AUTHORIZATION).and_then(|v| v.to_str().ok()).and_then(|v| v.strip_prefix("Bearer ")) else {
-        return unauthorized();
-    };
-    // Resolved in a plain sync fn, never a `MutexGuard` anywhere in this
-    // `async fn`'s own body -- `std::sync::MutexGuard` isn't `Send`, and
-    // `middleware::from_fn_with_state` requires the whole future this
-    // function produces to be `Send`. The guard here is always dropped
-    // before any `.await` regardless (both branches return early), but
-    // rustc's async state-machine transform doesn't reliably prove that on
-    // its own; moving the lookup out of the `async fn` sidesteps the
-    // question entirely instead of fighting the borrow checker over it.
-    let Some(caller) = resolve_mcp_caller(&state, token) else {
-        return unauthorized();
-    };
-    req.extensions_mut().insert(caller);
-    next.run(req).await
-}
-
-fn resolve_mcp_caller(state: &AppState, token: &str) -> Option<McpCaller> {
-    let accounts = state.accounts.as_ref()?;
-    let accounts = accounts.lock().unwrap();
-    if let Ok(user) = accounts.verify_session(token) {
-        return Some(McpCaller { tenant: user.tenant });
-    }
-    if let Ok(Some((_user_id, tenant))) = accounts.verify_user_api_key(token) {
-        return Some(McpCaller { tenant });
-    }
-    None
-}
-
-fn unauthorized() -> Response {
-    (StatusCode::UNAUTHORIZED, Json(json!({ "error": "missing or invalid credentials" }))).into_response()
 }
 
 /// Session path: server-derived tenant from the verified `User`, ignoring
@@ -633,6 +591,17 @@ struct ConnectionView {
     public_key_openssh: Option<String>,
     status: String,
     created_at: String,
+    /// Additive dashboard-unification fields (Initiative 1) -- `None`/`false`
+    /// for a non-`Active` connection or one whose store hasn't opened yet,
+    /// same "never fabricated zeros" contract `agentops_api::repos::
+    /// RepoSummary.counts` already has. Filled in by `list_repos` via
+    /// `dashboard::connection_counts`, not by this `From` impl (which has no
+    /// `AppState`/tenant to resolve a checkout path with).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    counts: Option<agentops_api::repos::RepoCounts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    path_missing: bool,
 }
 
 impl From<RepoConnection> for ConnectionView {
@@ -646,7 +615,7 @@ impl From<RepoConnection> for ConnectionView {
             agentops_repo_access::store::ConnectionMethod::Ssh => "ssh".to_string(),
             agentops_repo_access::store::ConnectionMethod::GitHubApp => "github_app".to_string(),
         };
-        ConnectionView { id: c.id, tenant: c.tenant, repo_url: c.repo_url, method, public_key_openssh: c.public_key_openssh, status, created_at: c.created_at }
+        ConnectionView { id: c.id, tenant: c.tenant, repo_url: c.repo_url, method, public_key_openssh: c.public_key_openssh, status, created_at: c.created_at, counts: None, branch: None, path_missing: false }
     }
 }
 
@@ -785,7 +754,33 @@ async fn list_repos(State(state): State<AppState>, user: Option<axum::Extension<
         true
     };
 
-    let views: Vec<ConnectionView> = connections.into_iter().map(ConnectionView::from).collect();
+    // Counts computed on a blocking thread -- `dashboard::connection_counts`
+    // opens each `Active` connection's graph store, which can `block_on` an
+    // internally-owned Tokio runtime under `AGENTOPS_DATABASE_URL` (see
+    // `dashboard`'s module doc comment); must not run directly on this
+    // already-async handler's thread.
+    let tenant_for_counts = tenant.clone();
+    let result = tokio::task::spawn_blocking(move || -> Vec<ConnectionView> {
+        connections
+            .into_iter()
+            .map(|c| {
+                let active = c.status == ConnectionStatus::Active;
+                let id = c.id.clone();
+                let mut view = ConnectionView::from(c);
+                let (counts, branch, path_missing) = dashboard::connection_counts(&state, &tenant_for_counts, &id, active);
+                view.counts = counts;
+                view.branch = branch;
+                view.path_missing = path_missing;
+                view
+            })
+            .collect()
+    })
+    .await;
+
+    let views = match result {
+        Ok(views) => views,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    };
     (StatusCode::OK, Json(json!({ "connections": views, "can_connect": can_connect })))
 }
 

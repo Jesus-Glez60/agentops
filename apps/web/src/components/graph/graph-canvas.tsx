@@ -5,7 +5,7 @@ import { forceCenter, forceCollide, forceLink, forceManyBody, forceSimulation, t
 import { ReactFlow, ReactFlowProvider, Controls, Background, useNodesState, useEdgesState, type Node as FlowNode, type Edge as FlowEdge } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Scale, TriangleAlert } from "lucide-react";
-import type { NodeDetail, SubgraphEdge, SubgraphNode } from "@/lib/api/agentops-api";
+import type { NodeDetail, SubgraphEdge, SubgraphNode } from "@/lib/api/repos-api";
 import { kindLabel } from "@/lib/node-detail-formatting";
 import { GraphNode, type GraphFlowNode } from "@/components/graph/graph-node";
 

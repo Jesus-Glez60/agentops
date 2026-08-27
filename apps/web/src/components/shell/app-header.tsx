@@ -2,7 +2,7 @@
 
 import useSWR from "swr";
 import { Bell, Database } from "lucide-react";
-import { getRepos, REPOS_SWR_KEY } from "@/lib/api/agentops-api";
+import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { repoHealth } from "@/lib/repo-health";
 import { BreadcrumbHeader } from "@/components/shell/breadcrumb-header";
 import { CommandPalette } from "@/components/shell/command-palette";
@@ -13,7 +13,8 @@ import { cn } from "@/lib/utils";
 export function AppHeader() {
   // Same SWR key as the Overview page's repo table -- one shared cache
   // entry/one network request, not two independent fetches.
-  const { data: repos } = useSWR(REPOS_SWR_KEY, getRepos);
+  const { data } = useSWR(REPOS_SWR_KEY, getRepos);
+  const repos = data?.connections;
 
   const repoCount = repos?.length;
   const allHealthy = repos?.every((r) => repoHealth(r) === "healthy") ?? false;

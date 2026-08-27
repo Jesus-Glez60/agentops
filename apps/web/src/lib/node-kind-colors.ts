@@ -1,4 +1,4 @@
-import type { NodeKind } from "@/lib/api/agentops-api";
+import type { NodeKind } from "@/lib/api/repos-api";
 
 // Same --node-* tokens search-filters.tsx's pills use, so a node's kind tag
 // always matches the color of the filter pill that would isolate it --

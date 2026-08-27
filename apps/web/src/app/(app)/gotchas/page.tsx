@@ -14,7 +14,7 @@ import {
   type GotchaBucket,
   type GotchaSummary,
   type NodeProminence,
-} from "@/lib/api/agentops-api";
+} from "@/lib/api/repos-api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScopeSelector } from "@/components/search/scope-selector";
@@ -80,7 +80,7 @@ export default function GotchasPage() {
   // already carries curation fields, so it's the one source of truth here.
   const detailKey = selected ? (["node", selected.repo, selected.id] as const) : null;
   const { data: detail } = useSWR(detailKey, () => getNodeDetail(selected!.repo, selected!.id));
-  const branch = selected ? allRepos?.find((r) => r.name === selected.repo)?.branch : undefined;
+  const branch = selected ? allRepos?.connections.find((r) => r.id === selected.repo)?.branch : undefined;
 
   async function applyCuration(prominence: NodeProminence, reason: string | null) {
     if (!selected) return;

@@ -18,7 +18,7 @@ use serde_json::{json, Value};
 use crate::repos::find_by_name;
 use crate::AppState;
 
-pub async fn docs_json(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn docs_json(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let target_name = name.clone();
 

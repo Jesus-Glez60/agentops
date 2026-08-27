@@ -1,4 +1,4 @@
-import type { NodeKind } from "@/lib/api/agentops-api";
+import type { NodeKind } from "@/lib/api/repos-api";
 import { RelevanceBadge, relevanceForScore } from "@/components/shared/relevance-badge";
 import { KIND_TAG_CLASSNAME } from "@/lib/node-kind-colors";
 import { cn } from "@/lib/utils";

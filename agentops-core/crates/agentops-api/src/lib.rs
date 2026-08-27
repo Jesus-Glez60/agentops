@@ -25,10 +25,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::cors::CorsLayer;
 
-mod docs;
-mod repos;
-mod search;
-mod subgraph;
+// `pub` -- `agentops-heavy-api` reuses the free functions in these modules
+// (tenant-scoped dashboard routes composing the same logic against a
+// `ConnectionStore`-resolved checkout path instead of a manifest-derived
+// one) rather than duplicating them. See each module's specific `pub fn`s
+// for what's actually meant to be called cross-crate; everything else stays
+// `pub(crate)`/private.
+pub mod docs;
+pub mod repos;
+pub mod search;
+pub mod subgraph;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
@@ -59,23 +65,54 @@ pub fn build_router(mode: AccessMode, api_key_hash: Option<String>, manifest_pat
 /// service's routes into a larger process (e.g. the merged `agentops-server`
 /// binary) that mounts its own single shared `/health` instead of one copy
 /// per merged service (`Router::merge` panics on a duplicate route).
+///
+/// Includes the dashboard routes (`/activity`, `/local-search`, `/gotchas`,
+/// `/repos/{name}/nodes/{id}*`, `/repos/{name}/graph`, `/repos/{name}/docs`)
+/// — see [`build_router_without_dashboard_routes`] for the merged-server
+/// variant that excludes them.
 pub fn build_router_without_health(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf) -> Router {
+    build_router_with_dashboard_flag(mode, api_key_hash, manifest_path, true)
+}
+
+/// Same as [`build_router_without_health`] minus the eight single-operator
+/// "dashboard" routes (`/activity`, `/local-search`, `/gotchas`,
+/// `/repos/{name}/nodes/{id}`, `/repos/{name}/nodes/{id}/curation`,
+/// `/repos/{name}/nodes/{id}/graph`, `/repos/{name}/graph`,
+/// `/repos/{name}/docs`) — these read from `agentops-manifest`'s local
+/// `~/.agentops/manifest.json`, which a tenant-scoped hosted deployment
+/// never populates. `agentops-heavy-api` registers tenant-scoped routes at
+/// these exact same paths (resolved via `ConnectionStore` instead of the
+/// manifest) for its own dashboard screens; `Router::merge` panics on a
+/// duplicate route, so a process composing both crates (e.g.
+/// `agentops-server`) must mount only one implementation per path — this is
+/// that exclusion, mirroring `agentops-heavy-api`'s own
+/// `build_router`/`build_router_without_tools` split for the identical
+/// reason.
+pub fn build_router_without_dashboard_routes(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf) -> Router {
+    build_router_with_dashboard_flag(mode, api_key_hash, manifest_path, false)
+}
+
+fn build_router_with_dashboard_flag(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf, include_dashboard_routes: bool) -> Router {
     let state = AppState { mode, api_key_hash, manifest_path };
-    Router::new()
+    let mut router = Router::new()
         .route("/tools", get(list_tools_handler))
         .route("/tools/{name}", post(call_tool_handler))
         .route("/nodes", get(list_nodes_json))
         .route("/scans", get(repos::list_repos_json))
         .route("/repos/{name}/rescan", post(repos::rescan_repo_json))
-        .route("/repos/{name}/nodes/{id}", get(search::node_detail_json))
-        .route("/repos/{name}/nodes/{id}/curation", post(search::set_curation_json))
-        .route("/repos/{name}/nodes/{id}/graph", get(subgraph::subgraph_json))
-        .route("/repos/{name}/graph", get(subgraph::repo_graph_json))
-        .route("/repos/{name}/edges/{id}/reinforce", post(subgraph::reinforce_edge_json))
-        .route("/repos/{name}/docs", get(docs::docs_json))
-        .route("/activity", get(repos::activity_json))
-        .route("/local-search", get(search::search_json))
-        .route("/gotchas", get(repos::gotchas_json))
+        .route("/repos/{name}/edges/{id}/reinforce", post(subgraph::reinforce_edge_json));
+    if include_dashboard_routes {
+        router = router
+            .route("/repos/{name}/nodes/{id}", get(search::node_detail_json))
+            .route("/repos/{name}/nodes/{id}/curation", post(search::set_curation_json))
+            .route("/repos/{name}/nodes/{id}/graph", get(subgraph::subgraph_json))
+            .route("/repos/{name}/graph", get(subgraph::repo_graph_json))
+            .route("/repos/{name}/docs", get(docs::docs_json))
+            .route("/activity", get(repos::activity_json))
+            .route("/local-search", get(search::search_json))
+            .route("/gotchas", get(repos::gotchas_json));
+    }
+    router
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))
         .with_state(state)
         .layer(CorsLayer::permissive())
@@ -146,9 +183,10 @@ struct NodesQuery {
     kind: Option<String>,
 }
 
-/// `pub(crate)` so `search.rs`'s kind filter reuses this instead of a
-/// second copy of the same string-to-`NodeKind` mapping.
-pub(crate) fn parse_kind(s: &str) -> Option<NodeKind> {
+/// `pub` -- `search.rs`/`subgraph.rs` reuse this instead of a second copy of
+/// the same string-to-`NodeKind` mapping, and so does `agentops-heavy-api`'s
+/// own kind-filter parsing for its tenant-scoped dashboard routes.
+pub fn parse_kind(s: &str) -> Option<NodeKind> {
     match s.to_lowercase().as_str() {
         "symbol" => Some(NodeKind::Symbol),
         "file" => Some(NodeKind::File),

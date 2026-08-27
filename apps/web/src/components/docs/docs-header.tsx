@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronDown, Search, Share2 } from "lucide-react";
-import type { DocPage } from "@/lib/api/agentops-api";
+import type { DocPage } from "@/lib/api/repos-api";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { RepoPicker } from "@/components/graph/repo-picker";
 

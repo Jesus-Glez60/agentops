@@ -12,7 +12,7 @@ import {
   type ConnectedNode,
   type GraphMode,
   type NodeKind,
-} from "@/lib/api/agentops-api";
+} from "@/lib/api/repos-api";
 import { GraphHeader } from "@/components/graph/graph-header";
 import { GraphFilterPanel, GRAPH_FILTERABLE_KINDS } from "@/components/graph/graph-filter-panel";
 import { GraphCanvas } from "@/components/graph/graph-canvas";
@@ -65,7 +65,7 @@ function GraphPageInner() {
   const { data: detail } = useSWR(selected ? ["node", selected.repo, selected.id] : null, () => getNodeDetail(selected!.repo, selected!.id));
   const { data: seedDetail } = useSWR(seed ? ["node", seed.repo, seed.id] : null, () => getNodeDetail(seed!.repo, seed!.id));
   const { data: allRepos } = useSWR(REPOS_SWR_KEY, getRepos);
-  const branch = repoName ? allRepos?.find((r) => r.name === repoName)?.branch : undefined;
+  const branch = repoName ? allRepos?.connections.find((r) => r.id === repoName)?.branch : undefined;
 
   function toggleKind(kind: NodeKind) {
     setKinds((prev) => {

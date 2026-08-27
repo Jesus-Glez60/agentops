@@ -1,5 +1,5 @@
 import { TriangleAlert } from "lucide-react";
-import type { ConnectedNode, NodeDetail } from "@/lib/api/agentops-api";
+import type { ConnectedNode, NodeDetail } from "@/lib/api/repos-api";
 import { connectedNodeLabel, kindLabel, relationText } from "@/lib/node-detail-formatting";
 import { languageFromPath } from "@/lib/language-from-path";
 import { CodeBlock } from "@/components/shared/code-block";

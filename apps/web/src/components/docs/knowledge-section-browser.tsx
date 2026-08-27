@@ -1,5 +1,5 @@
 import { ChevronLeft, ChevronRight } from "lucide-react";
-import type { DocBlock } from "@/lib/api/agentops-api";
+import type { DocBlock } from "@/lib/api/repos-api";
 import { kindLabel } from "@/lib/node-detail-formatting";
 import { KnowledgeCallout, CALLOUT_STYLE } from "@/components/docs/knowledge-callout";
 

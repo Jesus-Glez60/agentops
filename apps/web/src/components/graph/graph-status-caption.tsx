@@ -1,4 +1,4 @@
-import type { GraphMode } from "@/lib/api/agentops-api";
+import type { GraphMode } from "@/lib/api/repos-api";
 
 const MODE_LABEL: Record<GraphMode, string> = {
   local: "Local graph",

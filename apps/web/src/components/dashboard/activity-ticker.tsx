@@ -1,7 +1,7 @@
 "use client";
 
 import useSWR from "swr";
-import { getActivity } from "@/lib/api/agentops-api";
+import { getActivity } from "@/lib/api/repos-api";
 import { relativeTimeFromIsoString } from "@/lib/relative-time";
 
 export function ActivityTicker() {

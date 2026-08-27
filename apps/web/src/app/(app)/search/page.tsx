@@ -4,7 +4,7 @@ import { Suspense, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
 import { SearchIcon, SearchX, Workflow } from "lucide-react";
-import { getNodeDetail, getRepos, REPOS_SWR_KEY, search, type ConnectedNode, type NodeKind } from "@/lib/api/agentops-api";
+import { getNodeDetail, getRepos, REPOS_SWR_KEY, search, type ConnectedNode, type NodeKind } from "@/lib/api/repos-api";
 import { getRecentSearches, pushRecentSearch } from "@/lib/recent-searches";
 import { kindLabel } from "@/lib/node-detail-formatting";
 import { Button } from "@/components/ui/button";
@@ -86,7 +86,7 @@ function SearchPageInner() {
   // Same SWR key the Overview page/topbar/scope selector already share --
   // used here only to show a node's real branch, not a fabricated one.
   const { data: allRepos } = useSWR(REPOS_SWR_KEY, getRepos);
-  const branch = selected ? allRepos?.find((r) => r.name === selected.repo)?.branch : undefined;
+  const branch = selected ? allRepos?.connections.find((r) => r.id === selected.repo)?.branch : undefined;
 
   function runSearch(q: string) {
     const trimmed = q.trim();

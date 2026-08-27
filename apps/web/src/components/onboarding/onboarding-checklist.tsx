@@ -20,12 +20,11 @@ import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { completeOnboarding, createApiKey } from "@/lib/api/profile-api";
 import { InviteMemberDialog } from "@/components/team/invite-member-dialog";
 import { CopyButton } from "@/components/shared/copy-button";
+import { ToolSelect, DEFAULT_SELECTED_AGENTS } from "@/components/onboarding/tool-select";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-
-const CONNECT_COMMAND = "agentops connect";
 
 function ChecklistItem({ title, done, expanded, onToggle, children }: { title: string; done: boolean; expanded: boolean; onToggle: () => void; children: React.ReactNode }) {
   return (
@@ -74,6 +73,12 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
   // their first login.
   const [remoteApiKey, setRemoteApiKey] = useState<string | null>(null);
   const [generatingKey, setGeneratingKey] = useState(false);
+  // Shared between both connect modes -- which tools the generated command
+  // should register, mirroring the CLI's own `select_agents` defaults.
+  const [selectedAgents, setSelectedAgents] = useState<string[]>(DEFAULT_SELECTED_AGENTS);
+  const agentsArg = selectedAgents.length > 0 ? selectedAgents.join(",") : DEFAULT_SELECTED_AGENTS.join(",");
+  const localCommand = `agentops connect --agents ${agentsArg}`;
+  const connectScriptCommand = remoteApiKey ? `export AGENTOPS_API_KEY=${remoteApiKey} && curl -fsSL ${apiUrl}/connect.sh?agents=${agentsArg} | sh` : "";
 
   function toggle(item: string) {
     setExpanded((cur) => (cur === item ? null : item));
@@ -200,12 +205,13 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
                   A separate server
                 </Button>
               </div>
+              <ToolSelect selected={selectedAgents} onChange={setSelectedAgents} />
               {effectiveConnectMode === "local" ? (
                 <>
                   <p className="text-body text-ink-400">From your own machine, in your project repo, run:</p>
                   <div className="flex items-center gap-2">
-                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{CONNECT_COMMAND}</code>
-                    <CopyButton value={CONNECT_COMMAND} />
+                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{localCommand}</code>
+                    <CopyButton value={localCommand} />
                   </div>
                 </>
               ) : repos && repos.connections.length === 0 ? (
@@ -232,12 +238,15 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
                     </p>
                   )}
                   <p className="text-body text-ink-400">
-                    Copy this now — it won&apos;t be shown again. From your own machine, in your project repo, run:
+                    Copy this now — it won&apos;t be shown again. From your own machine (installs the CLI if it isn&apos;t already there), run:
                   </p>
                   <div className="flex items-center gap-2">
-                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{`export AGENTOPS_API_KEY=${remoteApiKey} && ${CONNECT_COMMAND} --remote ${apiUrl} --api-key ${remoteApiKey}`}</code>
-                    <CopyButton value={`export AGENTOPS_API_KEY=${remoteApiKey} && ${CONNECT_COMMAND} --remote ${apiUrl} --api-key ${remoteApiKey}`} />
+                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{connectScriptCommand}</code>
+                    <CopyButton value={connectScriptCommand} />
                   </div>
+                  <a href={`${apiUrl}/connect.sh?agents=${agentsArg}`} target="_blank" rel="noreferrer" className="text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
+                    Preview the script before running it
+                  </a>
                 </>
               )}
               <p className="text-body text-ink-500">Registers agentops&apos;s MCP server and distributes instructions to Claude Code, Cursor, Codex CLI, Gemini CLI, or another tool you choose.</p>

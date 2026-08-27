@@ -1,5 +1,5 @@
 import { FileText, Lightbulb, Share2, TriangleAlert } from "lucide-react";
-import type { DocBlock } from "@/lib/api/agentops-api";
+import type { DocBlock } from "@/lib/api/repos-api";
 import { kindLabel } from "@/lib/node-detail-formatting";
 import { Prose } from "@/components/shared/prose";
 

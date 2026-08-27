@@ -110,7 +110,7 @@ fn node_to_subgraph_node(node: Node, depth: u32) -> SubgraphNode {
 /// `(Node, depth)`/`Edge` shape into this endpoint's own
 /// `SubgraphNode`/`SubgraphEdge` response types (with their UI-facing
 /// relation labels).
-pub(crate) fn build_subgraph(store: &dyn GraphStore, repo: &str, seed_id: i64, mode: &str, depth: u32, kind_filter: &[NodeKind]) -> anyhow::Result<Option<SubgraphResponse>> {
+pub fn build_subgraph(store: &dyn GraphStore, repo: &str, seed_id: i64, mode: &str, depth: u32, kind_filter: &[NodeKind]) -> anyhow::Result<Option<SubgraphResponse>> {
     let Some((relations, direction)) = mode_filter(mode) else { return Ok(None) };
     if store.get_node(repo, seed_id)?.is_none() {
         return Ok(None);
@@ -130,7 +130,7 @@ pub(crate) fn build_subgraph(store: &dyn GraphStore, repo: &str, seed_id: i64, m
 
 /// `GET /repos/{name}/nodes/{id}/graph` -- path resolution mirrors
 /// `node_detail_json` exactly (unknown repo/path/node all 404).
-pub async fn subgraph_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>, Query(q): Query<SubgraphQuery>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn subgraph_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>, Query(q): Query<SubgraphQuery>) -> (StatusCode, Json<Value>) {
     let depth = q.depth.unwrap_or(2).clamp(1, 4);
     let kind_filter: Result<Vec<NodeKind>, String> = q
         .kind
@@ -197,7 +197,7 @@ pub struct RepoGraphResponse {
 /// didn't exist). The `kind` filter is still there for narrowing the
 /// *view* down when 1000+ Symbol nodes make it hard to read, not for
 /// bounding cost.
-pub(crate) fn build_repo_graph(store: &dyn GraphStore, repo: &str, kind_filter: &[NodeKind]) -> anyhow::Result<RepoGraphResponse> {
+pub fn build_repo_graph(store: &dyn GraphStore, repo: &str, kind_filter: &[NodeKind]) -> anyhow::Result<RepoGraphResponse> {
     let all_nodes = store.all_nodes(repo)?;
     let mut kept_ids: HashSet<i64> = HashSet::new();
     let mut nodes_out: Vec<SubgraphNode> = Vec::new();
@@ -224,7 +224,7 @@ pub(crate) fn build_repo_graph(store: &dyn GraphStore, repo: &str, kind_filter: 
 
 /// `GET /repos/{name}/graph` -- path resolution mirrors `node_detail_json`
 /// (unknown repo/path all 404).
-pub async fn repo_graph_json(State(state): State<AppState>, AxumPath(repo_name): AxumPath<String>, Query(q): Query<RepoGraphQuery>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn repo_graph_json(State(state): State<AppState>, AxumPath(repo_name): AxumPath<String>, Query(q): Query<RepoGraphQuery>) -> (StatusCode, Json<Value>) {
     let kind_filter: Result<Vec<NodeKind>, String> = q
         .kind
         .as_deref()
@@ -272,7 +272,7 @@ pub async fn repo_graph_json(State(state): State<AppState>, AxumPath(repo_name):
 /// passive re-observation), a call to this endpoint is a real, explicit
 /// action, the same "human/agent-initiated reinforcement" category
 /// `reinforce_edge`'s own doc comment already describes for `add_note`.
-pub async fn reinforce_edge_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn reinforce_edge_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<()>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;

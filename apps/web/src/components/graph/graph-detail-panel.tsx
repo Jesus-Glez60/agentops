@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { BookOpen, SearchIcon, Target, X } from "lucide-react";
-import type { ConnectedNode, NodeDetail } from "@/lib/api/agentops-api";
+import type { ConnectedNode, NodeDetail } from "@/lib/api/repos-api";
 import { kindLabel } from "@/lib/node-detail-formatting";
 import { KIND_TAG_CLASSNAME } from "@/lib/node-kind-colors";
 import { Button } from "@/components/ui/button";

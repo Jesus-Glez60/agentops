@@ -60,17 +60,22 @@ pub struct SearchResult {
     pub curation_reason: Option<String>,
 }
 
-/// `pub(crate)` so `repos.rs`'s `gotchas_json` reuses this instead of a
-/// second copy of the same truncation logic.
-pub(crate) fn snippet(content: &Option<String>) -> Option<String> {
+/// `pub` -- `repos.rs`'s `gotchas_json` reuses this instead of a second copy
+/// of the same truncation logic, and so does `agentops-heavy-api`'s
+/// tenant-scoped `GET /gotchas`/`GET /local-search`.
+pub fn snippet(content: &Option<String>) -> Option<String> {
     content.as_ref().map(|c| if c.chars().count() > SNIPPET_CHARS { format!("{}…", c.chars().take(SNIPPET_CHARS).collect::<String>()) } else { c.clone() })
 }
 
-fn distance_to_similarity(distance: f32) -> f32 {
+/// `pub` -- reused by `agentops-heavy-api`'s tenant-scoped `GET
+/// /local-search` so the distance→similarity derivation (see this module's
+/// doc comment) lives in exactly one place.
+pub fn distance_to_similarity(distance: f32) -> f32 {
     1.0 - (distance.powi(2) / 2.0)
 }
 
-fn node_to_result(repo: &str, node: Node, distance: f32) -> SearchResult {
+/// `pub` -- same reuse reason as `distance_to_similarity`.
+pub fn node_to_result(repo: &str, node: Node, distance: f32) -> SearchResult {
     SearchResult {
         repo: repo.to_string(),
         id: node.id,
@@ -88,7 +93,7 @@ fn node_to_result(repo: &str, node: Node, distance: f32) -> SearchResult {
     }
 }
 
-pub async fn search_json(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn search_json(State(state): State<AppState>, Query(q): Query<SearchQuery>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let top_k = q.top_k.unwrap_or(DEFAULT_TOP_K);
     let repo_filter: Option<Vec<String>> = q.repos.as_deref().map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect());
@@ -187,7 +192,9 @@ pub(crate) fn relation_label(relation: EdgeRelation, incoming: bool) -> String {
     if incoming { format!("← {label}") } else { label.to_string() }
 }
 
-fn connected_nodes(store: &dyn agentops_graph::GraphStore, repo: &str, node_id: i64) -> anyhow::Result<Vec<ConnectedNode>> {
+/// `pub` -- reused by `agentops-heavy-api`'s tenant-scoped
+/// `GET /repos/{id}/nodes/{node_id}`.
+pub fn connected_nodes(store: &dyn agentops_graph::GraphStore, repo: &str, node_id: i64) -> anyhow::Result<Vec<ConnectedNode>> {
     let mut connected = Vec::new();
     let resolve = |store: &dyn agentops_graph::GraphStore, other_id: i64| -> anyhow::Result<Option<Node>> { store.get_node(repo, other_id) };
 
@@ -206,7 +213,7 @@ fn connected_nodes(store: &dyn agentops_graph::GraphStore, repo: &str, node_id: 
     Ok(connected)
 }
 
-pub async fn node_detail_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn node_detail_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<NodeDetail>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
@@ -266,7 +273,7 @@ fn parse_prominence(s: &str) -> Option<NodeProminence> {
 /// `POST /repos/{name}/nodes/{id}/curation` — the gotchas page's Keep/
 /// Reduce/Restore actions. Path resolution mirrors `node_detail_json`
 /// exactly (unknown repo/path/node all 404, not a generic error).
-pub async fn set_curation_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>, Json(body): Json<SetCurationBody>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn set_curation_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>, Json(body): Json<SetCurationBody>) -> (StatusCode, Json<Value>) {
     let Some(prominence) = parse_prominence(&body.prominence) else {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("invalid 'prominence': {:?}", body.prominence) })));
     };

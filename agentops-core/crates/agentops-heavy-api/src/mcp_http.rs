@@ -26,8 +26,8 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::indexing::checkout_path;
-use crate::{AppState, McpCaller};
+use crate::tenant_repo::{resolve_connection_path, TenantCaller};
+use crate::AppState;
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -53,7 +53,7 @@ fn err(id: Value, code: i64, message: impl Into<String>) -> Value {
 /// A JSON-RPC *notification* (no `id`, e.g. `notifications/initialized`)
 /// gets `202 Accepted` with no body per the Streamable HTTP spec, not a
 /// JSON-RPC response -- there's nothing to reply to.
-pub(crate) async fn mcp_handler(Extension(caller): Extension<McpCaller>, State(state): State<AppState>, body: Result<Json<JsonRpcRequest>, axum::extract::rejection::JsonRejection>) -> Response {
+pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, State(state): State<AppState>, body: Result<Json<JsonRpcRequest>, axum::extract::rejection::JsonRejection>) -> Response {
     let Json(request) = match body {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(err(Value::Null, INTERNAL_ERROR, format!("parse error: {e}")))).into_response(),
@@ -78,7 +78,7 @@ pub(crate) async fn mcp_handler(Extension(caller): Extension<McpCaller>, State(s
     Json(response).into_response()
 }
 
-async fn handle_tools_call(state: &AppState, caller: &McpCaller, id: Value, params: &Value) -> Value {
+async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, params: &Value) -> Value {
     let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
         return err(id, INVALID_PARAMS, "missing 'name' in tools/call params");
     };
@@ -110,20 +110,4 @@ async fn handle_tools_call(state: &AppState, caller: &McpCaller, id: Value, para
         Err(e) => json!({ "content": [{ "type": "text", "text": format!("tool call panicked: {e}") }], "isError": true }),
     };
     ok(id, result)
-}
-
-/// `path` must name a `RepoConnection` (by id or its `repo_url`) belonging
-/// to `tenant` -- anything else is rejected, never treated as a literal
-/// filesystem path. See this module's doc comment for why.
-fn resolve_connection_path(state: &AppState, tenant: &str, connection_ref: &str) -> Result<std::path::PathBuf, String> {
-    let store = state.store.lock().unwrap();
-    let connection = store
-        .get_connection(tenant, connection_ref)
-        .ok()
-        .flatten()
-        .or_else(|| store.list_connections(tenant).ok()?.into_iter().find(|c| c.repo_url == connection_ref));
-    let Some(connection) = connection else {
-        return Err(format!("'{connection_ref}' is not a repo connection id or URL for your organization -- use one of the ids/URLs from GET /repos"));
-    };
-    Ok(checkout_path(&state.repo_checkouts_dir, tenant, &connection.id))
 }

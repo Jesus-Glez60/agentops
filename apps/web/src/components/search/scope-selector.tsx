@@ -2,7 +2,7 @@
 
 import useSWR from "swr";
 import { ChevronDown } from "lucide-react";
-import { getRepos, REPOS_SWR_KEY } from "@/lib/api/agentops-api";
+import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -17,10 +17,11 @@ export function ScopeSelector({
 }) {
   // Same SWR key the Overview page's repo table and the topbar already use --
   // one shared cache entry, no new fetch.
-  const { data: repos } = useSWR(REPOS_SWR_KEY, getRepos);
+  const { data } = useSWR(REPOS_SWR_KEY, getRepos);
+  const repos = data?.connections;
 
-  function toggle(name: string) {
-    onChange(selected.includes(name) ? selected.filter((r) => r !== name) : [...selected, name]);
+  function toggle(id: string) {
+    onChange(selected.includes(id) ? selected.filter((r) => r !== id) : [...selected, id]);
   }
 
   const label = selected.length === 0 ? "All repositories" : selected.length === 1 ? selected[0] : `${selected.length} repositories`;
@@ -37,7 +38,7 @@ export function ScopeSelector({
         {!repos ? (
           <p className="px-1 py-1 text-body text-ink-500">Loading repositories…</p>
         ) : repos.length === 0 ? (
-          <p className="px-1 py-1 text-body text-ink-500">No repositories scanned yet.</p>
+          <p className="px-1 py-1 text-body text-ink-500">No repositories connected yet.</p>
         ) : (
           <div className="flex flex-col gap-1">
             {selected.length > 0 && (
@@ -46,9 +47,9 @@ export function ScopeSelector({
               </button>
             )}
             {repos.map((repo) => (
-              <label key={repo.name} className="flex items-center gap-2 rounded-md px-1 py-1 text-body text-ink-300 hover:bg-raised">
-                <Checkbox checked={selected.includes(repo.name)} onCheckedChange={() => toggle(repo.name)} />
-                {repo.name}
+              <label key={repo.id} className="flex items-center gap-2 rounded-md px-1 py-1 text-body text-ink-300 hover:bg-raised">
+                <Checkbox checked={selected.includes(repo.id)} onCheckedChange={() => toggle(repo.id)} />
+                {repo.id}
               </label>
             ))}
           </div>

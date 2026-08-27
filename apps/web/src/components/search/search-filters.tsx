@@ -1,4 +1,4 @@
-import type { NodeKind } from "@/lib/api/agentops-api";
+import type { NodeKind } from "@/lib/api/repos-api";
 import { cn } from "@/lib/utils";
 
 // "Docs" has no dedicated NodeKind of its own -- it maps to Note, the kind

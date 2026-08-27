@@ -1,5 +1,5 @@
 import { ChevronDown } from "lucide-react";
-import type { DocGroup, DocSection, NodeKind } from "@/lib/api/agentops-api";
+import type { DocGroup, DocSection, NodeKind } from "@/lib/api/repos-api";
 import { cn } from "@/lib/utils";
 
 const GROUP_LABELS: Record<DocGroup, string> = {

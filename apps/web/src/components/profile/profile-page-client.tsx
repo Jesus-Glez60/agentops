@@ -13,7 +13,7 @@ import { PersonalIntegrationsTab } from "@/components/profile/personal-integrati
 import { EmptyState } from "@/components/shared/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
-export function ProfilePageClient({ initialUser }: { initialUser: SessionUser }) {
+export function ProfilePageClient({ initialUser, apiUrl, apiUrlIsGuessed }: { initialUser: SessionUser; apiUrl: string; apiUrlIsGuessed: boolean }) {
   const [tab, setTab] = useState("account");
   const { data: user } = useSWR(PROFILE_SWR_KEY, getProfile, { fallbackData: initialUser });
 
@@ -43,7 +43,7 @@ export function ProfilePageClient({ initialUser }: { initialUser: SessionUser })
             <EmptyState icon={Users} title="Coming soon" description="Team membership and role management will land here." />
           </TabsContent>
           <TabsContent value="api-keys" className="mt-0">
-            <ApiKeysTab />
+            <ApiKeysTab apiUrl={apiUrl} apiUrlIsGuessed={apiUrlIsGuessed} />
           </TabsContent>
           <TabsContent value="integrations" className="mt-0">
             <PersonalIntegrationsTab />

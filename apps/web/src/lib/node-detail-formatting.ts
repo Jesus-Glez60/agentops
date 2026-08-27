@@ -1,4 +1,4 @@
-import type { NodeKind } from "@/lib/api/agentops-api";
+import type { NodeKind } from "@/lib/api/repos-api";
 
 // "Docs" has no dedicated NodeKind of its own -- it maps display-wise to
 // Note. Shared by the search page and the gotchas page so both label a

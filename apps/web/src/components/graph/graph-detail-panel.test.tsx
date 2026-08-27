@@ -5,7 +5,7 @@ const { pushMock } = vi.hoisted(() => ({ pushMock: vi.fn() }));
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: pushMock }) }));
 
 import { GraphDetailPanel } from "@/components/graph/graph-detail-panel";
-import type { NodeDetail } from "@/lib/api/agentops-api";
+import type { NodeDetail } from "@/lib/api/repos-api";
 
 const detail: NodeDetail = {
   id: 1,

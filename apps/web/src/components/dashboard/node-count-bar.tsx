@@ -1,4 +1,4 @@
-import type { RepoCounts } from "@/lib/api/agentops-api";
+import type { RepoCounts } from "@/lib/api/repos-api";
 import { cn } from "@/lib/utils";
 
 const SEGMENTS: { key: keyof RepoCounts; className: string }[] = [

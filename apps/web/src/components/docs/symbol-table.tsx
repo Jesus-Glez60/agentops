@@ -1,4 +1,4 @@
-import type { DocBlock } from "@/lib/api/agentops-api";
+import type { DocBlock } from "@/lib/api/repos-api";
 
 type SymbolTableBlock = Extract<DocBlock, { block_type: "symbol_table" }>;
 

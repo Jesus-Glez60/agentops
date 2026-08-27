@@ -198,11 +198,14 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
             </Button>
           ) : (
             <>
-              <p className="mb-2 text-mono-code text-ink-500">Copy this now — it won&apos;t be shown again.</p>
+              <p className="mb-2 text-mono-code text-ink-500">Copy this now — it won&apos;t be shown again. Installs the CLI if it isn&apos;t already there.</p>
               <div className="flex items-center gap-2">
-                <code className="flex-1 truncate rounded-md border border-border-strong bg-canvas px-3 py-2 text-mono-code text-ink-200">{`export AGENTOPS_API_KEY=${apiKey} && agentops connect --remote ${apiUrl} --api-key ${apiKey}`}</code>
-                <CopyButton value={`export AGENTOPS_API_KEY=${apiKey} && agentops connect --remote ${apiUrl} --api-key ${apiKey}`} />
+                <code className="flex-1 truncate rounded-md border border-border-strong bg-canvas px-3 py-2 text-mono-code text-ink-200">{`export AGENTOPS_API_KEY=${apiKey} && curl -fsSL ${apiUrl}/connect.sh | sh`}</code>
+                <CopyButton value={`export AGENTOPS_API_KEY=${apiKey} && curl -fsSL ${apiUrl}/connect.sh | sh`} />
               </div>
+              <a href={`${apiUrl}/connect.sh`} target="_blank" rel="noreferrer" className="mt-2 inline-block text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
+                Preview the script before running it
+              </a>
             </>
           )}
         </div>

@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { NodeDetailSections } from "@/components/shared/node-detail-sections";
-import type { NodeDetail } from "@/lib/api/agentops-api";
+import type { NodeDetail } from "@/lib/api/repos-api";
 
 function detailWithConnections(connected: NodeDetail["connected"]): NodeDetail {
   return {

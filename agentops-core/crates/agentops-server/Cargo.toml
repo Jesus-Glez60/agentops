@@ -15,6 +15,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 tokio.workspace = true
 axum.workspace = true
+serde.workspace = true
 agentops-mcp = { path = "../agentops-mcp" }
 agentops-manifest = { path = "../agentops-manifest" }
 agentops-api = { path = "../agentops-api" }
@@ -22,3 +23,7 @@ agentops-heavy-api = { path = "../agentops-heavy-api" }
 docbrain-api = { path = "../../../docbrain-core/crates/docbrain-api" }
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
 docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

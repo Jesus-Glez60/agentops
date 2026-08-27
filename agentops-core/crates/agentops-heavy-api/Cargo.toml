@@ -35,6 +35,15 @@ agentops-teams = { path = "../agentops-teams" }
 agentops-integrations = { path = "../agentops-integrations" }
 agentops-integration-modules = { path = "../agentops-integration-modules" }
 agentops-manifest = { path = "../agentops-manifest" }
+# Dashboard-unification: reuses agentops-api's free functions
+# (summarize_repo, connected_nodes, build_subgraph, matches_bucket, etc.)
+# against ConnectionStore-resolved checkout paths instead of duplicating
+# that logic -- see agentops-api::lib's module doc comment on why those
+# functions are `pub`.
+agentops-api = { path = "../agentops-api" }
+# LocalEmbedder for GET /local-search -- distinct from the already-present
+# agentops-heavy-embeddings/SemanticIndex (Qdrant-backed), no type collision.
+agentops-embeddings = { path = "../agentops-embeddings" }
 
 [dev-dependencies]
 tempfile = "3"

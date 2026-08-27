@@ -3,7 +3,7 @@
 import { Suspense, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
-import { getDocs, DOCS_SWR_KEY } from "@/lib/api/agentops-api";
+import { getDocs, DOCS_SWR_KEY } from "@/lib/api/repos-api";
 import { DocsHeader } from "@/components/docs/docs-header";
 import { DocsNav } from "@/components/docs/docs-nav";
 import { DocsContent } from "@/components/docs/docs-content";

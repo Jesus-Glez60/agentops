@@ -23,12 +23,24 @@
 //! `agentops-mcp-server` binary, which is where a real unified `/tools`
 //! dispatcher covering all three tool tables belongs long-term (tracked as
 //! a follow-up, not resolved here).
+//!
+//! `/activity`, `/local-search`, `/gotchas`, and the `/repos/{id}/nodes/*`
+//! `/repos/{id}/graph` `/repos/{id}/docs` routes also collide: `agentops-api`
+//! registers them backed by `agentops-manifest`'s local scan registry
+//! (single-operator, this process's own filesystem), `agentops-heavy-api`
+//! registers the identical paths backed by `ConnectionStore` (tenant-scoped,
+//! hosted). This merged process needs the tenant-scoped versions — the web
+//! dashboard is a multi-tenant hosted deployment, not a local CLI install —
+//! so `agentops-api` is mounted via `build_router_without_dashboard_routes`
+//! rather than `build_router_without_health`.
 
 use std::path::PathBuf;
 
 use agentops_mcp::AccessMode;
 use axum::Router;
 use docbrain_graph::{DocbrainStore, SqliteDocbrainStore};
+
+mod connect_sh;
 
 /// Reads every env var this merged server needs, builds the composed
 /// `Router`, binds `AGENTOPS_ADDR` (default `127.0.0.1:8420`), and serves
@@ -43,7 +55,12 @@ pub async fn run() -> anyhow::Result<()> {
     };
     let api_key_hash = std::env::var("AGENTOPS_API_KEY_HASH").ok();
     let manifest_path = std::env::var("AGENTOPS_MANIFEST_PATH").map(PathBuf::from).unwrap_or_else(|_| agentops_manifest::default_manifest_path());
-    let agentops_router = agentops_api::build_router_without_health(mode, api_key_hash.clone(), manifest_path);
+    // `_without_dashboard_routes`, not just `_without_health` — this
+    // process also mounts `agentops-heavy-api`'s tenant-scoped equivalents
+    // of `/activity`, `/local-search`, `/gotchas`, and the `/repos/{id}/...`
+    // node/graph/docs routes at the identical paths; see
+    // `agentops_api::build_router_without_dashboard_routes`'s doc comment.
+    let agentops_router = agentops_api::build_router_without_dashboard_routes(mode, api_key_hash.clone(), manifest_path);
 
     let docbrain_db_path = docbrain_mcp::default_db_path();
     let docbrain_store = SqliteDocbrainStore::open(&docbrain_db_path)?;
@@ -71,7 +88,7 @@ pub async fn run() -> anyhow::Result<()> {
     let heavy_db_path = std::env::var("AGENTOPS_HEAVY_API_DB").map(PathBuf::from).unwrap_or_else(|_| agentops_data_dir().join("heavy-api.sqlite"));
     let heavy_router = agentops_heavy_api::build_full_router(&heavy_db_path, false).await?;
 
-    let app = Router::new().merge(agentops_router).nest("/docbrain", docbrain_router).merge(heavy_router);
+    let app = Router::new().merge(agentops_router).nest("/docbrain", docbrain_router).merge(heavy_router).merge(connect_sh::router());
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("agentops-server listening on {addr}");

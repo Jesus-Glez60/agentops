@@ -1,4 +1,4 @@
-import type { RepoSummary } from "@/lib/api/agentops-api";
+import type { RepoConnection } from "@/lib/api/repos-api";
 
 export type HealthStatus = "healthy" | "warning" | "stale" | "not-indexed";
 
@@ -13,9 +13,14 @@ export type HealthStatus = "healthy" | "warning" | "stale" | "not-indexed";
 // states (GitHub App/SSH), out of scope for this local-repos-only pass.
 const STALE_THRESHOLD_SECONDS = 60 * 60 * 24 * 7; // 7 days
 
-export function repoHealth(repo: Pick<RepoSummary, "counts" | "last_scanned_at">, nowSeconds: number = Date.now() / 1000): HealthStatus {
+/** `last_scanned_at` is optional (unlike the retired manifest-based
+ * `RepoSummary`, `RepoConnection` has no equivalent timestamp exposed yet
+ * by the tenant-scoped backend) -- when omitted, the staleness check is
+ * skipped entirely rather than fabricating a bogus "recently scanned"
+ * default. */
+export function repoHealth(repo: Pick<RepoConnection, "counts"> & { last_scanned_at?: number }, nowSeconds: number = Date.now() / 1000): HealthStatus {
   if (!repo.counts) return "not-indexed";
-  if (nowSeconds - repo.last_scanned_at > STALE_THRESHOLD_SECONDS) return "stale";
+  if (repo.last_scanned_at !== undefined && nowSeconds - repo.last_scanned_at > STALE_THRESHOLD_SECONDS) return "stale";
   // gotchas_needing_curation, not the raw gotchas total -- a gotcha is
   // permanent knowledge, never "resolved away", so keying "warning" off the
   // total meant it could never actually clear. Only the uncurated count is

@@ -1,7 +1,7 @@
 import { BookOpen, FileCode, Scale, SquareFunction, TriangleAlert } from "lucide-react";
 import type { NodeProps, Node as FlowNode } from "@xyflow/react";
 import { Handle, Position } from "@xyflow/react";
-import type { NodeKind, NodeProminence } from "@/lib/api/agentops-api";
+import type { NodeKind, NodeProminence } from "@/lib/api/repos-api";
 import { KIND_TAG_CLASSNAME } from "@/lib/node-kind-colors";
 import { cn } from "@/lib/utils";
 

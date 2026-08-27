@@ -4,9 +4,8 @@ import { useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { ExternalLink, GitBranch, RefreshCw } from "lucide-react";
-import { getRepos, rescanRepo, REPOS_SWR_KEY, type RepoSummary } from "@/lib/api/agentops-api";
+import { getRepos, startIndexing, REPOS_SWR_KEY, parseRepoStatus, type RepoConnection } from "@/lib/api/repos-api";
 import { repoHealth } from "@/lib/repo-health";
-import { relativeTimeFromUnixSeconds } from "@/lib/relative-time";
 import { HealthBadge } from "@/components/dashboard/health-badge";
 import { NodeCountBar } from "@/components/dashboard/node-count-bar";
 import { Button } from "@/components/ui/button";
@@ -15,31 +14,31 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 export function RepoTable() {
-  const { data: repos, isLoading } = useSWR(REPOS_SWR_KEY, getRepos);
+  const { data, isLoading } = useSWR(REPOS_SWR_KEY, getRepos);
+  const repos = data?.connections;
   // The context-bound mutate (not the top-level `import { mutate } from
   // "swr"`) -- guarantees this always targets whatever cache this
   // component's own useSWR call actually reads from, rather than assuming
   // it's always the implicit default cache.
   const { mutate } = useSWRConfig();
-  const [scanningNames, setScanningNames] = useState<Set<string>>(new Set());
+  const [reindexingIds, setReindexingIds] = useState<Set<string>>(new Set());
 
-  async function handleRescan(repo: RepoSummary) {
-    setScanningNames((prev) => new Set(prev).add(repo.name));
+  // Fires a background reindex job (async, polled elsewhere) -- unlike the
+  // retired manifest-based `rescanRepo`, this is not a synchronous
+  // rescan-and-return; the connection's `counts` only reflect the new data
+  // once the job finishes and this list is revalidated.
+  async function handleReindex(repo: RepoConnection) {
+    setReindexingIds((prev) => new Set(prev).add(repo.id));
     try {
-      await mutate(
-        REPOS_SWR_KEY,
-        async (current: RepoSummary[] | undefined) => {
-          const updated = await rescanRepo(repo.name);
-          return current?.map((r) => (r.name === repo.name ? updated : r));
-        },
-        { revalidate: false },
-      );
+      await startIndexing(repo.id, "reindex");
+      toast.success("Reindexing started.");
+      mutate(REPOS_SWR_KEY);
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Rescan failed. Please try again.");
+      toast.error(err instanceof Error ? err.message : "Reindex failed. Please try again.");
     } finally {
-      setScanningNames((prev) => {
+      setReindexingIds((prev) => {
         const next = new Set(prev);
-        next.delete(repo.name);
+        next.delete(repo.id);
         return next;
       });
     }
@@ -61,7 +60,7 @@ export function RepoTable() {
               <TableHead>Branch</TableHead>
               <TableHead>Health</TableHead>
               <TableHead>Nodes</TableHead>
-              <TableHead>Last scan</TableHead>
+              <TableHead>Status</TableHead>
               <TableHead className="text-right">Actions</TableHead>
             </TableRow>
           </TableHeader>
@@ -76,20 +75,21 @@ export function RepoTable() {
             {!isLoading && repos?.length === 0 && (
               <TableRow>
                 <TableCell colSpan={6} className="text-center text-ink-500">
-                  No repositories scanned yet — run <code className="text-mono-code">agentops install</code> in a repo to see it here.
+                  No repositories connected yet — connect one from Settings to see it here.
                 </TableCell>
               </TableRow>
             )}
             {repos?.map((repo) => {
-              const scanning = scanningNames.has(repo.name);
+              const reindexing = reindexingIds.has(repo.id);
+              const status = parseRepoStatus(repo.status);
               return (
-                <TableRow key={repo.name}>
+                <TableRow key={repo.id}>
                   <TableCell>
-                    <div className="font-medium text-ink-100">{repo.name}</div>
-                    <div className="truncate text-mono-path text-ink-500">{repo.path}</div>
+                    <div className="font-medium text-ink-100">{repo.id}</div>
+                    <div className="truncate text-mono-path text-ink-500">{repo.repo_url}</div>
                   </TableCell>
                   <TableCell className="text-mono-code text-ink-300">{repo.branch ?? "—"}</TableCell>
-                  <TableCell>{scanning ? <HealthBadgeScanning /> : <HealthBadge status={repoHealth(repo)} />}</TableCell>
+                  <TableCell>{reindexing ? <HealthBadgeScanning /> : <HealthBadge status={repoHealth(repo)} />}</TableCell>
                   <TableCell>
                     {repo.counts ? (
                       <div className="flex flex-col gap-1">
@@ -100,13 +100,13 @@ export function RepoTable() {
                       <span className="text-mono-code text-ink-500">not yet scanned</span>
                     )}
                   </TableCell>
-                  <TableCell className="text-mono-code text-ink-300">{relativeTimeFromUnixSeconds(repo.last_scanned_at)}</TableCell>
+                  <TableCell className="text-mono-code text-ink-300">{status.kind === "failed" ? status.reason : status.kind}</TableCell>
                   <TableCell>
                     <div className="flex justify-end gap-1">
                       <Tooltip>
                         <TooltipTrigger asChild>
-                          <Button variant="outline" size="icon" disabled={scanning || repo.path_missing} onClick={() => handleRescan(repo)} aria-label="Rescan repository">
-                            <RefreshCw className={scanning ? "size-4 animate-spin" : "size-4"} />
+                          <Button variant="outline" size="icon" disabled={reindexing || repo.path_missing || status.kind !== "active"} onClick={() => handleReindex(repo)} aria-label="Rescan repository">
+                            <RefreshCw className={reindexing ? "size-4 animate-spin" : "size-4"} />
                           </Button>
                         </TooltipTrigger>
                         <TooltipContent>{repo.path_missing ? "Repo path no longer exists" : "Rescan"}</TooltipContent>

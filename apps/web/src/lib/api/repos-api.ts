@@ -18,6 +18,17 @@ async function heavyFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
 
 export const REPOS_SWR_KEY = "/repos";
 
+export interface RepoCounts {
+  symbols: number;
+  files: number;
+  gotchas: number;
+  /** The subset of `gotchas` nobody's curated yet (`!curated`). Gotchas are
+   * permanent knowledge, never "resolved away" -- this is what drives the
+   * "needs curation" stat and health warning, not the total. */
+  gotchas_needing_curation: number;
+  decisions: number;
+}
+
 /** `"pending" | "active" | "failed: <reason>"` -- the backend encodes the failure reason directly into the status string rather than a separate field, see `parseRepoStatus`. */
 export interface RepoConnection {
   id: string;
@@ -28,6 +39,16 @@ export interface RepoConnection {
   public_key_openssh: string | null;
   status: string;
   created_at: string;
+  /** Dashboard-unification (Initiative 1) additive fields -- present only
+   * for an `Active` connection whose store opened; `undefined`/`false`
+   * otherwise, same "never fabricated zeros" contract the Rust
+   * `RepoSummary.counts` has. There is deliberately no `last_scanned_at`
+   * here (unlike the retired manifest-based `RepoSummary`) -- the
+   * tenant-scoped backend has no equivalent timestamp to expose yet, so
+   * `repoHealth` treats it as unknown/skipped rather than fabricating one. */
+  counts?: RepoCounts | null;
+  branch?: string | null;
+  path_missing?: boolean;
 }
 
 export interface ReposResponse {
@@ -159,4 +180,264 @@ export function retryIndexing(connectionId: string, jobId: string): Promise<{ jo
 /** SSH-method connections only -- 404s for a GitHub App connection (nothing to regenerate). */
 export function regenerateDeployKey(connectionId: string): Promise<{ connection: RepoConnection }> {
   return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/regenerate-key`, { method: "POST" });
+}
+
+// --- Dashboard unification (Initiative 1) ---------------------------------
+//
+// Migrated off the retired `agentops-api.ts` client (which called
+// `AGENTOPS_API_URL` directly from the browser, bypassing this file's
+// `/api/heavy/*` proxy and agentops-manifest's local-only scan registry --
+// see agentops-heavy-api's `dashboard.rs` module doc comment for the
+// backend side of this migration). Every `repo`/`connectionId` string below
+// is what the backend returns as `SearchResult.repo`/`NodeDetail.repo`/
+// `GotchaSummary.repo`/`ActivityEvent.repo` -- which is always exactly a
+// `RepoConnection.id` (the tenant-scoped backend derives it from the
+// connection's own checkout directory name, which *is* the connection id --
+// see `checkout_path`'s doc comment), so these opaque strings compose
+// directly with `RepoConnection.id` with no separate name-resolution step.
+
+export interface ActivityEvent {
+  repo: string;
+  /** SQLite `CURRENT_TIMESTAMP`-formatted, lexicographically sortable. */
+  started_at: string;
+  files_added: number;
+  files_changed: number;
+  files_removed: number;
+  symbols_added: number;
+  symbols_changed: number;
+  symbols_removed: number;
+}
+
+export function getActivity(): Promise<ActivityEvent[]> {
+  return heavyFetch<{ activity: ActivityEvent[] }>("/activity").then((r) => r.activity);
+}
+
+// Rust's `NodeKind` serializes as its bare (PascalCase) variant name, e.g.
+// `NodeKind::Symbol` -> `"Symbol"` -- no #[serde(rename_all)] involved.
+export type NodeKind = "Symbol" | "File" | "Gotcha" | "Decision" | "Definition" | "Note";
+
+// Same bare-variant-name convention as NodeKind. Curation only ever
+// reorders a gotcha's prominence -- there is no "closed"/hidden state.
+export type NodeProminence = "Full" | "Reduced";
+
+export interface SearchResult {
+  repo: string;
+  id: number;
+  kind: NodeKind;
+  name: string | null;
+  path: string | null;
+  container: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  /** A truncated preview of the node's content -- the detail panel fetches the full `content` separately via `getNodeDetail`. */
+  snippet: string | null;
+  /** 0–1, derived from `search_similar`'s distance -- see `search.rs`'s doc comment for the exact formula. */
+  similarity: number;
+  curated: boolean;
+  prominence: NodeProminence;
+  curation_reason: string | null;
+}
+
+export interface ConnectedNode {
+  id: number;
+  kind: NodeKind;
+  name: string | null;
+  path: string | null;
+  /** e.g. `"affects"` for an outgoing edge, `"← affects"` for an incoming one. */
+  relation: string;
+}
+
+export interface NodeDetail {
+  id: number;
+  kind: NodeKind;
+  repo: string;
+  path: string | null;
+  name: string | null;
+  container: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  content: string | null;
+  connected: ConnectedNode[];
+  curated: boolean;
+  prominence: NodeProminence;
+  curation_reason: string | null;
+}
+
+export interface SearchOptions {
+  /** Connection ids/URLs to search; omitted/empty means every one of the caller's own connections. */
+  repos?: string[];
+  /** Kind filter; omitted/empty means all kinds. */
+  kinds?: NodeKind[];
+  topK?: number;
+}
+
+export function search(query: string, options: SearchOptions = {}): Promise<SearchResult[]> {
+  const params = new URLSearchParams({ q: query });
+  if (options.repos?.length) params.set("repos", options.repos.join(","));
+  if (options.kinds?.length) params.set("kind", options.kinds.map((k) => k.toLowerCase()).join(","));
+  if (options.topK) params.set("top_k", String(options.topK));
+  return heavyFetch<{ results: SearchResult[] }>(`/local-search?${params.toString()}`).then((r) => r.results);
+}
+
+export function getNodeDetail(connectionId: string, id: number): Promise<NodeDetail> {
+  return heavyFetch<NodeDetail>(`/repos/${encodeURIComponent(connectionId)}/nodes/${id}`);
+}
+
+/** Shared SWR key for the gotchas page's list -- one cache entry, revalidated the same optimistic-mutate way REPOS_SWR_KEY already is. */
+export const GOTCHAS_SWR_KEY = "/gotchas";
+
+export interface GotchaSummary {
+  repo: string;
+  id: number;
+  name: string | null;
+  path: string | null;
+  container: string | null;
+  start_line: number | null;
+  end_line: number | null;
+  snippet: string | null;
+  curated: boolean;
+  prominence: NodeProminence;
+  curation_reason: string | null;
+}
+
+/** `needs_curation` (nobody's looked at it), `kept` (curated, still Full prominence), or `reduced` (curated down, always paired with a reason). */
+export type GotchaBucket = "needs_curation" | "kept" | "reduced";
+
+export function getGotchas(bucket?: GotchaBucket): Promise<GotchaSummary[]> {
+  const params = bucket ? `?bucket=${bucket}` : "";
+  return heavyFetch<{ gotchas: GotchaSummary[] }>(`/gotchas${params}`).then((r) => r.gotchas);
+}
+
+/** `reason` is required (non-empty) when `prominence` is `"Reduced"`, ignored otherwise -- enforced server-side too. */
+export function setCuration(connectionId: string, id: number, prominence: NodeProminence, reason: string | null): Promise<{ id: number; prominence: NodeProminence }> {
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/nodes/${id}/curation`, {
+    method: "POST",
+    body: JSON.stringify({ prominence: prominence.toLowerCase(), reason }),
+  });
+}
+
+/**
+ * The Knowledge Graph screen's 4 tabs, mapped onto real `EdgeRelation`s
+ * (there's no `Calls`/`Contains` edge in the graph) -- see
+ * `agentops-api/src/subgraph.rs`'s `mode_filter`:
+ * `local` = DependsOn+Documents+Affects both directions, `dep_chain` =
+ * DependsOn outgoing only, `impact` = DependsOn incoming only, `knowledge`
+ * = Affects both directions.
+ */
+export type GraphMode = "local" | "dep_chain" | "impact" | "knowledge";
+
+export interface SubgraphNode {
+  id: number;
+  kind: NodeKind;
+  name: string | null;
+  path: string | null;
+  curated: boolean;
+  prominence: NodeProminence;
+  /** BFS distance from the seed node; 0 for the seed itself. */
+  depth: number;
+}
+
+export interface SubgraphEdge {
+  id: number;
+  src_id: number;
+  dst_id: number;
+  relation: "DependsOn" | "Documents" | "Affects" | "References";
+  /** "depends on" / "documents" / "affects" / "references" -- see search.rs's relation_label. No "← " prefix: direction is conveyed structurally via src_id/dst_id. */
+  label: string;
+}
+
+export interface SubgraphResponse {
+  seed_id: number;
+  mode: GraphMode;
+  depth: number;
+  nodes: SubgraphNode[];
+  edges: SubgraphEdge[];
+  /** `true` if the backend's NODE_CAP (150) was hit -- the response is a partial subgraph, not the full neighborhood. */
+  truncated: boolean;
+}
+
+export interface SubgraphOptions {
+  /** 1-4; server defaults to 2 and clamps regardless of what's sent. */
+  depth?: number;
+  /** Empty/omitted = no filter. */
+  kinds?: NodeKind[];
+}
+
+export function getSubgraph(connectionId: string, id: number, mode: GraphMode, options: SubgraphOptions = {}): Promise<SubgraphResponse> {
+  const params = new URLSearchParams({ mode });
+  if (options.depth) params.set("depth", String(options.depth));
+  if (options.kinds?.length) params.set("kind", options.kinds.map((k) => k.toLowerCase()).join(","));
+  return heavyFetch<SubgraphResponse>(`/repos/${encodeURIComponent(connectionId)}/nodes/${id}/graph?${params.toString()}`);
+}
+
+/** Every node/edge in a repo, not centered on any seed -- the Knowledge Graph screen's "pick a repo" entry point. `SubgraphNode.depth` is always 0 here (there's no BFS distance without a seed). */
+export interface RepoGraphResponse {
+  repo: string;
+  nodes: SubgraphNode[];
+  edges: SubgraphEdge[];
+  /** `true` if the backend's NODE_CAP (150) was hit -- expect this often for large repos unless `kinds` narrows the result. */
+  truncated: boolean;
+}
+
+export function getRepoGraph(connectionId: string, kinds: NodeKind[] = []): Promise<RepoGraphResponse> {
+  const params = new URLSearchParams();
+  if (kinds.length) params.set("kind", kinds.map((k) => k.toLowerCase()).join(","));
+  const qs = params.toString();
+  return heavyFetch<RepoGraphResponse>(`/repos/${encodeURIComponent(connectionId)}/graph${qs ? `?${qs}` : ""}`);
+}
+
+// Documentation Viewer types mirror `agentops-docgen::model` exactly (see
+// that crate's `model.rs` for the Rust source of truth). `DocPage` is
+// `Serialize`-only in Rust -- these types are never sent back to the
+// server, only read from `GET /repos/{id}/docs`'s response.
+
+/** `#[serde(rename_all = "snake_case")]` on `DocGroup` -- no `execution_flows` variant exists yet (see that enum's own doc comment: no signal in the graph derives a call-chain "flow"). */
+export type DocGroup = "repository" | "core_modules" | "knowledge" | "setup";
+
+export interface SymbolRow {
+  name: string;
+  /** From a `Documents`-edge-connected `Definition` node's first line, when one exists (`explain_symbol`'s opt-in output) -- empty string otherwise, never fabricated. */
+  one_liner: string;
+  gotcha_count: number;
+  node_id: number;
+}
+
+/** `#[serde(tag = "block_type", rename_all = "snake_case")]` -- discriminated union, switch on `block_type`. */
+export type DocBlock =
+  | { block_type: "prose"; markdown: string }
+  | { block_type: "symbol_table"; file: string; rows: SymbolRow[] }
+  | { block_type: "dependency_chips"; deps: string[] }
+  | {
+      block_type: "knowledge_callout";
+      kind: NodeKind;
+      node_id: number;
+      title: string;
+      body: string;
+      /** e.g. "affects refreshSession()" -- empty string if the note has no Affects edge yet. */
+      affects: string;
+      /** `[path, line]` of the affected symbol/file, when known. */
+      source: [string, number] | null;
+    };
+
+export interface DocSection {
+  /** Stable slug -- nav href + TOC anchor. */
+  id: string;
+  group: DocGroup;
+  title: string;
+  blocks: DocBlock[];
+}
+
+export interface DocPage {
+  repo: string;
+  /** `ScanHistory.started_at` text, same lexicographically-sortable format as `ActivityEvent.started_at`. */
+  generated_at: string;
+  node_count: number;
+  sections: DocSection[];
+}
+
+/** Per-repo key -- unlike `REPOS_SWR_KEY`/`GOTCHAS_SWR_KEY` (one global list each), docs are scoped per repo, so callers compose `${DOCS_SWR_KEY}/${repo}` as the actual SWR key. */
+export const DOCS_SWR_KEY = "/docs";
+
+export function getDocs(connectionId: string): Promise<DocPage> {
+  return heavyFetch<DocPage>(`/repos/${encodeURIComponent(connectionId)}/docs`);
 }

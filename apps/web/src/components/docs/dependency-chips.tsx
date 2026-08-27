@@ -1,4 +1,4 @@
-import type { DocBlock } from "@/lib/api/agentops-api";
+import type { DocBlock } from "@/lib/api/repos-api";
 
 type DependencyChipsBlock = Extract<DocBlock, { block_type: "dependency_chips" }>;
 

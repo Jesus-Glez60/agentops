@@ -1,4 +1,4 @@
-import type { DocBlock, DocPage, DocSection } from "@/lib/api/agentops-api";
+import type { DocBlock, DocPage, DocSection } from "@/lib/api/repos-api";
 import { Prose } from "@/components/shared/prose";
 import { SymbolTable } from "@/components/docs/symbol-table";
 import { DependencyChips } from "@/components/docs/dependency-chips";

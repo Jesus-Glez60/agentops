@@ -10,8 +10,8 @@ const { getGotchas, getRepos, setCuration, getNodeDetail, toastError } = vi.hois
   toastError: vi.fn(),
 }));
 
-vi.mock("@/lib/api/agentops-api", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/agentops-api")>("@/lib/api/agentops-api");
+vi.mock("@/lib/api/repos-api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api/repos-api")>("@/lib/api/repos-api");
   return { ...actual, getGotchas, getRepos, setCuration, getNodeDetail };
 });
 
@@ -77,7 +77,7 @@ describe("GotchasPage", () => {
     setCuration.mockReset();
     getNodeDetail.mockReset();
     toastError.mockClear();
-    getRepos.mockResolvedValue([]);
+    getRepos.mockResolvedValue({ connections: [], can_connect: true });
   });
 
   it("renders a card per gotcha with its curation bucket badge", async () => {

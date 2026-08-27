@@ -122,8 +122,10 @@ pub fn read_branch(repo_path: &Path) -> Option<String> {
 /// /local-search`, both of which only care about repos with real, queryable
 /// data and silently skip everything else (unlike `GET /scans`, which must
 /// show a `path_missing` row rather than hide the gap, so it keeps its own
-/// per-entry logic in `summarize_repo`).
-pub(crate) fn open_scanned_repos(entries: &[ManifestEntry]) -> Vec<(String, Box<dyn GraphStore>)> {
+/// per-entry logic in `summarize_repo`). `pub` -- `agentops-heavy-api`'s
+/// tenant-scoped equivalents call this same pattern against
+/// `ConnectionStore`-resolved stores instead of manifest entries.
+pub fn open_scanned_repos(entries: &[ManifestEntry]) -> Vec<(String, Box<dyn GraphStore>)> {
     entries
         .iter()
         .filter_map(|entry| {
@@ -140,12 +142,18 @@ pub(crate) fn open_scanned_repos(entries: &[ManifestEntry]) -> Vec<(String, Box<
 /// Resolves a display name (`agentops_mcp::repo_name`'s output) back to its
 /// manifest entry -- shared by `rescan_repo_json` and `search.rs`'s node
 /// detail route, both of which take a repo *name* in the URL path rather
-/// than a raw filesystem path.
-pub(crate) fn find_by_name<'a>(entries: &'a [ManifestEntry], name: &str) -> Option<&'a ManifestEntry> {
+/// than a raw filesystem path. `pub` for the same cross-crate reuse reason
+/// as `open_scanned_repos`.
+pub fn find_by_name<'a>(entries: &'a [ManifestEntry], name: &str) -> Option<&'a ManifestEntry> {
     entries.iter().find(|e| agentops_mcp::repo_name(&PathBuf::from(&e.path)) == name)
 }
 
-fn summarize_repo(entry: &ManifestEntry) -> RepoSummary {
+/// `pub` -- `agentops-heavy-api`'s `GET /repos` extension calls this against
+/// a synthetic `ManifestEntry` built from each tenant connection's resolved
+/// checkout path (`ManifestEntry` is a plain two-field data carrier, not
+/// coupled to the real manifest file, so constructing one on the fly for
+/// this purpose is legitimate reuse, not a hack).
+pub fn summarize_repo(entry: &ManifestEntry) -> RepoSummary {
     let path = PathBuf::from(&entry.path);
     let name = agentops_mcp::repo_name(&path);
 
@@ -175,7 +183,7 @@ fn summarize_repo(entry: &ManifestEntry) -> RepoSummary {
 /// block on real I/O (a slow Postgres round-trip under
 /// `AGENTOPS_DATABASE_URL`), so this must not run on the async executor's
 /// own thread even though it's cheap for the SQLite default.
-pub async fn list_repos_json(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn list_repos_json(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RepoSummary>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
@@ -190,7 +198,7 @@ pub async fn list_repos_json(State(state): State<AppState>) -> (StatusCode, Json
     }
 }
 
-pub async fn rescan_repo_json(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn rescan_repo_json(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let target_name = name.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<RepoSummary>> {
@@ -234,7 +242,7 @@ pub async fn rescan_repo_json(State(state): State<AppState>, AxumPath(name): Axu
 /// SQLite `CURRENT_TIMESTAMP`-formatted string (lexicographically
 /// sortable), so a plain string comparison is a correct sort here, not an
 /// approximation.
-pub async fn activity_json(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn activity_json(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ActivityEvent>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
@@ -289,12 +297,13 @@ pub struct GotchasQuery {
     repos: Option<String>,
 }
 
-const GOTCHA_BUCKETS: [&str; 3] = ["needs_curation", "kept", "reduced"];
+pub const GOTCHA_BUCKETS: [&str; 3] = ["needs_curation", "kept", "reduced"];
 
 /// The three real curation states a gotcha can be in -- never a fourth
 /// "closed" one. Caller must validate `bucket` against `GOTCHA_BUCKETS`
-/// first; an unrecognized bucket here just matches nothing.
-fn matches_bucket(node: &Node, bucket: &str) -> bool {
+/// first; an unrecognized bucket here just matches nothing. `pub` -- reused
+/// by `agentops-heavy-api`'s tenant-scoped `GET /gotchas`.
+pub fn matches_bucket(node: &Node, bucket: &str) -> bool {
     match bucket {
         "needs_curation" => !node.curated,
         "kept" => node.curated && node.prominence == NodeProminence::Full,
@@ -308,7 +317,7 @@ fn matches_bucket(node: &Node, bucket: &str) -> bool {
 /// curation page. Composes `open_scanned_repos` + `GraphStore::nodes_by_kind`
 /// exactly the way `activity_json` composes `open_scanned_repos` +
 /// `latest_scan` — no new cross-repo iteration logic.
-pub async fn gotchas_json(State(state): State<AppState>, Query(q): Query<GotchasQuery>) -> (StatusCode, Json<Value>) {
+pub(crate) async fn gotchas_json(State(state): State<AppState>, Query(q): Query<GotchasQuery>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let bucket = q.bucket.clone();
     if let Some(b) = &bucket {

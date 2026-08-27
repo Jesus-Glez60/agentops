@@ -3,8 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import { SWRConfig } from "swr";
 
 const { getRepos } = vi.hoisted(() => ({ getRepos: vi.fn() }));
-vi.mock("@/lib/api/agentops-api", async () => {
-  const actual = await vi.importActual<typeof import("@/lib/api/agentops-api")>("@/lib/api/agentops-api");
+vi.mock("@/lib/api/repos-api", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/api/repos-api")>("@/lib/api/repos-api");
   return { ...actual, getRepos };
 });
 
@@ -20,7 +20,7 @@ function renderPicker(onSelect: (repo: string) => void) {
 
 describe("RepoPicker", () => {
   it("lists scanned repos and calls onSelect when clicked", async () => {
-    getRepos.mockResolvedValue([{ name: "agentops", path: "/x", branch: "main", last_scanned_at: 0, counts: null, path_missing: false }]);
+    getRepos.mockResolvedValue({ connections: [{ id: "agentops", tenant: "t", repo_url: "git@github.com:acme/agentops.git", method: "ssh", public_key_openssh: null, status: "active", created_at: "", branch: "main", counts: null, path_missing: false }], can_connect: true });
     const onSelect = vi.fn();
     renderPicker(onSelect);
 
@@ -29,7 +29,7 @@ describe("RepoPicker", () => {
   });
 
   it("shows an empty message when no repos are scanned", async () => {
-    getRepos.mockResolvedValue([]);
+    getRepos.mockResolvedValue({ connections: [], can_connect: true });
     renderPicker(vi.fn());
     expect(await screen.findByText("No repositories scanned yet.")).toBeInTheDocument();
   });

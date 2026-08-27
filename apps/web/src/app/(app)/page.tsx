@@ -2,18 +2,24 @@
 
 import useSWR from "swr";
 import { Clock, Database, Share2, TriangleAlert } from "lucide-react";
-import { getRepos, REPOS_SWR_KEY } from "@/lib/api/agentops-api";
+import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { repoHealth } from "@/lib/repo-health";
 import { StatCard } from "@/components/dashboard/stat-card";
 import { ActivityTicker } from "@/components/dashboard/activity-ticker";
 import { RepoTable } from "@/components/dashboard/repo-table";
 
 export default function OverviewPage() {
-  const { data: repos } = useSWR(REPOS_SWR_KEY, getRepos);
+  const { data } = useSWR(REPOS_SWR_KEY, getRepos);
+  const repos = data?.connections;
 
   const repoCount = repos?.length ?? 0;
   const nodeCount = repos?.reduce((sum, r) => sum + (r.counts ? r.counts.symbols + r.counts.files + r.counts.gotchas + r.counts.decisions : 0), 0) ?? 0;
   const gotchaCount = repos?.reduce((sum, r) => sum + (r.counts?.gotchas_needing_curation ?? 0), 0) ?? 0;
+  // Always 0 for now -- `repoHealth` can never return "stale" without a
+  // `last_scanned_at`, which the tenant-scoped backend doesn't expose yet
+  // (see repo-health.ts's doc comment). Kept as a real (if currently inert)
+  // stat rather than removing the card, so it lights up for free once a
+  // scan-recency field is added server-side.
   const staleCount = repos?.filter((r) => repoHealth(r) === "stale").length ?? 0;
 
   return (

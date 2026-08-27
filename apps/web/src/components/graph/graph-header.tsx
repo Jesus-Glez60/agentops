@@ -1,5 +1,5 @@
 import { ChevronDown } from "lucide-react";
-import type { GraphMode } from "@/lib/api/agentops-api";
+import type { GraphMode } from "@/lib/api/repos-api";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { RepoPicker } from "@/components/graph/repo-picker";
 import { cn } from "@/lib/utils";

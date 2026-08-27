@@ -1,4 +1,4 @@
-import type { NodeKind } from "@/lib/api/agentops-api";
+import type { NodeKind } from "@/lib/api/repos-api";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Slider } from "@/components/ui/slider";
 
