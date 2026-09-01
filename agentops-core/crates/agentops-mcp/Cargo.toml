@@ -9,6 +9,7 @@ name = "agentops_mcp"
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

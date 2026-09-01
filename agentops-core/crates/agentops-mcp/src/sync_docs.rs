@@ -28,8 +28,7 @@ pub struct SyncDocsSummary {
 /// one path constant would be a heavier cross-crate wire than this one-line
 /// join warrants.
 fn default_docbrain_db_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentops").join("docbrain.db")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".agentops").join("docbrain.db")
 }
 
 /// Scans `repo_path` for third-party dependencies and registers whichever

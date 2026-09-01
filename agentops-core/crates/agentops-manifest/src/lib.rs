@@ -39,12 +39,15 @@ pub fn default_manifest_path() -> PathBuf {
 /// service's own per-subsystem `AGENTOPS_*_DB`/`*_DIR` var defaults under,
 /// so a self-hosted deployment only needs to set one path to relocate all
 /// of them at once; each individual var still overrides its own default.
-fn agentops_data_dir() -> PathBuf {
+/// `pub` so other crates (e.g. `docbrain-mcp`) needing the same default
+/// don't duplicate this logic themselves — a duplicate is exactly how the
+/// `$HOME`-only Windows bug fixed here almost shipped unfixed in a second
+/// copy elsewhere.
+pub fn agentops_data_dir() -> PathBuf {
     if let Ok(dir) = std::env::var("AGENTOPS_DATA_DIR") {
         return PathBuf::from(dir);
     }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentops")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".agentops")
 }
 
 fn load(manifest_file: &Path) -> Result<Manifest> {

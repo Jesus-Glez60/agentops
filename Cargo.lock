@@ -110,12 +110,14 @@ dependencies = [
  "anyhow",
  "clap",
  "dialoguer",
+ "dirs",
  "docbrain-graph",
  "docbrain-ingest",
  "docbrain-mcp",
  "dotenvy",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "toml",
  "ureq",
@@ -345,6 +347,7 @@ dependencies = [
  "agentops-repo-access",
  "agentops-security",
  "anyhow",
+ "dirs",
  "serde",
  "serde_json",
  "tempfile",
@@ -366,6 +369,7 @@ dependencies = [
  "agentops-scanner",
  "anyhow",
  "candle-core",
+ "dirs",
  "docbrain-graph",
  "docbrain-ingest",
  "notify-debouncer-full",
@@ -1696,6 +1700,7 @@ dependencies = [
 name = "docbrain-mcp"
 version = "0.1.0"
 dependencies = [
+ "agentops-manifest",
  "anyhow",
  "docbrain-graph",
  "docbrain-ingest",

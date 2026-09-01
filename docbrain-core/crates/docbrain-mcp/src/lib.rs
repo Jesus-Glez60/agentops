@@ -28,15 +28,7 @@ pub fn default_db_path() -> PathBuf {
     if let Ok(path) = std::env::var("AGENTOPS_DOCBRAIN_DB") {
         return PathBuf::from(path);
     }
-    agentops_data_dir().join("docbrain.db")
-}
-
-fn agentops_data_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("AGENTOPS_DATA_DIR") {
-        return PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".agentops")
+    agentops_manifest::agentops_data_dir().join("docbrain.db")
 }
 
 /// Runs the server over stdin/stdout until stdin closes, backed by a

@@ -9,6 +9,7 @@ name = "agentops_manifest"
 
 [dependencies]
 anyhow.workspace = true
+dirs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 agentops-security = { path = "../agentops-security" }

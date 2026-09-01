@@ -77,6 +77,11 @@ notify-debouncer-full = "0.7"
 sha2 = "0.11"
 getrandom = "0.4"
 subtle = "2"
+# Already a transitive dependency via hf-hub at this major version -- pinned
+# here explicitly so `$HOME`-only env reads can move to `dirs::home_dir()`
+# (Windows uses `%USERPROFILE%`) without introducing a second major version
+# of the same crate into the dependency graph.
+dirs = "6"
 
 # --- agentops-graph-pg: optional Postgres GraphStore backend, part of core.
 # A store adapter talking to a real Postgres server at runtime is expected
