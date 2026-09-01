@@ -317,6 +317,18 @@ fn repo_context(args: &Value) -> anyhow::Result<(Box<dyn GraphStore>, String)> {
     Ok((store, repo_name(path)))
 }
 
+/// AgentOps's MCP server is now registered once, globally, for every repo
+/// on the machine (no per-repo `connect` step marks a repo as "known"
+/// anymore) — so a repo an agent has never `scan_repo`'d against looks
+/// identical to one that's genuinely empty: `open_store` silently
+/// auto-creates an empty `.context/graph.db` either way. Read tools that
+/// would otherwise return a bare "nothing found" call this to distinguish
+/// the two and nudge the agent toward `scan_repo` instead of concluding
+/// there's just nothing to know yet.
+fn never_scanned_hint(store: &dyn GraphStore, repo: &str) -> anyhow::Result<Option<&'static str>> {
+    Ok(if store.latest_scan(repo)?.is_none() { Some(" (this repo has never been scanned — call scan_repo first, then retry)") } else { None })
+}
+
 /// Module 6 (cross-tool session correlation): every write tool that accepts
 /// an optional `session_id` calls this after its own write succeeds. A
 /// missing/absent `session_id` is a normal, expected case (most callers
@@ -380,7 +392,8 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
     let (store, repo) = repo_context(args)?;
     let mut gotchas = store.nodes_by_kind(&repo, NodeKind::Gotcha)?;
     if gotchas.is_empty() {
-        return Ok("No gotchas recorded.".to_string());
+        let hint = never_scanned_hint(store.as_ref(), &repo)?.unwrap_or_default();
+        return Ok(format!("No gotchas recorded.{hint}"));
     }
     // Full-prominence first -- every gotcha is still listed (this is
     // permanent knowledge, never hidden), just ranked so a curated-down
@@ -407,7 +420,13 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
     let (store, repo) = repo_context(args)?;
     let name = get_str(args, "name").ok_or_else(|| anyhow::anyhow!("missing required 'name'"))?;
     let file = get_str(args, "file").map(Path::new);
-    let id = agentops_llm::find_symbol_by_name(store.as_ref(), &repo, name, file)?;
+    let id = match agentops_llm::find_symbol_by_name(store.as_ref(), &repo, name, file) {
+        Ok(id) => id,
+        Err(e) => {
+            let hint = never_scanned_hint(store.as_ref(), &repo)?.unwrap_or_default();
+            anyhow::bail!("{e}{hint}");
+        }
+    };
     let node = store.get_node(&repo, id)?.ok_or_else(|| anyhow::anyhow!("symbol resolved but node #{id} not found"))?;
 
     let mut out = format!(
@@ -891,6 +910,43 @@ mod tests {
         assert!(err.contains("unknown tool"));
     }
 
+    /// Now that MCP registration is global (no per-repo `connect` step
+    /// marks a repo as "known" anymore -- see the `agentops-cli` session
+    /// that moved MCP config to user-level), a never-scanned repo and a
+    /// genuinely-empty one look identical to `open_store`. `list_gotchas`
+    /// must distinguish them so an agent gets nudged toward `scan_repo`
+    /// instead of concluding there's just nothing to know yet.
+    #[test]
+    fn list_gotchas_on_a_never_scanned_repo_hints_at_scan_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let result = call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path })).unwrap();
+        assert!(result.content[0].text.contains("never been scanned"), "{:?}", result.content);
+        assert!(result.content[0].text.contains("scan_repo"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn list_gotchas_on_a_scanned_but_genuinely_empty_repo_does_not_suggest_scanning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        let result = call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path })).unwrap();
+        assert!(!result.content[0].text.contains("never been scanned"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn get_symbol_on_a_never_scanned_repo_hints_at_scan_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "greet" })).unwrap();
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("never been scanned"), "{:?}", result.content);
+    }
+
     #[test]
     fn scan_then_status_then_list_gotchas_round_trip() {
         let dir = tempfile::tempdir().unwrap();
@@ -1256,7 +1312,9 @@ mod tests {
         assert!(result.content[0].text.contains("Consolidation skipped:"), "a tiny fresh repo has too few plasticity-bearing pairs to train on yet: {:?}", result.content);
 
         let repo = crate::scan::repo_name(dir.path());
-        let _ = std::fs::remove_dir_all(std::path::PathBuf::from(std::env::var_os("HOME").unwrap()).join(".agentops").join("models").join(&repo));
+        if let Some(home) = dirs::home_dir() {
+            let _ = std::fs::remove_dir_all(home.join(".agentops").join("models").join(&repo));
+        }
     }
 
     /// `mode=gist_then_detail` (Initiative 2) end-to-end over MCP: a scan

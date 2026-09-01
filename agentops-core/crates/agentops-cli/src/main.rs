@@ -713,7 +713,7 @@ fn start_web_frontend_if_present(path: &Path) {
     // straight at an install dir), and a source checkout's own build
     // output (developer running from the repo).
     // Matches install.sh's AGENTOPS_INSTALL_DIR override / $HOME/.agentops default.
-    let install_dir = std::env::var("AGENTOPS_INSTALL_DIR").ok().map(PathBuf::from).or_else(|| std::env::var("HOME").ok().map(|home| PathBuf::from(home).join(".agentops")));
+    let install_dir = std::env::var("AGENTOPS_INSTALL_DIR").ok().map(PathBuf::from).or_else(|| dirs::home_dir().map(|home| home.join(".agentops")));
     let install_dir_web = install_dir.map(|d| d.join("web/server.js"));
     let candidates = [install_dir_web, Some(path.join("web/server.js")), Some(path.join("apps/web/.next/standalone/server.js"))];
     let Some(server_js) = candidates.into_iter().flatten().find(|p| p.exists()) else {
@@ -769,61 +769,53 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embedding
     Ok(())
 }
 
-/// Shared by `install()` and `connect()`: builds `.ruler/` (rules/skills) +
-/// `.ruler/mcp.json` (MCP server registration) and runs `ruler apply` for
-/// the given agent ids. Every failure here is a warning, not a hard error —
-/// matches `install()`'s existing posture that a scan/AGENTS.md write should
-/// never be undone by an optional downstream distribution step failing.
+/// Shared by `install()` and `connect()`: builds `.ruler/` (rules/skills)
+/// and runs `ruler apply` for the given agent ids. Every failure here is a
+/// warning, not a hard error — matches `install()`'s existing posture that a
+/// scan/AGENTS.md write should never be undone by an optional downstream
+/// distribution step failing.
+///
+/// MCP registration itself is handled separately, by `write_user_level_mcp_
+/// entries` below, at each tool's user-level (not project-level) config —
+/// see that function's doc comment for why. `apply()` is called with
+/// `with_mcp: false` accordingly; this fn only distributes `AGENTS.md`/the
+/// prompt pack/skills.
 ///
 /// **Remote-mode durability, not just a one-time write**: if
 /// `.context/agentops-remote.json` exists (written by `connect_remote` the
-/// first time `--remote` was used for this repo), this fn skips writing
-/// `.ruler/mcp.json`'s stdio entry entirely and, after `ruler apply` runs
-/// for `AGENTS.md`/prompt-pack distribution, re-runs the native remote-MCP
-/// writer as its own last step. Without this, any *later* call to this fn
-/// from a plain `agentops install` re-scan (which also calls this,
-/// unconditionally, for any reason) would silently revert a team member's
-/// coding tool back to the local/stdio entry the next time `ruler apply`
-/// regenerates their native config files — a real bug caught auditing this
-/// feature's first draft, not a hypothetical.
+/// first time `--remote` was used for this repo), this fn registers the
+/// remote MCP entry instead of the local/stdio one. Without this, any
+/// *later* call to this fn from a plain `agentops install` re-scan (which
+/// also calls this, unconditionally, for any reason) would silently revert
+/// a team member's coding tool back to the local/stdio entry — a real bug
+/// caught auditing this feature's first draft, not a hypothetical.
 fn distribute_via_ruler(path: &Path, agents_md_content: &str, agent_ids: &[String], access_mode: &str) {
     if let Err(e) = agentops_ruler_bridge::build_ruler_dir(path, agents_md_content) {
-        println!("WARNING: failed to build .ruler/ (skipping prompt-pack and MCP distribution): {e}");
+        println!("WARNING: failed to build .ruler/ (skipping prompt-pack distribution): {e}");
         return;
     }
 
-    let remote_marker = read_remote_marker(path);
-    if remote_marker.is_none() {
-        if let Err(e) = agentops_ruler_bridge::write_mcp_config(path, access_mode) {
-            println!("WARNING: failed to write .ruler/mcp.json (skipping MCP registration, prompt pack still distributed): {e}");
-        }
-    }
-
     let agent_ids_ref: Vec<&str> = agent_ids.iter().map(String::as_str).collect();
-    match agentops_ruler_bridge::apply(path, &agent_ids_ref, false) {
-        Ok(output) => println!("Distributed prompt pack + MCP config via Ruler to {}:\n{output}", agent_ids_ref.join(", ")),
+    match agentops_ruler_bridge::apply(path, &agent_ids_ref, false, false) {
+        Ok(output) => println!("Distributed prompt pack via Ruler to {}:\n{output}", agent_ids_ref.join(", ")),
         Err(e) => println!("WARNING: `ruler apply` failed (prompt pack still built at .ruler/, scan/AGENTS.md unaffected): {e}"),
     }
 
-    if let Some(marker) = remote_marker {
-        write_remote_mcp_entries(path, agent_ids, &marker.server_url);
+    match read_remote_marker(path) {
+        Some(marker) => write_user_level_mcp_entries(agent_ids, None, Some(&marker.server_url)),
+        None => write_user_level_mcp_entries(agent_ids, Some(access_mode), None),
     }
 }
 
 /// Where each named agent's MCP config actually lands, for the closing
-/// summary — matches each vendor's own current docs (fetched directly while
-/// planning this, not assumed): Claude Code's `.mcp.json`, Cursor's
-/// `.cursor/mcp.json`, Codex CLI's `.codex/config.toml`, Gemini CLI's
-/// `.gemini/settings.json`. Anything else Ruler supports but isn't in this
-/// table just gets a generic "check its docs" line.
-fn mcp_config_location(agent_id: &str) -> Option<&'static str> {
-    match agent_id {
-        "claude" => Some(".mcp.json"),
-        "cursor" => Some(".cursor/mcp.json"),
-        "codex" => Some(".codex/config.toml"),
-        "gemini-cli" => Some(".gemini/settings.json"),
-        _ => None,
-    }
+/// summary — the USER-level (not project-level) path, matching each
+/// vendor's own current docs (fetched directly while planning this, not
+/// assumed): Claude Code's `~/.claude.json`, Cursor's `~/.cursor/mcp.json`,
+/// Codex CLI's `~/.codex/config.toml`, Gemini CLI's `~/.gemini/settings.json`.
+/// Anything else Ruler supports but isn't in this table just gets a generic
+/// "check its docs" line.
+fn mcp_config_location(agent_id: &str) -> Option<PathBuf> {
+    user_level_mcp_config_path(agent_id)
 }
 
 /// Shared by `connect()`'s local and remote flows -- the "which coding
@@ -921,8 +913,8 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
     println!("\nConnected: {}", agents.join(", "));
     for agent_id in &agents {
         match mcp_config_location(agent_id) {
-            Some(loc) => println!("  {agent_id}: {loc} — restart {agent_id} to pick up the new MCP server."),
-            None => println!("  {agent_id}: check its docs for where Ruler wrote its MCP config."),
+            Some(loc) => println!("  {agent_id}: {} — restart {agent_id} to pick up the new MCP server.", loc.display()),
+            None => println!("  {agent_id}: not a recognized agent id for user-level MCP registration — check its docs for how to register a stdio MCP server manually."),
         }
     }
 
@@ -1134,7 +1126,7 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
     println!("Export your API key locally before using your coding tool: export AGENTOPS_API_KEY={api_key}");
     for agent_id in agents {
         match mcp_config_location(agent_id) {
-            Some(loc) => println!("  {agent_id}: {loc} — restart {agent_id} to pick up the new MCP server."),
+            Some(loc) => println!("  {agent_id}: {} — restart {agent_id} to pick up the new MCP server.", loc.display()),
             None => println!("  {agent_id}: not a recognized agent id for a remote entry — check its docs for how to register a Streamable HTTP MCP server manually."),
         }
     }
@@ -1157,23 +1149,95 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
 /// remote schema) is skipped with a note in `connect_remote`'s own
 /// closing summary -- its prompt-pack distribution via Ruler still works,
 /// just not an automatic remote MCP entry.
-fn write_remote_mcp_entries(path: &Path, agent_ids: &[String], server_url: &str) {
-    let url = format!("{server_url}/mcp");
+/// Each vendor's USER-level (not project-level) MCP config file, per each
+/// one's own current docs (fetched directly, not assumed): Claude Code's
+/// `claude mcp add --scope user` writes `~/.claude.json` (top-level
+/// `mcpServers`, same shape as its project `.mcp.json`); Cursor's own docs
+/// say "Create `~/.cursor/mcp.json` ... for tools available everywhere" —
+/// same schema as project-level, and this is also where any *other*
+/// user-scope Cursor MCP servers already live, so this must merge, never
+/// overwrite; Codex CLI supports both `~/.codex/config.toml` (global) and
+/// `.codex/config.toml` (project, "for trusted projects only" per its own
+/// docs); Gemini CLI's `~/.gemini/settings.json` uses the identical
+/// `mcpServers` shape as its project-level file, just a different path.
+fn user_level_mcp_config_path(agent_id: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    match agent_id {
+        "claude" => Some(home.join(".claude.json")),
+        "cursor" => Some(home.join(".cursor").join("mcp.json")),
+        "codex" => Some(home.join(".codex").join("config.toml")),
+        "gemini-cli" => Some(home.join(".gemini").join("settings.json")),
+        _ => None,
+    }
+}
+
+/// Registers (or refreshes) the `"agentops"` MCP entry at each target
+/// agent's USER-level config, for either local (`access_mode` set) or
+/// remote (`remote_server_url` set — exactly one of the two is ever
+/// `Some`) mode. User-level, not project-level, deliberately: Cursor
+/// currently has an active regression where project-level `.cursor/mcp.json`
+/// isn't read by its Customize UI at all (confirmed via multiple reports on
+/// Cursor's own community forum, independently reproduced live-testing this
+/// feature — not a hypothetical), and since `agentops-mcp-server`'s
+/// identity doesn't vary per repo the way `AGENTS.md`/notes content does,
+/// one registration per machine is simpler regardless of that bug. Trade-
+/// off, accepted deliberately: this makes the registration global — the
+/// most recent `agentops install`/`connect`/`connect --remote` run on any
+/// repo on this machine determines what "agentops" points to for every
+/// tool, for every project. A user managing two genuinely separate AgentOps
+/// deployments on one machine would need to re-run `connect` when switching
+/// between them.
+///
+/// Bypasses Ruler entirely (unlike `AGENTS.md`/skills distribution) since
+/// each of the four vendors uses a genuinely different schema (Claude Code
+/// needs an explicit `"type"`; Codex CLI uses a separate `bearer_token_env_
+/// var` key, not string interpolation; Gemini CLI's header env-var
+/// substitution isn't confirmed by its own docs) — verified against each
+/// vendor's own current docs individually, matching this codebase's
+/// established "verify empirically, don't assume" convention, rather than
+/// trusting a single generic entry translated by a pinned Ruler version.
+/// Read-modify-write throughout: any *other* MCP server already configured
+/// in these files (e.g. a user's existing Context7/Linear entries) is
+/// preserved untouched.
+fn write_user_level_mcp_entries(agent_ids: &[String], access_mode: Option<&str>, remote_server_url: Option<&str>) {
     for agent_id in agent_ids {
-        let Some(rel_path) = mcp_config_location(agent_id) else { continue };
-        let config_path = path.join(rel_path);
-        let result = if agent_id == "codex" { write_codex_remote_entry(&config_path, &url) } else { write_json_mcp_remote_entry(agent_id, &config_path, &url) };
+        let Some(config_path) = user_level_mcp_config_path(agent_id) else { continue };
+        let result = if agent_id == "codex" {
+            let entry = match remote_server_url {
+                Some(url) => codex_remote_entry(url),
+                None => codex_local_entry(access_mode.expect("exactly one of access_mode/remote_server_url is always Some")),
+            };
+            write_codex_mcp_entry(&config_path, entry)
+        } else {
+            let entry = match remote_server_url {
+                Some(url) => json_remote_entry(agent_id, url),
+                None => json_local_entry(access_mode.expect("exactly one of access_mode/remote_server_url is always Some")),
+            };
+            write_json_mcp_entry(&config_path, entry)
+        };
         if let Err(e) = result {
-            println!("WARNING: failed to write a remote MCP entry to {}: {e}", config_path.display());
+            println!("WARNING: failed to write agentops's MCP entry to {}: {e}", config_path.display());
         }
     }
 }
 
-/// Claude Code (`.mcp.json`), Cursor (`.cursor/mcp.json`), and Gemini CLI
-/// (`.gemini/settings.json`) all use the same `{"mcpServers": {...}}` JSON
-/// shape, differing only in the per-agent fields set here -- see this
-/// module's `write_remote_mcp_entries` doc comment for the schema sources.
-fn write_json_mcp_remote_entry(agent_id: &str, config_path: &Path, url: &str) -> Result<()> {
+fn json_local_entry(access_mode: &str) -> serde_json::Value {
+    serde_json::json!({ "type": "stdio", "command": "agentops-mcp-server", "env": { "AGENTOPS_ACCESS_MODE": access_mode } })
+}
+
+fn json_remote_entry(agent_id: &str, server_url: &str) -> serde_json::Value {
+    let url = format!("{server_url}/mcp");
+    match agent_id {
+        "claude" => serde_json::json!({ "type": "http", "url": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
+        "gemini-cli" => serde_json::json!({ "httpUrl": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
+        _ => serde_json::json!({ "url": url, "headers": { "Authorization": "Bearer ${env:AGENTOPS_API_KEY}" } }), // cursor
+    }
+}
+
+/// Claude Code (`~/.claude.json`), Cursor (`~/.cursor/mcp.json`), and Gemini
+/// CLI (`~/.gemini/settings.json`) all use the same `{"mcpServers": {...}}`
+/// JSON shape — see `write_user_level_mcp_entries`'s doc comment.
+fn write_json_mcp_entry(config_path: &Path, entry: serde_json::Value) -> Result<()> {
     let mut root: serde_json::Value = if config_path.exists() {
         serde_json::from_str(&std::fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
     } else {
@@ -1182,11 +1246,6 @@ fn write_json_mcp_remote_entry(agent_id: &str, config_path: &Path, url: &str) ->
     if !root.is_object() {
         root = serde_json::json!({});
     }
-    let entry = match agent_id {
-        "claude" => serde_json::json!({ "type": "http", "url": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
-        "gemini-cli" => serde_json::json!({ "httpUrl": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
-        _ => serde_json::json!({ "url": url, "headers": { "Authorization": "Bearer ${env:AGENTOPS_API_KEY}" } }), // cursor
-    };
     let root_obj = root.as_object_mut().expect("just normalized to an object above");
     let servers = root_obj.entry("mcpServers").or_insert_with(|| serde_json::json!({}));
     if !servers.is_object() {
@@ -1200,11 +1259,27 @@ fn write_json_mcp_remote_entry(agent_id: &str, config_path: &Path, url: &str) ->
     std::fs::write(config_path, serde_json::to_string_pretty(&root)?).with_context(|| format!("writing {}", config_path.display()))
 }
 
-/// Codex CLI's `.codex/config.toml` reads the bearer token from a *named
+fn codex_local_entry(access_mode: &str) -> toml::value::Table {
+    let mut entry = toml::value::Table::new();
+    entry.insert("command".to_string(), toml::Value::String("agentops-mcp-server".to_string()));
+    let mut env = toml::value::Table::new();
+    env.insert("AGENTOPS_ACCESS_MODE".to_string(), toml::Value::String(access_mode.to_string()));
+    entry.insert("env".to_string(), toml::Value::Table(env));
+    entry
+}
+
+/// Codex CLI's `~/.codex/config.toml` reads the bearer token from a *named
 /// env var* (`bearer_token_env_var`), not string interpolation inside
-/// `url`/headers the way the other three do — see `write_remote_mcp_
+/// `url`/headers the way the other three do — see `write_user_level_mcp_
 /// entries`'s doc comment.
-fn write_codex_remote_entry(config_path: &Path, url: &str) -> Result<()> {
+fn codex_remote_entry(server_url: &str) -> toml::value::Table {
+    let mut entry = toml::value::Table::new();
+    entry.insert("url".to_string(), toml::Value::String(format!("{server_url}/mcp")));
+    entry.insert("bearer_token_env_var".to_string(), toml::Value::String("AGENTOPS_API_KEY".to_string()));
+    entry
+}
+
+fn write_codex_mcp_entry(config_path: &Path, entry: toml::value::Table) -> Result<()> {
     let mut root: toml::Value = if config_path.exists() {
         std::fs::read_to_string(config_path).with_context(|| format!("reading {}", config_path.display()))?.parse().unwrap_or_else(|_| toml::Value::Table(Default::default()))
     } else {
@@ -1213,10 +1288,6 @@ fn write_codex_remote_entry(config_path: &Path, url: &str) -> Result<()> {
     let table = root.as_table_mut().ok_or_else(|| anyhow::anyhow!("{} is not a TOML table at its root", config_path.display()))?;
     let mcp_servers = table.entry("mcp_servers".to_string()).or_insert_with(|| toml::Value::Table(Default::default()));
     let mcp_servers_table = mcp_servers.as_table_mut().ok_or_else(|| anyhow::anyhow!("mcp_servers is not a table in {}", config_path.display()))?;
-
-    let mut entry = toml::value::Table::new();
-    entry.insert("url".to_string(), toml::Value::String(url.to_string()));
-    entry.insert("bearer_token_env_var".to_string(), toml::Value::String("AGENTOPS_API_KEY".to_string()));
     mcp_servers_table.insert("agentops".to_string(), toml::Value::Table(entry));
 
     if let Some(parent) = config_path.parent() {
@@ -1633,7 +1704,7 @@ fn api_key_generate() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_repo_path;
+    use super::*;
 
     #[test]
     fn scp_like_and_https_forms_of_the_same_repo_normalize_identically() {
@@ -1658,6 +1729,70 @@ mod tests {
     #[test]
     fn ssh_scheme_with_explicit_port_still_normalizes_correctly() {
         assert_eq!(normalize_repo_path("ssh://git@github.com:22/acme/widgets.git"), normalize_repo_path("git@github.com:acme/widgets.git"));
+    }
+
+    #[test]
+    fn user_level_mcp_config_path_resolves_each_known_agent_and_none_for_unknown() {
+        assert!(user_level_mcp_config_path("claude").unwrap().ends_with(".claude.json"));
+        assert!(user_level_mcp_config_path("cursor").unwrap().ends_with(".cursor/mcp.json"));
+        assert!(user_level_mcp_config_path("codex").unwrap().ends_with(".codex/config.toml"));
+        assert!(user_level_mcp_config_path("gemini-cli").unwrap().ends_with(".gemini/settings.json"));
+        assert!(user_level_mcp_config_path("some-other-ruler-agent").is_none());
+    }
+
+    /// The whole reason this write path exists: Cursor's `~/.cursor/mcp.json`
+    /// already holds a user's *other* MCP servers (Context7, Linear, etc.)
+    /// before agentops ever touches it -- overwriting the file instead of
+    /// merging into it would silently disconnect those.
+    #[test]
+    fn write_json_mcp_entry_merges_into_an_existing_file_without_clobbering_other_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("mcp.json");
+        std::fs::write(&config_path, r#"{"mcpServers":{"linear":{"command":"linear-mcp"}},"otherTopLevelSetting":true}"#).unwrap();
+
+        write_json_mcp_entry(&config_path, json_local_entry("advisor")).unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["mcpServers"]["linear"]["command"], "linear-mcp", "a pre-existing, unrelated MCP server must survive: {parsed}");
+        assert_eq!(parsed["otherTopLevelSetting"], true, "unrelated top-level settings must survive: {parsed}");
+        assert_eq!(parsed["mcpServers"]["agentops"]["command"], "agentops-mcp-server");
+        assert_eq!(parsed["mcpServers"]["agentops"]["env"]["AGENTOPS_ACCESS_MODE"], "advisor");
+    }
+
+    #[test]
+    fn write_json_mcp_entry_creates_the_file_and_parent_dir_when_neither_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join(".cursor").join("mcp.json");
+
+        write_json_mcp_entry(&config_path, json_remote_entry("cursor", "https://agentops.example.com")).unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed["mcpServers"]["agentops"]["url"], "https://agentops.example.com/mcp");
+    }
+
+    #[test]
+    fn write_codex_mcp_entry_merges_into_existing_toml_without_clobbering_other_tables() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "[mcp_servers.other_server]\ncommand = \"other-mcp\"\n\n[some_unrelated_table]\nfoo = \"bar\"\n").unwrap();
+
+        write_codex_mcp_entry(&config_path, codex_local_entry("full")).unwrap();
+
+        let raw = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Value = raw.parse().unwrap();
+        assert_eq!(parsed["mcp_servers"]["other_server"]["command"].as_str().unwrap(), "other-mcp", "a pre-existing, unrelated MCP server must survive: {raw}");
+        assert_eq!(parsed["some_unrelated_table"]["foo"].as_str().unwrap(), "bar", "unrelated tables must survive: {raw}");
+        assert_eq!(parsed["mcp_servers"]["agentops"]["command"].as_str().unwrap(), "agentops-mcp-server");
+        assert_eq!(parsed["mcp_servers"]["agentops"]["env"]["AGENTOPS_ACCESS_MODE"].as_str().unwrap(), "full");
+    }
+
+    #[test]
+    fn codex_remote_entry_uses_a_bearer_token_env_var_not_string_interpolation() {
+        let entry = codex_remote_entry("https://agentops.example.com");
+        assert_eq!(entry["url"].as_str().unwrap(), "https://agentops.example.com/mcp");
+        assert_eq!(entry["bearer_token_env_var"].as_str().unwrap(), "AGENTOPS_API_KEY");
     }
 }
 

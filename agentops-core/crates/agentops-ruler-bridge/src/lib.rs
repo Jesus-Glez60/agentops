@@ -13,18 +13,27 @@
 //! the format Ruler actually recognizes — a flat `.ruler/skills/<name>.md`
 //! produced "No valid skills found" in the same empirical check.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 use include_dir::{include_dir, Dir};
 
 /// The prompt pack, embedded into the binary at compile time — no separate
-/// asset directory needs to ship alongside the release binary. Currently
-/// just two files (`agents/vault-archivist.md`, `docs/vault-protocol.md`) —
-/// the full ~40-file pack (agent personas, `/plan`/`/session`/`/wrap`
-/// skills) is a separate, deliberately out-of-scope content-authoring
-/// undertaking, not something this crate's logic is blocked on.
+/// asset directory needs to ship alongside the release binary. Layout:
+/// `agents/*.md` (subagents), `docs/*.md` (protocol docs the subagents defer
+/// to), `skills/*.md` (fanned to every tool's native skills dir via Ruler),
+/// and `shared/*.md` (canonical instruction bodies, pulled into `skills/`
+/// via `@include`).
+///
+/// Deliberately no separate `commands/*.md` / `.claude/commands/` layer:
+/// Claude Code unified custom commands into Skills (a `.claude/skills/`
+/// entry now shows up in the `/` menu *and* can be auto-invoked — a plain
+/// legacy command file is strictly a subset), so writing both under the
+/// same name produced two menu entries for one capability — caught live,
+/// not a hypothetical. Skills alone now cover both Claude Code's `/` menu
+/// and Cursor's auto-invocation (Cursor has no slash-command support at
+/// all — an open feature request, not shipped).
 static PROMPTS: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../prompts");
 
 /// Pinned Ruler version — verified against this exact version's CLI surface.
@@ -106,9 +115,11 @@ pub fn build_ruler_dir(target_repo: &Path, agents_md_content: &str) -> Result<()
     if let Some(dir) = PROMPTS.get_dir("skills") {
         for file in dir.files() {
             let stem = file.path().file_stem().and_then(|n| n.to_str()).unwrap_or_default();
+            let source = file.contents_utf8().unwrap_or_default();
+            let resolved = resolve_includes(source, "skills")?;
             let skill_subdir = skills_dir.join(stem);
             std::fs::create_dir_all(&skill_subdir)?;
-            std::fs::write(skill_subdir.join("SKILL.md"), file.contents_utf8().unwrap_or_default())?;
+            std::fs::write(skill_subdir.join("SKILL.md"), resolved)?;
         }
     }
 
@@ -148,34 +159,19 @@ pub fn preflight_check_mcp_server_binary() -> Result<()> {
     }
 }
 
-/// Writes `.ruler/mcp.json` registering `agentops-mcp-server` (the merged
-/// stdio server — all 35 tools across agentops-mcp/agentops-heavy-mcp/
-/// docbrain-mcp, not the narrower 18-tool `agentops serve`) so Ruler's own
-/// MCP-propagation feature fans it out to each target agent's native format
-/// (`.mcp.json` for Claude Code, `.cursor/mcp.json` for Cursor, `config.toml`
-/// for Codex CLI, `settings.json` for Gemini CLI — verified against each
-/// vendor's own docs, not assumed). Overwrites on every call, same as
-/// `build_ruler_dir`'s other generated files — this isn't a hand-editable
-/// file in the way `ruler.toml` is.
-pub fn write_mcp_config(target_repo: &Path, access_mode: &str) -> Result<()> {
-    let ruler_dir = ruler_dir_path(target_repo);
-    std::fs::create_dir_all(&ruler_dir)?;
-
-    let config = serde_json::json!({
-        "mcpServers": {
-            "agentops": {
-                "command": "agentops-mcp-server",
-                "env": { "AGENTOPS_ACCESS_MODE": access_mode }
-            }
-        }
-    });
-    std::fs::write(ruler_dir.join("mcp.json"), serde_json::to_string_pretty(&config)?)?;
-    Ok(())
-}
-
 /// Invokes the pinned Ruler version's `apply` command against `target_repo`'s
 /// `.ruler/` directory. Returns combined stdout+stderr for the caller to print.
-pub fn apply(target_repo: &Path, agent_ids: &[&str], dry_run: bool) -> Result<String> {
+///
+/// `with_mcp` is always `false` from `agentops-cli` now: MCP registration
+/// moved to a user-level (`~/.claude.json`, `~/.cursor/mcp.json`, etc.)
+/// direct write instead of a project-level `.ruler/mcp.json` Ruler fans out
+/// — caught live: Cursor currently has an active regression where
+/// project-level `.cursor/mcp.json` isn't read by its Customize UI at all
+/// (confirmed via multiple reports on Cursor's own forum, not just this
+/// install). Since `agentops-mcp-server`'s identity doesn't vary per repo
+/// the way `AGENTS.md`/notes content does, one global registration per
+/// machine is also just simpler, not merely a workaround.
+pub fn apply(target_repo: &Path, agent_ids: &[&str], dry_run: bool, with_mcp: bool) -> Result<String> {
     preflight_check_npx()?;
 
     let mut args: Vec<String> = vec![
@@ -189,6 +185,9 @@ pub fn apply(target_repo: &Path, agent_ids: &[&str], dry_run: bool) -> Result<St
         // even though they're correctly generated. Skills are enabled by default.
         "--subagents".into(),
     ];
+    if !with_mcp {
+        args.push("--no-mcp".into());
+    }
     if !agent_ids.is_empty() {
         args.push("--agents".into());
         args.push(agent_ids.join(","));
@@ -215,12 +214,6 @@ pub fn apply(target_repo: &Path, agent_ids: &[&str], dry_run: bool) -> Result<St
     Ok(combined)
 }
 
-/// The paths this bridge writes into a target repo — used by the CLI to seed
-/// `.gitignore` if desired, mirroring the pattern already used for `.context/`.
-pub fn ruler_dir_path(target_repo: &Path) -> PathBuf {
-    target_repo.join(".ruler")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -239,22 +232,22 @@ mod tests {
         assert!(!archivist.is_empty());
         assert!(!archivist.contains("@include"));
 
-        // `.ruler/skills/` must be created even though the pack has no
-        // `skills/` dir at all yet — `get_dir` degrading gracefully, not a
-        // missing-skills bug.
-        assert!(dir.path().join(".ruler/skills").is_dir());
-        assert_eq!(std::fs::read_dir(dir.path().join(".ruler/skills")).unwrap().count(), 0);
-    }
+        // Every `prompts/agents/*.md` file is picked up automatically, no
+        // code change needed -- confirms ponytail-auditor.md (added
+        // alongside vault-archivist.md) flows through the same path.
+        assert!(dir.path().join(".ruler/agents/ponytail-auditor.md").exists());
 
-    #[test]
-    fn write_mcp_config_registers_agentops_mcp_server_with_the_requested_access_mode() {
-        let dir = tempfile::tempdir().unwrap();
-        write_mcp_config(dir.path(), "full").unwrap();
-
-        let raw = std::fs::read_to_string(dir.path().join(".ruler/mcp.json")).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed["mcpServers"]["agentops"]["command"], "agentops-mcp-server");
-        assert_eq!(parsed["mcpServers"]["agentops"]["env"]["AGENTOPS_ACCESS_MODE"], "full");
+        // Each `prompts/skills/<name>.md` becomes `.ruler/skills/<name>/SKILL.md`,
+        // with its `@include ../shared/<name>.md` resolved -- this is the
+        // ONLY artifact for these capabilities (see this crate's own doc
+        // comment on why there's deliberately no separate `.claude/commands/`
+        // layer: Claude Code unified commands into skills, so a plain
+        // command file next to an identically-named skill just double-lists
+        // the same capability in the `/` menu -- caught live, fixed by
+        // removing the redundant layer rather than renaming around it).
+        let ponytail_skill = std::fs::read_to_string(dir.path().join(".ruler/skills/ponytail-audit/SKILL.md")).unwrap();
+        assert!(!ponytail_skill.contains("@include"), "skills must resolve @include, same as agents do");
+        assert!(ponytail_skill.contains("reuse-before-writing decision ladder"), "the shared body's actual content must be inlined: {ponytail_skill:?}");
     }
 
     #[test]

@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+dirs.workspace = true
 tokio.workspace = true
 
 agentops-scanner = { path = "../agentops-scanner" }
@@ -45,3 +46,6 @@ ureq = { version = "3", features = ["json"] }
 
 # (`docgen` command goes through agentops-mcp::generate_docs, no direct
 # agentops-docgen dep needed here.)
+
+[dev-dependencies]
+tempfile = "3"
