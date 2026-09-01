@@ -4,3 +4,15 @@
 # otherwise fetch grammar binaries over the network at RUNTIME. See SECURITY.md.
 [env]
 TSLP_LANGUAGES = "python,javascript,typescript,go,rust,cpp,csharp"
+
+# Windows-only: `cpp`/`csharp` are the only two grammars above with C++ (not
+# plain C) external scanners, compiled at build time by tree-sitter-language-
+# pack's own build script via the `cc` crate. Caught live (first real
+# Windows CI build this project has ever run, via the v0.1.0 release
+# pipeline): one of those defaulted to the static CRT (/MT, libcmt.lib)
+# while Rust's own default for this target is the dynamic CRT (/MD,
+# msvcprt.lib/MSVCP140.dll) -- mixing the two in one link produces
+# LNK2005/LNK1169 duplicate-symbol errors. Forcing /MD here matches Rust's
+# default rather than fighting it.
+CFLAGS_x86_64_pc_windows_msvc = "/MD"
+CXXFLAGS_x86_64_pc_windows_msvc = "/MD"
