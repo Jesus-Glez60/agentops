@@ -1,6 +1,7 @@
 import { CircleCheck, Clock, TriangleAlert } from "lucide-react";
 import type { HealthStatus } from "@/lib/repo-health";
 import { cn } from "@/lib/utils";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 
 // Only the 4 states repoHealth() actually produces -- not main's full
 // 6-state union, since scanning/failed were always connection-registry
@@ -12,13 +13,20 @@ const HEALTH_CONFIG: Record<HealthStatus, { label: string; icon: typeof CircleCh
   "not-indexed": { label: "Not yet scanned", icon: Clock, className: "text-ink-500" },
 };
 
-export function HealthBadge({ status, className }: { status: HealthStatus; className?: string }) {
+export function HealthBadge({ status, reason, className }: { status: HealthStatus; reason?: string | null; className?: string }) {
   const config = HEALTH_CONFIG[status];
   const Icon = config.icon;
-  return (
+  const badge = (
     <span className={cn("inline-flex items-center gap-1.5 text-section font-medium", config.className, className)}>
       <Icon className="size-3.5" />
       {config.label}
     </span>
+  );
+  if (!reason) return badge;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>{badge}</TooltipTrigger>
+      <TooltipContent>{reason}</TooltipContent>
+    </Tooltip>
   );
 }

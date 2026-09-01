@@ -60,7 +60,7 @@ WORKDIR /app
 # not a hang and not an obviously-missing-dependency error. Caught live,
 # the first time SSH-method repo connection was actually exercised
 # against a real Docker deployment.
-RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git openssh-client ca-certificates && rm -rf /var/lib/apt/lists/*
 
 RUN npm install -g pm2
 

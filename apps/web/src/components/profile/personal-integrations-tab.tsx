@@ -4,10 +4,33 @@ import { useState } from "react";
 import useSWR from "swr";
 import { toast } from "sonner";
 import { getMyIntegrations, storeMyIntegration, deleteMyIntegration, MY_INTEGRATIONS_SWR_KEY } from "@/lib/api/integrations-api";
+import { getGithubAppInstallations, GITHUB_APP_INSTALLATIONS_SWR_KEY } from "@/lib/api/repos-api";
 import { relativeTimeFromIsoString } from "@/lib/relative-time";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+
+/** Read-only -- the connect/manage action lives on Team & Access >
+ * Integrations (`GithubAppIntegrationCard`, admin/owner-gated, since a
+ * GitHub App installation is tenant-wide, not per-user like Linear below).
+ * This just lets a solo/individual user see connection status without
+ * hunting through Team settings. */
+function GithubAppStatusRow() {
+  const { data, isLoading } = useSWR(GITHUB_APP_INSTALLATIONS_SWR_KEY, getGithubAppInstallations);
+  const installations = data?.installations ?? [];
+
+  if (isLoading) return null;
+  return (
+    <div className="flex items-center justify-between gap-4 px-6 py-4">
+      <div className="min-w-0">
+        <p className="text-body font-medium text-ink-100">GitHub App</p>
+        <p className="truncate text-mono-code text-ink-500">
+          {installations.length > 0 ? `Connected as ${installations[0].account_login}` : "Not connected — manage this from Team & Access > Integrations."}
+        </p>
+      </div>
+    </div>
+  );
+}
 
 const LINEAR_PROVIDER = "linear";
 
@@ -58,7 +81,7 @@ export function PersonalIntegrationsTab() {
         <CardHeader className="border-b border-border-strong pb-4">
           <CardTitle>Personal Integrations</CardTitle>
         </CardHeader>
-        <CardContent className="p-0">
+        <CardContent className="divide-y divide-border-strong p-0">
           {isLoading && <p className="px-6 py-4 text-body text-ink-500">Loading…</p>}
           {!isLoading && (
             <div className="flex items-center justify-between gap-4 px-6 py-4">
@@ -82,6 +105,7 @@ export function PersonalIntegrationsTab() {
               )}
             </div>
           )}
+          <GithubAppStatusRow />
         </CardContent>
       </Card>
       <p className="mt-3 text-section text-ink-500">Personal connections are yours alone — they pull your own assigned issues and are never visible to other members, even admins.</p>

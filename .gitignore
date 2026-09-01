@@ -38,6 +38,8 @@ apps/web/.env*.local
 *.pem
 *.key
 id_rsa*
+Caddyfile
+/secrets/
 
 # agentops generated scan output
 repo-map.md
@@ -49,6 +51,10 @@ repo-map.md
 # START Ruler Generated Files
 /.claude/agents
 /.claude/skills
+/.cursor/agents
+/.cursor/skills
+/AGENTS.md
+/AGENTS.md.bak
 /CLAUDE.md
 /CLAUDE.md.bak
 # END Ruler Generated Files

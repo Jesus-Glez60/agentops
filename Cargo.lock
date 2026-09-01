@@ -223,6 +223,7 @@ dependencies = [
  "agentops-teams",
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "docbrain-graph",
  "getrandom 0.4.3",
  "hmac 0.13.0",

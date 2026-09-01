@@ -8,6 +8,7 @@ import { relativeTimeFromIsoString } from "@/lib/relative-time";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { GithubAppIntegrationCard } from "@/components/team/github-app-integration-card";
 
 /** The two providers this deployment actually resolves credentials for
  * today (`resolve_linear_config`/`resolve_anthropic_config` in
@@ -94,6 +95,8 @@ export function OrgIntegrationsTab() {
         </CardContent>
       </Card>
       <p className="mt-3 text-section text-ink-500">These credentials are shared by the whole organization and managed by Owners and Admins only.</p>
+
+      <GithubAppIntegrationCard />
     </div>
   );
 }

@@ -50,6 +50,112 @@ pub struct GitHubAppConfig {
     pub webhook_secret: String,
 }
 
+/// Signs/verifies the `state` param carried on the GitHub App install
+/// redirect. The install flow leaves agentops's own frontend origin
+/// entirely (full top-level navigation to github.com and back), so by the
+/// time GitHub redirects to `github_app_callback` there is no session
+/// cookie for it to read -- the callback's origin never had one to begin
+/// with. This token is minted once, at `install-url` time (while a real
+/// session capability check still applies), and stands in for that check
+/// at callback time instead of requiring a live session there too.
+pub(crate) mod install_state {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct InstallState {
+        pub tenant: String,
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum StateError {
+        Malformed,
+        BadSignature,
+        Expired,
+    }
+
+    pub fn mint(secret: &str, tenant: &str, ttl_secs: i64) -> String {
+        let exp = now_secs() + ttl_secs;
+        // `tenant` may itself contain arbitrary characters, but never a raw
+        // `:` followed only by digits at the very end -- `verify` splits
+        // from the right so this is unambiguous regardless of what `tenant`
+        // contains.
+        let payload = format!("{tenant}:{exp}");
+        let payload_b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let mac = sign(secret, payload_b64.as_bytes());
+        format!("{payload_b64}.{mac}")
+    }
+
+    pub fn verify(secret: &str, token: &str) -> Result<InstallState, StateError> {
+        let (payload_b64, mac_b64) = token.split_once('.').ok_or(StateError::Malformed)?;
+
+        let mac_bytes = URL_SAFE_NO_PAD.decode(mac_b64).map_err(|_| StateError::Malformed)?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).map_err(|_| StateError::Malformed)?;
+        mac.update(payload_b64.as_bytes());
+        mac.verify_slice(&mac_bytes).map_err(|_| StateError::BadSignature)?;
+
+        let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).map_err(|_| StateError::Malformed)?;
+        let payload = String::from_utf8(payload_bytes).map_err(|_| StateError::Malformed)?;
+        let (tenant, exp_str) = payload.rsplit_once(':').ok_or(StateError::Malformed)?;
+        let exp: i64 = exp_str.parse().map_err(|_| StateError::Malformed)?;
+        if now_secs() > exp {
+            return Err(StateError::Expired);
+        }
+        Ok(InstallState { tenant: tenant.to_string() })
+    }
+
+    fn sign(secret: &str, data: &[u8]) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).expect("HMAC accepts a key of any length");
+        mac.update(data);
+        URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).expect("system clock is after the Unix epoch").as_secs() as i64
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn a_valid_token_round_trips() {
+            let token = mint("secret", "acme", 60);
+            assert_eq!(verify("secret", &token), Ok(InstallState { tenant: "acme".to_string() }));
+        }
+
+        #[test]
+        fn a_tampered_payload_is_rejected() {
+            let token = mint("secret", "acme", 60);
+            let (payload, mac) = token.split_once('.').unwrap();
+            let tampered_payload = URL_SAFE_NO_PAD.encode(b"evil-tenant:9999999999");
+            let tampered = format!("{tampered_payload}.{mac}");
+            let _ = payload;
+            assert_eq!(verify("secret", &tampered), Err(StateError::BadSignature));
+        }
+
+        #[test]
+        fn a_token_signed_with_a_different_secret_is_rejected() {
+            let token = mint("secret-a", "acme", 60);
+            assert_eq!(verify("secret-b", &token), Err(StateError::BadSignature));
+        }
+
+        #[test]
+        fn an_expired_token_is_rejected() {
+            let token = mint("secret", "acme", -1);
+            assert_eq!(verify("secret", &token), Err(StateError::Expired));
+        }
+
+        #[test]
+        fn garbage_input_is_rejected_as_malformed() {
+            assert_eq!(verify("secret", "not-a-real-token"), Err(StateError::Malformed));
+            assert_eq!(verify("secret", "not.base64either!!"), Err(StateError::Malformed));
+        }
+    }
+}
+
 fn service_unavailable() -> Response {
     (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "no GitHub App is configured for this deployment (AGENTOPS_GITHUB_APP_ID/PRIVATE_KEY/WEBHOOK_SECRET not all set)" }))).into_response()
 }
@@ -66,6 +172,24 @@ pub struct CallbackQuery {
     #[serde(default)]
     #[allow(dead_code)]
     setup_action: Option<String>,
+    /// Signed proof minted by `github_app_install_url` at the moment the
+    /// install flow started, while a real session still existed on this
+    /// origin. See `install_state`'s doc comment for why the callback
+    /// can't just rely on a session cookie the way every other route here
+    /// does.
+    #[serde(default)]
+    state: Option<String>,
+}
+
+/// Every failure path below sends the browser back to the frontend with an
+/// error code instead of returning raw JSON -- this endpoint is only ever
+/// reached via a top-level browser redirect from github.com, so a JSON
+/// body here is a dead end the user can't act on. `state.web_app_url`
+/// being unset (a same-origin self-hosted deployment that never set it)
+/// falls back to a relative path, which still works there.
+fn redirect_to_frontend(state: &AppState, path_and_query: &str) -> Response {
+    let base = state.web_app_url.as_deref().unwrap_or("");
+    Redirect::to(&format!("{base}{path_and_query}")).into_response()
 }
 
 /// `GET /repos/github-app/callback` -- GitHub redirects the browser here
@@ -74,33 +198,63 @@ pub struct CallbackQuery {
 /// (not just trusting the query param), persists it, and hands the browser
 /// off to the wizard's repo-selection step.
 pub async fn github_app_callback(State(state): State<AppState>, user: Option<axum::Extension<User>>, Query(q): Query<CallbackQuery>) -> Response {
-    let tenant = match resolve_tenant(&user, None) {
-        Ok(t) => t,
-        Err(e) => return e.into_response(),
+    let tenant = match &q.state {
+        Some(token) => {
+            let Some(secret) = state.install_state_secret.as_deref() else {
+                return redirect_to_frontend(&state, "/repositories/connect?github_app_error=not_configured");
+            };
+            match install_state::verify(secret, token) {
+                Ok(s) => s.tenant,
+                Err(_) => return redirect_to_frontend(&state, "/repositories/connect?github_app_error=no_session"),
+            }
+        }
+        // No state token present -- e.g. someone re-triggered install
+        // straight from GitHub's own "Configure" UI rather than through
+        // `install-url`. Fall back to the session-cookie check this route
+        // always had; still works for same-origin self-hosted deployments.
+        None => {
+            let tenant = match resolve_tenant(&user, None) {
+                Ok(t) => t,
+                Err(_) => return redirect_to_frontend(&state, "/repositories/connect?github_app_error=no_session"),
+            };
+            if require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT).is_err() {
+                return redirect_to_frontend(&state, "/repositories/connect?github_app_error=no_session");
+            }
+            tenant
+        }
     };
-    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
-        return e.into_response();
-    }
-    let Some(config) = &state.github_app_config else { return service_unavailable() };
+    let Some(config) = &state.github_app_config else {
+        return redirect_to_frontend(&state, "/repositories/connect?github_app_error=not_configured");
+    };
 
     let token = match fresh_installation_token(config, q.installation_id).await {
         Ok(t) => t,
-        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("confirming installation: {e}") }))).into_response(),
+        Err(_) => return redirect_to_frontend(&state, "/repositories/connect?github_app_error=token_exchange_failed"),
     };
     let repos = match agentops_github_app::list_installation_repos(&token) {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("listing installation repos: {e}") }))).into_response(),
+        Err(_) => return redirect_to_frontend(&state, "/repositories/connect?github_app_error=list_repos_failed"),
     };
     let account_login = repos.first().and_then(|r| r.full_name.split('/').next()).unwrap_or("unknown").to_string();
 
+    // Best-effort only -- an org-vs-personal-account distinction is needed
+    // to build the right "manage on GitHub" link later, but failing to
+    // fetch it here shouldn't fail the whole install; `account_type` just
+    // stays `None` (the manage-link builder falls back to the personal
+    // account URL shape in that case).
+    let account_type = agentops_github_app::generate_app_jwt(config.app_id, &config.private_key_pem)
+        .ok()
+        .and_then(|app_jwt| agentops_github_app::get_installation_details(&app_jwt, q.installation_id).ok())
+        .map(|d| d.account_type);
+
     {
         let store = state.indexing.lock().unwrap();
-        if let Err(e) = store.create_installation(&tenant, &q.installation_id.to_string(), &account_login) {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response();
+        if store.create_installation(&tenant, &q.installation_id.to_string(), &account_login, account_type.as_deref()).is_err() {
+            return redirect_to_frontend(&state, "/repositories/connect?github_app_error=save_failed");
         }
     }
 
-    Redirect::to(&format!("/repositories/connect/github-app/select?installation_id={}", q.installation_id)).into_response()
+    redirect_to_frontend(&state, &format!("/repositories/connect/github-app/select?installation_id={}", q.installation_id))
 }
 
 #[derive(Debug, Deserialize)]
@@ -139,6 +293,36 @@ pub async fn list_installation_repos_handler(State(state): State<AppState>, user
     match agentops_github_app::list_installation_repos(&token) {
         Ok(repos) => (StatusCode::OK, Json(json!({ "repositories": repos }))).into_response(),
         Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e.to_string() }))).into_response(),
+    }
+}
+
+/// `GET /repos/github-app/installations` -- every installation the caller's
+/// tenant has, for the dashboard's "is GitHub connected" status surfaces
+/// (Team & Access > Integrations gets a manage card, Profile > Integrations
+/// gets a read-only indicator; both call this same endpoint). `CAP_REPOS_VIEW`
+/// rather than `CAP_REPOS_CONNECT` -- this is read-only status, on the
+/// default role list every tenant member has, not just admins.
+pub async fn list_installations_handler(State(state): State<AppState>, user: Option<axum::Extension<User>>, Query(q): Query<InstallationQuery>) -> Response {
+    let tenant = match resolve_tenant(&user, q.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_VIEW) {
+        return e.into_response();
+    }
+    let installations = { state.indexing.lock().unwrap().list_installations(&tenant) };
+    match installations {
+        Ok(rows) => {
+            let installations: Vec<_> = rows
+                .into_iter()
+                .map(|i| {
+                    let manage_url = agentops_github_app::installation_html_url(&i.account_login, i.account_type.as_deref().unwrap_or("User"), i.id.parse().unwrap_or_default());
+                    json!({ "id": i.id, "account_login": i.account_login, "installed_at": i.installed_at, "manage_url": manage_url })
+                })
+                .collect();
+            (StatusCode::OK, Json(json!({ "installations": installations }))).into_response()
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
     }
 }
 
@@ -400,7 +584,7 @@ mod tests {
         // `connect_from_installation` would have created.
         {
             let indexing = deps.indexing.lock().unwrap();
-            indexing.create_installation("acme", "555", "acme-corp").unwrap();
+            indexing.create_installation("acme", "555", "acme-corp", None).unwrap();
         }
         {
             let connections = deps.connections.lock().unwrap();

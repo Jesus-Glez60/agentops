@@ -1,4 +1,4 @@
-import type { RepoConnection } from "@/lib/api/repos-api";
+import { parseRepoStatus, type RepoConnection } from "@/lib/api/repos-api";
 
 export type HealthStatus = "healthy" | "warning" | "stale" | "not-indexed";
 
@@ -27,4 +27,32 @@ export function repoHealth(repo: Pick<RepoConnection, "counts"> & { last_scanned
   // something a curation action (Keep/Reduce, never a delete) brings to zero.
   if (repo.counts.gotchas_needing_curation > 0) return "warning";
   return "healthy";
+}
+
+export interface RepoHealthResult {
+  status: HealthStatus;
+  /** Human-readable reason for the badge's tooltip -- `null` for "healthy" (nothing to explain). */
+  reason: string | null;
+}
+
+/**
+ * Layers a reason on top of `repoHealth`'s enum, using signals that are
+ * already on `RepoConnection` but never previously surfaced next to the
+ * badge itself: `path_missing` and a failed job's `status` reason. Priority
+ * order (most actionable first) -- `path_missing` wins even over a
+ * simultaneous warning/stale/failed state, since "the repo's gone" is a
+ * bigger problem than "some gotchas need curation."
+ */
+export function repoHealthWithReason(
+  repo: Pick<RepoConnection, "counts" | "path_missing" | "status"> & { last_scanned_at?: number },
+  nowSeconds: number = Date.now() / 1000,
+): RepoHealthResult {
+  const status = repoHealth(repo, nowSeconds);
+  if (repo.path_missing) return { status, reason: "Repo path no longer exists" };
+  const parsedStatus = parseRepoStatus(repo.status);
+  if (parsedStatus.kind === "failed") return { status, reason: parsedStatus.reason };
+  if (status === "stale") return { status, reason: "Not scanned in over 7 days" };
+  if (status === "warning") return { status, reason: `${repo.counts?.gotchas_needing_curation ?? 0} gotchas need curation` };
+  if (status === "not-indexed") return { status, reason: "Not yet scanned" };
+  return { status, reason: null };
 }

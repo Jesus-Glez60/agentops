@@ -176,6 +176,13 @@ pub struct GitHubAppInstallation {
     pub tenant: String,
     pub account_login: String,
     pub installed_at: String,
+    /// `"User"` or `"Organization"`, from GitHub's own installation
+    /// object -- `None` for a row written before this field existed, or if
+    /// the details fetch that populates it failed (non-fatal, see
+    /// `github_app_callback`). Needed to build the correct "manage on
+    /// GitHub" link: an organization's installation settings live under a
+    /// different URL shape than a personal account's.
+    pub account_type: Option<String>,
 }
 
 pub struct IndexingStore {
@@ -243,6 +250,13 @@ impl IndexingStore {
             CREATE INDEX IF NOT EXISTS idx_github_app_installations_tenant ON github_app_installations(tenant);",
         )
         .context("creating indexing-store tables")?;
+        // `ALTER TABLE ... ADD COLUMN` is a no-op error (not silently
+        // ignored) against a table that already has the column -- covers a
+        // database file created before `account_type` existed, matching
+        // `CREATE TABLE IF NOT EXISTS`'s own "don't error on an
+        // already-migrated file" posture, same pattern as `store.rs`'s
+        // `tracked_branch`/`installation_id` migrations.
+        let _ = conn.execute("ALTER TABLE github_app_installations ADD COLUMN account_type TEXT", []);
         Ok(Self { conn })
     }
 
@@ -386,12 +400,17 @@ impl IndexingStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().context("reading indexing job log rows")
     }
 
-    pub fn create_installation(&self, tenant: &str, id: &str, account_login: &str) -> Result<GitHubAppInstallation> {
+    /// `account_type` (`"User"`/`"Organization"`) is optional -- fetching it
+    /// requires an extra GitHub API call the caller may not want to fail
+    /// the whole install over (see `github_app_callback`'s non-fatal
+    /// treatment of that fetch); `None` just means the "manage on GitHub"
+    /// link build falls back to the personal-account URL shape.
+    pub fn create_installation(&self, tenant: &str, id: &str, account_login: &str, account_type: Option<&str>) -> Result<GitHubAppInstallation> {
         self.conn
             .execute(
-                "INSERT INTO github_app_installations (id, tenant, account_login) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (tenant, id) DO UPDATE SET account_login = excluded.account_login",
-                rusqlite::params![id, tenant, account_login],
+                "INSERT INTO github_app_installations (id, tenant, account_login, account_type) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (tenant, id) DO UPDATE SET account_login = excluded.account_login, account_type = excluded.account_type",
+                rusqlite::params![id, tenant, account_login, account_type],
             )
             .context("inserting github app installation")?;
         self.get_installation(tenant, id)?.context("just-inserted installation not found — this is a store bug")
@@ -400,13 +419,26 @@ impl IndexingStore {
     pub fn get_installation(&self, tenant: &str, id: &str) -> Result<Option<GitHubAppInstallation>> {
         self.conn
             .query_row(
-                "SELECT id, tenant, account_login, installed_at FROM github_app_installations WHERE tenant = ?1 AND id = ?2",
+                "SELECT id, tenant, account_login, installed_at, account_type FROM github_app_installations WHERE tenant = ?1 AND id = ?2",
                 rusqlite::params![tenant, id],
                 row_to_installation,
             )
             .map(Some)
             .or_else(|e| if e == rusqlite::Error::QueryReturnedNoRows { Ok(None) } else { Err(e) })
             .context("querying github app installation")
+    }
+
+    /// Every installation a tenant has -- for the dashboard's "is GitHub
+    /// connected" status surfaces (Team & Access > Integrations and the
+    /// Profile > Integrations read-only indicator), not just a single
+    /// known-id lookup the way `get_installation` is.
+    pub fn list_installations(&self, tenant: &str) -> Result<Vec<GitHubAppInstallation>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, tenant, account_login, installed_at, account_type FROM github_app_installations WHERE tenant = ?1 ORDER BY installed_at DESC")
+            .context("preparing github app installations query")?;
+        let rows = stmt.query_map(rusqlite::params![tenant], row_to_installation).context("querying github app installations")?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().context("reading github app installation rows")
     }
 
     /// Looks up which tenant owns installation `id`, with no tenant hint of
@@ -430,7 +462,7 @@ impl IndexingStore {
 }
 
 fn row_to_installation(row: &rusqlite::Row) -> rusqlite::Result<GitHubAppInstallation> {
-    Ok(GitHubAppInstallation { id: row.get(0)?, tenant: row.get(1)?, account_login: row.get(2)?, installed_at: row.get(3)? })
+    Ok(GitHubAppInstallation { id: row.get(0)?, tenant: row.get(1)?, account_login: row.get(2)?, installed_at: row.get(3)?, account_type: row.get(4)? })
 }
 
 fn row_to_job(row: &rusqlite::Row) -> rusqlite::Result<IndexingJob> {
@@ -555,5 +587,26 @@ mod tests {
 
         let latest = store.latest_job_for_connection("acme", "conn-1").unwrap().unwrap();
         assert_eq!(latest.id, "job-2");
+    }
+
+    #[test]
+    fn list_installations_is_scoped_to_the_tenant_and_ordered_most_recent_first() {
+        let store = IndexingStore::open_in_memory().unwrap();
+        store.create_installation("acme", "111", "acme-corp", Some("User")).unwrap();
+        store.create_installation("acme", "222", "acme-corp-second-org", Some("Organization")).unwrap();
+        store.create_installation("globex", "333", "globex-corp", None).unwrap();
+
+        let acme_installations = store.list_installations("acme").unwrap();
+        assert_eq!(acme_installations.len(), 2, "a tenant-scoped query must never leak another tenant's installations");
+        assert!(acme_installations.iter().all(|i| i.tenant == "acme"));
+        assert!(acme_installations.iter().any(|i| i.id == "111"));
+        assert!(acme_installations.iter().any(|i| i.id == "222"));
+
+        let globex_installations = store.list_installations("globex").unwrap();
+        assert_eq!(globex_installations.len(), 1);
+        assert_eq!(globex_installations[0].id, "333");
+
+        let none_for_unknown_tenant = store.list_installations("initech").unwrap();
+        assert!(none_for_unknown_tenant.is_empty());
     }
 }

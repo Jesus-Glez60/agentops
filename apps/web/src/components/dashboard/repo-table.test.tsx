@@ -108,10 +108,10 @@ describe("RepoTable", () => {
     expect(startIndexing).toHaveBeenCalledWith("agentops", "reindex");
   });
 
-  it("the 'view details' action is present but disabled -- no repo-detail page exists yet", async () => {
+  it("the 'view details' action links to the repo detail page", async () => {
     getRepos.mockResolvedValue({ connections: [scannedRepo], can_connect: true });
     renderTable();
     await screen.findByText("agentops");
-    expect(screen.getByRole("button", { name: "View details" })).toBeDisabled();
+    expect(screen.getByRole("link", { name: "View details" })).toHaveAttribute("href", "/repositories/agentops");
   });
 });

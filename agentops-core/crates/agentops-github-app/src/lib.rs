@@ -92,6 +92,71 @@ pub fn install_url(app_slug: &str) -> String {
     format!("https://github.com/apps/{app_slug}/installations/new")
 }
 
+#[derive(Debug, Deserialize)]
+struct InstallationAccount {
+    login: String,
+    /// `"User"` or `"Organization"` -- GitHub links to an org's installation
+    /// settings under a different URL shape than a personal account's, so
+    /// this is what `installation_html_url` needs to pick the right one.
+    #[serde(rename = "type")]
+    account_type: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InstallationDetailsResponse {
+    account: InstallationAccount,
+}
+
+pub struct InstallationDetails {
+    pub account_login: String,
+    pub account_type: String,
+}
+
+/// `GET /app/installations/{id}` -- App-JWT-authenticated (not an
+/// installation token), fetches the installation's own metadata rather
+/// than anything about its repos. Used to learn `account.type` (User vs
+/// Organization), which `create_installation`'s existing `account_login`
+/// (derived from listing repos, not this endpoint) has no way to know --
+/// needed to build the correct "manage on GitHub" link, since an
+/// organization's installation settings live under a different URL shape
+/// than a personal account's.
+pub fn get_installation_details(app_jwt: &str, installation_id: u64) -> Result<InstallationDetails> {
+    let url = format!("https://api.github.com/app/installations/{installation_id}");
+    let mut response = ureq::get(&url)
+        .header("Authorization", &format!("Bearer {app_jwt}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "agentops-heavy")
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .call()
+        .context("requesting installation details")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        anyhow::bail!("GitHub installation-details request failed ({status}): {body}");
+    }
+
+    let parsed = response.body_mut().read_json::<InstallationDetailsResponse>().context("parsing installation details response")?;
+    Ok(InstallationDetails { account_login: parsed.account.login, account_type: parsed.account.account_type })
+}
+
+/// The URL to a GitHub App installation's own management/settings page --
+/// organizations and personal accounts live under different URL shapes
+/// (confirmed against GitHub's own `installation.html_url` field, which
+/// this mirrors rather than calls, since it's a stable, documented format
+/// and callers here already have `account_login`/`account_type` in hand
+/// without an extra request).
+pub fn installation_html_url(account_login: &str, account_type: &str, installation_id: u64) -> String {
+    if account_type == "Organization" {
+        format!("https://github.com/organizations/{account_login}/settings/installations/{installation_id}")
+    } else {
+        format!("https://github.com/settings/installations/{installation_id}")
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct InstallationRepo {
     pub full_name: String,
