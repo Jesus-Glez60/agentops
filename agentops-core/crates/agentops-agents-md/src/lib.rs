@@ -100,6 +100,12 @@ pub fn generate(root: &Path, opts: &GenerateOptions) -> String {
 
     out.push_str("## Code style\n\n");
     out.push_str("Follow existing conventions in the codebase. No project-specific style guide detected yet.\n\n");
+    out.push_str(
+        "Before writing new code, check in order: does this need to exist at all? Is it \
+         already in this codebase? Does the standard library cover it? Does a native platform \
+         feature? Does an already-installed dependency? Is a one-line change enough? Only write \
+         more than the minimum that works once all of those are ruled out.\n\n",
+    );
 
     out.push_str("## Testing\n\n");
     out.push_str("Run the test command above before considering a change complete.\n\n");
@@ -115,6 +121,11 @@ pub fn generate(root: &Path, opts: &GenerateOptions) -> String {
         out.push_str("## Notes & Knowledge\n\n");
         out.push_str(&format!(
             "NOTES_PATH: {notes_path}\n\n\
+             Before researching a bug, symbol, or design decision from scratch, check this \
+             project's own recorded knowledge first — via MCP tools like `list_gotchas`, \
+             `get_symbol`, and `related_context` if available, or by reading the Markdown files \
+             directly at the path above otherwise. A past fix or decision recorded here answers \
+             the question faster than rediscovering it through general code search.\n\n\
              New gotchas, decisions, and other project knowledge learned while working here \
              should be recorded at the path above — via the `add_note` MCP tool if available, \
              or as a Markdown file with `title`/`type`/`tags` frontmatter directly in that \
@@ -137,7 +148,15 @@ pub fn generate(root: &Path, opts: &GenerateOptions) -> String {
 
     if opts.claude_code_installed {
         out.push_str("## Claude Code\n\n");
-        out.push_str("This project has the Claude Code prompt pack installed. Useful commands: `/session`, `/plan`, `/audit-plan`, `/wrap`.\n\n");
+        out.push_str(
+            "This project has the Claude Code prompt pack installed — a set of skills, \
+             invokable via `/session` (check recorded knowledge before starting), `/plan` \
+             (design with reuse checked first), `/audit-plan` (fact-check a plan before \
+             implementing it), `/ponytail-audit` (fact-check code just written), `/save-note` \
+             (record a finding), or `/wrap` (end-of-session notes sweep + audit) — or invoked \
+             automatically whenever one is relevant, without typing anything. Other connected \
+             tools (Cursor, etc.) get the same skills too.\n\n",
+        );
     }
 
     out
@@ -218,5 +237,27 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let content = generate(dir.path(), &GenerateOptions::default());
         assert!(content.contains("Co-Authored-By"), "must instruct coding agents not to add this trailer");
+    }
+
+    /// Ponytail-style decision ladder (github.com/DietrichGebert/ponytail):
+    /// reuse/stdlib/platform/dependency checks before writing new code, in
+    /// the file's existing plain-declarative tone rather than a new format.
+    #[test]
+    fn code_style_instructs_checking_for_reuse_before_writing_new_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = generate(dir.path(), &GenerateOptions::default());
+        assert!(content.contains("already in this codebase"), "must instruct agents to check for existing reuse before writing new code");
+    }
+
+    /// Knowledge-check ordering should point agents at AgentOps' own MCP
+    /// read tools before general code search -- otherwise "record notes
+    /// here" never translates into "check notes here first".
+    #[test]
+    fn notes_section_prioritizes_checking_existing_knowledge_before_researching() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = GenerateOptions { notes_path: Some("/repo/.agentops/notes".to_string()), ..Default::default() };
+        let content = generate(dir.path(), &opts);
+        assert!(content.contains("Before researching a bug"), "must instruct checking existing notes before re-researching from scratch");
+        assert!(content.contains("list_gotchas"), "should name the actual MCP read tools to check first");
     }
 }
