@@ -23,7 +23,7 @@ services:
     # Pinned by digest, not the floating `pg16` tag -- Postgres pool/batching
     # plan, Phase 3: the HNSW vector index migration needs pgvector >=0.5.0,
     # confirmed as 0.8.6 on this exact image (`SELECT extversion FROM
-    # pg_extension WHERE extname='vector'` against thedamnserver's live
+    # pg_extension WHERE extname='vector'` against a real deployment's live
     # container). A floating tag could silently move to a version this
     # migration wasn't verified against.
     image: pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b

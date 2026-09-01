@@ -242,7 +242,7 @@ ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depen
 -- constraint. Confirmed safe against live production data before adding
 -- this: `SELECT repo, kind, COALESCE(path,''), COALESCE(name,''),
 -- COALESCE(container,''), COUNT(*) FROM nodes GROUP BY 1,2,3,4,5 HAVING
--- COUNT(*) > 1` returned zero rows against thedamnserver's real database
+-- COUNT(*) > 1` returned zero rows against a real production database
 -- (every current write path -- docgen's DocSection creation, the notes
 -- vault's Note ingestion -- always sets a unique non-null synthetic `path`).
 CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_natural_key

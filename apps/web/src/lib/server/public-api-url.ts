@@ -17,7 +17,7 @@ import { headers } from "next/headers";
  * deployment) env var an operator sets once. Falls back to a best-effort
  * guess (the web request's own hostname + the *internal* default API port,
  * 8420) when unset -- correct only for the unmapped-default case, wrong
- * for anything remapped like `thedamnserver`'s 18420. The caller is told
+ * for anything remapped, like a deployment that maps the API to 18420. The caller is told
  * whether this was a real value or a guess, so the UI can warn rather than
  * silently hand out a broken command (caught exactly this way, live,
  * against a real remapped deployment).

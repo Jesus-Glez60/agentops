@@ -47,6 +47,32 @@ repo-map.md
 # Downloaded embedding model cache (multi-GB, fastembed's local cache dir)
 .fastembed_cache/
 
+# `agentops-ruler-bridge::build_ruler_dir`'s own generated source dir —
+# regenerated fresh by every `agentops install`/`connect` run, byte-for-byte
+# derived from AGENTS.md + the embedded prompt pack. Caught live: two of its
+# files ended up committed by mistake in an earlier session (harmless
+# content, but still generated output, not source).
+.ruler/
+
+# Local, per-developer coding-tool config a contributor's own
+# `agentops install`/`connect --remote <url>` run creates against *this*
+# repo while dogfooding it — never something to ship, and can contain a
+# real local network address (caught live: a contributor's own LAN IP was
+# sitting untracked here, one `git add -A` away from being committed).
+# `.claude/agents`/`.claude/skills`/`.cursor/agents`/`.cursor/skills` above
+# are Ruler's own managed block; these four are written outside Ruler
+# (`.mcp.json`/`.codex`/`.gemini`) or aren't Ruler-managed at all
+# (`settings.local.json`, a Claude Code permissions/approvals file some
+# contributors' global gitignore already covers, but the repo shouldn't
+# depend on that).
+/.mcp.json
+/.mcp.json.bak
+/.cursor/mcp.json
+/.cursor/mcp.json.bak
+/.codex/
+/.gemini/
+.claude/settings.local.json
+
 
 # START Ruler Generated Files
 /.claude/agents

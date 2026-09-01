@@ -175,8 +175,8 @@ async fn list_tools_handler(State(state): State<AppState>) -> Json<Value> {
 /// unwrapped against a real Postgres-backed deployment panics the worker
 /// thread with "Cannot start a runtime from within a runtime" and drops
 /// the connection with an empty reply, no error body at all -- caught
-/// testing the new `/mcp` route (`agentops-heavy-api::mcp_http`) against
-/// `thedamnserver`, which surfaced that this pre-existing route had the
+/// testing the new `/mcp` route (`agentops-heavy-api::mcp_http`) against a
+/// real deployment, which surfaced that this pre-existing route had the
 /// identical bug, just never exercised against Postgres before.
 async fn call_tool_handler(State(state): State<AppState>, AxumPath(name): AxumPath<String>, body: Option<Json<Value>>) -> (StatusCode, Json<Value>) {
     let empty = json!({});

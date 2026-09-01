@@ -173,9 +173,9 @@ mod tests {
     #[tokio::test]
     async fn remote_url_is_derived_from_the_requests_own_host_header() {
         let app = router();
-        let resp = app.oneshot(Request::builder().uri("/connect.sh").header("host", "thedamnserver:18420").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/connect.sh").header("host", "my-agentops-server:18420").body(Body::empty()).unwrap()).await.unwrap();
         let body = body_text(resp).await;
-        assert!(body.contains(r#"--remote "http://thedamnserver:18420""#), "{body}");
+        assert!(body.contains(r#"--remote "http://my-agentops-server:18420""#), "{body}");
     }
 
     #[tokio::test]
