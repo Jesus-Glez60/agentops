@@ -9,6 +9,7 @@ import { RolesTab } from "@/components/team/roles-tab";
 import { RepoAccessTab } from "@/components/team/repo-access-tab";
 import { AuditLogTab } from "@/components/team/audit-log-tab";
 import { OrgIntegrationsTab } from "@/components/team/org-integrations-tab";
+import { McpAccessTab } from "@/components/team/mcp-access-tab";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 export function TeamPageClient() {
@@ -26,6 +27,7 @@ export function TeamPageClient() {
           <TabsTrigger value="roles">Roles &amp; Permissions</TabsTrigger>
           <TabsTrigger value="repos">Repository Access</TabsTrigger>
           {(team.role === "admin" || team.is_owner) && <TabsTrigger value="integrations">Integrations</TabsTrigger>}
+          {team.role === "admin" && <TabsTrigger value="mcp-access">MCP Access</TabsTrigger>}
           {team.role === "admin" && <TabsTrigger value="audit">Audit Log</TabsTrigger>}
         </TabsList>
         <div className="flex-1 overflow-y-auto px-8 py-6">
@@ -40,6 +42,9 @@ export function TeamPageClient() {
           </TabsContent>
           <TabsContent value="integrations" className="mt-0">
             <OrgIntegrationsTab />
+          </TabsContent>
+          <TabsContent value="mcp-access" className="mt-0">
+            <McpAccessTab />
           </TabsContent>
           <TabsContent value="audit" className="mt-0">
             <AuditLogTab />

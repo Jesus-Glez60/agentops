@@ -93,7 +93,15 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "add_note",
             description: "Writes a new note (gotcha/decision/knowledge) to the repo's notes folder and ingests it into the graph in one step — the write-back tool for an agent that just learned something worth remembering. Omit note_type to let it be classified automatically. Set with_embeddings to make it findable via semantic_search. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
-            access: AccessMode::Full,
+            // `Advisor`, not `Full` -- deliberately available in both access
+            // modes, unlike every other write tool. Advisor mode exists to
+            // block destructive/costly actions (bulk rescans, paid LLM
+            // calls via explain_symbol); growing the knowledge base by
+            // recording a gotcha/decision is neither, and gating it behind
+            // `Full` would defeat the point of an advisor that's supposed
+            // to keep getting smarter across sessions even when an org
+            // hasn't opted a caller into write access generally.
+            access: AccessMode::Advisor,
             annotations: WRITE_IDEMPOTENT,
             input_schema: || {
                 json!({
@@ -115,7 +123,8 @@ fn tool_specs() -> Vec<ToolSpec> {
         ToolSpec {
             name: "ingest_notes",
             description: "Walks a notes folder (a real vault or an unorganized one) and ingests every note into the graph — classifying freeform notes with no frontmatter/folder signal via the heuristic classifier. Set with_embeddings to make every note findable via semantic_search. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
-            access: AccessMode::Full,
+            // `Advisor`, same reasoning as `add_note` just above.
+            access: AccessMode::Advisor,
             annotations: WRITE_IDEMPOTENT,
             input_schema: || {
                 json!({ "type": "object", "properties": { "path": { "type": "string" }, "notes_path": { "type": "string" }, "with_embeddings": { "type": "boolean" }, "session_id": { "type": "string" } }, "required": ["path"] })
@@ -828,6 +837,24 @@ mod tests {
                 assert!(call_result.is_error, "'{}' must be refused when called directly under Advisor mode", spec.name);
             }
         }
+    }
+
+    /// Locks in the "knowledge-growing tools bypass the access-mode gate"
+    /// decision: `add_note`/`ingest_notes` must be both listed and
+    /// dispatchable under Advisor (read-only) mode, unlike every other
+    /// write tool -- an org that hasn't opted a caller into `Full` access
+    /// must still be able to grow the knowledge base.
+    #[test]
+    fn add_note_and_ingest_notes_are_available_under_advisor_mode() {
+        let advisor_names: std::collections::HashSet<_> = list_tools(AccessMode::Advisor).iter().map(|t| t.name).collect();
+        assert!(advisor_names.contains("add_note"), "{advisor_names:?}");
+        assert!(advisor_names.contains("ingest_notes"), "{advisor_names:?}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let result = call_tool(AccessMode::Advisor, "add_note", &json!({ "path": path, "title": "Advisor can still add notes", "body": "growing the knowledge base is not a Full-only action." })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
     }
 
     #[test]

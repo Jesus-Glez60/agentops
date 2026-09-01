@@ -21,6 +21,7 @@ use crate::AppState;
 pub(crate) async fn docs_json(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let target_name = name.clone();
+    let pg_store = state.pg_store.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
@@ -32,7 +33,7 @@ pub(crate) async fn docs_json(State(state): State<AppState>, AxumPath(name): Axu
             return Ok(None);
         }
 
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
         let repo = agentops_mcp::repo_name(&path);
 
         if let Some((_generated_at, content_json)) = store.get_doc_page(&repo)? {

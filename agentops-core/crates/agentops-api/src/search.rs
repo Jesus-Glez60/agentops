@@ -110,12 +110,13 @@ pub(crate) async fn search_json(State(state): State<AppState>, Query(q): Query<S
     // rather than one pass per every possible kind (cheaper, and matches
     // search_similar's own "None = no kind restriction" contract).
     let kind_passes: Vec<Option<NodeKind>> = if kinds.is_empty() { vec![None] } else { kinds.into_iter().map(Some).collect() };
+    let pg_store = state.pg_store.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SearchResult>> {
         let embedding = LocalEmbedder.embed(&q.q)?;
 
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
-        let mut repos = open_scanned_repos(&entries);
+        let mut repos = open_scanned_repos(&entries, pg_store.as_ref());
         if let Some(names) = &repo_filter {
             repos.retain(|(name, _)| names.contains(name));
         }
@@ -215,6 +216,7 @@ pub fn connected_nodes(store: &dyn agentops_graph::GraphStore, repo: &str, node_
 
 pub(crate) async fn node_detail_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<NodeDetail>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
@@ -222,7 +224,7 @@ pub(crate) async fn node_detail_json(State(state): State<AppState>, AxumPath((re
         if !path.exists() {
             return Ok(None);
         }
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
 
         let Some(node) = store.get_node(&repo_name, id)? else { return Ok(None) };
         let connected = connected_nodes(store.as_ref(), &repo_name, id)?;
@@ -284,6 +286,7 @@ pub(crate) async fn set_curation_json(State(state): State<AppState>, AxumPath((r
     let reason = reason.map(str::to_string);
 
     let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<()>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
@@ -291,7 +294,7 @@ pub(crate) async fn set_curation_json(State(state): State<AppState>, AxumPath((r
         if !path.exists() {
             return Ok(None);
         }
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
 
         if store.get_node(&repo_name, id)?.is_none() {
             return Ok(None);
@@ -519,6 +522,100 @@ mod tests {
         let app = test_app(manifest_path());
         let resp = app.oneshot(Request::builder().uri("/repos/nope/nodes/1").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Reproduces the actual original production incident this session's
+    /// whole Postgres pool/batching plan exists to fix: a real user's "Keep
+    /// all" bulk-curation action against 54 real gotchas failed 32/54,
+    /// because `open_store` used to be called fresh on every request --
+    /// under `AGENTOPS_DATABASE_URL`, that meant 54 simultaneous connection
+    /// pool creations competing for Postgres connections. This test fires
+    /// the exact same shape (54 concurrent `POST .../curation` requests
+    /// against a real Postgres-backed router) and asserts 0 failures --
+    /// confirming `AppState.pg_store` (connected once, shared/cloned per
+    /// request via `resolve_store`) actually fixes it, not just in theory.
+    ///
+    /// Live against a real local Postgres; skips (not fails) when nothing
+    /// is reachable. `#[ignore]`d: mutates the process-global
+    /// `AGENTOPS_DATABASE_URL`, which every other test in this suite
+    /// implicitly assumes is unset (no `AGENTOPS_DATABASE_URL`-guarding
+    /// lock exists in this crate yet -- unlike `agentops-mcp`'s
+    /// `store::test_support::ENV_LOCK`, nothing else in this crate's test
+    /// suite currently touches this var, so a bespoke lock isn't needed
+    /// yet; add one if a second such test is ever added here). Run in
+    /// isolation: `cargo test -p agentops-api -- --ignored --test-threads=1
+    /// fifty_four_concurrent_curation_requests_all_succeed_against_a_shared_postgres_pool`.
+    #[tokio::test]
+    #[ignore = "mutates the process-global AGENTOPS_DATABASE_URL env var; run in isolation, see doc comment"]
+    async fn fifty_four_concurrent_curation_requests_all_succeed_against_a_shared_postgres_pool() {
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let reachable = { let url = url.clone(); tokio::task::spawn_blocking(move || agentops_mcp::PostgresGraphStore::connect(&url).is_ok()).await.unwrap_or(false) };
+        if !reachable {
+            eprintln!("skipping fifty_four_concurrent_curation_requests_all_succeed_against_a_shared_postgres_pool: no Postgres reachable at {url}");
+            return;
+        }
+
+        // SAFETY: no other test in this crate's suite reads/sets this var
+        // (see doc comment above) and `#[ignore]`d tests aren't run
+        // concurrently with the default suite.
+        unsafe { std::env::set_var("AGENTOPS_DATABASE_URL", &url) };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def f():\n    pass\n").unwrap();
+        // `scan_and_persist`/`build_router` both connect to Postgres
+        // internally when called -- `spawn_blocking`-wrapped since this
+        // whole test body is itself already async (same reasoning as
+        // every other Postgres-path test added this session).
+        let dir_path = dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || agentops_mcp::scan_and_persist(&dir_path, false)).await.unwrap().unwrap();
+
+        let repo_path = dir.path().to_path_buf();
+        let (name, node_id) = tokio::task::spawn_blocking(move || {
+            let store = agentops_mcp::open_store(&repo_path).unwrap();
+            let name = agentops_mcp::repo_name(&repo_path);
+            let symbol = store.nodes_by_kind(&name, NodeKind::Symbol).unwrap().into_iter().next().unwrap();
+            (name, symbol.id)
+        })
+        .await
+        .unwrap();
+
+        let manifest_path = manifest_path();
+        {
+            let manifest_path = manifest_path.clone();
+            let dir_path = dir.path().to_path_buf();
+            tokio::task::spawn_blocking(move || agentops_manifest::record_scan_at(&manifest_path, &dir_path)).await.unwrap().unwrap();
+        }
+        let app = tokio::task::spawn_blocking(move || test_app(manifest_path)).await.unwrap();
+
+        let uri = format!("/repos/{name}/nodes/{node_id}/curation");
+        let handles: Vec<_> = (0..54)
+            .map(|i| {
+                let app = app.clone();
+                let uri = uri.clone();
+                let (prominence, reason): (&str, Option<&str>) = if i % 2 == 0 { ("reduced", Some("flaky under load")) } else { ("full", None) };
+                tokio::spawn(async move { app.oneshot(curation_request(uri, prominence, reason)).await.unwrap().status() })
+            })
+            .collect();
+        let mut statuses = Vec::with_capacity(handles.len());
+        for h in handles {
+            statuses.push(h.await.unwrap());
+        }
+
+        let failures: Vec<_> = statuses.iter().filter(|s| **s != StatusCode::OK).collect();
+        assert!(failures.is_empty(), "expected all 54 concurrent curation requests to succeed, got {} failures: {statuses:?}", failures.len());
+
+        // Cleanup, then unset the env var regardless of outcome.
+        let repo_path = dir.path().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let store = agentops_mcp::open_store(&repo_path).unwrap();
+            let name = agentops_mcp::repo_name(&repo_path);
+            let ids: Vec<i64> = store.all_nodes(&name).unwrap().iter().map(|n| n.id).collect();
+            let _ = store.delete_nodes(&name, &ids);
+        })
+        .await
+        .unwrap();
+        // SAFETY: guarded by the reasoning above.
+        unsafe { std::env::remove_var("AGENTOPS_DATABASE_URL") };
     }
 
     fn curation_request(uri: String, prominence: &str, reason: Option<&str>) -> Request<Body> {

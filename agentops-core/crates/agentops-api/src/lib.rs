@@ -3,13 +3,19 @@
 //! implementation of each tool, two transports, mirroring `docbrain-api`'s
 //! identical relationship to `docbrain-mcp`.
 //!
-//! Unlike `docbrain-api`, there's no shared, pre-opened store here: every
-//! `agentops-mcp` tool takes a repo `path` in its own arguments and opens
-//! its own `GraphStore` per call via `agentops_mcp::open_store` (a design
-//! that supports one server process serving requests about many different
-//! repos, unlike docbrain's one-store-per-process model) — so `AppState`
-//! only needs the fixed `AccessMode` and optional API-key hash for this
-//! process.
+//! Unlike `docbrain-api`, there's no shared, pre-opened *SQLite* store here:
+//! every `agentops-mcp` tool takes a repo `path` in its own arguments and
+//! opens its own `GraphStore` per call via `agentops_mcp::open_store` (a
+//! design that supports one server process serving requests about many
+//! different repos, unlike docbrain's one-store-per-process model). When
+//! `AGENTOPS_DATABASE_URL` selects `PostgresGraphStore`, though, that would
+//! mean a brand-new connection pool per request — the exact incident
+//! `agentops-heavy-api::dashboard`'s own module doc comment documents. So
+//! `AppState` also carries an optional pre-shared `PostgresGraphStore`
+//! (`None` for SQLite-backed deployments), and every handler resolves its
+//! store via `agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)`
+//! instead of calling `open_store` directly — cheap either way (`open_store`
+//! unchanged for SQLite; a `Clone` of the shared pool for Postgres).
 
 use std::path::PathBuf;
 
@@ -48,6 +54,12 @@ pub(crate) struct AppState {
     /// inject an isolated tempdir path instead of racing on real global
     /// state under parallel test execution.
     pub(crate) manifest_path: PathBuf,
+    /// Pre-shared, cheaply-`Clone`-able Postgres pool for handlers to
+    /// resolve their store through (`agentops_mcp::resolve_store`) instead
+    /// of connecting fresh per request. `None` when `AGENTOPS_DATABASE_URL`
+    /// isn't set — SQLite-backed deployments fall back to `open_store`'s
+    /// existing per-call behavior unchanged.
+    pub(crate) pg_store: Option<agentops_mcp::PostgresGraphStore>,
 }
 
 /// `api_key_hash`, if set, requires every request except `/health` to
@@ -93,7 +105,8 @@ pub fn build_router_without_dashboard_routes(mode: AccessMode, api_key_hash: Opt
 }
 
 fn build_router_with_dashboard_flag(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf, include_dashboard_routes: bool) -> Router {
-    let state = AppState { mode, api_key_hash, manifest_path };
+    let pg_store = agentops_mcp::open_shared_postgres_store().expect("connect to AGENTOPS_DATABASE_URL");
+    let state = AppState { mode, api_key_hash, manifest_path, pg_store };
     let mut router = Router::new()
         .route("/tools", get(list_tools_handler))
         .route("/tools/{name}", post(call_tool_handler))
@@ -169,7 +182,15 @@ async fn call_tool_handler(State(state): State<AppState>, AxumPath(name): AxumPa
     let empty = json!({});
     let args = body.map(|Json(v)| v).unwrap_or(empty);
 
-    let result = tokio::task::spawn_blocking(move || agentops_mcp::call_tool(state.mode, &name, &args)).await;
+    // `with_shared_postgres_store` -- scopes `state.pg_store` as
+    // `open_store`'s override for this call, so every `tools.rs` handler
+    // this dispatches to reuses the shared pool instead of connecting
+    // fresh. Same fix as `agentops-heavy-api::mcp_http`'s identical `/mcp`
+    // gap -- this REST `/tools/{name}` route dispatches through the exact
+    // same `agentops_mcp::call_tool`, so it had the identical exposure.
+    let pg_store = state.pg_store.clone();
+    let mode = state.mode;
+    let result = tokio::task::spawn_blocking(move || agentops_mcp::with_shared_postgres_store(pg_store.as_ref(), || agentops_mcp::call_tool(mode, &name, &args))).await;
     match result {
         Ok(Ok(result)) => (StatusCode::OK, Json(serde_json::to_value(result).unwrap())),
         Ok(Err(refusal)) => (StatusCode::NOT_FOUND, Json(json!({ "error": refusal }))),
@@ -208,16 +229,17 @@ pub fn parse_kind(s: &str) -> Option<NodeKind> {
 /// doc comment on the sync bridge) — run inside `spawn_blocking` so a slow
 /// Postgres round-trip can't stall this process's async executor. Cheap
 /// for the SQLite default too, just an unneeded (harmless) thread hop.
-async fn list_nodes_json(Query(q): Query<NodesQuery>) -> (StatusCode, Json<Value>) {
+async fn list_nodes_json(State(state): State<AppState>, Query(q): Query<NodesQuery>) -> (StatusCode, Json<Value>) {
     let kind = match q.kind.as_deref().map(parse_kind) {
         Some(None) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid 'kind'" }))),
         Some(Some(kind)) => Some(kind),
         None => None,
     };
 
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<agentops_graph::Node>> {
         let repo_path = PathBuf::from(&q.path);
-        let store = agentops_mcp::open_store(&repo_path)?;
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &repo_path)?;
         let repo = repo_path.canonicalize().ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned())).unwrap_or(q.path.clone());
         match kind {
             Some(kind) => store.nodes_by_kind(&repo, kind),

@@ -19,7 +19,10 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: pgvector/pgvector:pg16
+          # Pinned by digest, not the floating `pg16` tag -- see
+          # docker-compose.yml's identical pin for why (Postgres
+          # pool/batching plan, Phase 3's HNSW migration).
+          image: pgvector/pgvector@sha256:ccc6e83d6e35e931dc7c5def2022729d5a6c370318d099181995567ff1fb4d6b
           env:
             - name: POSTGRES_USER
               value: agentops

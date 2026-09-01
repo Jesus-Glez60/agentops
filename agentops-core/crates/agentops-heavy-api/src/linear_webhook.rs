@@ -195,7 +195,12 @@ pub struct DispatchResult {
 /// already filtered to enabled enrollments only (`ModuleStore::list_enabled_for_module`),
 /// so the equivalent guarantee now lives at the enrollment layer instead of
 /// being re-checked here.
-pub fn handle_verified_payload(team_config: &AutoKickoffTeamConfig, linear_config: &agentops_linear::LinearConfig, payload: &serde_json::Value) -> Result<DispatchResult> {
+pub fn handle_verified_payload(
+    team_config: &AutoKickoffTeamConfig,
+    linear_config: &agentops_linear::LinearConfig,
+    payload: &serde_json::Value,
+    pg_store: Option<&agentops_mcp::PostgresGraphStore>,
+) -> Result<DispatchResult> {
     if payload.get("type").and_then(|v| v.as_str()) != Some("Issue") {
         return Ok(DispatchResult { dispatched: false, reason: "not an Issue event" });
     }
@@ -236,7 +241,7 @@ pub fn handle_verified_payload(team_config: &AutoKickoffTeamConfig, linear_confi
         eprintln!("auto-kickoff sync_docs failed (non-fatal): {e:#}");
     }
 
-    let store = agentops_mcp::open_store(&team_config.repo_path).context("auto-kickoff open_store")?;
+    let store = agentops_mcp::resolve_store(pg_store, &team_config.repo_path).context("auto-kickoff open_store")?;
     store
         .upsert_external_task(agentops_graph::NewTask {
             repo,
@@ -260,6 +265,7 @@ struct WebhookState {
     credentials: Arc<Mutex<CredentialStore>>,
     secrets: Arc<dyn SecretsProvider + Send + Sync>,
     seen: Arc<SeenDeliveries>,
+    pg_store: Option<agentops_mcp::PostgresGraphStore>,
 }
 
 async fn linear_webhook_handler(State(state): State<Arc<WebhookState>>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
@@ -302,8 +308,20 @@ async fn linear_webhook_handler(State(state): State<Arc<WebhookState>>, headers:
         }
     };
 
-    match handle_verified_payload(&team_config, &linear_config, &payload) {
-        Ok(result) => {
+    // `handle_verified_payload` blocks on scan/persist and (when
+    // Postgres-backed) a shared store whose runtime is reused across
+    // concurrent async call sites -- calling it directly here would risk
+    // the same "Cannot start a runtime from within a runtime" panic this
+    // codebase has already hit three times elsewhere (`/mcp`,
+    // `agentops-api`'s `/tools/{name}`, `indexing.rs`'s `run_job`).
+    let team_config_for_task = team_config.clone();
+    let linear_config_for_task = linear_config.clone();
+    let payload_for_task = payload.clone();
+    let pg_store_for_task = state.pg_store.clone();
+    let dispatch = tokio::task::spawn_blocking(move || handle_verified_payload(&team_config_for_task, &linear_config_for_task, &payload_for_task, pg_store_for_task.as_ref())).await;
+
+    match dispatch {
+        Ok(Ok(result)) => {
             // A real gap this pass's own live test caught: with no
             // success-path log line, the only way to see a dispatch happen
             // was a separate HTTP-traffic inspector (ngrok's), not this
@@ -312,15 +330,16 @@ async fn linear_webhook_handler(State(state): State<Arc<WebhookState>>, headers:
             println!("linear webhook: dispatched={} reason={:?} tenant={} team={}", result.dispatched, result.reason, tenant, team_config.linear_team_id);
             (StatusCode::OK, Json(result)).into_response()
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             eprintln!("linear webhook dispatch failed: {e:#}");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response()
         }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))).into_response(),
     }
 }
 
-pub fn merge_linear_webhook_route(app: Router, modules: Arc<Mutex<ModuleStore>>, credentials: Arc<Mutex<CredentialStore>>, secrets: Arc<dyn SecretsProvider + Send + Sync>) -> Router {
-    let state = Arc::new(WebhookState { modules, credentials, secrets, seen: Arc::new(SeenDeliveries::new(1000)) });
+pub fn merge_linear_webhook_route(app: Router, modules: Arc<Mutex<ModuleStore>>, credentials: Arc<Mutex<CredentialStore>>, secrets: Arc<dyn SecretsProvider + Send + Sync>, pg_store: Option<agentops_mcp::PostgresGraphStore>) -> Router {
+    let state = Arc::new(WebhookState { modules, credentials, secrets, seen: Arc::new(SeenDeliveries::new(1000)), pg_store });
     let webhook_router = Router::new().route("/webhooks/linear", post(linear_webhook_handler)).with_state(state);
     app.merge(webhook_router)
 }
@@ -341,6 +360,7 @@ struct LinearModuleState {
     credentials: Arc<Mutex<CredentialStore>>,
     secrets: Arc<dyn SecretsProvider + Send + Sync>,
     accounts: Arc<Mutex<AccountStore>>,
+    pg_store: Option<agentops_mcp::PostgresGraphStore>,
 }
 
 async fn require_session(State(state): State<Arc<LinearModuleState>>, mut req: Request, next: Next) -> Response {
@@ -491,13 +511,17 @@ async fn push_task_status_handler(State(state): State<Arc<LinearModuleState>>, a
             Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
         }
     };
-    let store = match agentops_mcp::open_store(&repo_path) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
-    };
-    match agentops_linear::sync_push(store.as_ref(), &linear_config, task_id, Some(&req.status_name)) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "pushed": true, "target_state": req.status_name }))).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+    let pg_store = state.pg_store.clone();
+    let status_name = req.status_name.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &repo_path)?;
+        agentops_linear::sync_push(store.as_ref(), &linear_config, task_id, Some(&status_name))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (StatusCode::OK, Json(json!({ "pushed": true, "target_state": req.status_name }))).into_response(),
+        Ok(Err(e)) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))).into_response(),
     }
 }
 
@@ -505,25 +529,6 @@ async fn summarize_task_handler(State(state): State<Arc<LinearModuleState>>, axu
     let Some(repo_path) = ({ repo_path_for_tenant(&state.modules.lock().unwrap(), &user.tenant) }) else {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "no enabled linear_auto_kickoff enrollment for this account" }))).into_response();
     };
-    let store = match agentops_mcp::open_store(&repo_path) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
-    };
-    let repo = agentops_mcp::repo_name(&repo_path);
-
-    let task = match store.get_task(task_id) {
-        Ok(Some(t)) => t,
-        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("task {task_id} not found") }))).into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
-    };
-    let Some(session_id) = &task.session_id else {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "task has no session_id — nothing to summarize" }))).into_response();
-    };
-    let events = match store.session_events(&repo, session_id) {
-        Ok(e) => e,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
-    };
-
     let anthropic_config = {
         let credentials = state.credentials.lock().unwrap();
         match crate::resolve_anthropic_config(&credentials, state.secrets.as_ref(), &user.tenant) {
@@ -531,31 +536,63 @@ async fn summarize_task_handler(State(state): State<Arc<LinearModuleState>>, axu
             Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": e.to_string() }))).into_response(),
         }
     };
-    let summaries = match agentops_llm::summarize_task_activity(&anthropic_config, &task.title, &events) {
-        Ok(s) => s,
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+    let linear_config = {
+        let credentials = state.credentials.lock().unwrap();
+        crate::resolve_linear_config(&credentials, state.secrets.as_ref(), &user.tenant).ok()
     };
 
-    let mut posted = false;
-    if task.external_source.as_deref() == Some("linear") {
-        if let Some(external_id) = &task.external_id {
-            let linear_config = {
-                let credentials = state.credentials.lock().unwrap();
-                crate::resolve_linear_config(&credentials, state.secrets.as_ref(), &user.tenant).ok()
-            };
-            if let Some(linear_config) = linear_config {
-                let technical_ok = agentops_linear::post_comment(&linear_config, external_id, &format!("**Technical summary**\n\n{}", summaries.technical));
-                let non_technical_ok = agentops_linear::post_comment(&linear_config, external_id, &format!("**Non-technical summary**\n\n{}", summaries.non_technical));
-                posted = technical_ok.is_ok() && non_technical_ok.is_ok();
+    // Everything past this point is blocking I/O -- the graph store, the
+    // Anthropic call, and (when posting) the Linear API calls -- so it all
+    // runs off the async executor thread together rather than piecemeal.
+    let pg_store = state.pg_store.clone();
+    let outcome = tokio::task::spawn_blocking(move || -> Response {
+        let store = match agentops_mcp::resolve_store(pg_store.as_ref(), &repo_path) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        };
+        let repo = agentops_mcp::repo_name(&repo_path);
+
+        let task = match store.get_task(task_id) {
+            Ok(Some(t)) => t,
+            Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("task {task_id} not found") }))).into_response(),
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        };
+        let Some(session_id) = &task.session_id else {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": "task has no session_id — nothing to summarize" }))).into_response();
+        };
+        let events = match store.session_events(&repo, session_id) {
+            Ok(e) => e,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        };
+
+        let summaries = match agentops_llm::summarize_task_activity(&anthropic_config, &task.title, &events) {
+            Ok(s) => s,
+            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
+        };
+
+        let mut posted = false;
+        if task.external_source.as_deref() == Some("linear") {
+            if let Some(external_id) = &task.external_id {
+                if let Some(linear_config) = &linear_config {
+                    let technical_ok = agentops_linear::post_comment(linear_config, external_id, &format!("**Technical summary**\n\n{}", summaries.technical));
+                    let non_technical_ok = agentops_linear::post_comment(linear_config, external_id, &format!("**Non-technical summary**\n\n{}", summaries.non_technical));
+                    posted = technical_ok.is_ok() && non_technical_ok.is_ok();
+                }
             }
         }
-    }
 
-    (StatusCode::OK, Json(json!({ "technical": summaries.technical, "non_technical": summaries.non_technical, "client_friendly": summaries.client_friendly, "posted_to_linear": posted }))).into_response()
+        (StatusCode::OK, Json(json!({ "technical": summaries.technical, "non_technical": summaries.non_technical, "client_friendly": summaries.client_friendly, "posted_to_linear": posted }))).into_response()
+    })
+    .await;
+
+    match outcome {
+        Ok(response) => response,
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))).into_response(),
+    }
 }
 
-pub fn merge_linear_module_routes(app: Router, modules: Arc<Mutex<ModuleStore>>, credentials: Arc<Mutex<CredentialStore>>, secrets: Arc<dyn SecretsProvider + Send + Sync>, accounts: Arc<Mutex<AccountStore>>) -> Router {
-    let state = Arc::new(LinearModuleState { modules, credentials, secrets, accounts });
+pub fn merge_linear_module_routes(app: Router, modules: Arc<Mutex<ModuleStore>>, credentials: Arc<Mutex<CredentialStore>>, secrets: Arc<dyn SecretsProvider + Send + Sync>, accounts: Arc<Mutex<AccountStore>>, pg_store: Option<agentops_mcp::PostgresGraphStore>) -> Router {
+    let state = Arc::new(LinearModuleState { modules, credentials, secrets, accounts, pg_store });
     let router = Router::new()
         .route("/linear/auto-kickoff", post(enroll_auto_kickoff_handler).get(list_auto_kickoff_handler))
         .route("/linear/auto-kickoff/{team_id}", delete(disable_auto_kickoff_handler))
@@ -698,7 +735,7 @@ mod tests {
         let linear_config = agentops_linear::LinearConfig { api_key: "unused".into(), api_url: "http://127.0.0.1:1".into() };
         let payload = issue_payload("some-other-team", "user-1", "create", false);
 
-        let result = handle_verified_payload(&team, &linear_config, &payload).unwrap();
+        let result = handle_verified_payload(&team, &linear_config, &payload, None).unwrap();
         assert!(!result.dispatched);
         assert_eq!(result.reason, "payload team id does not match the verified webhook's team");
     }
@@ -711,7 +748,7 @@ mod tests {
         // update, but no `updatedFrom.assigneeId` — some unrelated field changed.
         let payload = issue_payload("team-1", "user-1", "update", false);
 
-        let result = handle_verified_payload(&team, &linear_config, &payload).unwrap();
+        let result = handle_verified_payload(&team, &linear_config, &payload, None).unwrap();
         assert!(!result.dispatched);
         assert_eq!(result.reason, "not a new assignment");
     }
@@ -730,7 +767,7 @@ mod tests {
         let linear_config = agentops_linear::LinearConfig { api_key: "unused".into(), api_url: server.uri() };
         let payload = issue_payload("team-1", "user-1", "create", false);
 
-        let result = handle_verified_payload(&team, &linear_config, &payload).unwrap();
+        let result = handle_verified_payload(&team, &linear_config, &payload, None).unwrap();
         assert!(result.dispatched, "{result:?}");
 
         let store = agentops_mcp::open_store(dir.path()).unwrap();
@@ -749,6 +786,7 @@ mod tests {
             credentials: Arc::new(Mutex::new(CredentialStore::open_in_memory().unwrap())),
             secrets,
             accounts: Arc::new(Mutex::new(AccountStore::open_in_memory().unwrap())),
+            pg_store: None,
         })
     }
 
@@ -778,7 +816,7 @@ mod tests {
 
         let state = test_module_state();
         let (_user, token) = signup(&state).await;
-        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone());
+        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone(), state.pg_store.clone());
 
         let response = router
             .oneshot(
@@ -800,7 +838,7 @@ mod tests {
         use tower::ServiceExt;
 
         let state = test_module_state();
-        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone());
+        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone(), state.pg_store.clone());
 
         let response = router.oneshot(HttpRequest::post("/linear/tasks/1/push-status").header("content-type", "application/json").body(Body::from(r#"{"status_name":"Done"}"#)).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -814,7 +852,7 @@ mod tests {
 
         let state = test_module_state();
         let (_user, token) = signup(&state).await;
-        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone());
+        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone(), state.pg_store.clone());
 
         let response = router
             .oneshot(
@@ -841,7 +879,7 @@ mod tests {
         state.modules.lock().unwrap().enroll("someone-elses-tenant", MODULE_NAME, r#"{"linear_team_id":"team-x","repo_path":"/tmp","assignee_emails":[]}"#).unwrap();
 
         let (_user, token) = signup(&state).await;
-        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone());
+        let router = merge_linear_module_routes(Router::new(), state.modules.clone(), state.credentials.clone(), state.secrets.clone(), state.accounts.clone(), state.pg_store.clone());
 
         let response = router.oneshot(HttpRequest::get("/linear/auto-kickoff").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);

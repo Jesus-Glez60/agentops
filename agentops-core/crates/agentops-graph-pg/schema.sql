@@ -230,3 +230,36 @@ ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depen
 -- becomes a no-op there, not a crash) until this is done properly.
 
 
+-- Postgres pool/batching plan, Phase 2: formalizes the natural-key identity
+-- rule `find_node`'s `IS`-based match already enforces in Rust, at the
+-- schema level -- enables `upsert_nodes_batch`'s `ON CONFLICT`-based bulk
+-- upsert (see `PostgresGraphStore`'s batch overrides). A unique *index*, not
+-- a named `CONSTRAINT` -- `CREATE UNIQUE INDEX IF NOT EXISTS` is safely
+-- replayable on every connection the way a named constraint's `ADD
+-- CONSTRAINT` (with no `IF NOT EXISTS` form in Postgres) is not, matching
+-- this file's own replay-safety discipline documented above. `ON CONFLICT`
+-- can target a unique index exactly the same way it targets a named
+-- constraint. Confirmed safe against live production data before adding
+-- this: `SELECT repo, kind, COALESCE(path,''), COALESCE(name,''),
+-- COALESCE(container,''), COUNT(*) FROM nodes GROUP BY 1,2,3,4,5 HAVING
+-- COUNT(*) > 1` returned zero rows against thedamnserver's real database
+-- (every current write path -- docgen's DocSection creation, the notes
+-- vault's Note ingestion -- always sets a unique non-null synthetic `path`).
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_natural_key
+    ON nodes (repo, kind, COALESCE(path, ''), COALESCE(name, ''), COALESCE(container, ''));
+
+-- Postgres pool/batching plan, Phase 3: two indexes the query patterns
+-- above were missing. `node_versions`'s existing `idx_node_versions_node`
+-- covers `node_history` (every version for a node), but `node_as_of`'s
+-- "current open version" comparison (`valid_until IS NULL`) and
+-- `close_node_version`/`snapshot_node_version`'s own `WHERE node_id = $1
+-- AND valid_until IS NULL` updates had no index narrowing to just the
+-- (usually single) open row -- a partial index matching that exact
+-- predicate keeps those lookups cheap regardless of how many closed
+-- historical versions a long-lived node accumulates. `task_links` had no
+-- index on `node_id` at all -- `task_links` itself is only ever queried by
+-- `task_id` (see `idx_task_links_unique`'s leading column) today, but
+-- nothing in the schema stopped a future node-centric query ("which tasks
+-- reference this node") from becoming a full scan.
+CREATE INDEX IF NOT EXISTS idx_node_versions_node_current ON node_versions(node_id) WHERE valid_until IS NULL;
+CREATE INDEX IF NOT EXISTS idx_task_links_node ON task_links(node_id);

@@ -54,6 +54,7 @@ pub fn build_team_router(accounts: AccountStore, teams: TeamStore, repos: Connec
         .route("/team/invites/{id}/resend", post(resend_invite))
         .route("/team/invites/{id}", axum::routing::delete(revoke_invite))
         .route("/team/repo-access", get(get_repo_access).put(save_repo_access))
+        .route("/team/mcp-access-mode", get(get_mcp_access_mode).put(set_mcp_access_mode))
         .route("/team/audit-log", get(get_audit_log))
         .route("/invites/accept", post(accept_invite))
         .layer(middleware::from_fn_with_state(state.clone(), require_session))
@@ -888,6 +889,58 @@ async fn save_repo_access(State(state): State<TeamState>, headers: axum::http::H
         let _ = teams.record_audit_event(&user.tenant, Some(user.id), "repo_access_changed", None, client_ip(&headers).as_deref(), &metadata);
     }
     (StatusCode::OK, Json(json!({ "saved": true })))
+}
+
+/// Any member can view -- this only reports whether `/mcp` write tools are
+/// currently enabled for the org, not a secret. `mcp_access_mode` is never
+/// actually `None` in practice once `ensure_membership` has run (which this
+/// handler runs first), but falls back to `"advisor"` (read-only) rather
+/// than unwrapping, matching the deployment-level `AGENTOPS_ACCESS_MODE`
+/// env var's own default.
+async fn get_mcp_access_mode(State(state): State<TeamState>, axum::Extension(user): axum::Extension<User>) -> (StatusCode, Json<serde_json::Value>) {
+    let teams = state.teams.lock().unwrap();
+    if let Err(e) = teams.ensure_membership(&user.tenant, user.id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    let mode = match teams.mcp_access_mode(&user.tenant) {
+        Ok(m) => m.unwrap_or_else(|| "advisor".to_string()),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    (StatusCode::OK, Json(json!({ "mode": mode })))
+}
+
+#[derive(Deserialize)]
+struct SetMcpAccessModeRequest {
+    mode: String,
+}
+
+/// Admin-only, matching every other team-mutation endpoint --
+/// `CAP_MCP_MANAGE_ACCESS_MODE`. `"full"` enables every write tool
+/// (`scan_repo`, `explain_symbol`, `end_session`, task tools, ...) over
+/// `/mcp` for the whole org, not just the caller -- this is genuinely a
+/// blast-radius decision, not a personal preference, hence the capability
+/// gate and audit log entry (same posture as `repo_access_changed`).
+/// `add_note`/`ingest_notes` are deliberately unaffected by this setting at
+/// all (see `agentops-mcp::tools`'s `ToolSpec.access` for those two) --
+/// growing the knowledge base is safe even in read-only Advisor mode, so
+/// there's nothing for an org to "enable" there.
+async fn set_mcp_access_mode(State(state): State<TeamState>, headers: axum::http::HeaderMap, axum::Extension(user): axum::Extension<User>, Json(req): Json<SetMcpAccessModeRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let teams = state.teams.lock().unwrap();
+    if let Err(e) = teams.ensure_membership(&user.tenant, user.id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    if let Err(err) = require_capability(&teams, &user.tenant, user.id, agentops_teams::CAP_MCP_MANAGE_ACCESS_MODE) {
+        return err;
+    }
+    if req.mode != "advisor" && req.mode != "full" {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "mode must be 'advisor' or 'full'" })));
+    }
+    if let Err(e) = teams.set_mcp_access_mode(&user.tenant, &req.mode) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    let metadata = json!({ "mode": req.mode }).to_string();
+    let _ = teams.record_audit_event(&user.tenant, Some(user.id), "mcp_access_mode_changed", None, client_ip(&headers).as_deref(), &metadata);
+    (StatusCode::OK, Json(json!({ "mode": req.mode })))
 }
 
 #[derive(Deserialize, Default)]
@@ -1841,5 +1894,93 @@ mod tests {
         let events = events.as_array().unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0]["action"], "role_changed");
+    }
+
+    #[tokio::test]
+    async fn get_mcp_access_mode_defaults_to_advisor() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (_, token) = signup_user(&accounts, "dev@example.com");
+        let app = build_team_router(accounts, TeamStore::open_in_memory().unwrap(), ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        let response = app.oneshot(HttpRequest::get("/team/mcp-access-mode").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["mode"], "advisor");
+    }
+
+    #[tokio::test]
+    async fn admin_can_set_mcp_access_mode_and_it_round_trips_and_is_audited() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (admin, admin_token) = signup_user(&accounts, "admin@example.com");
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::put("/team/mcp-access-mode")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"full"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["mode"], "full");
+
+        let get_response = app.clone().oneshot(HttpRequest::get("/team/mcp-access-mode").header("authorization", format!("Bearer {admin_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(body_json(get_response).await["mode"], "full", "must persist, not just echo back the request");
+
+        let audit_response =
+            app.oneshot(HttpRequest::get("/team/audit-log").header("authorization", format!("Bearer {admin_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        let events = body_json(audit_response).await;
+        let events = events.as_array().unwrap();
+        assert!(events.iter().any(|e| e["action"] == "mcp_access_mode_changed"), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn a_non_admin_member_cannot_set_mcp_access_mode() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (admin, _) = signup_user(&accounts, "admin@example.com");
+        let (member, member_token) = signup_user(&accounts, "member@example.com");
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        teams.add_member(&admin.tenant, member.id, "member").unwrap();
+        accounts.switch_tenant(member.id, &admin.tenant).unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        let response = app
+            .oneshot(
+                HttpRequest::put("/team/mcp-access-mode")
+                    .header("authorization", format!("Bearer {member_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"full"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn set_mcp_access_mode_rejects_an_invalid_mode_string() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (admin, admin_token) = signup_user(&accounts, "admin@example.com");
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        let response = app
+            .oneshot(
+                HttpRequest::put("/team/mcp-access-mode")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"mode":"omniscient"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

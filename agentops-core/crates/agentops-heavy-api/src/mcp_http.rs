@@ -7,9 +7,18 @@
 //! `docbrain_store`/`heavy_index` fields are fixed per-process (a single
 //! shared DB/Qdrant collection), not tenant-safe. Only `agentops_mcp`'s
 //! tools are exposed here -- every one of them takes its own `path`
-//! argument and opens its own store per call, which is what makes them
-//! safe to expose to many different tenants from one process (see
-//! `agentops-api`'s own doc comment for the same design, reused unchanged).
+//! argument, which is what makes them safe to expose to many different
+//! tenants from one process (data isolation is per-repo via `GraphStore`'s
+//! own `repo`-scoping, unaffected by what's below). Each call still opens
+//! its own logical store per invocation from the *caller's* point of view
+//! (`agentops_mcp::call_tool` itself is unaware anything is shared) -- but
+//! when `AGENTOPS_DATABASE_URL` selects `PostgresGraphStore`, the
+//! underlying *connection pool* is now `AppState.pg_store`, shared across
+//! every tenant/call in this process via `agentops_mcp::with_shared_postgres_store`
+//! (see that function's own doc comment for the real incident this fixes:
+//! without it, concurrent `/mcp` tool calls each opened an independent
+//! pool and replayed the full schema DDL, causing real Postgres deadlocks
+//! under load).
 //!
 //! **The `path` tool argument is never trusted as a literal filesystem
 //! path here.** A local/stdio MCP client is a single trusted user's own
@@ -71,11 +80,30 @@ pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, Stat
                 "serverInfo": { "name": "agentops-heavy-api", "version": env!("CARGO_PKG_VERSION") },
             }),
         ),
-        "tools/list" => ok(id, json!({ "tools": agentops_mcp::list_tools(state.mode) })),
+        "tools/list" => ok(id, json!({ "tools": agentops_mcp::list_tools(resolve_access_mode(&state, &caller.tenant)) })),
         "tools/call" => handle_tools_call(&state, &caller, id, &request.params).await,
         other => err(id, METHOD_NOT_FOUND, format!("method not found: {other}")),
     };
     Json(response).into_response()
+}
+
+/// Resolves the caller's tenant's own `mcp_access_mode` setting
+/// (`GET/PUT /team/mcp-access-mode`, admin-toggleable, defaults `"advisor"`
+/// -- read-only) instead of the single process-wide `AppState.mode`
+/// (`AGENTOPS_ACCESS_MODE` env var). Falls back to `state.mode` when
+/// `accounts`/`teams` aren't wired up at all -- the self-hosted,
+/// single-operator deployment shape this crate's own `AppState.teams` doc
+/// comment already models as `None`, where there's no per-tenant setting to
+/// look up and the env var remains the only knob. `add_note`/`ingest_notes`
+/// are unaffected by whatever this resolves to either way -- see those two
+/// `ToolSpec.access` fields in `agentops-mcp::tools`.
+fn resolve_access_mode(state: &AppState, tenant: &str) -> agentops_mcp::AccessMode {
+    state
+        .teams
+        .as_ref()
+        .and_then(|teams| teams.lock().unwrap().mcp_access_mode(tenant).ok().flatten())
+        .map(|mode| if mode == "full" { agentops_mcp::AccessMode::Full } else { agentops_mcp::AccessMode::Advisor })
+        .unwrap_or(state.mode)
 }
 
 async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, params: &Value) -> Value {
@@ -101,9 +129,17 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     // panic ("Cannot start a runtime from within a runtime") caught live
     // against a Postgres-backed deployment is what surfaced this, here and
     // in `agentops-api`'s pre-existing `/tools/{name}` route.
-    let mode = state.mode;
+    //
+    // `with_shared_postgres_store` -- scopes `state.pg_store` as
+    // `open_store`'s override for the duration of this one call, so every
+    // `tools.rs` handler this dispatches to transparently reuses the shared
+    // pool instead of connecting fresh. See that function's own doc
+    // comment for the real incident (concurrent `/mcp` calls deadlocking
+    // Postgres) this fixes.
+    let mode = resolve_access_mode(state, &caller.tenant);
     let name = name.to_string();
-    let call_result = tokio::task::spawn_blocking(move || agentops_mcp::call_tool(mode, &name, &arguments)).await;
+    let pg_store = state.pg_store.clone();
+    let call_result = tokio::task::spawn_blocking(move || agentops_mcp::with_shared_postgres_store(pg_store.as_ref(), || agentops_mcp::call_tool(mode, &name, &arguments))).await;
     let result = match call_result {
         Ok(Ok(result)) => serde_json::to_value(result).unwrap(),
         Ok(Err(refusal)) => json!({ "content": [{ "type": "text", "text": refusal }], "isError": true }),

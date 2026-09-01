@@ -191,6 +191,26 @@ export function saveRepoAccess(changes: { user_id: number; repo_id: string; allo
   return heavyFetch<void>(TEAM_REPO_ACCESS_SWR_KEY, { method: "PUT", body: JSON.stringify({ changes }) });
 }
 
+export const TEAM_MCP_ACCESS_MODE_SWR_KEY = "/team/mcp-access-mode";
+
+export type McpAccessMode = "advisor" | "full";
+
+/**
+ * Gates every `/mcp` write tool (`scan_repo`, `explain_symbol`, task tools,
+ * ...) for the whole org, not just the caller -- defaults to `"advisor"`
+ * (read-only) server-side, admin-only to change (`CAP_MCP_MANAGE_ACCESS_MODE`).
+ * `add_note`/`ingest_notes` are never gated by this at all -- growing the
+ * knowledge base is safe even in Advisor mode, so there's nothing to
+ * "unlock" there regardless of what this is set to.
+ */
+export function getMcpAccessMode(): Promise<{ mode: McpAccessMode }> {
+  return heavyFetch<{ mode: McpAccessMode }>(TEAM_MCP_ACCESS_MODE_SWR_KEY);
+}
+
+export function setMcpAccessMode(mode: McpAccessMode): Promise<{ mode: McpAccessMode }> {
+  return heavyFetch<{ mode: McpAccessMode }>(TEAM_MCP_ACCESS_MODE_SWR_KEY, { method: "PUT", body: JSON.stringify({ mode }) });
+}
+
 export const TEAM_AUDIT_LOG_SWR_KEY = "/team/audit-log";
 
 export interface AuditEvent {

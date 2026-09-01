@@ -106,6 +106,37 @@ pub struct AppState {
     /// router`'s own established pattern of reading its env vars itself
     /// rather than requiring every caller to pass them through.
     mode: agentops_mcp::AccessMode,
+    /// HMAC secret signing the GitHub App install `state` token -- see
+    /// `github_app_routes::install_state`'s doc comment for why the
+    /// install/callback handoff needs this instead of a session cookie.
+    /// Read directly in `build_router_with_tools_flag`, same
+    /// already-at-the-argument-limit rationale as `mode` above. Required:
+    /// `github_app_install_url` 503s with a clear message when unset,
+    /// matching `load_github_app_config`'s all-or-nothing posture for the
+    /// GitHub App feature as a whole.
+    install_state_secret: Option<String>,
+    /// Absolute base URL of the paired frontend deployment (e.g.
+    /// `https://app.agentops.dedyn.io`), used to build an absolute redirect
+    /// target when `github_app_callback` needs to send the browser back to
+    /// the frontend after a failure -- the callback itself always runs on
+    /// this API's own origin, which is a different domain from the
+    /// frontend, so a relative redirect would land nowhere useful. Also
+    /// read directly here, same as `install_state_secret`/`mode`.
+    web_app_url: Option<String>,
+    /// Process-lifetime shared `PostgresGraphStore`, when `AGENTOPS_DATABASE_URL`
+    /// is set -- see `agentops_mcp::open_shared_postgres_store`'s doc
+    /// comment for the incident this fixes (every handler used to call
+    /// `agentops_mcp::open_store` fresh per request, meaning a brand-new
+    /// connection pool per request under Postgres). `None` when Postgres
+    /// isn't configured; handlers resolve their store via
+    /// `agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)`, which
+    /// falls back to `open_store`'s existing per-call SQLite/Postgres
+    /// behavior in that case. Read directly here, same
+    /// already-at-the-argument-limit rationale as `mode`/`install_state_secret`/
+    /// `web_app_url` above. Fails fast (`.expect`) at startup if Postgres is
+    /// configured but unreachable -- strictly better than today's
+    /// first-request failure.
+    pg_store: Option<agentops_mcp::PostgresGraphStore>,
 }
 
 pub fn build_router(
@@ -121,7 +152,16 @@ pub fn build_router(
     repo_checkouts_dir: std::path::PathBuf,
     github_app_config: Option<github_app_routes::GitHubAppConfig>,
 ) -> Router {
-    build_router_with_tools_flag(store, secrets, github_app_slug, api_key_hash, search_index, docbrain_db_dir, accounts, teams, indexing, repo_checkouts_dir, github_app_config, true)
+    // Safe to connect directly here (not `spawn_blocking`-wrapped) only
+    // because this function is itself synchronous -- a caller running
+    // inside an already-active Tokio runtime must not call this function
+    // directly either (same hazard `build_full_router`'s own doc comment
+    // documents); every current caller of this specific function is a
+    // genuinely sync context (tests, `agentops-cli`), unlike
+    // `build_full_router` below, which is why that one connects via
+    // `spawn_blocking` instead of calling this function's sibling pattern.
+    let pg_store = agentops_mcp::open_shared_postgres_store().expect("connect to AGENTOPS_DATABASE_URL");
+    build_router_with_tools_flag(store, secrets, github_app_slug, api_key_hash, search_index, docbrain_db_dir, accounts, teams, indexing, repo_checkouts_dir, github_app_config, pg_store, true)
 }
 
 /// Same as [`build_router`] minus `/tools`/`/tools/{name}` — `agentops-api`
@@ -145,9 +185,25 @@ pub fn build_router_without_tools(
     repo_checkouts_dir: std::path::PathBuf,
     github_app_config: Option<github_app_routes::GitHubAppConfig>,
 ) -> Router {
-    build_router_with_tools_flag(store, secrets, github_app_slug, api_key_hash, search_index, docbrain_db_dir, accounts, teams, indexing, repo_checkouts_dir, github_app_config, false)
+    // See `build_router`'s identical comment just above.
+    let pg_store = agentops_mcp::open_shared_postgres_store().expect("connect to AGENTOPS_DATABASE_URL");
+    build_router_with_tools_flag(store, secrets, github_app_slug, api_key_hash, search_index, docbrain_db_dir, accounts, teams, indexing, repo_checkouts_dir, github_app_config, pg_store, false)
 }
 
+/// `pg_store` is connected by the caller, not internally -- unlike this
+/// function's two sync public callers just above (safe to connect directly,
+/// since they're only ever invoked from genuinely sync contexts),
+/// `build_full_router` below is `async` and gets awaited from inside an
+/// already-running Tokio runtime in production (`agentops-server::run`,
+/// this crate's own `run`) -- `PostgresGraphStore::connect()` spins up and
+/// enters its own dedicated `Runtime` internally (see that struct's own doc
+/// comment), which panics ("Cannot start a runtime from within a runtime")
+/// if attempted from a thread that already has one entered. Confirmed live:
+/// this exact panic took down `agentops-server` on deploy the first time
+/// this function tried to connect internally instead of accepting an
+/// already-connected store -- `build_full_router` now connects via
+/// `spawn_blocking` (safe: that pool's threads have no ambient Tokio
+/// context of their own) and passes the result in here.
 #[allow(clippy::too_many_arguments)]
 fn build_router_with_tools_flag(
     store: ConnectionStore,
@@ -161,12 +217,15 @@ fn build_router_with_tools_flag(
     indexing: agentops_repo_access::indexing_store::IndexingStore,
     repo_checkouts_dir: std::path::PathBuf,
     github_app_config: Option<github_app_routes::GitHubAppConfig>,
+    pg_store: Option<agentops_mcp::PostgresGraphStore>,
     include_tools: bool,
 ) -> Router {
     let mode = match std::env::var("AGENTOPS_ACCESS_MODE").as_deref() {
         Ok("full") => agentops_mcp::AccessMode::Full,
         _ => agentops_mcp::AccessMode::Advisor,
     };
+    let install_state_secret = std::env::var("AGENTOPS_GITHUB_INSTALL_STATE_SECRET").ok();
+    let web_app_url = std::env::var("AGENTOPS_WEB_APP_URL").ok();
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         secrets,
@@ -180,6 +239,9 @@ fn build_router_with_tools_flag(
         repo_checkouts_dir,
         github_app_config,
         mode,
+        install_state_secret,
+        web_app_url,
+        pg_store,
     };
     let mut router = Router::new()
         .route("/repos/connect", post(connect_repo))
@@ -193,6 +255,7 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/regenerate-key", post(regenerate_key))
         .route("/repos/github-app/install-url", get(github_app_install_url))
         .route("/repos/github-app/callback", get(github_app_routes::github_app_callback))
+        .route("/repos/github-app/installations", get(github_app_routes::list_installations_handler))
         .route("/repos/github-app/installations/{id}/repos", get(github_app_routes::list_installation_repos_handler))
         .route("/repos/github-app/installations/{id}/connect", post(github_app_routes::connect_from_installation))
         .route("/search/index", post(search_index_handler))
@@ -487,6 +550,18 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
         github_app_config: github_app_config.clone(),
     };
 
+    // Connected via `spawn_blocking`, not called directly -- this function
+    // is `async` and gets awaited from inside an already-running Tokio
+    // runtime in production (`agentops-server::run`, this crate's own
+    // `run`); `PostgresGraphStore::connect()` spins up and enters its own
+    // dedicated `Runtime` internally, which panics ("Cannot start a runtime
+    // from within a runtime") if attempted directly from a thread that
+    // already has one entered. `spawn_blocking`'s pool threads have no
+    // ambient Tokio context of their own, so connecting there is safe --
+    // same fix already applied to every HTTP-handler call site that opens a
+    // store (see `PostgresGraphStore`'s own module doc comment).
+    let pg_store = tokio::task::spawn_blocking(agentops_mcp::open_shared_postgres_store).await??;
+
     let mut app = build_router_with_tools_flag(
         store,
         secrets.clone(),
@@ -499,6 +574,7 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
         indexing_store,
         repo_checkouts_dir,
         github_app_config.clone(),
+        pg_store.clone(),
         include_tools,
     );
     app = github_app_routes::merge_github_webhook_route(app, webhook_deps, github_app_config);
@@ -526,8 +602,16 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
     let linear_credentials_2 = Arc::new(Mutex::new(agentops_integrations::CredentialStore::open(&credentials_db_path)?));
     let accounts_for_linear = Arc::new(Mutex::new(agentops_accounts::AccountStore::open(&accounts_db_path)?));
 
-    app = linear_webhook::merge_linear_webhook_route(app, linear_modules.clone(), linear_credentials_2.clone(), secrets.clone());
-    app = linear_webhook::merge_linear_module_routes(app, linear_modules, linear_credentials_2, secrets.clone(), accounts_for_linear);
+    // Reuses the same connected `pg_store` from above rather than opening a
+    // second independent pool -- unlike `webhook_deps`/`linear_modules`'s
+    // deliberate "own SQLite connection" precedent (see
+    // `LinearModuleState`'s doc comment), there's no reason to pay for a
+    // second Postgres pool within this same process just to mirror that
+    // pattern; `PostgresGraphStore::clone()` is cheap (see its own doc
+    // comment) and every connect() this crate performs already goes through
+    // this one `spawn_blocking`-wrapped call above.
+    app = linear_webhook::merge_linear_webhook_route(app, linear_modules.clone(), linear_credentials_2.clone(), secrets.clone(), pg_store.clone());
+    app = linear_webhook::merge_linear_module_routes(app, linear_modules, linear_credentials_2, secrets.clone(), accounts_for_linear, pg_store);
     if std::env::var("AGENTOPS_LINEAR_WEBHOOK_URL").is_err() {
         println!("AGENTOPS_LINEAR_WEBHOOK_URL is not set — POST /linear/auto-kickoff will report 503 until it's configured.");
     }
@@ -914,11 +998,32 @@ async fn regenerate_key(State(state): State<AppState>, user: Option<axum::Extens
     }
 }
 
-async fn github_app_install_url(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    match &state.github_app_slug {
-        Some(slug) => (StatusCode::OK, Json(json!({ "install_url": agentops_github_app::install_url(slug) }))),
-        None => (StatusCode::NOT_FOUND, Json(json!({ "error": "no GitHub App is configured for this deployment (AGENTOPS_GITHUB_APP_SLUG not set)" }))),
+/// Mints a `state` token (see `github_app_routes::install_state`) and
+/// embeds it in the returned install URL -- this is the one point in the
+/// whole install/callback handoff where a live session still exists, so
+/// it's also the one point `CAP_REPOS_CONNECT` gets checked; the callback
+/// itself (a different origin, reached only after a full round trip
+/// through github.com) trusts the token instead of re-resolving a session.
+async fn github_app_install_url(State(state): State<AppState>, user: Option<axum::Extension<User>>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let Some(slug) = &state.github_app_slug else {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "no GitHub App is configured for this deployment (AGENTOPS_GITHUB_APP_SLUG not set)" })));
+    };
+    let Some(secret) = &state.install_state_secret else {
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "AGENTOPS_GITHUB_INSTALL_STATE_SECRET not set for this deployment" })));
+    };
+    let tenant = match resolve_tenant(&user, q.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
+        return e;
     }
+    // 10 minutes -- long enough to cover a real install click-through on
+    // github.com, short enough that a leaked/logged URL isn't a standing
+    // credential.
+    let state_token = github_app_routes::install_state::mint(secret, &tenant, 600);
+    let install_url = format!("{}?state={state_token}", agentops_github_app::install_url(slug));
+    (StatusCode::OK, Json(json!({ "install_url": install_url })))
 }
 
 /// `503 Service Unavailable` — this deployment simply doesn't have Qdrant
@@ -1606,18 +1711,40 @@ mod tests {
     async fn install_url_404s_when_no_app_is_configured() {
         let (store, secrets) = test_state();
         let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
-        let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
+        let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url?tenant=acme").body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
-    async fn install_url_returns_the_configured_slug() {
-        let (store, secrets) = test_state();
-        let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
-        let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url").body(Body::empty()).unwrap()).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_json(resp).await;
-        assert_eq!(body["install_url"], "https://github.com/apps/agentops-dev/installations/new");
+    async fn install_url_503s_without_a_state_secret_then_succeeds_with_a_signed_state_token_once_configured() {
+        // Both assertions live in one test, run sequentially, rather than
+        // two separate #[tokio::test]s racing on the same process-global
+        // env var under cargo's default parallel test execution.
+        // SAFETY: no other test in this binary reads/writes this env var.
+        unsafe { std::env::remove_var("AGENTOPS_GITHUB_INSTALL_STATE_SECRET") };
+        {
+            let (store, secrets) = test_state();
+            let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+            let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url?tenant=acme").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+
+        unsafe { std::env::set_var("AGENTOPS_GITHUB_INSTALL_STATE_SECRET", "test-install-state-secret") };
+        {
+            let (store, secrets) = test_state();
+            let app = build_router(store, secrets, Some("agentops-dev".to_string()), None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+            let resp = app.oneshot(Request::builder().uri("/repos/github-app/install-url?tenant=acme").body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            let install_url = body["install_url"].as_str().unwrap();
+            assert!(install_url.starts_with("https://github.com/apps/agentops-dev/installations/new?state="), "unexpected install_url: {install_url}");
+            let token = install_url.split("state=").nth(1).unwrap();
+            assert_eq!(
+                github_app_routes::install_state::verify("test-install-state-secret", token),
+                Ok(github_app_routes::install_state::InstallState { tenant: "acme".to_string() })
+            );
+        }
+        unsafe { std::env::remove_var("AGENTOPS_GITHUB_INSTALL_STATE_SECRET") };
     }
 
     #[tokio::test]
@@ -1950,5 +2077,191 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["result"]["isError"], false, "{body:?}");
         assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no scans recorded yet"), "{body:?}");
+    }
+
+    /// Locks in the per-tenant access-mode resolution `mcp_http::resolve_access_mode`
+    /// does: with no `AGENTOPS_ACCESS_MODE` env var set (this process's own
+    /// default, always Advisor in tests) and no team setting configured
+    /// either, `/mcp` must still refuse a `Full`-only tool -- but `add_note`
+    /// (knowledge-growing, deliberately exempt) must succeed regardless.
+    #[tokio::test]
+    async fn mcp_access_mode_defaults_to_advisor_refusing_scan_repo_but_add_note_bypasses_the_gate() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "own-repo").unwrap();
+        store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/own.git", &keypair).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(TeamStore::open_in_memory().unwrap()), test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("tools/call", json!({ "name": "scan_repo", "arguments": { "path": "own-repo" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], true, "{body:?}");
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("requires Full access mode"), "{body:?}");
+
+        let mut req = mcp_request("tools/call", json!({ "name": "add_note", "arguments": { "path": "own-repo", "title": "Advisor mode still grows knowledge", "body": "add_note bypasses the access-mode gate entirely." } }), 2);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+    }
+
+    /// The actual per-tenant resolution, not just the process-wide default:
+    /// an admin's `mcp_access_mode` setting (what `PUT /team/mcp-access-mode`
+    /// writes) must unlock `Full`-only tools over `/mcp` even though the
+    /// process's own `AGENTOPS_ACCESS_MODE` env var is unset (Advisor).
+    #[tokio::test]
+    async fn mcp_access_mode_full_from_team_settings_unlocks_a_full_only_tool() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "own-repo").unwrap();
+        store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/own.git", &keypair).unwrap();
+
+        // `scan_repo` (unlike `status`) actually walks the filesystem, so
+        // the connection's checkout path must exist for real -- otherwise
+        // a `full`-mode call would still fail, just for the wrong reason
+        // ("no such directory"), and wouldn't prove the access-mode gate
+        // itself opened up.
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let repo_dir = checkouts_dir.path().join(&user.tenant).join("own-repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::write(repo_dir.join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.set_mcp_access_mode(&user.tenant, "full").unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), checkouts_dir.path().to_path_buf(), None);
+
+        let mut req = mcp_request("tools/call", json!({ "name": "scan_repo", "arguments": { "path": "own-repo" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+    }
+
+    /// MCP-side companion to `agentops-api::search`'s
+    /// `fifty_four_concurrent_curation_requests_all_succeed_against_a_shared_postgres_pool`
+    /// -- the original production incident was specifically a REST/dashboard
+    /// action, but the shared-pool fix (`AppState.pg_store`) is generic
+    /// infrastructure every store-touching route benefits from, including
+    /// `/mcp`. Fires 54 concurrent `tools/call` "status" requests through
+    /// the real `/mcp` route against a Postgres-backed router and asserts
+    /// every one comes back `isError: false` -- confirming an agent
+    /// hammering this endpoint (the actual expected `/mcp` usage pattern,
+    /// unlike the human-paced dashboard) doesn't reintroduce the
+    /// thundering-herd pool-exhaustion shape either.
+    ///
+    /// Live against a real local Postgres; skips (not fails) when nothing
+    /// is reachable. `#[ignore]`d for the same env-var-mutation reason as
+    /// this file's other Postgres-path tests.
+    #[tokio::test]
+    #[ignore = "mutates the process-global AGENTOPS_DATABASE_URL env var; run in isolation, see doc comment"]
+    async fn fifty_four_concurrent_mcp_status_calls_all_succeed_against_a_shared_postgres_pool() {
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let reachable = { let url = url.clone(); tokio::task::spawn_blocking(move || agentops_mcp::PostgresGraphStore::connect(&url).is_ok()).await.unwrap_or(false) };
+        if !reachable {
+            eprintln!("skipping fifty_four_concurrent_mcp_status_calls_all_succeed_against_a_shared_postgres_pool: no Postgres reachable at {url}");
+            return;
+        }
+
+        // SAFETY: guarded by the same reasoning as this file's other
+        // Postgres-path `#[ignore]`d tests -- run in isolation.
+        unsafe { std::env::set_var("AGENTOPS_DATABASE_URL", &url) };
+
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "own-repo").unwrap();
+            store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/own.git", &keypair).unwrap();
+        }
+        // `spawn_blocking`-wrapped: `build_router` connects to Postgres
+        // internally when `AGENTOPS_DATABASE_URL` is set, and this whole
+        // test body is itself already async (same reasoning as every other
+        // Postgres-path test added this session).
+        let app = tokio::task::spawn_blocking(move || build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None)).await.unwrap();
+
+        let handles: Vec<_> = (0..54)
+            .map(|i| {
+                let app = app.clone();
+                let token = token.clone();
+                tokio::spawn(async move {
+                    let mut req = mcp_request("tools/call", json!({ "name": "status", "arguments": { "path": "own-repo" } }), i);
+                    req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+                    let resp = app.oneshot(req).await.unwrap();
+                    assert_eq!(resp.status(), StatusCode::OK);
+                    body_json(resp).await
+                })
+            })
+            .collect();
+
+        let mut errors = Vec::new();
+        for h in handles {
+            let body = h.await.unwrap();
+            if body["result"]["isError"] != false {
+                errors.push(body["result"]["content"][0]["text"].as_str().unwrap_or("<no text>").to_string());
+            }
+        }
+        assert!(errors.is_empty(), "expected all 54 concurrent /mcp status calls to succeed with isError: false, got {} errors, first few: {:?}", errors.len(), &errors[..errors.len().min(3)]);
+
+        // SAFETY: guarded by the reasoning above.
+        unsafe { std::env::remove_var("AGENTOPS_DATABASE_URL") };
+    }
+
+    /// Regression test for a real deploy-time incident: `build_full_router`
+    /// is `async` and gets `.await`ed from inside an already-running Tokio
+    /// runtime in production (`agentops-server::run`, this crate's own
+    /// `run`) -- every other test in this file calls `build_router`/
+    /// `build_router_without_tools` with no `AGENTOPS_DATABASE_URL` set, so
+    /// none of them exercised the Postgres-connect path from within an
+    /// async context. The first version of the Postgres pool/batching plan
+    /// connected internally inside `build_router_with_tools_flag` (a sync
+    /// fn called directly, unwrapped, from this same async call chain) --
+    /// confirmed live: this panicked the whole merged server on deploy with
+    /// "Cannot start a runtime from within a runtime" the moment
+    /// `AGENTOPS_DATABASE_URL` was set. This test reproduces the exact
+    /// shape (an async `#[tokio::test]` calling `build_full_router`, real
+    /// Postgres configured) that would have caught it before it ever
+    /// reached a real deployment.
+    ///
+    /// Live against a real local Postgres; skips (not fails) when nothing
+    /// is reachable. `#[ignore]`d for the same reason `agentops-mcp::scan`'s
+    /// Postgres-path tests are: mutates the process-global
+    /// `AGENTOPS_DATABASE_URL`, which every other test in this large suite
+    /// implicitly assumes is unset. Run in isolation: `cargo test -p
+    /// agentops-heavy-api -- --ignored --test-threads=1
+    /// build_full_router_does_not_panic_when_awaited_from_an_already_running_tokio_runtime_with_postgres_configured`.
+    #[tokio::test]
+    #[ignore = "mutates the process-global AGENTOPS_DATABASE_URL env var; run in isolation, see doc comment"]
+    async fn build_full_router_does_not_panic_when_awaited_from_an_already_running_tokio_runtime_with_postgres_configured() {
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        // `spawn_blocking`-wrapped for the same reason the fix under test
+        // requires it -- this is itself an async test body, so calling
+        // `connect()` directly here would panic for the exact bug this test
+        // exists to catch, before ever reaching the code under test.
+        let reachable = { let url = url.clone(); tokio::task::spawn_blocking(move || agentops_mcp::PostgresGraphStore::connect(&url).is_ok()).await.unwrap_or(false) };
+        if !reachable {
+            eprintln!("skipping build_full_router_does_not_panic_when_awaited_from_an_already_running_tokio_runtime_with_postgres_configured: no Postgres reachable at {url}");
+            return;
+        }
+
+        // SAFETY: no other test in this suite runs concurrently with an
+        // `#[ignore]`d test under `--test-threads=1`, which this test's own
+        // doc comment requires it be run under.
+        unsafe {
+            std::env::set_var("AGENTOPS_DATABASE_URL", &url);
+            std::env::set_var("AGENTOPS_SECRETS_MASTER_KEY", "11".repeat(32));
+        }
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let result = build_full_router(&db_dir.path().join("heavy-api.sqlite"), true).await;
+
+        unsafe {
+            std::env::remove_var("AGENTOPS_DATABASE_URL");
+            std::env::remove_var("AGENTOPS_SECRETS_MASTER_KEY");
+        }
+
+        assert!(result.is_ok(), "build_full_router must not panic or error when awaited from within an already-running Tokio runtime with Postgres configured: {result:?}");
     }
 }

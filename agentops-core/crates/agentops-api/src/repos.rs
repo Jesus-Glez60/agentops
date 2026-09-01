@@ -125,7 +125,12 @@ pub fn read_branch(repo_path: &Path) -> Option<String> {
 /// per-entry logic in `summarize_repo`). `pub` -- `agentops-heavy-api`'s
 /// tenant-scoped equivalents call this same pattern against
 /// `ConnectionStore`-resolved stores instead of manifest entries.
-pub fn open_scanned_repos(entries: &[ManifestEntry]) -> Vec<(String, Box<dyn GraphStore>)> {
+///
+/// `pg_store`, when `Some`, is used instead of connecting fresh per repo —
+/// see `agentops_mcp::resolve_store`'s own doc comment for why (avoids the
+/// N-repos-worth-of-fresh-Postgres-pools shape this function would otherwise
+/// have under `AGENTOPS_DATABASE_URL`).
+pub fn open_scanned_repos(entries: &[ManifestEntry], pg_store: Option<&agentops_mcp::PostgresGraphStore>) -> Vec<(String, Box<dyn GraphStore>)> {
     entries
         .iter()
         .filter_map(|entry| {
@@ -134,7 +139,7 @@ pub fn open_scanned_repos(entries: &[ManifestEntry]) -> Vec<(String, Box<dyn Gra
                 return None;
             }
             let name = agentops_mcp::repo_name(&path);
-            agentops_mcp::open_store(&path).ok().map(|store| (name, store))
+            agentops_mcp::resolve_store(pg_store, &path).ok().map(|store| (name, store))
         })
         .collect()
 }
@@ -153,7 +158,10 @@ pub fn find_by_name<'a>(entries: &'a [ManifestEntry], name: &str) -> Option<&'a 
 /// checkout path (`ManifestEntry` is a plain two-field data carrier, not
 /// coupled to the real manifest file, so constructing one on the fly for
 /// this purpose is legitimate reuse, not a hack).
-pub fn summarize_repo(entry: &ManifestEntry) -> RepoSummary {
+///
+/// `pg_store`, when `Some`, is used instead of connecting fresh — same
+/// reasoning as `open_scanned_repos`.
+pub fn summarize_repo(entry: &ManifestEntry, pg_store: Option<&agentops_mcp::PostgresGraphStore>) -> RepoSummary {
     let path = PathBuf::from(&entry.path);
     let name = agentops_mcp::repo_name(&path);
 
@@ -163,7 +171,7 @@ pub fn summarize_repo(entry: &ManifestEntry) -> RepoSummary {
 
     let branch = read_branch(&path);
 
-    let store = match agentops_mcp::open_store(&path) {
+    let store = match agentops_mcp::resolve_store(pg_store, &path) {
         Ok(store) => store,
         Err(e) => {
             eprintln!("GET /scans: could not open graph store for {:?}: {e:#}", entry.path);
@@ -185,9 +193,10 @@ pub fn summarize_repo(entry: &ManifestEntry) -> RepoSummary {
 /// own thread even though it's cheap for the SQLite default.
 pub(crate) async fn list_repos_json(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<RepoSummary>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
-        Ok(entries.iter().map(summarize_repo).collect())
+        Ok(entries.iter().map(|e| summarize_repo(e, pg_store.as_ref())).collect())
     })
     .await;
 
@@ -201,6 +210,7 @@ pub(crate) async fn list_repos_json(State(state): State<AppState>) -> (StatusCod
 pub(crate) async fn rescan_repo_json(State(state): State<AppState>, AxumPath(name): AxumPath<String>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
     let target_name = name.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<RepoSummary>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let Some(entry) = find_by_name(&entries, &target_name) else {
@@ -225,7 +235,7 @@ pub(crate) async fn rescan_repo_json(State(state): State<AppState>, AxumPath(nam
 
         let refreshed_entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let refreshed = refreshed_entries.iter().find(|e| e.path == entry.path).cloned().unwrap_or_else(|| entry.clone());
-        Ok(Some(summarize_repo(&refreshed)))
+        Ok(Some(summarize_repo(&refreshed, pg_store.as_ref())))
     })
     .await;
 
@@ -244,10 +254,11 @@ pub(crate) async fn rescan_repo_json(State(state): State<AppState>, AxumPath(nam
 /// approximation.
 pub(crate) async fn activity_json(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ActivityEvent>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let mut events = Vec::new();
-        for (name, store) in open_scanned_repos(&entries) {
+        for (name, store) in open_scanned_repos(&entries, pg_store.as_ref()) {
             if let Ok(Some(scan)) = store.latest_scan(&name) {
                 events.push(ActivityEvent {
                     repo: name,
@@ -326,10 +337,11 @@ pub(crate) async fn gotchas_json(State(state): State<AppState>, Query(q): Query<
         }
     }
     let repo_filter: Option<Vec<String>> = q.repos.as_deref().map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect());
+    let pg_store = state.pg_store.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<GotchaSummary>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
-        let mut repos = open_scanned_repos(&entries);
+        let mut repos = open_scanned_repos(&entries, pg_store.as_ref());
         if let Some(names) = &repo_filter {
             repos.retain(|(name, _)| names.contains(name));
         }

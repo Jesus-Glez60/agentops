@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use agentops_embeddings::Embedder;
-use agentops_graph::{upsert_node, prune_stale_nodes, EdgeRelation, NewNode, NewScanHistoryEntry, NodeKind, ScanChange};
+use agentops_graph::{prune_stale_nodes, EdgeRelation, NewNode, NewScanHistoryEntry, NodeKind, ScanChange};
 use agentops_scanner::ScanReport;
 use anyhow::Result;
 
@@ -79,49 +79,77 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
     let mut new_file_ids: HashSet<i64> = HashSet::new();
     let mut files_with_symbol_changes: HashSet<i64> = HashSet::new();
     // Same-file symbol `References` pairs, accumulated across every file --
-    // see the block after the main loop for how each path is chosen.
+    // see the block after the phase-1/2 loops for how each path is chosen.
     let mut reference_pairs: Vec<(i64, i64)> = Vec::new();
 
-    for file in &report.files {
-        let mut file_symbol_ids: Vec<i64> = Vec::with_capacity(file.symbols.len());
-        let path_str = file.path.to_string_lossy().to_string();
-        let existing_file = store.find_node(&repo, NodeKind::File, Some(&path_str), None, None)?;
-        let file_id = upsert_node(
-            store.as_ref(),
-            NewNode { kind: NodeKind::File, repo: repo.clone(), path: Some(path_str.clone()), name: None, container: None, start_line: None, end_line: None, content: None },
-        )?;
+    // -- Phase 1: files, one batched find + one batched upsert for the
+    // whole scan instead of one round trip per file. --
+    let file_path_strs: Vec<String> = report.files.iter().map(|f| f.path.to_string_lossy().to_string()).collect();
+    let file_keys: Vec<(NodeKind, Option<&str>, Option<&str>, Option<&str>)> = file_path_strs.iter().map(|p| (NodeKind::File, Some(p.as_str()), None, None)).collect();
+    let existing_files = store.find_nodes_batch(&repo, &file_keys)?;
+    let file_new_nodes: Vec<NewNode> =
+        file_path_strs.iter().map(|p| NewNode { kind: NodeKind::File, repo: repo.clone(), path: Some(p.clone()), name: None, container: None, start_line: None, end_line: None, content: None }).collect();
+    let file_ids = store.upsert_nodes_batch(&file_new_nodes)?;
+
+    for (file, (path_str, &file_id)) in report.files.iter().zip(file_path_strs.iter().zip(&file_ids)) {
         kept_file_ids.push(file_id);
         file_id_by_path.insert(file.path.clone(), file_id);
-        if existing_file.is_none() {
+        if !existing_files.contains_key(&(NodeKind::File, Some(path_str.clone()), None, None)) {
             new_file_ids.insert(file_id);
             scan_entries.push(NewScanHistoryEntry { node_id: file_id, kind: NodeKind::File, path: Some(path_str.clone()), name: None, change: ScanChange::Added });
         }
+    }
 
+    // -- Phase 2: symbols, same batched-find + batched-upsert shape across
+    // every file's symbols in one pass (not one call per file). Per-symbol
+    // content-diff classification (Added/Changed/None) stays an in-memory
+    // loop over the already-fetched `existing_symbols` map -- free, not a
+    // query. --
+    let mut symbol_keys: Vec<(NodeKind, Option<&str>, Option<&str>, Option<&str>)> = Vec::new();
+    let mut symbol_new_nodes: Vec<NewNode> = Vec::new();
+    for (file, path_str) in report.files.iter().zip(&file_path_strs) {
         for symbol in &file.symbols {
-            let existing_symbol = store.find_node(&repo, NodeKind::Symbol, Some(&path_str), Some(&symbol.name), symbol.container.as_deref())?;
-            let symbol_id = upsert_node(
-                store.as_ref(),
-                NewNode {
-                    kind: NodeKind::Symbol,
-                    repo: repo.clone(),
-                    path: Some(path_str.clone()),
-                    name: Some(symbol.name.clone()),
-                    container: symbol.container.clone(),
-                    start_line: Some(symbol.start_line as i64),
-                    end_line: Some(symbol.end_line as i64),
-                    content: Some(symbol.source.clone()),
-                },
-            )?;
+            symbol_keys.push((NodeKind::Symbol, Some(path_str.as_str()), Some(symbol.name.as_str()), symbol.container.as_deref()));
+            symbol_new_nodes.push(NewNode {
+                kind: NodeKind::Symbol,
+                repo: repo.clone(),
+                path: Some(path_str.clone()),
+                name: Some(symbol.name.clone()),
+                container: symbol.container.clone(),
+                start_line: Some(symbol.start_line as i64),
+                end_line: Some(symbol.end_line as i64),
+                content: Some(symbol.source.clone()),
+            });
+        }
+    }
+    let existing_symbols = store.find_nodes_batch(&repo, &symbol_keys)?;
+    let symbol_ids = store.upsert_nodes_batch(&symbol_new_nodes)?;
+
+    // -- Phase 3: versions + embeddings for changed symbols, one batched
+    // call each instead of one per symbol. Embedding computation itself is
+    // CPU-bound (no DB round trip), so it stays an in-loop call; only the
+    // two `GraphStore` writes at the end are batched. --
+    let mut changed_versions: Vec<(i64, Option<String>, Option<i64>, Option<i64>)> = Vec::new();
+    let mut changed_embeddings: Vec<(i64, Vec<f32>)> = Vec::new();
+
+    let mut symbol_idx = 0;
+    for (file, path_str) in report.files.iter().zip(&file_path_strs) {
+        let mut file_symbol_ids: Vec<i64> = Vec::with_capacity(file.symbols.len());
+        for symbol in &file.symbols {
+            let symbol_id = symbol_ids[symbol_idx];
+            symbol_idx += 1;
             kept_symbol_ids.push(symbol_id);
             file_symbol_ids.push(symbol_id);
             symbol_count += 1;
 
-            let change = match &existing_symbol {
+            let existing = existing_symbols.get(&(NodeKind::Symbol, Some(path_str.clone()), Some(symbol.name.clone()), symbol.container.clone()));
+            let change = match existing {
                 None => Some(ScanChange::Added),
                 Some(existing) if existing.content.as_deref() != Some(symbol.source.as_str()) => Some(ScanChange::Changed),
                 Some(_) => None,
             };
             if let Some(change) = change {
+                let file_id = file_id_by_path[&file.path];
                 scan_entries.push(NewScanHistoryEntry { node_id: symbol_id, kind: NodeKind::Symbol, path: Some(path_str.clone()), name: Some(symbol.name.clone()), change });
                 files_with_symbol_changes.insert(file_id);
 
@@ -130,13 +158,13 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
                 // no-op for a brand-new symbol's first version). Always the
                 // new value, never the old one — see
                 // GraphStore::snapshot_node_version's doc comment for why.
-                store.snapshot_node_version(symbol_id, Some(&symbol.source), Some(symbol.start_line as i64), Some(symbol.end_line as i64))?;
+                changed_versions.push((symbol_id, Some(symbol.source.clone()), Some(symbol.start_line as i64), Some(symbol.end_line as i64)));
 
                 // Only new/changed symbols need (re)embedding — an unchanged
                 // symbol's embedding from a prior scan is still accurate.
                 if with_embeddings {
                     let embedding = agentops_embeddings::LocalEmbedder.embed(&symbol.source)?;
-                    store.set_embedding(&repo, symbol_id, &embedding)?;
+                    changed_embeddings.push((symbol_id, embedding));
                 }
             }
         }
@@ -157,6 +185,9 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
             }
         }
     }
+    let symbol_versions_repo = repo.clone();
+    store.snapshot_node_versions_batch(&symbol_versions_repo, &changed_versions.iter().map(|(id, content, sl, el)| (*id, content.as_deref(), *sl, *el)).collect::<Vec<_>>())?;
+    store.set_embeddings_batch(&repo, &changed_embeddings)?;
 
     // A File node never carries `content`, so "file changed" can't be
     // detected via content-diff the way a symbol's can — instead a file
@@ -192,28 +223,41 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
     for &file_id in file_id_by_path.values() {
         store.delete_edges_from(&repo, file_id, EdgeRelation::DependsOn)?;
     }
-    let mut dependency_edges = 0;
+    // -- Phase 4: dependency edges, one batched insert instead of one
+    // `add_edge` call per resolved import. `delete_edges_from` stays a loop
+    // per touched file (O(files), not O(symbols) -- low-cost relative to the
+    // edge-count problem batching actually targets). --
+    let mut new_depends_on_edges: Vec<(i64, i64, EdgeRelation)> = Vec::new();
     for (from, to) in &dep_edges {
         if let (Some(&from_id), Some(&to_id)) = (file_id_by_path.get(from), file_id_by_path.get(to)) {
-            store.add_edge(&repo, from_id, to_id, EdgeRelation::DependsOn)?;
-            dependency_edges += 1;
+            new_depends_on_edges.push((from_id, to_id, EdgeRelation::DependsOn));
         }
     }
+    let dependency_edges = new_depends_on_edges.len();
+    store.add_edges_batch(&repo, &new_depends_on_edges)?;
 
-    // Reference edges are plastic (Initiative 1, CLS-inspired retrieval
-    // plan) -- unlike DependsOn above, no longer fully deleted and
+    // -- Phase 5: reference-edge reconciliation, the most complex batched
+    // phase. Reference edges are plastic (Initiative 1, CLS-inspired
+    // retrieval plan) -- unlike DependsOn above, no longer fully deleted and
     // recreated per touched symbol each scan. A reference re-confirmed this
     // scan reinforces its existing edge (bumping weight, same mechanism a
     // repeat-matched `Affects` edge already uses) instead of resetting to
-    // weight 1.0; a reference whose target genuinely disappeared is pruned
-    // via `delete_edge` rather than the whole per-symbol set being wiped.
+    // weight 1.0; a reference whose target genuinely disappeared is pruned.
+    // One `edges_from_batch` call replaces one `edges_from` call per symbol;
+    // the same in-memory reinforce/delete/add decision as before is then
+    // applied via one batched call each instead of per-edge calls. --
     let mut new_targets_by_symbol: HashMap<i64, HashSet<i64>> = HashMap::new();
     for (from_id, to_id) in &reference_pairs {
         new_targets_by_symbol.entry(*from_id).or_default().insert(*to_id);
     }
+    let existing_edges_by_symbol = store.edges_from_batch(&repo, &kept_symbol_ids)?;
+
+    let mut reinforce_ids: Vec<i64> = Vec::new();
+    let mut delete_ids: Vec<i64> = Vec::new();
+    let mut new_reference_edges: Vec<(i64, i64, EdgeRelation)> = Vec::new();
     let mut reference_edges = 0;
     for &symbol_id in &kept_symbol_ids {
-        let existing: Vec<_> = store.edges_from(&repo, symbol_id)?.into_iter().filter(|e| e.relation == EdgeRelation::References).collect();
+        let existing: Vec<_> = existing_edges_by_symbol.get(&symbol_id).into_iter().flatten().filter(|e| e.relation == EdgeRelation::References).collect();
         let new_targets = new_targets_by_symbol.get(&symbol_id).cloned().unwrap_or_default();
 
         for edge in &existing {
@@ -224,22 +268,25 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
                 // re-observation, not a deliberate human reconfirmation, so
                 // it must not reset the staleness clock `tool_get_symbol`
                 // compares against `node_history`.
-                store.reinforce_edge(&repo, edge.id, false)?;
+                reinforce_ids.push(edge.id);
             } else {
                 // No longer referenced this scan -- pruned, not left to
                 // decay forever as a stale edge.
-                store.delete_edge(&repo, edge.id)?;
+                delete_ids.push(edge.id);
             }
         }
 
         let existing_targets: HashSet<i64> = existing.iter().map(|e| e.dst_id).collect();
         for &to_id in &new_targets {
             if !existing_targets.contains(&to_id) {
-                store.add_edge(&repo, symbol_id, to_id, EdgeRelation::References)?;
+                new_reference_edges.push((symbol_id, to_id, EdgeRelation::References));
             }
             reference_edges += 1;
         }
     }
+    store.reinforce_edges_batch(&repo, &reinforce_ids, false)?;
+    store.delete_edges_batch(&repo, &delete_ids)?;
+    store.add_edges_batch(&repo, &new_reference_edges)?;
 
     store.record_scan(&repo, &scan_entries)?;
 
@@ -270,15 +317,20 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
         // permanently unembedded regardless of `with_embeddings`, unlike
         // Symbol nodes just above. Found via live testing: the search
         // page's kind=gotcha filter returned nothing until this was added.
+        //
+        // -- Phase 6: note-embedding backfill, one batched `set_embeddings_batch`
+        // call instead of one `set_embedding` call per note. --
         if with_embeddings {
+            let mut note_embeddings: Vec<(i64, Vec<f32>)> = Vec::new();
             for kind in [NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note] {
                 for node in store.nodes_by_kind(&repo, kind)? {
                     if let Some(content) = &node.content {
                         let embedding = agentops_embeddings::LocalEmbedder.embed(content)?;
-                        store.set_embedding(&repo, node.id, &embedding)?;
+                        note_embeddings.push((node.id, embedding));
                     }
                 }
             }
+            store.set_embeddings_batch(&repo, &note_embeddings)?;
         }
     }
 
@@ -345,6 +397,213 @@ mod tests {
 
         let store_all_nodes = store.all_nodes(&repo).unwrap();
         assert_eq!(store_all_nodes.iter().filter(|n| n.kind == NodeKind::Symbol).count(), 1, "rescanning must not duplicate the symbol node");
+    }
+
+    /// Same invariant as `rescanning_an_unchanged_file_records_nothing_as_changed`
+    /// above, but against the real production write path: `persist()`'s own
+    /// `crate::store::open_store()` call, with `AGENTOPS_DATABASE_URL` set so
+    /// it picks `PostgresGraphStore` -- every other test in this file uses
+    /// this module's local `open_store` helper (hardcoded to SQLite), which
+    /// exercises the upsert logic but never the actual backend this
+    /// deployment runs against. Live against a real local Postgres, matching
+    /// `agentops-graph-pg`'s own established discipline; skips (not fails)
+    /// when nothing is reachable, so this crate's suite doesn't hard-require
+    /// Docker/Postgres on every machine.
+    ///
+    /// `#[ignore]`d deliberately: `AGENTOPS_DATABASE_URL` is process-global,
+    /// and this crate has many other tests (`tools::tests::*`, `docgen::
+    /// tests::*`) that call `scan_and_persist`/`open_store` expecting the
+    /// SQLite default -- confirmed live that running this test under normal
+    /// `cargo test` parallelism intermittently reroutes those unrelated
+    /// tests to Postgres mid-run and breaks them, `ENV_LOCK` only
+    /// serializes tests that explicitly opt into acquiring it, not every
+    /// test that happens to touch `open_store`. Run this one in isolation:
+    /// `cargo test -p agentops-mcp -- --ignored --test-threads=1
+    /// rescanning_an_unchanged_repo_against_postgres_does_not_duplicate_nodes`.
+    #[test]
+    #[ignore = "mutates the process-global AGENTOPS_DATABASE_URL env var; run in isolation, see doc comment"]
+    fn rescanning_an_unchanged_repo_against_postgres_does_not_duplicate_nodes() {
+        let _guard = crate::store::test_support::ENV_LOCK.lock().unwrap();
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let Ok(pg_store) = agentops_graph_pg::PostgresGraphStore::connect(&url) else {
+            eprintln!("skipping rescanning_an_unchanged_repo_against_postgres_does_not_duplicate_nodes: no Postgres reachable at {url}");
+            return;
+        };
+
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::set_var("AGENTOPS_DATABASE_URL", &url) };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let repo = repo_name(dir.path());
+
+        let result = (|| -> Result<()> {
+            scan_and_persist(dir.path(), false)?;
+            scan_and_persist(dir.path(), false)?;
+
+            let nodes = GraphStore::all_nodes(&pg_store, &repo)?;
+            assert_eq!(
+                nodes.iter().filter(|n| n.kind == NodeKind::File).count(),
+                1,
+                "a second scan of an unchanged repo must not duplicate the file node against Postgres"
+            );
+            assert_eq!(
+                nodes.iter().filter(|n| n.kind == NodeKind::Symbol).count(),
+                1,
+                "a second scan of an unchanged repo must not duplicate the symbol node against Postgres"
+            );
+            Ok(())
+        })();
+
+        // Cleanup runs regardless of assertion outcome, then the env var is
+        // unset, regardless of outcome -- a panicked assertion above must
+        // not leak either test rows or a mutated global env var into
+        // whatever test runs next.
+        if let Ok(nodes) = GraphStore::all_nodes(&pg_store, &repo) {
+            let ids: Vec<i64> = nodes.iter().map(|n| n.id).collect();
+            let _ = GraphStore::delete_nodes(&pg_store, &repo, &ids);
+        }
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::remove_var("AGENTOPS_DATABASE_URL") };
+
+        result.unwrap();
+    }
+
+    /// Broader companion to the test above -- that one only exercises
+    /// Phase 1/2 (files/symbols) against Postgres; this one exercises
+    /// Phase 3 (versions/embeddings), Phase 4 (dependency edges), and
+    /// Phase 5 (reference-edge reconciliation) too, across an edit and a
+    /// rescan, against the real batched `PostgresGraphStore` overrides --
+    /// not just the SQLite path every other test in this file covers. Same
+    /// `#[ignore]`/`ENV_LOCK` discipline as the test above, for the same
+    /// reason (mutates the process-global `AGENTOPS_DATABASE_URL`).
+    #[test]
+    #[ignore = "mutates the process-global AGENTOPS_DATABASE_URL env var; run in isolation, see doc comment"]
+    fn batched_persist_produces_correct_deps_references_versions_and_embeddings_against_postgres() {
+        let _guard = crate::store::test_support::ENV_LOCK.lock().unwrap();
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let Ok(pg_store) = agentops_graph_pg::PostgresGraphStore::connect(&url) else {
+            eprintln!("skipping batched_persist_produces_correct_deps_references_versions_and_embeddings_against_postgres: no Postgres reachable at {url}");
+            return;
+        };
+
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::set_var("AGENTOPS_DATABASE_URL", &url) };
+
+        // Cross-file import (util.ts -> app.ts's DependsOn) plus a
+        // same-file symbol call (helper/main in main.rs -- References edges
+        // are same-file only, see `symbols_in_different_files_with_matching_
+        // names_never_get_a_reference_edge` below, so the cross-file pair
+        // above can't exercise Phase 5 on its own).
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/util.ts"), "export function greet() { return 'hi'; }\n").unwrap();
+        std::fs::write(dir.path().join("src/app.ts"), "import { greet } from './util';\nexport function main() { return greet(); }\n").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn helper() -> i32 { 1 }\n\nfn caller() -> i32 { helper() }\n").unwrap();
+        let repo = repo_name(dir.path());
+
+        let result = (|| -> Result<()> {
+            let summary1 = scan_and_persist(dir.path(), true)?;
+            assert_eq!(summary1.dependency_edges, 1, "the import must produce one DependsOn edge via the batched Phase 4 path");
+            assert_eq!(summary1.reference_edges, 1, "caller calling helper (same file) must produce one References edge via the batched Phase 5 path");
+
+            let nodes = GraphStore::all_nodes(&pg_store, &repo)?;
+            let caller_fn = nodes.iter().find(|n| n.name.as_deref() == Some("caller")).expect("caller must exist");
+            let helper_fn = nodes.iter().find(|n| n.name.as_deref() == Some("helper")).expect("helper must exist");
+
+            // Phase 3: embeddings actually landed via the batched
+            // `set_embeddings_batch` override, not silently skipped.
+            assert!(GraphStore::get_embedding(&pg_store, &repo, caller_fn.id)?.is_some(), "caller's embedding must be set after a with_embeddings scan");
+            assert!(GraphStore::get_embedding(&pg_store, &repo, helper_fn.id)?.is_some(), "helper's embedding must be set after a with_embeddings scan");
+
+            // Edit helper's body, then rescan -- exercises Phase 3's
+            // snapshot_node_versions_batch (a real second version must
+            // open) and Phase 5's reinforce path (the still-present
+            // reference edge must be reinforced, not recreated at weight 1.0).
+            std::fs::write(dir.path().join("main.rs"), "fn helper() -> i32 { 2 }\n\nfn caller() -> i32 { helper() }\n").unwrap();
+            let summary2 = scan_and_persist(dir.path(), true)?;
+            assert_eq!(summary2.dependency_edges, 1, "rescanning identical imports must not accumulate duplicate DependsOn edges");
+            assert_eq!(summary2.reference_edges, 1, "the still-present reference must not be dropped or duplicated on rescan");
+
+            let history = GraphStore::node_history(&pg_store, helper_fn.id)?;
+            assert_eq!(history.len(), 2, "editing helper must open a real second version via the batched Phase 3 path: {history:?}");
+            assert!(history[0].content.as_deref().unwrap().contains('2'));
+            assert!(history[1].valid_until.is_some(), "the original version must have been closed, not left open");
+
+            let all_edges = GraphStore::all_edges(&pg_store, &repo)?;
+            let references: Vec<_> = all_edges.iter().filter(|e| e.relation == agentops_graph::EdgeRelation::References).collect();
+            assert_eq!(references.len(), 1, "still exactly one reference edge after rescan, not a duplicate");
+            assert_eq!(references[0].weight, 1.5, "the still-present reference must be reinforced (Phase 5's batched reinforce path), not recreated at a fresh weight");
+
+            let depends_on: Vec<_> = all_edges.iter().filter(|e| e.relation == agentops_graph::EdgeRelation::DependsOn).collect();
+            assert_eq!(depends_on.len(), 1, "still exactly one DependsOn edge after rescan, not accumulated");
+
+            Ok(())
+        })();
+
+        // Cleanup runs regardless of assertion outcome, same discipline as
+        // the test above.
+        if let Ok(nodes) = GraphStore::all_nodes(&pg_store, &repo) {
+            let ids: Vec<i64> = nodes.iter().map(|n| n.id).collect();
+            let _ = GraphStore::delete_nodes(&pg_store, &repo, &ids);
+        }
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::remove_var("AGENTOPS_DATABASE_URL") };
+
+        result.unwrap();
+    }
+
+    /// Reproduces the exact real-world shape that broke production the
+    /// first time `scan_and_persist` ran against the real `agentops` repo
+    /// after the batched-upsert rewrite: two `impl` blocks for the same
+    /// type each defining a method with the same name (`container` only
+    /// records the *type* name, not which `impl` block -- see
+    /// `agentops-scanner::ast_extract`'s own test coverage, which only
+    /// covers *different* types, not two blocks for the *same* type). This
+    /// collided `(path, name, container)` and made `PostgresGraphStore`'s
+    /// first `upsert_nodes_batch` implementation fail outright ("ON
+    /// CONFLICT DO UPDATE command cannot affect row a second time") the
+    /// moment a real file with this shape was scanned -- SQLite's simpler
+    /// per-row upsert loop never surfaced it (see this file's own
+    /// `same_name_methods_in_different_impl_blocks_both_persist`, which
+    /// only exercises SQLite). This test is the Postgres-path analog,
+    /// confirming `scan_and_persist` -- the single implementation shared by
+    /// both the MCP `scan_repo` tool and the REST/indexing-pipeline `rescan`
+    /// path -- no longer crashes on this shape against the real backend
+    /// this deployment runs.
+    #[test]
+    #[ignore = "mutates the process-global AGENTOPS_DATABASE_URL env var; run in isolation, see doc comment"]
+    fn scanning_two_impl_blocks_with_a_same_named_method_does_not_crash_against_postgres() {
+        let _guard = crate::store::test_support::ENV_LOCK.lock().unwrap();
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let Ok(pg_store) = agentops_graph_pg::PostgresGraphStore::connect(&url) else {
+            eprintln!("skipping scanning_two_impl_blocks_with_a_same_named_method_does_not_crash_against_postgres: no Postgres reachable at {url}");
+            return;
+        };
+
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::set_var("AGENTOPS_DATABASE_URL", &url) };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lora.rs"),
+            "struct Widget;\n\nimpl Widget {\n    pub fn forward(&self, x: i32) -> i32 { x + 1 }\n}\n\nimpl Widget {\n    fn forward(&self, y: i32) -> i32 { y + 2 }\n}\n",
+        )
+        .unwrap();
+        let repo = repo_name(dir.path());
+
+        let result = scan_and_persist(dir.path(), false);
+
+        // Cleanup regardless of outcome, same discipline as this file's
+        // other live-Postgres tests.
+        if let Ok(nodes) = GraphStore::all_nodes(&pg_store, &repo) {
+            let ids: Vec<i64> = nodes.iter().map(|n| n.id).collect();
+            let _ = GraphStore::delete_nodes(&pg_store, &repo, &ids);
+        }
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::remove_var("AGENTOPS_DATABASE_URL") };
+
+        assert!(result.is_ok(), "scanning a real same-named-method-across-impl-blocks collision must not crash: {:?}", result.err());
     }
 
     #[test]

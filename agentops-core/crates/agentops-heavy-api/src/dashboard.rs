@@ -81,7 +81,7 @@ pub(crate) async fn activity_json(State(state): State<AppState>, user: Option<ax
         let repos = tenant_repo_paths(&state, &tenant)?;
         let mut events = Vec::new();
         for (name, path) in repos {
-            let Ok(store) = agentops_mcp::open_store(&path) else { continue };
+            let Ok(store) = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path) else { continue };
             if let Ok(Some(scan)) = store.latest_scan(&name) {
                 events.push(agentops_api::repos::ActivityEvent {
                     repo: name,
@@ -155,7 +155,7 @@ pub(crate) async fn local_search_json(State(state): State<AppState>, user: Optio
 
         let mut hits: Vec<agentops_api::search::SearchResult> = Vec::new();
         for (name, path) in &repos {
-            let Ok(store) = agentops_mcp::open_store(path) else { continue };
+            let Ok(store) = agentops_mcp::resolve_store(state.pg_store.as_ref(), path) else { continue };
             for kind in &kind_passes {
                 for (node, distance) in store.search_similar(name, &embedding, top_k, *kind)? {
                     hits.push(agentops_api::search::node_to_result(name, node, distance));
@@ -193,7 +193,7 @@ pub(crate) async fn node_detail_json(State(state): State<AppState>, user: Option
             Err(_) => return Ok(None),
         };
         let repo = agentops_mcp::repo_name(&path);
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
         let Some(node) = store.get_node(&repo, node_id)? else { return Ok(None) };
         let connected = agentops_api::search::connected_nodes(store.as_ref(), &repo, node_id)?;
         Ok(Some(agentops_api::search::NodeDetail {
@@ -264,7 +264,7 @@ pub(crate) async fn set_curation_json(
             Err(_) => return Ok(None),
         };
         let repo = agentops_mcp::repo_name(&path);
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
         if store.get_node(&repo, node_id)?.is_none() {
             return Ok(None);
         }
@@ -311,7 +311,7 @@ pub(crate) async fn subgraph_json(State(state): State<AppState>, user: Option<ax
             Err(_) => return Ok(None),
         };
         let repo = agentops_mcp::repo_name(&path);
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
         agentops_api::subgraph::build_subgraph(store.as_ref(), &repo, node_id, &mode, depth, &kinds)
     })
     .await;
@@ -349,7 +349,7 @@ pub(crate) async fn repo_graph_json(State(state): State<AppState>, user: Option<
             Err(_) => return Ok(None),
         };
         let repo = agentops_mcp::repo_name(&path);
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
         Ok(Some(agentops_api::subgraph::build_repo_graph(store.as_ref(), &repo, &kinds)?))
     })
     .await;
@@ -376,7 +376,7 @@ pub(crate) async fn docs_json(State(state): State<AppState>, user: Option<axum::
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
         let repo = agentops_mcp::repo_name(&path);
 
         if let Some((_generated_at, content_json)) = store.get_doc_page(&repo)? {
@@ -436,7 +436,7 @@ pub(crate) async fn gotchas_json(State(state): State<AppState>, user: Option<axu
 
         let mut gotchas = Vec::new();
         for (name, path) in &repos {
-            let Ok(store) = agentops_mcp::open_store(path) else { continue };
+            let Ok(store) = agentops_mcp::resolve_store(state.pg_store.as_ref(), path) else { continue };
             for node in store.nodes_by_kind(name, NodeKind::Gotcha)? {
                 if let Some(b) = &bucket {
                     if !agentops_api::repos::matches_bucket(&node, b) {
@@ -483,7 +483,7 @@ pub(crate) fn connection_counts(state: &AppState, tenant: &str, connection_id: &
     }
     let path = crate::indexing::checkout_path(&state.repo_checkouts_dir, tenant, connection_id);
     let entry = ManifestEntry { path: path.display().to_string(), last_scanned_at: 0 };
-    let summary = agentops_api::repos::summarize_repo(&entry);
+    let summary = agentops_api::repos::summarize_repo(&entry, state.pg_store.as_ref());
     (summary.counts, summary.branch, summary.path_missing)
 }
 

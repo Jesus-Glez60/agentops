@@ -17,21 +17,95 @@
 //! (`agentops-api`'s handlers) must wrap calls in `tokio::task::spawn_blocking`
 //! to avoid stalling its executor, and must never call from inside an
 //! already-running Tokio runtime directly (nested `block_on` panics).
+//!
+//! **Cheaply `Clone`, deliberately** — `connect()` used to be called fresh
+//! on every HTTP request (a brand-new `Runtime` + connection pool per
+//! call), which broke under real concurrent load: 54 simultaneous requests
+//! meant 54 simultaneous pool creations competing for Postgres connections,
+//! and 32 of them failed. Callers that live for the process's lifetime
+//! (`agentops-heavy-api`/`agentops-api`'s `AppState`) now call `connect()`
+//! once at startup and clone the result per request instead — cheap, since
+//! `deadpool_postgres::Pool` is already `Arc`-backed internally and `rt` is
+//! wrapped in `Arc` below purely so `Clone` is possible at all (`Runtime`
+//! itself isn't `Clone`). See `agentops_mcp::store::open_shared_postgres_store`/
+//! `resolve_store` for how callers actually get a shared instance.
+//!
+//! **Pool sizing** (`AGENTOPS_PG_POOL_MAX_SIZE`, default 25): grounded in
+//! the standard Postgres pool-sizing guidance `(server_core_count * 2) +
+//! effective_spindle_count` (Oracle's Real-World Performance Group,
+//! corroborated across current PgBouncer/HikariCP-for-Postgres tuning
+//! writeups) — 25 for a 12-core Postgres server on SSD storage. This is the
+//! **Postgres server's** own core count, not this process's — deadpool's
+//! own implicit default (`num_cpus::get() * 2`, used when unset) reflects
+//! whatever container this Rust process happens to run in, which can
+//! differ from the Postgres server's. Bigger is not automatically better:
+//! the same research found shrinking an oversized pool dropped response
+//! time from ~100ms to ~2ms — oversized pools measurably hurt latency, not
+//! just waste memory. Override this env var only after profiling against
+//! the real deployment's actual Postgres server core count/storage.
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NewNode, NewScanHistoryEntry, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewNode, NewScanHistoryEntry, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
 use anyhow::Result;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 const SCHEMA: &str = include_str!("../schema.sql");
 
+#[derive(Clone)]
 pub struct PostgresGraphStore {
     // Kept alive for the store's whole lifetime, not just at construction —
     // `deadpool-postgres`'s `Runtime::Tokio1`-mode pool needs an active
     // Tokio context for background connection recycling the entire time
     // it's in use. Dropping this right after building the pool would panic
-    // on the first query issued afterward.
-    rt: tokio::runtime::Runtime,
+    // on the first query issued afterward. `Arc`-wrapped so the whole
+    // struct can be cheaply `Clone`d (see module doc comment) — `Runtime`
+    // itself has no `Clone` impl.
+    rt: Arc<RuntimeGuard>,
     pool: deadpool_postgres::Pool,
+}
+
+/// Wraps `Runtime` purely so its *last* `Arc` clone's drop calls
+/// `shutdown_background()` instead of `Runtime`'s own default `Drop`, which
+/// blocks waiting for every worker thread to finish -- disallowed ("Cannot
+/// drop a runtime in a context where blocking is not allowed") when that
+/// final drop happens to run on a thread that's itself inside another async
+/// context, e.g. an `axum::Router` (and the `PostgresGraphStore` it
+/// captured, all the way back through `AppState`) going out of scope inside
+/// `agentops-server::run`'s own `#[tokio::main]` runtime on graceful
+/// shutdown. Confirmed live: this exact panic fired from a regression test
+/// added for the sibling "Cannot start a runtime from within a runtime"
+/// incident, one layer deeper -- fixing the connect-time panic surfaced
+/// this drop-time one right behind it. `shutdown_background()` returns
+/// immediately without waiting for in-flight queries to finish, an
+/// acceptable tradeoff for a pool that's being torn down anyway (unlike a
+/// mid-request cancellation, nothing is waiting on the result).
+struct RuntimeGuard(Option<tokio::runtime::Runtime>);
+
+impl Drop for RuntimeGuard {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
+// So every existing `self.rt.block_on(...)` call site keeps working
+// unchanged through the `Arc<RuntimeGuard>` -- `Option::unwrap` is safe
+// here since `0` is only ever `None` after `drop` has already run (nothing
+// can call a method on a value mid-drop).
+impl std::ops::Deref for RuntimeGuard {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &tokio::runtime::Runtime {
+        self.0.as_ref().unwrap()
+    }
+}
+
+/// Defaults to the standard `(postgres_server_cores * 2) + effective_spindle_count`
+/// sizing guidance, not deadpool's implicit `num_cpus::get() * 2` (see this
+/// module's own doc comment for why that default is the wrong basis here).
+fn pg_pool_max_size() -> usize {
+    std::env::var("AGENTOPS_PG_POOL_MAX_SIZE").ok().and_then(|v| v.parse().ok()).unwrap_or(25)
 }
 
 impl PostgresGraphStore {
@@ -44,12 +118,13 @@ impl PostgresGraphStore {
         let pool = rt.block_on(async {
             let mut cfg = deadpool_postgres::Config::new();
             cfg.url = Some(database_url.to_string());
+            cfg.pool = Some(deadpool_postgres::PoolConfig::new(pg_pool_max_size()));
             let pool = cfg.create_pool(Some(deadpool_postgres::Runtime::Tokio1), tokio_postgres::NoTls)?;
             let client = pool.get().await?;
             client.batch_execute(SCHEMA).await?;
             Ok::<deadpool_postgres::Pool, anyhow::Error>(pool)
         })?;
-        Ok(Self { rt, pool })
+        Ok(Self { rt: Arc::new(RuntimeGuard(Some(rt))), pool })
     }
 
     /// Deletes every row scoped to `repo` across every table — `nodes`
@@ -781,6 +856,251 @@ impl GraphStore for PostgresGraphStore {
             Ok(rows.iter().map(row_to_task_link).collect())
         })
     }
+
+    // -- Batch overrides (Postgres pool/batching plan, Phase 2) --
+    //
+    // Real multi-row SQL, replacing the trait's loop-based defaults --
+    // `scan.rs::persist`'s intended caller pays one round trip per phase
+    // instead of one per row. Same `self.rt.block_on` + `self.pool.get()`
+    // pattern every other method here already uses, no new concurrency
+    // primitive.
+
+    fn find_nodes_batch(&self, repo: &str, keys: &[(NodeKind, Option<&str>, Option<&str>, Option<&str>)]) -> Result<HashMap<NaturalKey, Node>> {
+        if keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let kinds: Vec<&str> = keys.iter().map(|k| k.0.as_db_str()).collect();
+            let paths: Vec<Option<&str>> = keys.iter().map(|k| k.1).collect();
+            let names: Vec<Option<&str>> = keys.iter().map(|k| k.2).collect();
+            let containers: Vec<Option<&str>> = keys.iter().map(|k| k.3).collect();
+            // Same `IS NOT DISTINCT FROM` semantics as `find_node` itself
+            // (see that method's own comment) -- a plain `=` join would
+            // wrongly fail to match two keys that both have a NULL
+            // path/name/container against each other.
+            let rows = client
+                .query(
+                    "SELECT n.* FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[]) AS k(kind, path, name, container)
+                     JOIN nodes n ON n.repo = $1 AND n.kind = k.kind
+                         AND n.path IS NOT DISTINCT FROM k.path
+                         AND n.name IS NOT DISTINCT FROM k.name
+                         AND n.container IS NOT DISTINCT FROM k.container",
+                    &[&repo, &kinds, &paths, &names, &containers],
+                )
+                .await?;
+            let mut out = HashMap::new();
+            for row in &rows {
+                let node = row_to_node(row);
+                out.insert((node.kind, node.path.clone(), node.name.clone(), node.container.clone()), node);
+            }
+            Ok(out)
+        })
+    }
+
+    fn upsert_nodes_batch(&self, nodes: &[NewNode]) -> Result<Vec<i64>> {
+        if nodes.is_empty() {
+            return Ok(vec![]);
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+
+            // Deduped, last-wins per natural key -- confirmed live against
+            // real production data that the trait method's own documented
+            // "no duplicate natural key within a batch" precondition does
+            // NOT always hold in practice (the scanner can legitimately
+            // emit two `Symbol` entries sharing the same `(path, name,
+            // container)` for one file), and `ON CONFLICT DO UPDATE`
+            // refuses to affect the same row twice within one statement
+            // ("ON CONFLICT DO UPDATE command cannot affect row a second
+            // time" -- a real Postgres error this exact scenario produced
+            // in production, not a hypothetical). Last-wins matches the
+            // trait default's own loop-based semantics: each subsequent
+            // `upsert_node` call for the same key overwrites the previous
+            // one's `start_line`/`end_line`/`content`. Only the *insert*
+            // arrays are deduped -- the id-lookup query below still joins
+            // against the full, non-deduped `nodes` slice, since every
+            // duplicate-keyed input position resolves to the same
+            // underlying row either way, so this doesn't break the
+            // input-order-preserving contract of this method's return value.
+            let mut dedup: HashMap<(&str, &str, Option<&str>, Option<&str>, Option<&str>), &NewNode> = HashMap::new();
+            for n in nodes {
+                dedup.insert((n.repo.as_str(), n.kind.as_db_str(), n.path.as_deref(), n.name.as_deref(), n.container.as_deref()), n);
+            }
+            let deduped: Vec<&NewNode> = dedup.into_values().collect();
+
+            let repos: Vec<&str> = deduped.iter().map(|n| n.repo.as_str()).collect();
+            let kinds: Vec<&str> = deduped.iter().map(|n| n.kind.as_db_str()).collect();
+            let paths: Vec<Option<&str>> = deduped.iter().map(|n| n.path.as_deref()).collect();
+            let names: Vec<Option<&str>> = deduped.iter().map(|n| n.name.as_deref()).collect();
+            let containers: Vec<Option<&str>> = deduped.iter().map(|n| n.container.as_deref()).collect();
+            let start_lines: Vec<Option<i64>> = deduped.iter().map(|n| n.start_line).collect();
+            let end_lines: Vec<Option<i64>> = deduped.iter().map(|n| n.end_line).collect();
+            let contents: Vec<Option<&str>> = deduped.iter().map(|n| n.content.as_deref()).collect();
+
+            client
+                .execute(
+                    "INSERT INTO nodes (repo, kind, path, name, container, start_line, end_line, content)
+                     SELECT * FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::bigint[], $7::bigint[], $8::text[])
+                     ON CONFLICT (repo, kind, COALESCE(path, ''), COALESCE(name, ''), COALESCE(container, ''))
+                     DO UPDATE SET start_line = EXCLUDED.start_line, end_line = EXCLUDED.end_line, content = EXCLUDED.content",
+                    &[&repos, &kinds, &paths, &names, &containers, &start_lines, &end_lines, &contents],
+                )
+                .await?;
+
+            // A second round trip to recover ids in input order -- against
+            // the *full*, non-deduped input slice, so every original
+            // position (including duplicate-keyed ones) gets an id back.
+            // `RETURNING` on an `INSERT ... SELECT` can only return columns
+            // of the target table, not the source query's own row number,
+            // so ids can't be pulled straight off the statement above.
+            // Still O(1) round trips for the whole batch, not O(n) -- and
+            // guaranteed to find exactly one row per input node, since
+            // `idx_nodes_natural_key` means the insert above just created
+            // or updated exactly one row per distinct natural key.
+            let repos: Vec<&str> = nodes.iter().map(|n| n.repo.as_str()).collect();
+            let kinds: Vec<&str> = nodes.iter().map(|n| n.kind.as_db_str()).collect();
+            let paths: Vec<Option<&str>> = nodes.iter().map(|n| n.path.as_deref()).collect();
+            let names: Vec<Option<&str>> = nodes.iter().map(|n| n.name.as_deref()).collect();
+            let containers: Vec<Option<&str>> = nodes.iter().map(|n| n.container.as_deref()).collect();
+            let rows = client
+                .query(
+                    "SELECT k.ord, n.id FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) WITH ORDINALITY AS k(repo, kind, path, name, container, ord)
+                     JOIN nodes n ON n.repo = k.repo AND n.kind = k.kind
+                         AND n.path IS NOT DISTINCT FROM k.path
+                         AND n.name IS NOT DISTINCT FROM k.name
+                         AND n.container IS NOT DISTINCT FROM k.container",
+                    &[&repos, &kinds, &paths, &names, &containers],
+                )
+                .await?;
+
+            let mut id_by_ord: HashMap<i64, i64> = HashMap::new();
+            for row in &rows {
+                id_by_ord.insert(row.get::<_, i64>("ord"), row.get::<_, i64>("id"));
+            }
+            (1..=nodes.len() as i64)
+                .map(|ord| id_by_ord.get(&ord).copied().ok_or_else(|| anyhow::anyhow!("upsert_nodes_batch: no row found for input #{ord} after insert -- unexpected")))
+                .collect()
+        })
+    }
+
+    fn add_edges_batch(&self, repo: &str, edges: &[(i64, i64, EdgeRelation)]) -> Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let src_ids: Vec<i64> = edges.iter().map(|e| e.0).collect();
+            let dst_ids: Vec<i64> = edges.iter().map(|e| e.1).collect();
+            let relations: Vec<&str> = edges.iter().map(|e| e.2.as_db_str()).collect();
+            client
+                .execute(
+                    "INSERT INTO edges (repo, src_id, dst_id, relation, weight, updated_at)
+                     SELECT $1, src_id, dst_id, relation, 1.0, now()
+                     FROM UNNEST($2::bigint[], $3::bigint[], $4::text[]) AS t(src_id, dst_id, relation)",
+                    &[&repo, &src_ids, &dst_ids, &relations],
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn set_embeddings_batch(&self, repo: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<()> {
+        if embeddings.is_empty() {
+            return Ok(());
+        }
+        for (_, e) in embeddings {
+            anyhow::ensure!(e.len() == EMBEDDING_DIM, "embedding has {} dims, expected {EMBEDDING_DIM}", e.len());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let ids: Vec<i64> = embeddings.iter().map(|(id, _)| *id).collect();
+            let vectors: Vec<pgvector::Vector> = embeddings.iter().map(|(_, e)| pgvector::Vector::from(e.clone())).collect();
+            let updated = client
+                .execute(
+                    "UPDATE nodes n SET embedding = t.embedding
+                     FROM UNNEST($2::bigint[], $3::vector[]) AS t(id, embedding)
+                     WHERE n.repo = $1 AND n.id = t.id",
+                    &[&repo, &ids, &vectors],
+                )
+                .await?;
+            anyhow::ensure!(updated as usize == embeddings.len(), "set_embeddings_batch: expected to update {} rows, updated {updated} -- some node ids weren't found in repo {repo:?}", embeddings.len());
+            Ok(())
+        })
+    }
+
+    fn snapshot_node_versions_batch(&self, repo: &str, versions: &[(i64, Option<&str>, Option<i64>, Option<i64>)]) -> Result<()> {
+        let _ = repo;
+        if versions.is_empty() {
+            return Ok(());
+        }
+        self.rt.block_on(async {
+            let mut client = self.pool.get().await?;
+            let txn = client.transaction().await?;
+            let node_ids: Vec<i64> = versions.iter().map(|v| v.0).collect();
+            let contents: Vec<Option<&str>> = versions.iter().map(|v| v.1).collect();
+            let start_lines: Vec<Option<i64>> = versions.iter().map(|v| v.2).collect();
+            let end_lines: Vec<Option<i64>> = versions.iter().map(|v| v.3).collect();
+
+            txn.execute("UPDATE node_versions SET valid_until = now() WHERE node_id = ANY($1) AND valid_until IS NULL", &[&node_ids]).await?;
+            txn.execute(
+                "INSERT INTO node_versions (node_id, content, start_line, end_line, valid_from, valid_until)
+                 SELECT node_id, content, start_line, end_line, now(), NULL
+                 FROM UNNEST($1::bigint[], $2::text[], $3::bigint[], $4::bigint[]) AS t(node_id, content, start_line, end_line)",
+                &[&node_ids, &contents, &start_lines, &end_lines],
+            )
+            .await?;
+            txn.commit().await?;
+            Ok(())
+        })
+    }
+
+    fn edges_from_batch(&self, repo: &str, src_ids: &[i64]) -> Result<HashMap<i64, Vec<Edge>>> {
+        // Every requested src_id must appear in the result, mapped to an
+        // empty Vec if it has no edges -- same "always present" contract
+        // the trait default (looping `edges_from`) already has.
+        let mut out: HashMap<i64, Vec<Edge>> = src_ids.iter().map(|&id| (id, Vec::new())).collect();
+        if src_ids.is_empty() {
+            return Ok(out);
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {EDGES_COLUMNS} FROM edges WHERE repo = $1 AND src_id = ANY($2)");
+            let rows = client.query(&sql, &[&repo, &src_ids]).await?;
+            for row in &rows {
+                let edge = row_to_edge(row);
+                out.entry(edge.src_id).or_default().push(edge);
+            }
+            Ok(out)
+        })
+    }
+
+    fn reinforce_edges_batch(&self, repo: &str, edge_ids: &[i64], bump_confirmed_at: bool) -> Result<()> {
+        if edge_ids.is_empty() {
+            return Ok(());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = if bump_confirmed_at {
+                "UPDATE edges SET weight = LEAST(weight + 0.5, 5.0), updated_at = now() WHERE repo = $1 AND id = ANY($2)"
+            } else {
+                "UPDATE edges SET weight = LEAST(weight + 0.5, 5.0) WHERE repo = $1 AND id = ANY($2)"
+            };
+            client.execute(sql, &[&repo, &edge_ids]).await?;
+            Ok(())
+        })
+    }
+
+    fn delete_edges_batch(&self, repo: &str, edge_ids: &[i64]) -> Result<()> {
+        if edge_ids.is_empty() {
+            return Ok(());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("DELETE FROM edges WHERE repo = $1 AND id = ANY($2)", &[&repo, &edge_ids]).await?;
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -833,6 +1153,24 @@ mod tests {
         assert_eq!(got.content.as_deref(), Some("fn foo() { changed }"));
 
         store.delete_nodes("pg-repo-a", &[id1]).unwrap();
+    }
+
+    #[test]
+    fn a_clone_shares_the_same_pool_not_a_fresh_one() {
+        // Regression test for the actual production incident this Clone
+        // impl fixes: confirms a cloned store sees writes made through the
+        // original (same pool/connections), not an independent one -- the
+        // property that lets `AppState` share one `PostgresGraphStore`
+        // across concurrent requests instead of `connect()`-ing fresh per
+        // request.
+        let store = require_store!();
+        let cloned = store.clone();
+
+        let id = upsert_node(&store, node("pg-repo-clone", NodeKind::File, Some("a.rs"), None)).unwrap();
+        let seen_via_clone = cloned.get_node("pg-repo-clone", id).unwrap();
+        assert!(seen_via_clone.is_some(), "a clone must see writes made through the original store");
+
+        store.delete_nodes("pg-repo-clone", &[id]).unwrap();
     }
 
     #[test]
@@ -1016,5 +1354,216 @@ mod tests {
         let id = upsert_node(&store, node("pg-repo-j", NodeKind::Symbol, Some("a.rs"), Some("sym"))).unwrap();
         assert!(store.set_embedding("pg-repo-other", id, &unit_vec(0)).is_err());
         store.delete_nodes("pg-repo-j", &[id]).unwrap();
+    }
+
+    #[test]
+    fn upsert_nodes_batch_inserts_new_then_updates_the_same_natural_key_in_place() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-upsert";
+        let first = vec![node(repo, NodeKind::File, Some("a.py"), None)];
+        let ids1 = store.upsert_nodes_batch(&first).unwrap();
+
+        let mut second = node(repo, NodeKind::File, Some("a.py"), None);
+        second.content = Some("changed".into());
+        let ids2 = store.upsert_nodes_batch(&[second]).unwrap();
+
+        assert_eq!(ids1, ids2, "same natural key must preserve the node's id, not create a second row");
+        let got = store.get_node(repo, ids2[0]).unwrap().unwrap();
+        assert_eq!(got.content.as_deref(), Some("changed"));
+
+        store.delete_nodes(repo, &ids1).unwrap();
+    }
+
+    /// The highest-risk correctness detail this plan called out explicitly:
+    /// a naive `UNNEST` + `=` join does *not* preserve `find_node`'s
+    /// `IS NOT DISTINCT FROM` semantics for NULL path/name/container --
+    /// two File nodes that both have no `name` must not collide with each
+    /// other in a batch upsert.
+    #[test]
+    fn upsert_nodes_batch_does_not_cross_match_two_nodes_that_both_have_a_null_name() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-null-safe";
+        let nodes = vec![node(repo, NodeKind::File, Some("a.rs"), None), node(repo, NodeKind::File, Some("b.rs"), None)];
+        let ids = store.upsert_nodes_batch(&nodes).unwrap();
+
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "two distinct File nodes with no name must not collide into the same row");
+        assert_eq!(store.get_node(repo, ids[0]).unwrap().unwrap().path.as_deref(), Some("a.rs"));
+        assert_eq!(store.get_node(repo, ids[1]).unwrap().unwrap().path.as_deref(), Some("b.rs"));
+
+        store.delete_nodes(repo, &ids).unwrap();
+    }
+
+    /// Regression test for the id-recovery join's ordinality-based ordering
+    /// -- `upsert_nodes_batch` promises ids back in input order so a caller
+    /// can `zip` the two slices; this is the property that promise actually
+    /// depends on.
+    #[test]
+    fn upsert_nodes_batch_returns_ids_in_the_same_order_as_the_input() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-order";
+        let nodes: Vec<NewNode> = (0..5).map(|i| node(repo, NodeKind::File, Some(&format!("f{i}.rs")), None)).collect();
+        let ids = store.upsert_nodes_batch(&nodes).unwrap();
+
+        assert_eq!(ids.len(), 5);
+        for (i, id) in ids.iter().enumerate() {
+            let got = store.get_node(repo, *id).unwrap().unwrap();
+            assert_eq!(got.path.as_deref(), Some(format!("f{i}.rs").as_str()), "id at position {i} must correspond to input position {i}");
+        }
+
+        store.delete_nodes(repo, &ids).unwrap();
+    }
+
+    /// Regression test for a real production incident: the scanner can
+    /// legitimately emit two `Symbol` entries sharing the same natural key
+    /// `(path, name, container)` within one file's symbol list, and the
+    /// first version of this override sent both straight through to one
+    /// `INSERT ... ON CONFLICT DO UPDATE` statement -- Postgres rejects
+    /// that outright ("ON CONFLICT DO UPDATE command cannot affect row a
+    /// second time"), which surfaced live as every scan of a real repo
+    /// failing with "persisting scan: db error" the moment it hit a file
+    /// with this shape. Confirms both that the call succeeds and that the
+    /// id-lookup for the *duplicate* position still resolves correctly
+    /// (same id as the position that actually won the upsert), preserving
+    /// the "one id per input position" contract even though only one row
+    /// existed in Postgres to answer both queries.
+    #[test]
+    fn upsert_nodes_batch_tolerates_two_entries_sharing_the_same_natural_key() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-dup-key";
+        let mut first = node(repo, NodeKind::Symbol, Some("a.rs"), Some("foo"));
+        first.content = Some("v1".into());
+        let mut second = node(repo, NodeKind::Symbol, Some("a.rs"), Some("foo"));
+        second.content = Some("v2".into());
+
+        let ids = store.upsert_nodes_batch(&[first, second]).unwrap();
+        assert_eq!(ids.len(), 2, "one id per input position, even for the duplicate-keyed one");
+        assert_eq!(ids[0], ids[1], "both positions share the same natural key, so they must resolve to the same underlying row");
+
+        let got = store.get_node(repo, ids[0]).unwrap().unwrap();
+        assert_eq!(got.content.as_deref(), Some("v2"), "last-wins, matching a sequential upsert_node loop's own semantics");
+
+        store.delete_nodes(repo, &[ids[0]]).unwrap();
+    }
+
+    #[test]
+    fn find_nodes_batch_does_not_cross_match_two_nodes_that_both_have_a_null_name() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-find-null-safe";
+        let ids = store.upsert_nodes_batch(&[node(repo, NodeKind::File, Some("a.rs"), None), node(repo, NodeKind::File, Some("b.rs"), None)]).unwrap();
+
+        let found = store.find_nodes_batch(repo, &[(NodeKind::File, Some("a.rs"), None, None), (NodeKind::File, Some("b.rs"), None, None)]).unwrap();
+        assert_eq!(found.len(), 2);
+        assert_eq!(found.get(&(NodeKind::File, Some("a.rs".to_string()), None, None)).map(|n| n.path.as_deref()), Some(Some("a.rs")));
+        assert_eq!(found.get(&(NodeKind::File, Some("b.rs".to_string()), None, None)).map(|n| n.path.as_deref()), Some(Some("b.rs")));
+
+        store.delete_nodes(repo, &ids).unwrap();
+    }
+
+    #[test]
+    fn set_embeddings_batch_round_trips_every_vector_to_its_own_node() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-embed";
+        let ids = store.upsert_nodes_batch(&[node(repo, NodeKind::Symbol, Some("a.rs"), Some("a")), node(repo, NodeKind::Symbol, Some("b.rs"), Some("b"))]).unwrap();
+
+        store.set_embeddings_batch(repo, &[(ids[0], unit_vec(0)), (ids[1], unit_vec(1))]).unwrap();
+
+        let hits = store.search_similar(repo, &unit_vec(0), 1, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.id, ids[0], "the node embedded with unit_vec(0) must be the nearest match for that same query");
+
+        store.delete_nodes(repo, &ids).unwrap();
+    }
+
+    #[test]
+    fn add_edges_batch_creates_every_edge_in_one_call() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-edges";
+        let a = test_symbol_pg(&store, repo, "a");
+        let b = test_symbol_pg(&store, repo, "b");
+        let c = test_symbol_pg(&store, repo, "c");
+
+        store.add_edges_batch(repo, &[(a, b, EdgeRelation::DependsOn), (a, c, EdgeRelation::References)]).unwrap();
+
+        let edges = store.edges_from(repo, a).unwrap();
+        assert_eq!(edges.len(), 2);
+
+        store.delete_nodes(repo, &[a, b, c]).unwrap();
+    }
+
+    #[test]
+    fn edges_from_batch_includes_an_empty_vec_for_a_src_id_with_no_edges() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-edges-from";
+        let a = test_symbol_pg(&store, repo, "a");
+        let b = test_symbol_pg(&store, repo, "b");
+        let c = test_symbol_pg(&store, repo, "c");
+        store.add_edge(repo, a, b, EdgeRelation::DependsOn).unwrap();
+
+        let result = store.edges_from_batch(repo, &[a, c]).unwrap();
+        assert_eq!(result.get(&a).map(Vec::len), Some(1));
+        assert_eq!(result.get(&c).map(Vec::len), Some(0), "a src_id with no edges must still appear, mapped to an empty Vec");
+
+        store.delete_nodes(repo, &[a, b, c]).unwrap();
+    }
+
+    #[test]
+    fn reinforce_edges_batch_bumps_every_edges_weight_and_respects_bump_confirmed_at() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-reinforce";
+        let a = test_symbol_pg(&store, repo, "a");
+        let b = test_symbol_pg(&store, repo, "b");
+        let c = test_symbol_pg(&store, repo, "c");
+        let e1 = store.add_edge(repo, a, b, EdgeRelation::Affects).unwrap();
+        let e2 = store.add_edge(repo, a, c, EdgeRelation::Affects).unwrap();
+
+        store.reinforce_edges_batch(repo, &[e1, e2], false).unwrap();
+        let edges = store.edges_from(repo, a).unwrap();
+        assert!(edges.iter().all(|e| e.weight > 1.0), "{edges:?}");
+
+        store.delete_nodes(repo, &[a, b, c]).unwrap();
+    }
+
+    #[test]
+    fn delete_edges_batch_removes_every_listed_edge_but_leaves_others() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-delete-edges";
+        let a = test_symbol_pg(&store, repo, "a");
+        let b = test_symbol_pg(&store, repo, "b");
+        let c = test_symbol_pg(&store, repo, "c");
+        let e1 = store.add_edge(repo, a, b, EdgeRelation::DependsOn).unwrap();
+        let e2 = store.add_edge(repo, a, c, EdgeRelation::DependsOn).unwrap();
+
+        store.delete_edges_batch(repo, &[e1]).unwrap();
+        let remaining = store.edges_from(repo, a).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, e2);
+
+        store.delete_nodes(repo, &[a, b, c]).unwrap();
+    }
+
+    #[test]
+    fn snapshot_node_versions_batch_closes_the_open_row_and_opens_a_new_one_for_every_node() {
+        let store = require_store!();
+        let repo = "pg-repo-batch-versions";
+        let a = test_symbol_pg(&store, repo, "a");
+        let b = test_symbol_pg(&store, repo, "b");
+        store.snapshot_node_version(a, Some("v1"), Some(1), Some(2)).unwrap();
+        store.snapshot_node_version(b, Some("v1"), Some(1), Some(2)).unwrap();
+
+        store.snapshot_node_versions_batch(repo, &[(a, Some("v2"), Some(1), Some(3)), (b, Some("v2"), Some(1), Some(3))]).unwrap();
+
+        for id in [a, b] {
+            let history = store.node_history(id).unwrap();
+            assert_eq!(history.len(), 2, "{history:?}");
+            assert_eq!(history[0].content.as_deref(), Some("v2"), "the most recent version must be the batch's new one");
+            assert!(history[1].valid_until.is_some(), "the original version must have been closed, not left open");
+        }
+
+        store.delete_nodes(repo, &[a, b]).unwrap();
+    }
+
+    fn test_symbol_pg(store: &PostgresGraphStore, repo: &str, name: &str) -> i64 {
+        upsert_node(store, node(repo, NodeKind::Symbol, Some(&format!("{name}.rs")), Some(name))).unwrap()
     }
 }

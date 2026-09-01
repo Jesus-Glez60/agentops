@@ -107,6 +107,28 @@ fn migrate_add_owner_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Additive `organizations.mcp_access_mode` column -- same idiom as
+/// `migrate_add_owner_column` just above. `DEFAULT 'advisor'`: a brand-new
+/// org (and every pre-existing one, transparently, on next open) starts
+/// read-only-for-write-tools until an admin explicitly opts in to `'full'`
+/// -- matches the deployment-level `AGENTOPS_ACCESS_MODE` env var's own
+/// existing default, just made per-tenant and admin-toggleable instead of
+/// operator-only.
+fn migrate_add_mcp_access_mode_column(conn: &Connection) -> Result<()> {
+    let mut existing_columns = std::collections::HashSet::new();
+    {
+        let mut stmt = conn.prepare("PRAGMA table_info(organizations)")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            existing_columns.insert(row.get::<_, String>(1)?);
+        }
+    }
+    if !existing_columns.contains("mcp_access_mode") {
+        conn.execute("ALTER TABLE organizations ADD COLUMN mcp_access_mode TEXT NOT NULL DEFAULT 'advisor'", [])?;
+    }
+    Ok(())
+}
+
 /// Invite links are valid for this long from creation/resend -- long
 /// enough for a real person to notice an email/Slack message and click it,
 /// short enough that a copy-pasted link left in some old chat log isn't a
@@ -159,6 +181,7 @@ pub const CAP_TEAM_MANAGE_MEMBERS: &str = "team.manage_members";
 pub const CAP_TEAM_MANAGE_ROLES: &str = "team.manage_roles";
 pub const CAP_TEAM_BILLING: &str = "team.billing";
 pub const CAP_INTEGRATIONS_MANAGE: &str = "integrations.manage";
+pub const CAP_MCP_MANAGE_ACCESS_MODE: &str = "mcp.manage_access_mode";
 
 /// The permissions matrix -- **the single source of truth** for what each
 /// role can do, for both the displayed Roles & Permissions matrix and
@@ -179,6 +202,7 @@ pub const PERMISSIONS_MATRIX: &[Capability] = &[
     Capability { key: CAP_TEAM_MANAGE_ROLES, feature_area: "Team & Billing", label: "Assign & change member roles", allowed_roles: &["admin"] },
     Capability { key: CAP_TEAM_BILLING, feature_area: "Team & Billing", label: "Manage billing & subscriptions", allowed_roles: &["admin", "billing"] },
     Capability { key: CAP_INTEGRATIONS_MANAGE, feature_area: "Integrations", label: "Connect, view & remove org-wide integration credentials", allowed_roles: &["admin"] },
+    Capability { key: CAP_MCP_MANAGE_ACCESS_MODE, feature_area: "MCP", label: "Change MCP access mode (Advisor/Full)", allowed_roles: &["admin"] },
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +273,7 @@ impl TeamStore {
         let conn = Connection::open(path).context("opening teams store")?;
         conn.execute_batch(SCHEMA).context("initializing teams schema")?;
         migrate_add_owner_column(&conn).context("migrating organizations.owner_user_id")?;
+        migrate_add_mcp_access_mode_column(&conn).context("migrating organizations.mcp_access_mode")?;
         Ok(Self { conn })
     }
 
@@ -256,6 +281,7 @@ impl TeamStore {
         let conn = Connection::open_in_memory().context("opening in-memory teams store")?;
         conn.execute_batch(SCHEMA).context("initializing teams schema")?;
         migrate_add_owner_column(&conn).context("migrating organizations.owner_user_id")?;
+        migrate_add_mcp_access_mode_column(&conn).context("migrating organizations.mcp_access_mode")?;
         Ok(Self { conn })
     }
 
@@ -298,6 +324,30 @@ impl TeamStore {
         self.conn.execute(
             "INSERT INTO organizations (tenant, owner_user_id) VALUES (?1, ?2) ON CONFLICT(tenant) DO UPDATE SET owner_user_id = excluded.owner_user_id",
             rusqlite::params![tenant, user_id],
+        )?;
+        Ok(())
+    }
+
+    /// Never actually `None` in practice -- the column's own `DEFAULT
+    /// 'advisor'` supplies a value even for a tenant whose `organizations`
+    /// row was inserted via `ensure_organization`'s explicit `(tenant,
+    /// name)` column list (SQLite still applies the default to columns
+    /// omitted from an `INSERT`'s column list). `Option` in the return type
+    /// only to cover the genuinely-missing-row case (a tenant nothing has
+    /// called `ensure_organization` for yet) the same way `owner_user_id`/
+    /// `organization_name` do.
+    pub fn mcp_access_mode(&self, tenant: &str) -> Result<Option<String>> {
+        self.conn.query_row("SELECT mcp_access_mode FROM organizations WHERE tenant = ?1", [tenant], |r| r.get(0)).optional().map_err(Into::into)
+    }
+
+    /// Upsert, same reasoning as `rename_organization`/`set_owner`. Caller
+    /// (the HTTP layer) is responsible for validating `mode` is `"advisor"`
+    /// or `"full"` -- this layer stores whatever string it's given, same
+    /// posture `rename_organization` takes on `name`.
+    pub fn set_mcp_access_mode(&self, tenant: &str, mode: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO organizations (tenant, mcp_access_mode) VALUES (?1, ?2) ON CONFLICT(tenant) DO UPDATE SET mcp_access_mode = excluded.mcp_access_mode",
+            rusqlite::params![tenant, mode],
         )?;
         Ok(())
     }
@@ -830,6 +880,26 @@ mod tests {
         let store = TeamStore::open_in_memory().unwrap();
         store.set_owner("tenant-a", 1).unwrap();
         assert_eq!(store.owner_user_id("tenant-a").unwrap(), Some(1));
+    }
+
+    #[test]
+    fn mcp_access_mode_defaults_to_advisor_once_a_row_exists_and_set_upserts() {
+        let store = TeamStore::open_in_memory().unwrap();
+        assert_eq!(store.mcp_access_mode("tenant-a").unwrap(), None, "no organizations row yet");
+
+        store.ensure_organization("tenant-a", "Ada's Org").unwrap();
+        assert_eq!(store.mcp_access_mode("tenant-a").unwrap(), Some("advisor".to_string()), "the column's own DEFAULT applies even though ensure_organization's INSERT doesn't list it");
+
+        store.set_mcp_access_mode("tenant-a", "full").unwrap();
+        assert_eq!(store.mcp_access_mode("tenant-a").unwrap(), Some("full".to_string()));
+        assert_eq!(store.organization_name("tenant-a").unwrap(), Some("Ada's Org".to_string()), "must not clobber the name");
+    }
+
+    #[test]
+    fn set_mcp_access_mode_upserts_even_with_no_prior_organizations_row() {
+        let store = TeamStore::open_in_memory().unwrap();
+        store.set_mcp_access_mode("tenant-a", "full").unwrap();
+        assert_eq!(store.mcp_access_mode("tenant-a").unwrap(), Some("full".to_string()));
     }
 
     #[test]

@@ -148,6 +148,7 @@ pub(crate) async fn subgraph_json(State(state): State<AppState>, AxumPath((repo_
 
     let manifest_path = state.manifest_path.clone();
     let mode = q.mode.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<SubgraphResponse>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
@@ -155,7 +156,7 @@ pub(crate) async fn subgraph_json(State(state): State<AppState>, AxumPath((repo_
         if !path.exists() {
             return Ok(None);
         }
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
         build_subgraph(store.as_ref(), &repo_name, id, &mode, depth, &kinds)
     })
     .await;
@@ -236,6 +237,7 @@ pub(crate) async fn repo_graph_json(State(state): State<AppState>, AxumPath(repo
     };
 
     let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<RepoGraphResponse>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
@@ -243,7 +245,7 @@ pub(crate) async fn repo_graph_json(State(state): State<AppState>, AxumPath(repo
         if !path.exists() {
             return Ok(None);
         }
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
         Ok(Some(build_repo_graph(store.as_ref(), &repo_name, &kinds)?))
     })
     .await;
@@ -274,6 +276,7 @@ pub(crate) async fn repo_graph_json(State(state): State<AppState>, AxumPath(repo
 /// `reinforce_edge`'s own doc comment already describes for `add_note`.
 pub(crate) async fn reinforce_edge_json(State(state): State<AppState>, AxumPath((repo_name, id)): AxumPath<(String, i64)>) -> (StatusCode, Json<Value>) {
     let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<()>> {
         let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
         let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
@@ -281,7 +284,7 @@ pub(crate) async fn reinforce_edge_json(State(state): State<AppState>, AxumPath(
         if !path.exists() {
             return Ok(None);
         }
-        let store = agentops_mcp::open_store(&path)?;
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
 
         if !store.all_edges(&repo_name)?.iter().any(|e| e.id == id) {
             return Ok(None);

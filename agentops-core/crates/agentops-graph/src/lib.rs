@@ -18,10 +18,12 @@ mod sqlite;
 
 pub use sqlite::SqliteGraphStore;
 
+use std::collections::HashMap;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeKind {
     Symbol,
     File,
@@ -561,6 +563,14 @@ pub struct SessionEvent {
 /// trait boundary is what lets a future adapter (Postgres-backed, shared
 /// across repos) exist without touching any use-case or MCP-handler code.
 pub trait GraphStore {
+    /// `PostgresGraphStore` enforces this trait's own natural-key identity
+    /// rule (`repo, kind, path, name, container`) at the schema level via a
+    /// unique index (`idx_nodes_natural_key`) — a direct `add_node` call for
+    /// a node whose natural key collides with an existing row now fails
+    /// loudly there instead of silently creating a duplicate. Not a concern
+    /// for any current call site (every one already goes through
+    /// `upsert_node`, which checks first), but worth knowing before adding a
+    /// new one that calls `add_node` directly.
     fn add_node(&self, node: NewNode) -> Result<i64>;
     fn get_node(&self, repo: &str, id: i64) -> Result<Option<Node>>;
     fn nodes_by_kind(&self, repo: &str, kind: NodeKind) -> Result<Vec<Node>>;
@@ -738,7 +748,155 @@ pub trait GraphStore {
     /// first. Same "best-first, don't compare the score across sources"
     /// contract as `search_lexical`.
     fn search_exact(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>>;
+
+    // -- Batch primitives (Postgres pool/batching plan, Phase 2) --
+    //
+    // Every method below has a correct, loop-based default impl, so
+    // `SqliteGraphStore` inherits working (if unbatched) behavior for free
+    // -- only `PostgresGraphStore` overrides these with real multi-row SQL
+    // (`UNNEST`-based), since it's the adapter that actually pays a network
+    // round trip per call. `agentops-mcp::scan::persist` is the intended
+    // caller: one call per phase (files, symbols, edges, ...) instead of one
+    // per row, cutting a full scan from O(files×symbols) round trips to
+    // O(files+symbols) against Postgres, with no behavior change against
+    // SQLite.
+
+    /// Batched `find_node`. `keys` are `(kind, path, name, container)`
+    /// tuples; a key with no matching node is simply absent from the
+    /// returned map (never an error) -- same "missing means not found, not
+    /// found means missing" contract `find_node` itself has, just batched.
+    ///
+    /// **Correctness note for any real (non-default) override**: `find_node`
+    /// compares `NULL` path/name/container with `IS`, not `=`, so two
+    /// distinct nodes that both happen to have no `name` (e.g. two `File`
+    /// nodes) never spuriously match each other. A naive `UNNEST` + `=` join
+    /// does *not* preserve that -- any override must replicate the `IS`
+    /// semantics exactly (`PostgresGraphStore`'s does, via `COALESCE`-based
+    /// equality against the same natural-key shape `idx_nodes_natural_key`
+    /// uses).
+    fn find_nodes_batch(&self, repo: &str, keys: &[(NodeKind, Option<&str>, Option<&str>, Option<&str>)]) -> Result<HashMap<NaturalKey, Node>> {
+        let mut out = HashMap::new();
+        for &(kind, path, name, container) in keys {
+            if let Some(node) = self.find_node(repo, kind, path, name, container)? {
+                out.insert((kind, path.map(str::to_string), name.map(str::to_string), container.map(str::to_string)), node);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Batched natural-key upsert -- the batch analog of the free function
+    /// `upsert_node`, not a batched version of `add_node` alone. Returns ids
+    /// in the same order as `nodes`, so a caller can `zip` the two slices
+    /// back together. Tolerates `nodes` containing two (or more) entries
+    /// sharing the same natural key -- last-wins, matching what a
+    /// sequential loop of `upsert_node` calls would do. This is not just a
+    /// hypothetical edge case: confirmed live in production that
+    /// `agentops-mcp::scan::persist`'s scanner can legitimately emit two
+    /// `Symbol` entries with the same `(path, name, container)` for one
+    /// file, and a naive `ON CONFLICT`-based override that assumes
+    /// otherwise fails outright ("ON CONFLICT DO UPDATE command cannot
+    /// affect row a second time" -- Postgres refuses to let one `INSERT`
+    /// statement affect the same row twice via its conflict target). Any
+    /// override must dedupe its own insert batch before executing (see
+    /// `PostgresGraphStore`'s implementation for the pattern: dedupe the
+    /// arrays fed to `INSERT`, but resolve returned ids against the *full*,
+    /// non-deduped input so every original position still gets one back).
+    ///
+    /// The default impl duplicates (rather than calls) the free function
+    /// `upsert_node`'s exact `find_node`-then-`update_node`/`add_node` logic
+    /// -- it can't just delegate to that free function per item, since
+    /// `upsert_node` takes `&dyn GraphStore` and coercing `&Self` to that
+    /// inside a default method body would require a `Self: Sized` bound,
+    /// which would exclude this method from `dyn GraphStore`'s vtable --
+    /// and every real caller in this codebase holds its store as
+    /// `Box<dyn GraphStore>`/`&dyn GraphStore`, never a concrete generic
+    /// `S: GraphStore`. Calling `self.find_node(...)`/`self.add_node(...)`
+    /// directly (ordinary trait-method calls, not a free-function argument
+    /// needing unsizing) keeps this dyn-compatible like every other method
+    /// here.
+    fn upsert_nodes_batch(&self, nodes: &[NewNode]) -> Result<Vec<i64>> {
+        nodes
+            .iter()
+            .map(|n| match self.find_node(&n.repo, n.kind, n.path.as_deref(), n.name.as_deref(), n.container.as_deref())? {
+                Some(existing) => {
+                    self.update_node(&n.repo, existing.id, n.start_line, n.end_line, n.content.clone())?;
+                    Ok(existing.id)
+                }
+                None => self.add_node(n.clone()),
+            })
+            .collect()
+    }
+
+    /// Batched `add_edge`. Unlike `upsert_nodes_batch`, plain inserts here
+    /// have no natural-key conflict to resolve (an edge's identity is just
+    /// its own new row), so there's no same-batch-duplicate precondition to
+    /// document.
+    fn add_edges_batch(&self, repo: &str, edges: &[(i64, i64, EdgeRelation)]) -> Result<()> {
+        for &(src_id, dst_id, relation) in edges {
+            self.add_edge(repo, src_id, dst_id, relation)?;
+        }
+        Ok(())
+    }
+
+    /// Batched `set_embedding`.
+    fn set_embeddings_batch(&self, repo: &str, embeddings: &[(i64, Vec<f32>)]) -> Result<()> {
+        for (node_id, embedding) in embeddings {
+            self.set_embedding(repo, *node_id, embedding)?;
+        }
+        Ok(())
+    }
+
+    /// Batched `snapshot_node_version`. `repo` is accepted for symmetry with
+    /// every other batch method and so a real override can scope its
+    /// `UPDATE ... WHERE repo = $n` clause -- `snapshot_node_version` itself
+    /// takes no `repo` (see its own doc comment), so the default loop simply
+    /// ignores this parameter when delegating.
+    fn snapshot_node_versions_batch(&self, repo: &str, versions: &[(i64, Option<&str>, Option<i64>, Option<i64>)]) -> Result<()> {
+        let _ = repo;
+        for &(node_id, content, start_line, end_line) in versions {
+            self.snapshot_node_version(node_id, content, start_line, end_line)?;
+        }
+        Ok(())
+    }
+
+    /// Batched `edges_from` -- one lookup per `src_id`, merged into a map
+    /// keyed by `src_id` so a caller doesn't need to remember which input
+    /// order produced which output (unlike `upsert_nodes_batch`'s
+    /// order-preserving contract, order doesn't matter here since every
+    /// result is already tagged with its own `src_id`).
+    fn edges_from_batch(&self, repo: &str, src_ids: &[i64]) -> Result<HashMap<i64, Vec<Edge>>> {
+        let mut out = HashMap::new();
+        for &src_id in src_ids {
+            out.insert(src_id, self.edges_from(repo, src_id)?);
+        }
+        Ok(out)
+    }
+
+    /// Batched `reinforce_edge` -- same `bump_confirmed_at` contract as the
+    /// single-edge method (see its doc comment), applied uniformly across
+    /// every id in one call (`persist()`'s automatic every-scan rematch
+    /// never mixes `true`/`false` within the same batch).
+    fn reinforce_edges_batch(&self, repo: &str, edge_ids: &[i64], bump_confirmed_at: bool) -> Result<()> {
+        for &edge_id in edge_ids {
+            self.reinforce_edge(repo, edge_id, bump_confirmed_at)?;
+        }
+        Ok(())
+    }
+
+    /// Batched `delete_edge`.
+    fn delete_edges_batch(&self, repo: &str, edge_ids: &[i64]) -> Result<()> {
+        for &edge_id in edge_ids {
+            self.delete_edge(repo, edge_id)?;
+        }
+        Ok(())
+    }
 }
+
+/// `(kind, path, name, container)` -- the natural-key identity portion not
+/// already fixed by `repo` (`find_node`'s own first, always-scalar
+/// parameter). Owned strings, since `find_nodes_batch`'s returned map
+/// outlives the borrowed `&str` keys callers pass in.
+pub type NaturalKey = (NodeKind, Option<String>, Option<String>, Option<String>);
 
 /// Ranks every `kind` node (`Gotcha`/`Decision`) in `repo` by the sum of
 /// `effective_weight` across its own outgoing `Affects` edges (a note is
@@ -1011,6 +1169,58 @@ mod tests {
         store
             .add_node(NewNode { kind: NodeKind::Symbol, repo: repo.into(), path: Some(format!("{name}.py")), name: Some(name.into()), container: None, start_line: Some(1), end_line: Some(2), content: Some(name.into()) })
             .unwrap()
+    }
+
+    /// The whole point of `upsert_nodes_batch`'s default body calling
+    /// `self.find_node`/`self.add_node`/`self.update_node` directly (instead
+    /// of the free function `upsert_node`, which needs `&dyn GraphStore`) is
+    /// so this compiles and works through a boxed trait object, matching
+    /// every real call site in this codebase (`scan.rs::persist` holds its
+    /// store as `Box<dyn GraphStore>`, never a concrete generic).
+    #[test]
+    fn upsert_nodes_batch_is_callable_through_a_boxed_trait_object() {
+        let store: Box<dyn GraphStore> = Box::new(SqliteGraphStore::open_in_memory().unwrap());
+        let node = NewNode { kind: NodeKind::File, repo: "repo-a".into(), path: Some("a.py".into()), name: None, container: None, start_line: None, end_line: None, content: None };
+        let ids = store.upsert_nodes_batch(&[node]).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert!(store.get_node("repo-a", ids[0]).unwrap().is_some());
+    }
+
+    #[test]
+    fn upsert_nodes_batch_inserts_new_then_updates_the_same_natural_key_in_place() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let first = NewNode { kind: NodeKind::File, repo: "repo-a".into(), path: Some("a.py".into()), name: None, container: None, start_line: None, end_line: None, content: Some("v1".into()) };
+        let ids1 = store.upsert_nodes_batch(&[first]).unwrap();
+
+        let second = NewNode { kind: NodeKind::File, repo: "repo-a".into(), path: Some("a.py".into()), name: None, container: None, start_line: None, end_line: None, content: Some("v2".into()) };
+        let ids2 = store.upsert_nodes_batch(&[second]).unwrap();
+
+        assert_eq!(ids1, ids2, "same natural key must preserve the node's id, not create a second row");
+        let node = store.get_node("repo-a", ids2[0]).unwrap().unwrap();
+        assert_eq!(node.content.as_deref(), Some("v2"), "the second upsert must have updated the existing row's content");
+    }
+
+    #[test]
+    fn find_nodes_batch_returns_only_keys_that_actually_matched() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.add_node(NewNode { kind: NodeKind::File, repo: "repo-a".into(), path: Some("a.py".into()), name: None, container: None, start_line: None, end_line: None, content: None }).unwrap();
+
+        let found = store.find_nodes_batch("repo-a", &[(NodeKind::File, Some("a.py"), None, None), (NodeKind::File, Some("missing.py"), None, None)]).unwrap();
+        assert_eq!(found.len(), 1, "only the key that actually matched a node should appear in the result");
+        assert!(found.contains_key(&(NodeKind::File, Some("a.py".to_string()), None, None)));
+    }
+
+    #[test]
+    fn edges_from_batch_keys_results_by_their_own_src_id() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = test_symbol(&store, "repo-a", "a");
+        let b = test_symbol(&store, "repo-a", "b");
+        let c = test_symbol(&store, "repo-a", "c");
+        store.add_edge("repo-a", a, b, EdgeRelation::DependsOn).unwrap();
+
+        let result = store.edges_from_batch("repo-a", &[a, c]).unwrap();
+        assert_eq!(result.get(&a).map(Vec::len), Some(1));
+        assert_eq!(result.get(&c).map(Vec::len), Some(0), "a src_id with no edges must still appear, mapped to an empty Vec");
     }
 
     /// `bounded_neighborhood` accepts multiple seeds -- new behavior not

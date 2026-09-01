@@ -60,7 +60,17 @@ pub async fn run() -> anyhow::Result<()> {
     // of `/activity`, `/local-search`, `/gotchas`, and the `/repos/{id}/...`
     // node/graph/docs routes at the identical paths; see
     // `agentops_api::build_router_without_dashboard_routes`'s doc comment.
-    let agentops_router = agentops_api::build_router_without_dashboard_routes(mode, api_key_hash.clone(), manifest_path);
+    //
+    // `spawn_blocking`-wrapped, not called directly: `build_router_without_dashboard_routes`
+    // connects to Postgres internally when `AGENTOPS_DATABASE_URL` is set,
+    // and `PostgresGraphStore::connect()` spins up and enters its own
+    // dedicated `Runtime`, which panics ("Cannot start a runtime from
+    // within a runtime") if attempted directly from this already-running
+    // `#[tokio::main]` runtime's thread. Confirmed live: this exact panic
+    // took the whole merged server down on deploy the first time this line
+    // called the sync builder unwrapped.
+    let api_key_hash_for_agentops = api_key_hash.clone();
+    let agentops_router = tokio::task::spawn_blocking(move || agentops_api::build_router_without_dashboard_routes(mode, api_key_hash_for_agentops, manifest_path)).await?;
 
     let docbrain_db_path = docbrain_mcp::default_db_path();
     let docbrain_store = SqliteDocbrainStore::open(&docbrain_db_path)?;
