@@ -103,3 +103,25 @@ jobs:
         with:
           files: release/*
           generate_release_notes: true
+
+  # npm/agentops-cli's postinstall shim downloads from this tag's GitHub
+  # Release assets by exact version, so it must only publish once those
+  # assets actually exist -- `needs: [release]`, not `needs: [build-binaries]`,
+  # closes that race.
+  publish-npm:
+    needs: [release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: "https://registry.npmjs.org"
+      - name: Set package version from tag
+        working-directory: npm/agentops-cli
+        run: npm version --no-git-tag-version "${GITHUB_REF_NAME#v}"
+      - name: Publish
+        working-directory: npm/agentops-cli
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

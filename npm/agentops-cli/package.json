@@ -1,0 +1,27 @@
+{
+  "name": "agentops-cli",
+  "version": "0.1.0",
+  "description": "Install the agentops CLI and connect your coding tools (Claude Code, Cursor, Codex CLI, Gemini CLI) to AgentOps.",
+  "bin": {
+    "agentops-cli": "bin/agentops.js"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jesus-Glez60/agentops"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "dependencies": {
+    "cross-spawn": "^7.0.3",
+    "tar": "^7.4.3"
+  }
+}

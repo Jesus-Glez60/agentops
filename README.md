@@ -61,17 +61,19 @@ Whichever method, the first visitor to `/login` sets up the org (they become Own
 
 ### Connect your coding tool
 
-Separately from the server deployment above — this runs on your own machine, against your own repo:
+Separately from the server deployment above — this runs on your own machine, against your own repo. No separate install step needed — `npx agentops-cli` downloads the right platform binary on first run and execs it (macOS, Linux, and Windows, x64 or arm64):
 
 ```sh
 cd your-project
-agentops install    # scan the repo into the graph, generate AGENTS.md
-agentops connect    # register agentops's MCP server + distribute AGENTS.md/skills to Claude Code, Cursor, Codex CLI, Gemini CLI, or others
+npx agentops-cli install   # scan the repo into the graph, generate AGENTS.md
+npx agentops-cli connect   # register agentops's MCP server + distribute AGENTS.md/skills to Claude Code, Cursor, Codex CLI, Gemini CLI, or others
 ```
 
-`agentops connect` is re-runnable any time you want to add another tool. It uses [Ruler](https://github.com/intellectronica/ruler) under the hood, so it also supports every agent Ruler does (Copilot, Windsurf, Aider, Zed, and more) via `--agents <id>` even if not offered in the interactive prompt.
+If you already installed the CLI via the Classic method above, the bare `agentops` binary on your `PATH` works identically (`agentops install`, `agentops connect`) — `npx agentops-cli` and `agentops` are the same binary, just two ways to reach it.
 
-**Connecting to a shared server instead of a local one**: if your team runs agentops on a shared server rather than everyone self-hosting solo, run `agentops connect --remote <server-url>` instead — it points your coding tool at that instance's MCP endpoint (authenticated with a personal API key from Settings → API Keys) rather than scanning a fresh local copy, since the repo is already indexed server-side. If you omit `--remote` and run the command interactively, it asks which case you're in before doing anything.
+`connect` is re-runnable any time you want to add another tool. It uses [Ruler](https://github.com/intellectronica/ruler) under the hood, so it also supports every agent Ruler does (Copilot, Windsurf, Aider, Zed, and more) via `--agents <id>` even if not offered in the interactive prompt.
+
+**Connecting to a shared server instead of a local one**: if your team runs agentops on a shared server rather than everyone self-hosting solo, run `npx agentops-cli connect --remote <server-url>` instead — it points your coding tool at that instance's MCP endpoint (authenticated with a personal API key from Settings → API Keys) rather than scanning a fresh local copy, since the repo is already indexed server-side. If you omit `--remote` and run the command interactively, it asks which case you're in before doing anything.
 
 ## CLI reference
 

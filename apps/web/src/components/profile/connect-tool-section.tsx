@@ -10,19 +10,22 @@
 // home for the same action -- caught live: there was no way to retry or add
 // tools short of re-onboarding.
 import { useState } from "react";
+import { ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 import { createApiKey } from "@/lib/api/profile-api";
 import { ToolSelect, DEFAULT_SELECTED_AGENTS } from "@/components/onboarding/tool-select";
 import { CopyButton } from "@/components/shared/copy-button";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 
 export function ConnectToolSection({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; apiUrlIsGuessed: boolean }) {
   const [selectedAgents, setSelectedAgents] = useState<string[]>(DEFAULT_SELECTED_AGENTS);
   const [apiKey, setApiKey] = useState<string | null>(null);
   const [generating, setGenerating] = useState(false);
   const agentsArg = selectedAgents.length > 0 ? selectedAgents.join(",") : DEFAULT_SELECTED_AGENTS.join(",");
-  const command = apiKey ? `export AGENTOPS_API_KEY=${apiKey} && curl -fsSL ${apiUrl}/connect.sh?agents=${agentsArg} | sh` : "";
+  const npxCommand = apiKey ? `export AGENTOPS_API_KEY=${apiKey} && npx agentops-cli connect --remote ${apiUrl} --api-key "$AGENTOPS_API_KEY" --agents ${agentsArg}` : "";
+  const curlCommand = apiKey ? `export AGENTOPS_API_KEY=${apiKey} && curl -fsSL ${apiUrl}/connect.sh?agents=${agentsArg} | sh` : "";
 
   async function generate() {
     setGenerating(true);
@@ -56,12 +59,24 @@ export function ConnectToolSection({ apiUrl, apiUrlIsGuessed }: { apiUrl: string
           <>
             <p className="text-body text-ink-400">Copy this now — it won&apos;t be shown again. From your own machine (installs the CLI if it isn&apos;t already there), run:</p>
             <div className="flex items-center gap-2">
-              <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{command}</code>
-              <CopyButton value={command} />
+              <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{npxCommand}</code>
+              <CopyButton value={npxCommand} />
             </div>
-            <a href={`${apiUrl}/connect.sh?agents=${agentsArg}`} target="_blank" rel="noreferrer" className="inline-block text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
-              Preview the script before running it
-            </a>
+            <Collapsible>
+              <CollapsibleTrigger className="group flex items-center gap-1 text-body text-ink-500 hover:text-ink-300">
+                <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" />
+                Advanced: install via curl instead
+              </CollapsibleTrigger>
+              <CollapsibleContent className="space-y-2 pt-2">
+                <div className="flex items-center gap-2">
+                  <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{curlCommand}</code>
+                  <CopyButton value={curlCommand} />
+                </div>
+                <a href={`${apiUrl}/connect.sh?agents=${agentsArg}`} target="_blank" rel="noreferrer" className="inline-block text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
+                  Preview the script before running it
+                </a>
+              </CollapsibleContent>
+            </Collapsible>
           </>
         )}
       </CardContent>

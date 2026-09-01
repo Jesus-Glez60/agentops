@@ -14,6 +14,7 @@ import { useRouter } from "next/navigation";
 import useSWR from "swr";
 import { toast } from "sonner";
 import { Check, ChevronDown, ChevronRight } from "lucide-react";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import type { SessionUser } from "@/lib/auth/types";
 import { getTeam, renameOrg, TEAM_SWR_KEY } from "@/lib/api/team-api";
 import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
@@ -77,7 +78,9 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
   // should register, mirroring the CLI's own `select_agents` defaults.
   const [selectedAgents, setSelectedAgents] = useState<string[]>(DEFAULT_SELECTED_AGENTS);
   const agentsArg = selectedAgents.length > 0 ? selectedAgents.join(",") : DEFAULT_SELECTED_AGENTS.join(",");
-  const localCommand = `agentops connect --agents ${agentsArg}`;
+  const localCommand = `npx agentops-cli connect --agents ${agentsArg}`;
+  const localCommandCurl = `agentops connect --agents ${agentsArg}`;
+  const connectNpxCommand = remoteApiKey ? `export AGENTOPS_API_KEY=${remoteApiKey} && npx agentops-cli connect --remote ${apiUrl} --api-key "$AGENTOPS_API_KEY" --agents ${agentsArg}` : "";
   const connectScriptCommand = remoteApiKey ? `export AGENTOPS_API_KEY=${remoteApiKey} && curl -fsSL ${apiUrl}/connect.sh?agents=${agentsArg} | sh` : "";
 
   function toggle(item: string) {
@@ -213,6 +216,18 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
                     <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{localCommand}</code>
                     <CopyButton value={localCommand} />
                   </div>
+                  <Collapsible>
+                    <CollapsibleTrigger className="group flex items-center gap-1 text-body text-ink-500 hover:text-ink-300">
+                      <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" />
+                      Advanced: already have the CLI installed?
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="pt-2">
+                      <div className="flex items-center gap-2">
+                        <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{localCommandCurl}</code>
+                        <CopyButton value={localCommandCurl} />
+                      </div>
+                    </CollapsibleContent>
+                  </Collapsible>
                 </>
               ) : repos && repos.connections.length === 0 ? (
                 <>
@@ -241,12 +256,24 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
                     Copy this now — it won&apos;t be shown again. From your own machine (installs the CLI if it isn&apos;t already there), run:
                   </p>
                   <div className="flex items-center gap-2">
-                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{connectScriptCommand}</code>
-                    <CopyButton value={connectScriptCommand} />
+                    <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{connectNpxCommand}</code>
+                    <CopyButton value={connectNpxCommand} />
                   </div>
-                  <a href={`${apiUrl}/connect.sh?agents=${agentsArg}`} target="_blank" rel="noreferrer" className="text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
-                    Preview the script before running it
-                  </a>
+                  <Collapsible>
+                    <CollapsibleTrigger className="group flex items-center gap-1 text-body text-ink-500 hover:text-ink-300">
+                      <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" />
+                      Advanced: install via curl instead
+                    </CollapsibleTrigger>
+                    <CollapsibleContent className="space-y-2 pt-2">
+                      <div className="flex items-center gap-2">
+                        <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{connectScriptCommand}</code>
+                        <CopyButton value={connectScriptCommand} />
+                      </div>
+                      <a href={`${apiUrl}/connect.sh?agents=${agentsArg}`} target="_blank" rel="noreferrer" className="text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
+                        Preview the script before running it
+                      </a>
+                    </CollapsibleContent>
+                  </Collapsible>
                 </>
               )}
               <p className="text-body text-ink-500">Registers agentops&apos;s MCP server and distributes instructions to Claude Code, Cursor, Codex CLI, Gemini CLI, or another tool you choose.</p>
