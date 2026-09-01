@@ -26,6 +26,16 @@ describe("isAllowedPath", () => {
     expect(isAllowedPath("integrations")).toBe(true);
     expect(isAllowedPath("integrations/me")).toBe(true);
     expect(isAllowedPath("integrations/me/linear")).toBe(true);
+    // Regression: these three were genuinely called by the frontend
+    // (getGotchas/search/getActivity in repos-api.ts) but missing from
+    // this allowlist -- every request 404'd from the proxy itself before
+    // ever reaching the backend, which looked like an empty/broken data
+    // bug (the Gotchas page silently showing 0 of everything) rather than
+    // the routing gap it actually was. Caught live against the deployed
+    // Gotchas page.
+    expect(isAllowedPath("gotchas")).toBe(true);
+    expect(isAllowedPath("local-search")).toBe(true);
+    expect(isAllowedPath("activity")).toBe(true);
   });
 
   it("rejects anything not on the allowlist, including prefix look-alikes", () => {

@@ -11,4 +11,9 @@ export const KIND_TAG_CLASSNAME: Record<NodeKind, string> = {
   Decision: "border-node-decision/40 text-node-decision",
   Definition: "border-node-symbol/40 text-node-symbol",
   Note: "border-node-note/40 text-node-note",
+  // No dedicated --node-doc-section token exists -- reuses File's neutral
+  // tone, same "borrow the nearest existing token" precedent Definition
+  // already sets above rather than growing the design-token set for a
+  // node kind that isn't user-filterable (see GRAPH_FILTERABLE_KINDS).
+  DocSection: "border-node-file/40 text-node-file",
 };

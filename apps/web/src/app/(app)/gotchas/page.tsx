@@ -22,6 +22,7 @@ import { CopyButton } from "@/components/shared/copy-button";
 import { EmptyState } from "@/components/shared/empty-state";
 import { NodeDetailSections } from "@/components/shared/node-detail-sections";
 import { CurationReasonDialog } from "@/components/gotchas/curation-reason-dialog";
+import { mapWithConcurrency } from "@/lib/concurrency";
 import { cn } from "@/lib/utils";
 
 const BUCKET_TABS: { label: string; value: GotchaBucket | "all" }[] = [
@@ -100,7 +101,12 @@ export default function GotchasPage() {
   // it does what's visible on screen, not a silent global action.
   async function applyCurationToMany(targets: GotchaSummary[], prominence: NodeProminence, reason: string | null) {
     if (targets.length === 0) return;
-    const results = await Promise.allSettled(targets.map((g) => setCuration(g.repo, g.id, prominence, reason)));
+    // Concurrency-limited, not a bare `Promise.allSettled(targets.map(...))`
+    // -- the backend opens a fresh Postgres connection pool per request
+    // rather than sharing one, so firing every target at once is a burst
+    // of concurrent pool creations. Confirmed live: an unthrottled "Keep
+    // all" against 54 gotchas failed 32 of them.
+    const results = await mapWithConcurrency(targets, 5, (g) => setCuration(g.repo, g.id, prominence, reason));
     const failed = results.filter((r) => r.status === "rejected").length;
     const succeeded = new Set(targets.filter((_, i) => results[i].status === "fulfilled").map((g) => `${g.repo}:${g.id}`));
     const patch = { curated: true, prominence, curation_reason: prominence === "Reduced" ? reason : null };

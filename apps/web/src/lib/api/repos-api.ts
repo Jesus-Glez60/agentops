@@ -125,6 +125,21 @@ export function connectFromInstallation(installationId: string, repoFullNames: s
   });
 }
 
+/** Shared SWR key for "is the GitHub App connected for this tenant" -- read by both the Team & Access manage card and the Profile read-only indicator, and revalidated by both after a successful install. */
+export const GITHUB_APP_INSTALLATIONS_SWR_KEY = "/repos/github-app/installations";
+
+export interface GithubAppInstallation {
+  id: string;
+  account_login: string;
+  installed_at: string;
+  /** GitHub's own installation-management page -- org vs personal account URL shape resolved server-side (`agentops_github_app::installation_html_url`). */
+  manage_url: string;
+}
+
+export function getGithubAppInstallations(): Promise<{ installations: GithubAppInstallation[] }> {
+  return heavyFetch(GITHUB_APP_INSTALLATIONS_SWR_KEY);
+}
+
 // --- Indexing progress --------------------------------------------------
 
 /** The 9 stages in the exact fixed order the backend always creates them in (`STAGE_ORDER` in `indexing_store.rs`) -- mirrored here as display labels for the wizard's progress screen. */
@@ -226,7 +241,16 @@ export function getActivity(): Promise<ActivityEvent[]> {
 
 // Rust's `NodeKind` serializes as its bare (PascalCase) variant name, e.g.
 // `NodeKind::Symbol` -> `"Symbol"` -- no #[serde(rename_all)] involved.
-export type NodeKind = "Symbol" | "File" | "Gotcha" | "Decision" | "Definition" | "Note";
+// `DocSection` (agentops-graph/src/lib.rs) was missing here entirely --
+// every `Record<NodeKind, ...>` lookup table below was therefore silently
+// incomplete for it, and the graph endpoints do return real DocSection
+// nodes (`subgraph.rs` seeds an "overview" DocSection unconditionally).
+// Indexing an incomplete Record with an unlisted key returns `undefined`
+// at runtime with no compile-time warning (the object literal type-checked
+// fine against the old, incomplete union) -- confirmed live as the actual
+// cause of the /graph page's "element type is invalid" crash: `GraphNode`
+// used the missing key's `undefined` result directly as a JSX component.
+export type NodeKind = "Symbol" | "File" | "Gotcha" | "Decision" | "Definition" | "Note" | "DocSection";
 
 // Same bare-variant-name convention as NodeKind. Curation only ever
 // reorders a gotcha's prominence -- there is no "closed"/hidden state.

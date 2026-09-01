@@ -1,4 +1,4 @@
-import { BookOpen, FileCode, Scale, SquareFunction, TriangleAlert } from "lucide-react";
+import { BookOpen, FileCode, FileText, Scale, SquareFunction, TriangleAlert } from "lucide-react";
 import type { NodeProps, Node as FlowNode } from "@xyflow/react";
 import { Handle, Position } from "@xyflow/react";
 import type { NodeKind, NodeProminence } from "@/lib/api/repos-api";
@@ -12,6 +12,7 @@ const KIND_ICON: Record<NodeKind, typeof SquareFunction> = {
   Decision: Scale,
   Definition: SquareFunction,
   Note: BookOpen,
+  DocSection: FileText,
 };
 
 export interface GraphNodeData {

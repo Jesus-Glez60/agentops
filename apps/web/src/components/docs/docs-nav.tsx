@@ -19,6 +19,11 @@ const BADGE_CLASSNAME: Record<NodeKind, string> = {
   Symbol: "border-node-symbol/30 bg-node-symbol/10 text-node-symbol",
   File: "border-node-file/30 bg-node-file/10 text-node-file",
   Definition: "border-node-symbol/30 bg-node-symbol/10 text-node-symbol",
+  // A knowledge callout's `kind` field is only ever Gotcha/Decision/Note in
+  // practice (see `agentops-mcp/docgen.rs`'s callout generation) -- this
+  // entry exists purely so the Record type-checks exhaustively against the
+  // full NodeKind union, not because a DocSection-kind callout is expected.
+  DocSection: "border-node-file/30 bg-node-file/10 text-node-file",
 };
 
 // No `execution_flows` entry -- ships as an omitted nav group for v1, see

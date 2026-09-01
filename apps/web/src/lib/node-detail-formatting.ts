@@ -4,7 +4,9 @@ import type { NodeKind } from "@/lib/api/repos-api";
 // Note. Shared by the search page and the gotchas page so both label a
 // Note-kind node the same way.
 export function kindLabel(kind: NodeKind): string {
-  return kind === "Note" ? "Docs" : kind;
+  if (kind === "Note") return "Docs";
+  if (kind === "DocSection") return "Doc section";
+  return kind;
 }
 
 // Symbol names alone are frequently ambiguous (every Next.js route handler
