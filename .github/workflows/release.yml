@@ -59,6 +59,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - name: Build
+        # Explicit bash -- this is POSIX `if [ ... ]` syntax, but the
+        # windows-latest runner's default shell is pwsh, which choked
+        # parsing it ("Missing '(' after 'if'") the one time this ran for
+        # real. bash is preinstalled (Git Bash) on GitHub's Windows runners
+        # for exactly this reason.
+        shell: bash
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
             cargo build --release --target ${{ matrix.target }} --bin agentops --bin agentops-server --bin agentops-mcp-server
