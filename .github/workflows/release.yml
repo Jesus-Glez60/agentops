@@ -12,17 +12,13 @@
 # link, trixie's GCC 14 works). ubuntu-24.04 ships GCC 13, which is why
 # it's pinned below rather than ubuntu-latest/22.04.
 #
-# `ort-sys` is also why `x86_64-apple-darwin` can't cross-compile from an
-# Apple Silicon host either (tried live, for real, against this exact
-# workflow): it ships no prebuilt xcframework/binary for that specific
-# cross pair at all ("no prebuilt binaries available for target
-# x86_64-apple-darwin" building from a macos-14 runner) -- it must build
-# natively on real Intel hardware. `macos-13` (the last plain Intel image)
-# is being fully retired -- a real run against it sat "awaiting a runner"
-# for the full 24h job timeout and never even started -- so this uses
-# `macos-15-intel`, GitHub's dedicated Intel-architecture successor label
-# (announced alongside the macos-13 retirement, supported through August
-# 2027).
+# No x86_64-apple-darwin (Intel Mac) target: `ort-sys` 2.0.0-rc.13 ships no
+# prebuilt ONNX Runtime binary for that target at all, on any host --
+# confirmed live against this exact workflow on both a macos-14 cross-
+# compile attempt and a native macos-15-intel build, and matches multiple
+# open upstream issues against pykeio/ort. Not a CI config problem, an
+# upstream gap -- revisit if/when ort ships one again. Intel Mac users can
+# still build from source (`cargo install --path agentops-core/crates/agentops-cli`).
 #
 # This hand-written workflow targets the same platform list as
 # [workspace.metadata.dist] in the root Cargo.toml; running `cargo dist
@@ -46,8 +42,6 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-pc-windows-msvc

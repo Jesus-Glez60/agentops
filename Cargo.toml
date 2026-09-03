@@ -137,6 +137,9 @@ tokenizers = "0.22"
 [workspace.metadata.dist]
 cargo-dist-version = "0.28.0"
 installers = ["shell", "powershell"]
-targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
+# No x86_64-apple-darwin (Intel Mac) -- see release.yml's build-binaries
+# matrix comment: ort-sys 2.0.0-rc.13 ships no prebuilt ONNX Runtime binary
+# for that target on any host, confirmed live, not a CI config gap.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
 ci = "github"
 pr-run-mode = "plan"

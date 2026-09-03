@@ -37,6 +37,16 @@ case "$arch" in
     ;;
 esac
 
+# ort-sys 2.0.0-rc.13 (an agentops dependency, via fastembed) ships no
+# prebuilt ONNX Runtime binary for Intel Mac on any host -- confirmed live
+# against .github/workflows/release.yml, not a gap in this installer --
+# so that release asset was never built. Caught here explicitly rather
+# than letting the curl download below 404 with no useful explanation.
+if [ "$platform_os" = "apple-darwin" ] && [ "$platform_arch" = "x86_64" ]; then
+  echo "error: Intel Mac (x86_64-apple-darwin) isn't supported by prebuilt releases right now -- ort-sys ships no ONNX Runtime binary for it. Build from source instead: cargo install --path agentops-core/crates/agentops-cli (after cloning the repo)." >&2
+  exit 1
+fi
+
 target="${platform_arch}-${platform_os}"
 asset="agentops-${target}.tar.gz"
 release_url="https://github.com/${REPO}/releases/latest/download"

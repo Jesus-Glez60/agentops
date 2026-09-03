@@ -7,8 +7,12 @@ const path = require("path");
 // `${platform_arch}-${platform_os}` convention exactly, since both this
 // shim and install.sh download from the same GitHub Release assets and
 // must resolve to the same cached binary path.
+// No "darwin:x64" (Intel Mac) -- ort-sys 2.0.0-rc.13 ships no prebuilt
+// ONNX Runtime binary for x86_64-apple-darwin on any host, so
+// release.yml's build matrix doesn't produce that asset at all. An Intel
+// Mac falls through to `resolveTarget`'s `null` case below and gets a
+// clear "unsupported platform" error instead of a 404 mid-download.
 const TARGETS = {
-  "darwin:x64": "x86_64-apple-darwin",
   "darwin:arm64": "aarch64-apple-darwin",
   "linux:x64": "x86_64-unknown-linux-gnu",
   "linux:arm64": "aarch64-unknown-linux-gnu",
