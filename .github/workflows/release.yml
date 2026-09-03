@@ -4,13 +4,15 @@
 # "automate the frontend too" requirement -- see install.sh, which
 # downloads and extracts both).
 #
-# Each target builds on a runner whose OS actually matches it (no
-# cross-compilation) -- deliberate given a real, empirically-confirmed
-# constraint: `ort` (ONNX Runtime, via fastembed) downloads a prebuilt
-# library at build time that needs GCC 13+'s libstdc++ ABI (verified while
-# building the Method 1 Docker image -- Debian bookworm's GCC 12 fails to
-# link, trixie's GCC 14 works). ubuntu-24.04 ships GCC 13, which is why
-# it's pinned below rather than ubuntu-latest/22.04.
+# Each target builds on a runner whose OS actually matches it, with one
+# exception (`x86_64-apple-darwin` cross-compiles from `macos-14` -- see
+# that matrix entry's own comment for why) -- deliberate given a real,
+# empirically-confirmed constraint: `ort` (ONNX Runtime, via fastembed)
+# downloads a prebuilt library at build time that needs GCC 13+'s
+# libstdc++ ABI (verified while building the Method 1 Docker image --
+# Debian bookworm's GCC 12 fails to link, trixie's GCC 14 works).
+# ubuntu-24.04 ships GCC 13, which is why it's pinned below rather than
+# ubuntu-latest/22.04.
 #
 # This hand-written workflow targets the same platform list as
 # [workspace.metadata.dist] in the root Cargo.toml; running `cargo dist
@@ -34,8 +36,18 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
+          # GitHub has been retiring `macos-13` (the last Intel-hosted
+          # runner image) -- a real release run against this exact matrix
+          # entry sat "awaiting a runner" for the full 24h job timeout and
+          # never started. `macos-14` is Apple Silicon only, so this target
+          # now cross-compiles from there instead of building natively --
+          # well-established or `rustup target add x86_64-apple-darwin`
+          # plus `cargo build --target` alone is enough, Xcode's own
+          # toolchain on the runner already supports linking for either
+          # Apple Silicon Mach-O target from either host arch.
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-14
+            cross: true
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-pc-windows-msvc
@@ -44,13 +56,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --bin agentops --bin agentops-server --bin agentops-mcp-server
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cargo build --release --target ${{ matrix.target }} --bin agentops --bin agentops-server --bin agentops-mcp-server
+          else
+            cargo build --release --bin agentops --bin agentops-server --bin agentops-mcp-server
+          fi
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          tar -czf dist/agentops-${{ matrix.target }}.tar.gz -C target/release agentops agentops-server agentops-mcp-server
+          BIN_DIR=target/release
+          if [ "${{ matrix.cross }}" = "true" ]; then BIN_DIR=target/${{ matrix.target }}/release; fi
+          tar -czf dist/agentops-${{ matrix.target }}.tar.gz -C "$BIN_DIR" agentops agentops-server agentops-mcp-server
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
