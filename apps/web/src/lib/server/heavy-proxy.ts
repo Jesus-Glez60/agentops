@@ -14,7 +14,12 @@ import { HeavyApiError, heavyApiFetch } from "@/lib/server/heavy-api";
 import { getSessionToken } from "@/lib/auth/session";
 
 /** Prefixes (relative to agentops-heavy-api's root) this proxy will forward -- everything else 404s before any backend call is made. */
-const ALLOWED_PREFIXES = ["auth/me", "auth/sessions", "auth/2fa", "auth/api-keys", "team", "invites", "repos", "integrations", "gotchas", "local-search", "activity"];
+// `auth/cli/device/approve` only, not the broader `auth/cli` prefix --
+// `auth/cli/device`/`auth/cli/device/token` are unauthenticated backend
+// routes the CLI calls directly (never through this session-authed proxy,
+// which requires a token before forwarding anything); only the browser's
+// Approve/Deny click on `/cli-auth` goes through here.
+const ALLOWED_PREFIXES = ["auth/me", "auth/sessions", "auth/2fa", "auth/api-keys", "auth/cli/device/approve", "team", "invites", "repos", "integrations", "gotchas", "local-search", "activity"];
 
 export function isAllowedPath(path: string): boolean {
   return ALLOWED_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));

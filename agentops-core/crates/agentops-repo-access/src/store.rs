@@ -15,6 +15,15 @@ use serde::{Deserialize, Serialize};
 pub enum ConnectionMethod {
     Ssh,
     GitHubApp,
+    /// An agent (via the `register_repo` MCP tool) found this repo's git
+    /// remote mentioned during a session, but no human has granted real
+    /// access yet -- no keypair, no App installation, nothing in
+    /// `public_key_openssh`/`encrypted_private_key_openssh`/
+    /// `installation_id`. Always created `Pending` (see
+    /// `create_discovered_connection`); a human finishes connecting it via
+    /// the same `/repositories/connect` wizard as any other repo, which
+    /// replaces this row's method entirely once real auth material exists.
+    Discovered,
 }
 
 impl ConnectionMethod {
@@ -22,6 +31,7 @@ impl ConnectionMethod {
         match self {
             ConnectionMethod::Ssh => "ssh",
             ConnectionMethod::GitHubApp => "github_app",
+            ConnectionMethod::Discovered => "discovered",
         }
     }
 
@@ -29,6 +39,7 @@ impl ConnectionMethod {
         match s {
             "ssh" => Ok(ConnectionMethod::Ssh),
             "github_app" => Ok(ConnectionMethod::GitHubApp),
+            "discovered" => Ok(ConnectionMethod::Discovered),
             other => anyhow::bail!("unknown connection method {other:?}"),
         }
     }
@@ -174,6 +185,25 @@ impl ConnectionStore {
                 rusqlite::params![id, tenant, repo_url, ConnectionMethod::GitHubApp.as_str(), installation_id, ConnectionStatus::Active.as_db_string()],
             )
             .context("inserting github app repo connection")?;
+        self.get_connection(tenant, id)?.context("just-inserted connection not found — this is a store bug")
+    }
+
+    /// Records a repo an agent found mentioned (a git remote with no
+    /// existing connection) via the `register_repo` MCP tool. Always starts
+    /// `Pending`, like `create_ssh_connection` — never `Active` like
+    /// `create_github_app_connection`, since unlike an App installation-
+    /// token exchange, nothing here proves real access: no keypair was
+    /// generated, no App was installed, an agent just reported seeing this
+    /// URL. A human must still finish connecting it (SSH or GitHub App)
+    /// before anything can actually clone/index it.
+    pub fn create_discovered_connection(&self, tenant: &str, id: &str, repo_url: &str) -> Result<RepoConnection> {
+        self.conn
+            .execute(
+                "INSERT INTO repo_connections (id, tenant, repo_url, method, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, tenant, repo_url, ConnectionMethod::Discovered.as_str(), ConnectionStatus::Pending.as_db_string()],
+            )
+            .context("inserting discovered repo connection")?;
         self.get_connection(tenant, id)?.context("just-inserted connection not found — this is a store bug")
     }
 
@@ -401,6 +431,20 @@ mod tests {
         assert!(store.get_connection("globex", "repo-1").unwrap().is_some());
         let globex_view_of_acme = store.get_connection("globex", "repo-1").unwrap().unwrap();
         assert_eq!(globex_view_of_acme.repo_url, "git@github.com:globex/gadgets.git");
+    }
+
+    #[test]
+    fn create_discovered_connection_starts_pending_with_no_auth_material() {
+        let store = test_store();
+        let created = store.create_discovered_connection("acme", "repo-1", "git@github.com:acme/widgets.git").unwrap();
+        assert_eq!(created.method, ConnectionMethod::Discovered);
+        assert_eq!(created.status, ConnectionStatus::Pending);
+        assert_eq!(created.public_key_openssh, None);
+        assert_eq!(created.encrypted_private_key_openssh, None);
+        assert_eq!(created.installation_id, None);
+
+        let fetched = store.get_connection("acme", "repo-1").unwrap().unwrap();
+        assert_eq!(fetched.repo_url, "git@github.com:acme/widgets.git");
     }
 
     #[test]

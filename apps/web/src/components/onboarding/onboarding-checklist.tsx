@@ -18,7 +18,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import type { SessionUser } from "@/lib/auth/types";
 import { getTeam, renameOrg, TEAM_SWR_KEY } from "@/lib/api/team-api";
 import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
-import { completeOnboarding, createApiKey } from "@/lib/api/profile-api";
+import { completeOnboarding } from "@/lib/api/profile-api";
 import { InviteMemberDialog } from "@/components/team/invite-member-dialog";
 import { CopyButton } from "@/components/shared/copy-button";
 import { ToolSelect, DEFAULT_SELECTED_AGENTS } from "@/components/onboarding/tool-select";
@@ -47,9 +47,12 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
   const { data: team } = useSWR(TEAM_SWR_KEY, getTeam); // also triggers the ensure_membership Owner backfill as a side effect
   // Only relevant for the remote path below -- `agentops connect --remote`
   // needs a server-side connection to point at, but local/stdio mode scans
-  // the repo directly and never touches this at all. Caught live: a
-  // freshly generated key + the exact shown command fails with "no repos
-  // are connected to your organization yet" when this step gets skipped.
+  // the repo directly and never touches this at all. Caught live: the exact
+  // shown command fails with "no repos are connected to your organization
+  // yet" when none exist -- surfaced as an inline hint below the command
+  // rather than a hard gate blocking the whole step, since `register_repo`
+  // now also lets an agent auto-register one during a session instead of
+  // requiring this to be done here first.
   const { data: repos } = useSWR(REPOS_SWR_KEY, getRepos);
   const [expanded, setExpanded] = useState<string | null>("workspace");
   const [finishing, setFinishing] = useState(false);
@@ -68,20 +71,17 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
   // almost always implies shared hosting), never inferred silently.
   const [connectMode, setConnectMode] = useState<"local" | "remote" | null>(null);
   const effectiveConnectMode = connectMode ?? (team && team.member_count > 1 ? "remote" : "local");
-  // Generated inline rather than sending the user to Settings -> API Keys
-  // and back -- that round trip is exactly the kind of friction this
-  // checklist is designed to avoid for a step that's already interrupting
-  // their first login.
-  const [remoteApiKey, setRemoteApiKey] = useState<string | null>(null);
-  const [generatingKey, setGeneratingKey] = useState(false);
   // Shared between both connect modes -- which tools the generated command
   // should register, mirroring the CLI's own `select_agents` defaults.
   const [selectedAgents, setSelectedAgents] = useState<string[]>(DEFAULT_SELECTED_AGENTS);
   const agentsArg = selectedAgents.length > 0 ? selectedAgents.join(",") : DEFAULT_SELECTED_AGENTS.join(",");
   const localCommand = `npx agentops-cli connect --agents ${agentsArg}`;
   const localCommandCurl = `agentops connect --agents ${agentsArg}`;
-  const connectNpxCommand = remoteApiKey ? `export AGENTOPS_API_KEY=${remoteApiKey} && npx agentops-cli connect --remote ${apiUrl} --api-key "$AGENTOPS_API_KEY" --agents ${agentsArg}` : "";
-  const connectScriptCommand = remoteApiKey ? `export AGENTOPS_API_KEY=${remoteApiKey} && curl -fsSL ${apiUrl}/connect.sh?agents=${agentsArg} | sh` : "";
+  // No API key to generate anymore -- `agentops connect` logs in via a
+  // browser-based device-authorization flow the first time it runs, so
+  // this command is identical for every user, no per-visit setup needed.
+  const connectNpxCommand = `npx agentops-cli connect --remote ${apiUrl} --agents ${agentsArg}`;
+  const connectScriptCommand = `curl -fsSL ${apiUrl}/connect.sh?agents=${agentsArg} | sh`;
 
   function toggle(item: string) {
     setExpanded((cur) => (cur === item ? null : item));
@@ -110,18 +110,6 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
       toast.error(err instanceof Error ? err.message : "Couldn't save that name. Please try again.");
     } finally {
       setSavingOrg(false);
-    }
-  }
-
-  async function generateRemoteApiKey() {
-    setGeneratingKey(true);
-    try {
-      const created = await createApiKey("Coding tool");
-      setRemoteApiKey(created.key);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Couldn't generate an API key. Please try again.");
-    } finally {
-      setGeneratingKey(false);
     }
   }
 
@@ -229,21 +217,6 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
                     </CollapsibleContent>
                   </Collapsible>
                 </>
-              ) : repos && repos.connections.length === 0 ? (
-                <>
-                  <p className="text-body text-ink-400">You&apos;ll need at least one connected repository before your coding tool has anything to reach. This is fully web-based — no CLI needed.</p>
-                  <Button size="sm" onClick={() => navigateWithinApp("/repositories/connect")}>
-                    Connect a repository
-                  </Button>
-                  <p className="text-body text-ink-500">Once that&apos;s done, come back here to generate an API key and get the connect command.</p>
-                </>
-              ) : remoteApiKey === null ? (
-                <>
-                  <p className="text-body text-ink-400">Generates a personal API key so your coding tool can authenticate to this server.</p>
-                  <Button size="sm" disabled={generatingKey} onClick={generateRemoteApiKey}>
-                    {generatingKey ? "Generating…" : "Generate API key"}
-                  </Button>
-                </>
               ) : (
                 <>
                   {apiUrlIsGuessed && (
@@ -252,9 +225,16 @@ export function OnboardingChecklist({ user, apiUrl, apiUrlIsGuessed }: { user: S
                       <code className="text-mono-code">AGENTOPS_PUBLIC_API_URL</code> and reload this page.
                     </p>
                   )}
-                  <p className="text-body text-ink-400">
-                    Copy this now — it won&apos;t be shown again. From your own machine (installs the CLI if it isn&apos;t already there), run:
-                  </p>
+                  {repos && repos.connections.length === 0 && (
+                    <p className="text-body text-ink-500">
+                      No repositories are connected yet — an agent can register one automatically the first time it works in an unrecognized repo, or you can{" "}
+                      <button type="button" onClick={() => navigateWithinApp("/repositories/connect")} className="underline underline-offset-2 hover:text-ink-300">
+                        connect one now
+                      </button>
+                      .
+                    </p>
+                  )}
+                  <p className="text-body text-ink-400">From your own machine (installs the CLI if it isn&apos;t already there, then opens a browser to log in), run:</p>
                   <div className="flex items-center gap-2">
                     <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{connectNpxCommand}</code>
                     <CopyButton value={connectNpxCommand} />

@@ -27,6 +27,9 @@ agentops-embeddings = { path = "../agentops-embeddings" }
 agentops-retrieval = { path = "../agentops-retrieval" }
 agentops-manifest = { path = "../agentops-manifest" }
 agentops-ruler-bridge = { path = "../agentops-ruler-bridge" }
+# For `normalize_repo_path` -- shared with the server-side `register_repo`
+# MCP tool so the two never drift apart (see agentops-repo-access::store).
+agentops-repo-access = { path = "../agentops-repo-access" }
 docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
 docbrain-ingest = { path = "../../../docbrain-core/crates/docbrain-ingest" }
@@ -43,6 +46,11 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 ureq = { version = "3", features = ["json"] }
+# For `agentops connect --remote`'s device-authorization login: attempts
+# to auto-open the browser to the verification URL. Shells out to
+# xdg-open/open/`cmd /c start` per-OS -- no HTTP/TLS deps of its own, so
+# no interaction with this workspace's rustls-only policy.
+open = "5"
 
 # (`docgen` command goes through agentops-mcp::generate_docs, no direct
 # agentops-docgen dep needed here.)

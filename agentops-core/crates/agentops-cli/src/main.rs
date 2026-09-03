@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use agentops_graph::{GraphStore, NodeKind};
+use agentops_repo_access::normalize_repo_path;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -254,8 +255,18 @@ enum Command {
         remote: Option<String>,
         /// Personal API key for --remote (generate one from Settings ->
         /// API Keys in the web app). Prompted for interactively if omitted.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "device_login")]
         api_key: Option<String>,
+        /// Skip the interactive "how do you want to authenticate" prompt
+        /// and go straight to browser-based device-authorization login —
+        /// for non-interactive contexts with no stdin at all (e.g.
+        /// `curl | sh`, which `connect.sh` uses this for), where even
+        /// showing a menu would hang forever. A human running this
+        /// directly in a terminal doesn't need this flag; the interactive
+        /// menu already offers the same browser-login option as its
+        /// default choice.
+        #[arg(long, conflicts_with = "api_key")]
+        device_login: bool,
     },
     /// One-off: copy one repo's entire local SQLite graph store into a
     /// Postgres-backed `PostgresGraphStore` (e.g. a server-hosted
@@ -498,7 +509,7 @@ fn main() -> Result<()> {
             TaskAction::SyncLinear { path, limit, push, status_name } => task_sync_linear(&path, limit, push, status_name.as_deref()),
         },
         Command::Init { yes, path } => init(yes, &path),
-        Command::Connect { path, agents, access_mode, yes, remote, api_key } => connect(&path, agents, access_mode, yes, remote, api_key),
+        Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login } => connect(&path, agents, access_mode, yes, remote, api_key, device_login),
         Command::MigrateGraph { from, to, repo, wipe_target } => migrate_graph(&from, &to, &repo, wipe_target),
     }
 }
@@ -802,7 +813,7 @@ fn distribute_via_ruler(path: &Path, agents_md_content: &str, agent_ids: &[Strin
     }
 
     match read_remote_marker(path) {
-        Some(marker) => write_user_level_mcp_entries(agent_ids, None, Some(&marker.server_url)),
+        Some(marker) => write_user_level_mcp_entries(agent_ids, None, Some((&marker.server_url, &marker.api_key))),
         None => write_user_level_mcp_entries(agent_ids, Some(access_mode), None),
     }
 }
@@ -843,7 +854,7 @@ fn select_agents(mut agents: Vec<String>, yes: bool) -> Result<Vec<String>> {
     Ok(agents)
 }
 
-fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>) -> Result<()> {
+fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool) -> Result<()> {
     // Whether to use local/stdio vs. remote/HTTP is not inferable from
     // anything about this invocation on its own (a solo dev can self-host
     // on their own separate personal server too) -- ask directly rather
@@ -874,7 +885,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
             println!("No agents selected — nothing to do.");
             return Ok(());
         }
-        return connect_remote(path, &server_url, api_key, &agents, yes);
+        return connect_remote(path, &server_url, api_key, &agents, yes, device_login);
     }
 
     let agents = select_agents(agents, yes)?;
@@ -933,6 +944,12 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
 struct RemoteMcpMarker {
     server_url: String,
     connection_id: String,
+    // Embedded literally into 3 of 4 tools' MCP config (see
+    // `json_remote_entry`) so re-running `agentops install`/`connect` here
+    // later can re-embed the same key without re-prompting or re-doing
+    // device-login. Written with `0600` perms below — this file carries a
+    // real credential, unlike the rest of `.context/`.
+    api_key: String,
 }
 
 fn remote_marker_path(path: &Path) -> PathBuf {
@@ -944,13 +961,28 @@ fn read_remote_marker(path: &Path) -> Option<RemoteMcpMarker> {
     serde_json::from_str(&content).ok()
 }
 
-fn write_remote_marker(path: &Path, server_url: &str, connection_id: &str) -> Result<()> {
+/// `0600` on Unix, matching the precedent for the only other secret-bearing
+/// file this codebase writes (`agentops-repo-access`'s `write_private_key_file`)
+/// — a no-op permission-wise on Windows, where there's no equivalent bit.
+#[cfg(unix)]
+fn write_remote_marker_file(marker_path: &Path, contents: &str) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(marker_path).with_context(|| format!("writing {}", marker_path.display()))?;
+    std::io::Write::write_all(&mut file, contents.as_bytes()).with_context(|| format!("writing {}", marker_path.display()))
+}
+
+#[cfg(not(unix))]
+fn write_remote_marker_file(marker_path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(marker_path, contents).with_context(|| format!("writing {}", marker_path.display()))
+}
+
+fn write_remote_marker(path: &Path, server_url: &str, connection_id: &str, api_key: &str) -> Result<()> {
     let marker_path = remote_marker_path(path);
     if let Some(parent) = marker_path.parent() {
         std::fs::create_dir_all(parent).context("creating .context/")?;
     }
-    let marker = RemoteMcpMarker { server_url: server_url.to_string(), connection_id: connection_id.to_string() };
-    std::fs::write(&marker_path, serde_json::to_string_pretty(&marker)?).with_context(|| format!("writing {}", marker_path.display()))
+    let marker = RemoteMcpMarker { server_url: server_url.to_string(), connection_id: connection_id.to_string(), api_key: api_key.to_string() };
+    write_remote_marker_file(&marker_path, &serde_json::to_string_pretty(&marker)?)
 }
 
 #[derive(serde::Deserialize)]
@@ -975,44 +1007,6 @@ fn git_remote_url(path: &Path) -> Option<String> {
         .ok()
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-}
-
-/// Reduces a git remote URL to its `owner/repo` path, dropping the host
-/// entirely -- so `git@github-personal:acme/widgets.git` (an SSH config
-/// alias pointing at github.com, e.g. via a `Host github-personal` block in
-/// `~/.ssh/config`) normalizes to the same thing as
-/// `git@github.com:acme/widgets.git`. Caught live: `resolve_connection_id`'s
-/// original exact-string match failed for exactly this case -- a real
-/// checkout using a custom SSH host alias never auto-matched its own
-/// server-recorded `repo_url`, even though it's unambiguously the same
-/// repo. Handles the three shapes git remotes actually come in:
-/// `scheme://[user@]host[:port]/path`, SCP-like `[user@]host:path`
-/// (`.git` suffix optional in either), and a bare path (already just
-/// `owner/repo`, nothing to strip). Returns `None` only for a string with
-/// no recognizable path segment at all.
-fn normalize_repo_path(url: &str) -> Option<String> {
-    let path = if let Some(idx) = url.find("://") {
-        // scheme://[user@]host[:port]/path -- everything after the first
-        // '/' following the scheme is the path; the host (and any userinfo/
-        // port) is exactly what this function exists to ignore.
-        let rest = &url[idx + 3..];
-        rest.split_once('/').map(|(_, p)| p)?
-    } else if let Some(idx) = url.find(':') {
-        // SCP-like `[user@]host:path` -- but a bare Windows-style drive
-        // path like `C:/repo` would also match this pattern; git remotes
-        // are never local Windows paths in practice for this codebase's
-        // deployment targets, so not special-cased here.
-        &url[idx + 1..]
-    } else {
-        url
-    };
-    let trimmed = path.trim_start_matches('/').trim_end_matches('/');
-    let trimmed = trimmed.strip_suffix(".git").unwrap_or(trimmed);
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
 }
 
 fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool) -> Result<String> {
@@ -1094,13 +1088,73 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
     Ok(connections[selected].id.clone())
 }
 
-fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents: &[String], yes: bool) -> Result<()> {
+/// `gh auth login`-style device-authorization flow: no browser required on
+/// this machine (works over SSH on a headless server, the whole reason
+/// this was chosen over a local-loopback redirect) -- prints a short code
+/// and a link, the person approves on *any* device's browser, this polls
+/// until it gets a real API key back. Field/status names match RFC 8628
+/// (OAuth 2.0 Device Authorization Grant) directly.
+fn device_flow_login(server_url: &str) -> Result<String> {
+    let device_name = std::process::Command::new("hostname").output().ok().filter(|o| o.status.success()).and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "this device".to_string());
+
+    let mut response = ureq::post(format!("{server_url}/auth/cli/device")).config().http_status_as_error(false).build().send_json(serde_json::json!({ "device_name": device_name })).context("calling POST /auth/cli/device")?;
+    if !response.status().is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        anyhow::bail!("POST /auth/cli/device returned {}: {body}", response.status());
+    }
+    let start: serde_json::Value = response.body_mut().read_json().context("parsing POST /auth/cli/device response")?;
+    let device_code = start["device_code"].as_str().context("missing device_code in response")?.to_string();
+    let verification_uri_complete = start["verification_uri_complete"].as_str().context("missing verification_uri_complete in response")?;
+    let user_code = start["user_code"].as_str().context("missing user_code in response")?;
+    let expires_in = start["expires_in"].as_u64().unwrap_or(900);
+    let interval = start["interval"].as_u64().unwrap_or(5).max(1);
+
+    println!("\nOpen this URL to authorize this device (code: {user_code}):\n  {verification_uri_complete}\n");
+    if open::that(verification_uri_complete).is_err() {
+        println!("(couldn't open a browser automatically — copy the URL above into one on any device)");
+    }
+    println!("Waiting for approval...");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_in);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("device authorization expired before it was approved — run this again");
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval));
+
+        let mut poll_response = ureq::post(format!("{server_url}/auth/cli/device/token")).config().http_status_as_error(false).build().send_json(serde_json::json!({ "device_code": device_code })).context("calling POST /auth/cli/device/token")?;
+        if !poll_response.status().is_success() {
+            let body = poll_response.body_mut().read_to_string().unwrap_or_default();
+            anyhow::bail!("POST /auth/cli/device/token returned {}: {body}", poll_response.status());
+        }
+        let poll_body: serde_json::Value = poll_response.body_mut().read_json().context("parsing POST /auth/cli/device/token response")?;
+
+        if let Some(api_key) = poll_body["api_key"].as_str() {
+            println!("Authorized.");
+            return Ok(api_key.to_string());
+        }
+        match poll_body["error"].as_str() {
+            Some("authorization_pending") | None => continue,
+            Some("access_denied") => anyhow::bail!("the request was denied in the browser"),
+            Some("expired_token") => anyhow::bail!("device authorization expired before it was approved — run this again"),
+            Some(other) => anyhow::bail!("unexpected response from POST /auth/cli/device/token: {other}"),
+        }
+    }
+}
+
+fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents: &[String], yes: bool, device_login: bool) -> Result<()> {
     let api_key = match api_key {
         Some(k) => k,
-        None if yes => anyhow::bail!("--remote requires --api-key when --yes is set (nothing to prompt for non-interactively)"),
+        None if device_login => device_flow_login(server_url)?,
+        None if yes => anyhow::bail!("--remote requires --api-key or --device-login when --yes is set (nothing to prompt for non-interactively)"),
         None => {
-            println!("Generate a personal API key from Settings -> API Keys in the web app, then paste it below (or pass --api-key next time).");
-            dialoguer::Password::new().with_prompt("API key").interact()?
+            let choice = dialoguer::Select::new().with_prompt("How do you want to authenticate?").items(&["Log in via browser (recommended)", "Paste an already-generated API key"]).default(0).interact()?;
+            if choice == 0 {
+                device_flow_login(server_url)?
+            } else {
+                println!("Generate a personal API key from Settings -> API Keys in the web app.");
+                dialoguer::Password::new().with_prompt("API key").interact()?
+            }
         }
     };
 
@@ -1118,12 +1172,16 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
     // Written before `distribute_via_ruler` runs -- that fn checks for
     // this marker to skip the stdio `.ruler/mcp.json` entry and re-apply
     // the remote native entries as its own last step, every time it runs
-    // from here on (not just this one call). See its doc comment.
-    write_remote_marker(path, server_url, &connection_id)?;
+    // from here on (not just this one call). See its doc comment. Also
+    // carries `api_key` so a later plain `agentops install` re-run can
+    // re-embed the same key without re-prompting or re-doing device-login.
+    write_remote_marker(path, server_url, &connection_id, &api_key)?;
     distribute_via_ruler(path, &agents_md_content, agents, "advisor");
 
     println!("\nConnected to {server_url} (repo: {connection_id}).");
-    println!("Export your API key locally before using your coding tool: export AGENTOPS_API_KEY={api_key}");
+    if agents.iter().any(|a| a == "codex") {
+        println!("Codex CLI still needs `AGENTOPS_API_KEY` exported in your shell — its config format doesn't support embedding a literal key: export AGENTOPS_API_KEY={api_key}");
+    }
     for agent_id in agents {
         match mcp_config_location(agent_id) {
             Some(loc) => println!("  {agent_id}: {} — restart {agent_id} to pick up the new MCP server.", loc.display()),
@@ -1199,19 +1257,19 @@ fn user_level_mcp_config_path(agent_id: &str) -> Option<PathBuf> {
 /// Read-modify-write throughout: any *other* MCP server already configured
 /// in these files (e.g. a user's existing Context7/Linear entries) is
 /// preserved untouched.
-fn write_user_level_mcp_entries(agent_ids: &[String], access_mode: Option<&str>, remote_server_url: Option<&str>) {
+fn write_user_level_mcp_entries(agent_ids: &[String], access_mode: Option<&str>, remote: Option<(&str, &str)>) {
     for agent_id in agent_ids {
         let Some(config_path) = user_level_mcp_config_path(agent_id) else { continue };
         let result = if agent_id == "codex" {
-            let entry = match remote_server_url {
-                Some(url) => codex_remote_entry(url),
-                None => codex_local_entry(access_mode.expect("exactly one of access_mode/remote_server_url is always Some")),
+            let entry = match remote {
+                Some((url, _api_key)) => codex_remote_entry(url),
+                None => codex_local_entry(access_mode.expect("exactly one of access_mode/remote is always Some")),
             };
             write_codex_mcp_entry(&config_path, entry)
         } else {
-            let entry = match remote_server_url {
-                Some(url) => json_remote_entry(agent_id, url),
-                None => json_local_entry(access_mode.expect("exactly one of access_mode/remote_server_url is always Some")),
+            let entry = match remote {
+                Some((url, api_key)) => json_remote_entry(agent_id, url, api_key),
+                None => json_local_entry(access_mode.expect("exactly one of access_mode/remote is always Some")),
             };
             write_json_mcp_entry(&config_path, entry)
         };
@@ -1225,12 +1283,24 @@ fn json_local_entry(access_mode: &str) -> serde_json::Value {
     serde_json::json!({ "type": "stdio", "command": "agentops-mcp-server", "env": { "AGENTOPS_ACCESS_MODE": access_mode } })
 }
 
-fn json_remote_entry(agent_id: &str, server_url: &str) -> serde_json::Value {
+/// Embeds the real key literally rather than an env-var reference —
+/// deliberate, not an oversight: this writes to USER-level config (see
+/// `write_user_level_mcp_entries`'s doc comment), never git-tracked, so the
+/// project-level-config-could-be-committed risk that ruled out embedding a
+/// literal key in an earlier session no longer applies. Without this, every
+/// single MCP request from these three tools (independently authenticated,
+/// no session caching) would fail unless the user separately exported
+/// `AGENTOPS_API_KEY` in whatever shell launches their coding tool — the
+/// exact friction this whole feature exists to remove. Codex CLI is the one
+/// exception (see `codex_remote_entry`): its schema only accepts a named env
+/// var, not a literal token, so it keeps the export requirement.
+fn json_remote_entry(agent_id: &str, server_url: &str, api_key: &str) -> serde_json::Value {
     let url = format!("{server_url}/mcp");
+    let bearer = format!("Bearer {api_key}");
     match agent_id {
-        "claude" => serde_json::json!({ "type": "http", "url": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
-        "gemini-cli" => serde_json::json!({ "httpUrl": url, "headers": { "Authorization": "Bearer ${AGENTOPS_API_KEY}" } }),
-        _ => serde_json::json!({ "url": url, "headers": { "Authorization": "Bearer ${env:AGENTOPS_API_KEY}" } }), // cursor
+        "claude" => serde_json::json!({ "type": "http", "url": url, "headers": { "Authorization": bearer } }),
+        "gemini-cli" => serde_json::json!({ "httpUrl": url, "headers": { "Authorization": bearer } }),
+        _ => serde_json::json!({ "url": url, "headers": { "Authorization": bearer } }), // cursor
     }
 }
 
@@ -1707,31 +1777,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scp_like_and_https_forms_of_the_same_repo_normalize_identically() {
-        assert_eq!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("https://github.com/acme/widgets.git"));
-        assert_eq!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("https://github.com/acme/widgets"));
-    }
-
-    #[test]
-    fn an_ssh_config_alias_host_normalizes_the_same_as_the_real_host() {
-        // The exact bug caught live: a checkout's remote goes through a
-        // `Host github-personal` alias in ~/.ssh/config, but the server
-        // stores the connection's repo_url with the literal github.com host.
-        assert_eq!(normalize_repo_path("git@github-personal:acme/widgets.git"), normalize_repo_path("git@github.com:acme/widgets.git"));
-    }
-
-    #[test]
-    fn different_repos_never_normalize_the_same() {
-        assert_ne!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("git@github.com:acme/gadgets.git"));
-        assert_ne!(normalize_repo_path("git@github.com:acme/widgets.git"), normalize_repo_path("git@github.com:other-org/widgets.git"));
-    }
-
-    #[test]
-    fn ssh_scheme_with_explicit_port_still_normalizes_correctly() {
-        assert_eq!(normalize_repo_path("ssh://git@github.com:22/acme/widgets.git"), normalize_repo_path("git@github.com:acme/widgets.git"));
-    }
-
-    #[test]
     fn user_level_mcp_config_path_resolves_each_known_agent_and_none_for_unknown() {
         assert!(user_level_mcp_config_path("claude").unwrap().ends_with(".claude.json"));
         assert!(user_level_mcp_config_path("cursor").unwrap().ends_with(".cursor/mcp.json"));
@@ -1765,11 +1810,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join(".cursor").join("mcp.json");
 
-        write_json_mcp_entry(&config_path, json_remote_entry("cursor", "https://agentops.example.com")).unwrap();
+        write_json_mcp_entry(&config_path, json_remote_entry("cursor", "https://agentops.example.com", "ao_testkey")).unwrap();
 
         let raw = std::fs::read_to_string(&config_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(parsed["mcpServers"]["agentops"]["url"], "https://agentops.example.com/mcp");
+        assert_eq!(parsed["mcpServers"]["agentops"]["headers"]["Authorization"], "Bearer ao_testkey");
     }
 
     #[test]

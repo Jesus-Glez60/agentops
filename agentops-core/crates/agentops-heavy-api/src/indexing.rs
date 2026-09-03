@@ -227,6 +227,9 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
                 fail_and_return!(STAGE_ORDER[1], format!("{e}"));
             }
         }
+        agentops_repo_access::store::ConnectionMethod::Discovered => {
+            fail_and_return!(STAGE_ORDER[1], "this repo was auto-discovered but not yet connected — finish connecting it from Repositories before it can be indexed".to_string());
+        }
     }
     log!("clone complete");
     if let Some(branch) = &connection.tracked_branch {
@@ -575,6 +578,9 @@ pub async fn list_branches(State(state): State<AppState>, user: Option<axum::Ext
             // github_app_routes.rs's ConnectFromInstallationRequest handler).
             let owner_repo = connection.repo_url.strip_prefix("https://github.com/").and_then(|s| s.strip_suffix(".git")).unwrap_or(&connection.repo_url);
             agentops_github_app::list_repo_branches(&token, owner_repo)
+        }
+        agentops_repo_access::store::ConnectionMethod::Discovered => {
+            return (StatusCode::CONFLICT, Json(json!({ "error": "this repo was auto-discovered but not yet connected — finish connecting it from Repositories first" })));
         }
     };
 

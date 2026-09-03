@@ -41,10 +41,28 @@ struct AccountsState {
     /// one-line fix here, not the many-call-site cost that made `AppState`
     /// keep its fields optional.
     teams: Arc<Mutex<TeamStore>>,
+    /// For building `verification_uri`/`verification_uri_complete` on the
+    /// device-authorization flow's `POST /auth/cli/device` response --
+    /// reuses the same `AGENTOPS_WEB_APP_URL` value `AppState` (the
+    /// `/repos/*` router) already reads for its GitHub App install-flow
+    /// callback, rather than introducing a second env var for the same
+    /// "what's this deployment's own public URL" concept.
+    ///
+    /// Deliberately `Option`, not a silently-wrong fallback like
+    /// `http://localhost:3000` -- caught live: the API backend and the
+    /// web app frontend are commonly on entirely different public domains
+    /// in a real deployment (confirmed against this project's own
+    /// `app.agentops.dedyn.io` web app vs. a separate API host), so
+    /// there's no correct default to guess from the request itself the
+    /// way `connect_sh.rs`'s `derive_remote_url` can for a same-host
+    /// deployment. `cli_device_start` returns a clear, actionable error
+    /// when this is unset rather than minting a device code that would
+    /// point at a dead link.
+    web_app_url: Option<String>,
 }
 
-pub fn build_accounts_integrations_router(accounts: AccountStore, credentials: CredentialStore, secrets: Arc<dyn SecretsProvider + Send + Sync>, teams: TeamStore) -> Router {
-    let state = AccountsState { accounts: Arc::new(Mutex::new(accounts)), credentials: Arc::new(Mutex::new(credentials)), secrets, teams: Arc::new(Mutex::new(teams)) };
+pub fn build_accounts_integrations_router(accounts: AccountStore, credentials: CredentialStore, secrets: Arc<dyn SecretsProvider + Send + Sync>, teams: TeamStore, web_app_url: Option<String>) -> Router {
+    let state = AccountsState { accounts: Arc::new(Mutex::new(accounts)), credentials: Arc::new(Mutex::new(credentials)), secrets, teams: Arc::new(Mutex::new(teams)), web_app_url };
 
     Router::new()
         .route("/integrations", get(list_integrations))
@@ -67,12 +85,15 @@ pub fn build_accounts_integrations_router(accounts: AccountStore, credentials: C
         .route("/auth/2fa/disable", post(disable_2fa))
         .route("/auth/2fa/backup-codes/regenerate", post(regenerate_backup_codes))
         .route("/auth/logout", post(logout))
+        .route("/auth/cli/device/approve", post(cli_device_approve))
         .layer(middleware::from_fn_with_state(state.clone(), require_session))
         .route("/auth/bootstrap-status", get(bootstrap_status))
         .route("/bootstrap/config", post(bootstrap_config))
         .route("/auth/signup", post(signup))
         .route("/auth/login", post(login))
         .route("/auth/login/2fa", post(login_2fa))
+        .route("/auth/cli/device", post(cli_device_start))
+        .route("/auth/cli/device/token", post(cli_device_token))
         .with_state(state)
 }
 
@@ -342,6 +363,94 @@ async fn login_2fa(State(state): State<AccountsState>, headers: axum::http::Head
             (StatusCode::OK, Json(serde_json::to_value(AuthResponse { user: user_view(&accounts, user), session_token }).unwrap()))
         }
         Err(e) => (StatusCode::UNAUTHORIZED, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// `gh auth login`-style device-authorization flow, step 1: a CLI with no
+/// browser of its own (or on a headless/SSH-only machine) requests a code
+/// pair here, then shows `verification_uri_complete` for the person to
+/// open on *any* device with a browser. Field/status names throughout
+/// this flow follow RFC 8628 (OAuth 2.0 Device Authorization Grant)
+/// directly rather than inventing ad-hoc equivalents.
+#[derive(Deserialize)]
+struct CliDeviceStartRequest {
+    device_name: String,
+}
+
+async fn cli_device_start(State(state): State<AccountsState>, Json(req): Json<CliDeviceStartRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(web_app_url) = state.web_app_url.as_deref() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "this deployment hasn't set AGENTOPS_WEB_APP_URL, so device-authorization login can't build a working link — ask your admin to set it, or paste an already-generated API key instead" })),
+        );
+    };
+    let result = { state.accounts.lock().unwrap().create_device_auth_code(&req.device_name) };
+    match result {
+        Ok((device_code, user_code, expires_in)) => {
+            let verification_uri = format!("{web_app_url}/cli-auth");
+            let verification_uri_complete = format!("{web_app_url}/cli-auth?code={user_code}");
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "device_code": device_code,
+                    "user_code": user_code,
+                    "verification_uri": verification_uri,
+                    "verification_uri_complete": verification_uri_complete,
+                    "expires_in": expires_in,
+                    "interval": 5,
+                })),
+            )
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// Step 2: the browser-side approval, called from the logged-in user's own
+/// session (the `/cli-auth` page) when they click Approve/Deny.
+#[derive(Deserialize)]
+struct CliDeviceApproveRequest {
+    user_code: String,
+    action: String,
+}
+
+async fn cli_device_approve(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<CliDeviceApproveRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let approve = match req.action.as_str() {
+        "approve" => true,
+        "deny" => false,
+        _ => return (StatusCode::BAD_REQUEST, Json(json!({ "error": "action must be \"approve\" or \"deny\"" }))),
+    };
+    let result = { state.accounts.lock().unwrap().resolve_device_auth_code(&req.user_code, user.id, approve) };
+    match result {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+/// Step 3: the CLI polls this repeatedly until it stops returning
+/// `authorization_pending`. On `approved`, a key is minted just-in-time --
+/// `resolve_device_auth_code` never stores a raw key anywhere, so this is
+/// the only place one comes into existence, right before being handed
+/// back over the wire once.
+#[derive(Deserialize)]
+struct CliDeviceTokenRequest {
+    device_code: String,
+}
+
+async fn cli_device_token(State(state): State<AccountsState>, Json(req): Json<CliDeviceTokenRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let poll_result = { state.accounts.lock().unwrap().poll_device_auth_code(&req.device_code) };
+    match poll_result {
+        Ok(agentops_accounts::DeviceAuthPollResult::Pending) => (StatusCode::OK, Json(json!({ "error": "authorization_pending" }))),
+        Ok(agentops_accounts::DeviceAuthPollResult::Denied) => (StatusCode::OK, Json(json!({ "error": "access_denied" }))),
+        Ok(agentops_accounts::DeviceAuthPollResult::Expired) => (StatusCode::OK, Json(json!({ "error": "expired_token" }))),
+        Ok(agentops_accounts::DeviceAuthPollResult::Approved { user_id, device_name }) => {
+            let key_name = device_name.map(|n| format!("CLI ({n})")).unwrap_or_else(|| "CLI".to_string());
+            let key_result = { state.accounts.lock().unwrap().create_user_api_key(user_id, &key_name) };
+            match key_result {
+                Ok((_, raw_key)) => (StatusCode::OK, Json(json!({ "status": "approved", "api_key": raw_key }))),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
     }
 }
 
@@ -781,7 +890,7 @@ mod tests {
         let credentials = CredentialStore::open_in_memory().unwrap();
         let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap());
         let teams = TeamStore::open_in_memory().unwrap();
-        build_accounts_integrations_router(accounts, credentials, secrets, teams)
+        build_accounts_integrations_router(accounts, credentials, secrets, teams, Some("http://localhost:3000".to_string()))
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -872,7 +981,7 @@ mod tests {
         let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap());
         let teams = TeamStore::open_in_memory().unwrap();
         let (_, raw_token) = teams.create_invite("tenant-a", "dev@example.com", "member", None, 1).unwrap();
-        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams);
+        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams, Some("http://localhost:3000".to_string()));
 
         let response = app
             .oneshot(
@@ -923,7 +1032,7 @@ mod tests {
 
         let credentials = CredentialStore::open_in_memory().unwrap();
         let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap());
-        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams);
+        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams, Some("http://localhost:3000".to_string()));
 
         let list = app.clone().oneshot(HttpRequest::get("/integrations").header("authorization", format!("Bearer {member_token}")).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(list.status(), StatusCode::FORBIDDEN, "even read access is admin-only");
@@ -961,7 +1070,7 @@ mod tests {
 
         let credentials = CredentialStore::open_in_memory().unwrap();
         let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap());
-        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams);
+        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams, Some("http://localhost:3000".to_string()));
 
         let list_before = app.clone().oneshot(HttpRequest::get("/integrations/me").header("authorization", format!("Bearer {member_token}")).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(list_before.status(), StatusCode::OK, "no capability check for the personal layer");
@@ -1007,7 +1116,7 @@ mod tests {
 
         let credentials = CredentialStore::open_in_memory().unwrap();
         let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap());
-        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams);
+        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams, Some("http://localhost:3000".to_string()));
 
         // The admin sets the org-wide credential.
         app.clone()
@@ -1544,5 +1653,112 @@ mod tests {
 
         let response = app.oneshot(HttpRequest::get("/integrations/linear/oauth/start").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn device_auth_flow_round_trips_from_device_start_through_approve_to_a_real_api_key() {
+        let app = test_router();
+
+        // CLI: request a device code.
+        let start_response = app.clone().oneshot(HttpRequest::post("/auth/cli/device").header("content-type", "application/json").body(Body::from(r#"{"device_name":"Jesus's MacBook"}"#)).unwrap()).await.unwrap();
+        assert_eq!(start_response.status(), StatusCode::OK);
+        let start_body = body_json(start_response).await;
+        assert!(start_body["verification_uri_complete"].as_str().unwrap().starts_with("http://localhost:3000/cli-auth?code="));
+        let device_code = start_body["device_code"].as_str().unwrap().to_string();
+        let user_code = start_body["user_code"].as_str().unwrap().to_string();
+
+        // CLI: polling before approval reports authorization_pending.
+        let pending = app.clone().oneshot(HttpRequest::post("/auth/cli/device/token").header("content-type", "application/json").body(Body::from(json!({ "device_code": device_code }).to_string())).unwrap()).await.unwrap();
+        assert_eq!(body_json(pending).await["error"], "authorization_pending");
+
+        // Browser: the person logs in, then approves.
+        let signup_response =
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"correct horse battery staple","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
+        let session_token = body_json(signup_response).await["session_token"].as_str().unwrap().to_string();
+
+        let approve_response = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/auth/cli/device/approve")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from(json!({ "user_code": user_code, "action": "approve" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(approve_response.status(), StatusCode::OK);
+
+        // CLI: the next poll returns a real, usable API key -- and only once.
+        let approved = app.clone().oneshot(HttpRequest::post("/auth/cli/device/token").header("content-type", "application/json").body(Body::from(json!({ "device_code": device_code }).to_string())).unwrap()).await.unwrap();
+        let approved_body = body_json(approved).await;
+        assert_eq!(approved_body["status"], "approved");
+        let api_key = approved_body["api_key"].as_str().unwrap();
+        assert!(api_key.starts_with("ao_"));
+
+        let list_keys = app.clone().oneshot(HttpRequest::get("/auth/api-keys").header("authorization", format!("Bearer {session_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        let keys = body_json(list_keys).await;
+        assert_eq!(keys.as_array().unwrap()[0]["name"], "CLI (Jesus's MacBook)");
+
+        let expired = app.oneshot(HttpRequest::post("/auth/cli/device/token").header("content-type", "application/json").body(Body::from(json!({ "device_code": device_code }).to_string())).unwrap()).await.unwrap();
+        assert_eq!(body_json(expired).await["error"], "expired_token", "a device_code must not be pollable to \"approved\" twice");
+    }
+
+    #[tokio::test]
+    async fn denying_a_device_auth_code_reports_access_denied_to_the_cli() {
+        let app = test_router();
+        let start_response = app.clone().oneshot(HttpRequest::post("/auth/cli/device").header("content-type", "application/json").body(Body::from(r#"{"device_name":"some device"}"#)).unwrap()).await.unwrap();
+        let start_body = body_json(start_response).await;
+        let device_code = start_body["device_code"].as_str().unwrap().to_string();
+        let user_code = start_body["user_code"].as_str().unwrap().to_string();
+
+        let signup_response =
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"correct horse battery staple","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
+        let session_token = body_json(signup_response).await["session_token"].as_str().unwrap().to_string();
+
+        app.clone()
+            .oneshot(
+                HttpRequest::post("/auth/cli/device/approve")
+                    .header("content-type", "application/json")
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::from(json!({ "user_code": user_code, "action": "deny" }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let polled = app.oneshot(HttpRequest::post("/auth/cli/device/token").header("content-type", "application/json").body(Body::from(json!({ "device_code": device_code }).to_string())).unwrap()).await.unwrap();
+        assert_eq!(body_json(polled).await["error"], "access_denied");
+    }
+
+    #[tokio::test]
+    async fn approving_a_device_code_without_a_session_is_rejected() {
+        let app = test_router();
+        let start_response = app.clone().oneshot(HttpRequest::post("/auth/cli/device").header("content-type", "application/json").body(Body::from(r#"{"device_name":"some device"}"#)).unwrap()).await.unwrap();
+        let user_code = body_json(start_response).await["user_code"].as_str().unwrap().to_string();
+
+        let response = app
+            .oneshot(HttpRequest::post("/auth/cli/device/approve").header("content-type", "application/json").body(Body::from(json!({ "user_code": user_code, "action": "approve" }).to_string())).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// Caught live: the API backend and the web app frontend are commonly
+    /// on entirely different public domains in a real deployment -- a
+    /// silently-guessed fallback URL (e.g. `http://localhost:3000`) would
+    /// mint a device code pointing at a dead link with no indication
+    /// anything was wrong. Must fail loudly and specifically instead.
+    #[tokio::test]
+    async fn device_start_reports_a_clear_error_when_web_app_url_is_not_configured() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let credentials = CredentialStore::open_in_memory().unwrap();
+        let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"ab".repeat(32)).unwrap());
+        let teams = TeamStore::open_in_memory().unwrap();
+        let app = build_accounts_integrations_router(accounts, credentials, secrets, teams, None);
+
+        let response = app.oneshot(HttpRequest::post("/auth/cli/device").header("content-type", "application/json").body(Body::from(r#"{"device_name":"some device"}"#)).unwrap()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body_json(response).await["error"].as_str().unwrap().contains("AGENTOPS_WEB_APP_URL"));
     }
 }

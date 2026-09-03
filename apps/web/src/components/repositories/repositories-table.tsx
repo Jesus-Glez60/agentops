@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { GitBranch, RefreshCw } from "lucide-react";
@@ -82,15 +83,28 @@ export function RepositoriesTable() {
                 <TableCell className="text-mono-code text-ink-400">{relativeTimeFromIsoString(repo.created_at)}</TableCell>
                 <TableCell>
                   <div className="flex justify-end gap-1">
-                    {repo.public_key_openssh && (
-                      <Button variant="outline" size="sm" onClick={() => setKeyDialogRepo(repo)}>
-                        View key
+                    {repo.method === "discovered" ? (
+                      // A discovered connection has no keypair/App install yet
+                      // -- "Verify" assumes real auth material already exists,
+                      // so it needs its own CTA into the same wizard a human
+                      // would otherwise start from scratch, pre-filled with
+                      // the URL an agent already found.
+                      <Button variant="outline" size="sm" asChild>
+                        <Link href={`/repositories/connect/ssh?repo_url=${encodeURIComponent(repo.repo_url)}`}>Finish connecting</Link>
                       </Button>
+                    ) : (
+                      <>
+                        {repo.public_key_openssh && (
+                          <Button variant="outline" size="sm" onClick={() => setKeyDialogRepo(repo)}>
+                            View key
+                          </Button>
+                        )}
+                        <Button variant="outline" size="sm" onClick={() => handleVerify(repo)} disabled={verifying}>
+                          <RefreshCw className={cn("size-3.5", verifying && "animate-spin")} />
+                          Verify
+                        </Button>
+                      </>
                     )}
-                    <Button variant="outline" size="sm" onClick={() => handleVerify(repo)} disabled={verifying}>
-                      <RefreshCw className={cn("size-3.5", verifying && "animate-spin")} />
-                      Verify
-                    </Button>
                   </div>
                 </TableCell>
               </TableRow>

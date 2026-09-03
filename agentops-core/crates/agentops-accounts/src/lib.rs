@@ -77,6 +77,19 @@ pub struct ApiKeyInfo {
     pub created_at: String,
 }
 
+/// What `poll_device_auth_code` finds -- `Expired` covers both "genuinely
+/// past its `expires_at`" and "no such code at all" (already consumed, or
+/// never existed), since a CLI polling after either one should behave
+/// identically: stop and report failure, not distinguish "expired" from
+/// "not found" for what's a single-use, short-lived code anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceAuthPollResult {
+    Pending,
+    Approved { user_id: i64, device_name: Option<String> },
+    Denied,
+    Expired,
+}
+
 /// Everything the Security tab's enroll dialog needs to render the QR code
 /// (`qr_data_uri`, a ready-to-use `data:image/png;base64,...` string) and
 /// the "can't scan? enter this code manually" fallback (`secret_base32`,
@@ -178,6 +191,16 @@ const SCHEMA: &str = "
         expires_at TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS device_auth_codes (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_code_hash TEXT NOT NULL UNIQUE,
+        user_code        TEXT NOT NULL UNIQUE,
+        device_name      TEXT,
+        status           TEXT NOT NULL DEFAULT 'pending',
+        user_id          INTEGER REFERENCES users(id),
+        expires_at       TEXT NOT NULL,
+        created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
 ";
 
 /// Login challenges (the short-lived "password verified, waiting on a 2FA
@@ -192,6 +215,36 @@ const LOGIN_CHALLENGE_LIFETIME_MINUTES: i64 = 5;
 /// mechanism yet (a real follow-up, not built here); a session simply stops
 /// working after 30 days and the user logs in again.
 const SESSION_LIFETIME_DAYS: i64 = 30;
+
+/// A device-authorization code (the `gh auth login`-style CLI flow) lives
+/// this long -- long enough to walk to a browser on another device and
+/// approve it, short enough to bound exposure. Matches GitHub CLI's own
+/// device-flow convention.
+const DEVICE_CODE_LIFETIME_MINUTES: i64 = 15;
+
+/// Charset for the human-typed `user_code` half of the device-auth pair
+/// (the `device_code` half is a full `generate_api_key()` secret, hashed
+/// before storage same as everything else in this file) -- per RFC 8628's
+/// own security recommendation ("enough entropy that, combined with
+/// rate-limiting, brute-force becomes infeasible"; its own example is an
+/// 8-char code over a 20-letter base excluding vowels/ambiguous
+/// characters, ~34.5 bits of entropy). Not a secret by itself -- knowing a
+/// user_code grants nothing without also being logged in as a real
+/// account to approve it -- so it's stored plaintext, unlike device_code.
+const USER_CODE_CHARSET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
+
+/// Generates an 8-character `user_code` (`XXXX-XXXX`) over
+/// `USER_CODE_CHARSET`. No existing short-code generator in this codebase
+/// to reuse (invite tokens use a different, longer mechanism) -- this maps
+/// random bytes into the charset via modulo, which is fine here (a
+/// negligible, non-adversarial bias toward the charset's earlier
+/// characters) since `user_code` isn't itself the secret being protected.
+fn generate_user_code() -> Result<String> {
+    let mut bytes = [0u8; 8];
+    getrandom::fill(&mut bytes).context("generating user code bytes")?;
+    let chars: String = bytes.iter().map(|b| USER_CODE_CHARSET[(*b as usize) % USER_CODE_CHARSET.len()] as char).collect();
+    Ok(format!("{}-{}", &chars[..4], &chars[4..]))
+}
 
 /// Column list shared by every query that constructs a full `User` — kept
 /// as one constant so `user_from_row`'s fixed positional `row.get(N)`
@@ -603,6 +656,76 @@ impl AccountStore {
         let user = self.get_user_by_id(user_id)?.context("user vanished during login challenge completion")?;
         let session_token = self.issue_session(user_id)?;
         Ok((user, session_token))
+    }
+
+    /// Starts a `gh auth login`-style device-authorization flow: a CLI
+    /// with no browser of its own (or on a headless/SSH-only machine)
+    /// gets a long secret (`device_code`, hashed before storage like
+    /// every other secret here) to poll with, and a short human-typeable
+    /// `user_code` to show/print, so a person can approve the request
+    /// from *any* device with a browser -- not necessarily the CLI's own
+    /// machine. Returns `(raw_device_code, user_code, expires_in_secs)`.
+    pub fn create_device_auth_code(&self, device_name: &str) -> Result<(String, String, i64)> {
+        let (raw_device_code, device_code_hash) = generate_api_key().context("generating device code")?;
+        let user_code = generate_user_code()?;
+        self.conn.execute(
+            "INSERT INTO device_auth_codes (device_code_hash, user_code, device_name, expires_at) VALUES (?1, ?2, ?3, datetime('now', ?4))",
+            rusqlite::params![device_code_hash, user_code, device_name, format!("+{DEVICE_CODE_LIFETIME_MINUTES} minutes")],
+        )?;
+        Ok((raw_device_code, user_code, DEVICE_CODE_LIFETIME_MINUTES * 60))
+    }
+
+    /// The browser-side half: a logged-in user clicking Approve/Deny on
+    /// the `/cli-auth` page. Deliberately does NOT mint an API key here --
+    /// see `poll_device_auth_code`'s doc comment for why.
+    pub fn resolve_device_auth_code(&self, user_code: &str, user_id: i64, approve: bool) -> Result<()> {
+        let row: Option<(String, String)> = self.conn.query_row("SELECT status, expires_at FROM device_auth_codes WHERE user_code = ?1", [user_code], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+        let Some((status, expires_at)) = row else {
+            anyhow::bail!("invalid or expired code");
+        };
+        let now: String = self.conn.query_row("SELECT datetime('now')", [], |r| r.get(0))?;
+        if status != "pending" || expires_at < now {
+            anyhow::bail!("invalid or expired code");
+        }
+        let new_status = if approve { "approved" } else { "denied" };
+        self.conn.execute("UPDATE device_auth_codes SET status = ?1, user_id = ?2 WHERE user_code = ?3", rusqlite::params![new_status, if approve { Some(user_id) } else { None }, user_code])?;
+        Ok(())
+    }
+
+    /// The CLI-side half: called repeatedly until it stops returning
+    /// `Pending`. Deliberately never stores a raw API key anywhere --
+    /// `resolve_device_auth_code` only ever stamps `status`/`user_id`, so
+    /// the key this returns on `Approved` is minted just-in-time, right
+    /// here, then the row is deleted (single-use) -- a raw secret is
+    /// never persisted to disk even transiently, matching the invariant
+    /// every other credential in this file already follows.
+    pub fn poll_device_auth_code(&self, raw_device_code: &str) -> Result<DeviceAuthPollResult> {
+        let hash = hash_api_key(raw_device_code);
+        let row: Option<(i64, String, Option<i64>, String, Option<String>)> = self
+            .conn
+            .query_row("SELECT id, status, user_id, expires_at, device_name FROM device_auth_codes WHERE device_code_hash = ?1", [&hash], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+            .optional()?;
+        let Some((id, status, user_id, expires_at, device_name)) = row else {
+            return Ok(DeviceAuthPollResult::Expired);
+        };
+        let now: String = self.conn.query_row("SELECT datetime('now')", [], |r| r.get(0))?;
+        if expires_at < now {
+            self.conn.execute("DELETE FROM device_auth_codes WHERE id = ?1", [id])?;
+            return Ok(DeviceAuthPollResult::Expired);
+        }
+        match status.as_str() {
+            "pending" => Ok(DeviceAuthPollResult::Pending),
+            "denied" => {
+                self.conn.execute("DELETE FROM device_auth_codes WHERE id = ?1", [id])?;
+                Ok(DeviceAuthPollResult::Denied)
+            }
+            "approved" => {
+                let user_id = user_id.context("approved device code missing user_id")?;
+                self.conn.execute("DELETE FROM device_auth_codes WHERE id = ?1", [id])?;
+                Ok(DeviceAuthPollResult::Approved { user_id, device_name })
+            }
+            other => anyhow::bail!("unexpected device_auth_codes status: {other}"),
+        }
     }
 
     /// Public wrapper over `get_user_by_id` -- for callers outside this
@@ -1440,6 +1563,51 @@ mod tests {
 
         // Single-use: the same challenge can't be completed again.
         assert!(store.complete_login_challenge(&secrets, &challenge, &totp.generate_current().unwrap()).is_err());
+    }
+
+    #[test]
+    fn device_auth_code_round_trips_from_creation_through_approval_to_a_single_use_poll() {
+        let store = AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
+
+        let (device_code, user_code, expires_in) = store.create_device_auth_code("Jesus's MacBook").unwrap();
+        assert_eq!(expires_in, DEVICE_CODE_LIFETIME_MINUTES * 60);
+        assert_eq!(user_code.len(), 9); // XXXX-XXXX
+        assert_eq!(store.poll_device_auth_code(&device_code).unwrap(), DeviceAuthPollResult::Pending);
+
+        store.resolve_device_auth_code(&user_code, user.id, true).unwrap();
+        assert_eq!(store.poll_device_auth_code(&device_code).unwrap(), DeviceAuthPollResult::Approved { user_id: user.id, device_name: Some("Jesus's MacBook".to_string()) });
+
+        // Single-use: the same device_code can't be polled to an approved result again.
+        assert_eq!(store.poll_device_auth_code(&device_code).unwrap(), DeviceAuthPollResult::Expired);
+    }
+
+    #[test]
+    fn denying_a_device_auth_code_reports_denied_exactly_once() {
+        let store = AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
+        let (device_code, user_code, _) = store.create_device_auth_code("some device").unwrap();
+
+        store.resolve_device_auth_code(&user_code, user.id, false).unwrap();
+        assert_eq!(store.poll_device_auth_code(&device_code).unwrap(), DeviceAuthPollResult::Denied);
+        assert_eq!(store.poll_device_auth_code(&device_code).unwrap(), DeviceAuthPollResult::Expired);
+    }
+
+    #[test]
+    fn resolving_an_already_resolved_or_unknown_user_code_errors() {
+        let store = AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&store, "dev@example.com", "correct horse battery staple").unwrap();
+        let (_, user_code, _) = store.create_device_auth_code("some device").unwrap();
+
+        store.resolve_device_auth_code(&user_code, user.id, true).unwrap();
+        assert!(store.resolve_device_auth_code(&user_code, user.id, true).is_err(), "already-resolved code must not be resolvable again");
+        assert!(store.resolve_device_auth_code("ZZZZ-ZZZZ", user.id, true).is_err(), "an unknown user_code must error");
+    }
+
+    #[test]
+    fn polling_an_unknown_device_code_reports_expired_not_an_error() {
+        let store = AccountStore::open_in_memory().unwrap();
+        assert_eq!(store.poll_device_auth_code("ao_not-a-real-device-code").unwrap(), DeviceAuthPollResult::Expired);
     }
 
     #[test]

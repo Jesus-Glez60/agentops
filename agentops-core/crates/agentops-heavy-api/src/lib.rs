@@ -621,7 +621,18 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
     // `accounts_for_repos`/`accounts_for_teams` -- needed to gate the
     // org-wide `/integrations*` routes behind `integrations.manage`.
     let teams_for_integrations = agentops_teams::TeamStore::open(&teams_db_path)?;
-    app = app.merge(build_accounts_integrations_router(accounts, credentials, secrets, teams_for_integrations));
+    // Same `AGENTOPS_WEB_APP_URL` `AppState` reads above for the GitHub App
+    // callback -- re-read here rather than threading it across functions,
+    // matching this file's existing per-call-site env-var-read convention.
+    // No fallback default: `cli_device_start` returns a clear error if
+    // this is unset rather than minting a device code pointing at a
+    // guessed, possibly-wrong URL (the API backend and the web frontend
+    // are commonly on different domains in a real deployment).
+    let web_app_url_for_accounts = std::env::var("AGENTOPS_WEB_APP_URL").ok();
+    if web_app_url_for_accounts.is_none() {
+        println!("AGENTOPS_WEB_APP_URL is not set — device-authorization CLI login (`agentops connect --remote`'s browser-login option) will report an error until it's configured; pasting an API key still works.");
+    }
+    app = app.merge(build_accounts_integrations_router(accounts, credentials, secrets, teams_for_integrations, web_app_url_for_accounts));
     println!("Accounts + integrations vault live: POST /auth/signup, POST /auth/login, GET /auth/me, POST /auth/logout, GET /integrations, POST /integrations/{{provider}}.");
 
     // Team Management's Members tab — own connection to the same
@@ -705,6 +716,7 @@ impl From<RepoConnection> for ConnectionView {
         let method = match c.method {
             agentops_repo_access::store::ConnectionMethod::Ssh => "ssh".to_string(),
             agentops_repo_access::store::ConnectionMethod::GitHubApp => "github_app".to_string(),
+            agentops_repo_access::store::ConnectionMethod::Discovered => "discovered".to_string(),
         };
         ConnectionView {
             id: c.id,
@@ -2077,6 +2089,66 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["result"]["isError"], false, "{body:?}");
         assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no scans recorded yet"), "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_register_repo_creates_a_pending_discovered_connection_scoped_to_the_callers_tenant() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (_user, token) = signup(&accounts, "dev@example.com");
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("tools/call", json!({ "name": "register_repo", "arguments": { "repo_url": "git@github.com:acme/widgets.git" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("Registered"), "{body:?}");
+
+        // A follow-up `path`-based tool call against the id this just
+        // created must now resolve past the tenant-ownership check -- same
+        // "no scans recorded yet" success signal the sibling path test
+        // above uses.
+        let mut req = mcp_request("tools/call", json!({ "name": "status", "arguments": { "path": "acme--widgets" } }), 2);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no scans recorded yet"), "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_register_repo_returns_the_existing_connection_instead_of_duplicating() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "own-repo").unwrap();
+        store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/widgets.git", &keypair).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("tools/call", json!({ "name": "register_repo", "arguments": { "repo_url": "git@github.com:acme/widgets.git" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("already connected"), "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_register_repo_only_ever_sees_the_callers_own_tenants_connections() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), "other-tenant", "their-repo").unwrap();
+        store.create_ssh_connection("other-tenant", "their-repo", "git@github.com:acme/widgets.git", &keypair).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("tools/call", json!({ "name": "register_repo", "arguments": { "repo_url": "git@github.com:acme/widgets.git" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        // Must register a *new* connection for this caller's own tenant,
+        // not silently reuse another tenant's row with the same repo_url.
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("Registered"), "{body:?}");
     }
 
     /// Locks in the per-tenant access-mode resolution `mcp_http::resolve_access_mode`

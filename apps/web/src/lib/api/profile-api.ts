@@ -127,3 +127,12 @@ export function createApiKey(name: string): Promise<ApiKeyInfo & { key: string }
 export function revokeApiKey(id: number): Promise<void> {
   return heavyFetch<void>(`/auth/api-keys/${id}`, { method: "DELETE" });
 }
+
+/** `gh auth login`-style CLI device-authorization flow -- the `/cli-auth` page's Approve/Deny buttons. */
+export function approveDeviceAuth(userCode: string): Promise<void> {
+  return heavyFetch<void>("/auth/cli/device/approve", { method: "POST", body: JSON.stringify({ user_code: userCode, action: "approve" }) });
+}
+
+export function denyDeviceAuth(userCode: string): Promise<void> {
+  return heavyFetch<void>("/auth/cli/device/approve", { method: "POST", body: JSON.stringify({ user_code: userCode, action: "deny" }) });
+}

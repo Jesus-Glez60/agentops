@@ -35,8 +35,22 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::tenant_repo::{resolve_connection_path, TenantCaller};
+use crate::tenant_repo::{register_repo, resolve_connection_path, TenantCaller};
 use crate::AppState;
+
+/// Not one of `agentops_mcp::tool_specs()` -- see `handle_tools_call`'s
+/// special-casing below for why (it needs `AppState`/tenant access that
+/// generic tool signature doesn't carry). Appended to every `tools/list`
+/// response here instead, so a client still discovers it via the normal
+/// MCP listing rather than needing to know about it out-of-band.
+fn register_repo_tool_definition() -> agentops_mcp::ToolDefinition {
+    agentops_mcp::ToolDefinition {
+        name: "register_repo",
+        description: "Registers this repo's git remote URL as a pending connection for your organization, if it isn't connected yet. Use this when another tool call reports a repo/path isn't a recognized connection. Returns the existing connection if one already matches. A registered repo still needs a human to finish connecting it (SSH deploy key or GitHub App) from Repositories -> Connect a repository before it can be scanned/indexed.",
+        input_schema: json!({ "type": "object", "properties": { "repo_url": { "type": "string" } }, "required": ["repo_url"] }),
+        annotations: agentops_mcp::ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: false },
+    }
+}
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -80,7 +94,11 @@ pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, Stat
                 "serverInfo": { "name": "agentops-heavy-api", "version": env!("CARGO_PKG_VERSION") },
             }),
         ),
-        "tools/list" => ok(id, json!({ "tools": agentops_mcp::list_tools(resolve_access_mode(&state, &caller.tenant)) })),
+        "tools/list" => {
+            let mut tools = agentops_mcp::list_tools(resolve_access_mode(&state, &caller.tenant));
+            tools.push(register_repo_tool_definition());
+            ok(id, json!({ "tools": tools }))
+        }
         "tools/call" => handle_tools_call(&state, &caller, id, &request.params).await,
         other => err(id, METHOD_NOT_FOUND, format!("method not found: {other}")),
     };
@@ -112,6 +130,14 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     };
     let empty = json!({});
     let mut arguments = params.get("arguments").cloned().unwrap_or(empty);
+
+    if name == "register_repo" {
+        let Some(repo_url) = arguments.get("repo_url").and_then(|v| v.as_str()) else {
+            return err(id, INVALID_PARAMS, "missing 'repo_url' in register_repo arguments");
+        };
+        let message = register_repo(state, &caller.tenant, repo_url);
+        return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": false }));
+    }
 
     if let Some(connection_ref) = arguments.get("path").and_then(|v| v.as_str()).map(str::to_string) {
         match resolve_connection_path(state, &caller.tenant, &connection_ref) {

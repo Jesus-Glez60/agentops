@@ -1,12 +1,15 @@
 //! `GET /connect.sh` -- Initiative 2's one-command remote connect:
 //! `curl -fsSL <server>/connect.sh | sh` installs the `agentops` CLI (if
-//! missing) and runs `agentops connect --remote ... --agents ... --yes`
-//! against *this* server, with the right `--remote` URL and tool selection
-//! already filled in. Deliberately unauthenticated (no tenant/session
-//! logic) -- it's a small, mostly-static script, the same public-
-//! fetchability posture as `install.sh` on GitHub; the real secret (the
-//! user's `AGENTOPS_API_KEY`) is read from the caller's own shell
-//! environment at run time, never embedded in this script's text.
+//! missing) and runs `agentops connect --remote ... --agents ... --yes
+//! --device-login` against *this* server, with the right `--remote` URL and
+//! tool selection already filled in. Deliberately unauthenticated (no
+//! tenant/session logic) -- it's a small, mostly-static script, the same
+//! public-fetchability posture as `install.sh` on GitHub; no API key is
+//! ever embedded in or read by this script at all -- `--device-login`
+//! triggers `agentops-cli`'s browser-based device-authorization flow
+//! instead, which needs no stdin (unlike the interactive credential menu
+//! `agentops connect` shows by default, which would hang forever piped
+//! from `curl`).
 //!
 //! **Self-referential URL, no `AGENTOPS_PUBLIC_API_URL` needed here**: the
 //! handler derives `--remote` from the *incoming request's own*
@@ -110,11 +113,7 @@ _agentops_connect() {{
       export PATH="$HOME/.agentops/bin:$PATH"
     fi
   fi
-  if [ -z "${{AGENTOPS_API_KEY:-}}" ]; then
-    echo "error: set AGENTOPS_API_KEY first (Profile -> Connect a coding tool, or the onboarding checklist's \"Generate API key\")" >&2
-    return 1
-  fi
-  agentops connect --remote "{remote_url}" --api-key "$AGENTOPS_API_KEY" --agents "{agents_csv}" --yes
+  agentops connect --remote "{remote_url}" --agents "{agents_csv}" --yes --device-login
 }}
 _agentops_connect
 "#

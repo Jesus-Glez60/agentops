@@ -85,7 +85,51 @@ pub(crate) fn resolve_connection_path(state: &AppState, tenant: &str, connection
         .flatten()
         .or_else(|| store.list_connections(tenant).ok()?.into_iter().find(|c| c.repo_url == connection_ref));
     let Some(connection) = connection else {
-        return Err(format!("'{connection_ref}' is not a repo connection id or URL for your organization -- use one of the ids/URLs from GET /repos"));
+        return Err(format!(
+            "'{connection_ref}' is not a repo connection id or URL for your organization -- use one of the ids/URLs from GET /repos, or call register_repo with this repo's git remote URL to auto-register it as pending"
+        ));
     };
     Ok(checkout_path(&state.repo_checkouts_dir, tenant, &connection.id))
+}
+
+/// Backs the `register_repo` MCP tool (special-cased in `mcp_http`'s
+/// `handle_tools_call`, alongside `resolve_connection_path`'s `path`
+/// interception -- both need `AppState`/tenant access that
+/// `agentops_mcp::call_tool`'s generic `(mode, name, arguments)` signature
+/// doesn't carry). Lets an agent that finds itself in a repo AgentOps has
+/// never seen register it (as a `Discovered`, `Pending` connection --
+/// `ConnectionMethod::Discovered`'s own doc comment explains why never
+/// `Active`) instead of hitting a dead end, without needing a human to open
+/// the web UI first. Matches by exact `repo_url` first, then by the
+/// shared `normalize_repo_path` (so an SSH-config-alias remote matches an
+/// already-connected repo instead of creating a duplicate row for the same
+/// repo).
+pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: &str) -> String {
+    let store = state.store.lock().unwrap();
+    let connections = store.list_connections(tenant).unwrap_or_default();
+
+    if let Some(existing) = connections.iter().find(|c| c.repo_url == repo_url) {
+        return format!("'{repo_url}' is already connected (id: {}, status: {:?}).", existing.id, existing.status);
+    }
+    if let Some(normalized) = agentops_repo_access::normalize_repo_path(repo_url) {
+        if let Some(existing) = connections.iter().find(|c| agentops_repo_access::normalize_repo_path(&c.repo_url).as_deref() == Some(normalized.as_str())) {
+            return format!("'{repo_url}' matches an already-connected repo (id: {}, status: {:?}).", existing.id, existing.status);
+        }
+    }
+
+    let Some(owner_repo) = agentops_repo_access::normalize_repo_path(repo_url) else {
+        return format!("'{repo_url}' doesn't look like a git remote URL -- nothing to register");
+    };
+    // Same `owner--repo` id convention `github_app_routes`'s installation
+    // connect flow uses for `full_name.replace('/', "--")` -- keeps ids
+    // human-readable and consistent across every way a connection gets
+    // created, not just this one.
+    let id = owner_repo.replace('/', "--");
+
+    match store.create_discovered_connection(tenant, &id, repo_url) {
+        Ok(created) => {
+            format!("Registered '{repo_url}' as a pending connection (id: {}). Ask an admin to finish connecting it from Repositories -> Connect a repository.", created.id)
+        }
+        Err(e) => format!("failed to register '{repo_url}': {e}"),
+    }
 }
