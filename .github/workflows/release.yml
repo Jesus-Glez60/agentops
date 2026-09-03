@@ -4,15 +4,25 @@
 # "automate the frontend too" requirement -- see install.sh, which
 # downloads and extracts both).
 #
-# Each target builds on a runner whose OS actually matches it, with one
-# exception (`x86_64-apple-darwin` cross-compiles from `macos-14` -- see
-# that matrix entry's own comment for why) -- deliberate given a real,
-# empirically-confirmed constraint: `ort` (ONNX Runtime, via fastembed)
-# downloads a prebuilt library at build time that needs GCC 13+'s
-# libstdc++ ABI (verified while building the Method 1 Docker image --
-# Debian bookworm's GCC 12 fails to link, trixie's GCC 14 works).
-# ubuntu-24.04 ships GCC 13, which is why it's pinned below rather than
-# ubuntu-latest/22.04.
+# Each target builds on a runner whose OS actually matches it (no
+# cross-compilation) -- deliberate given a real, empirically-confirmed
+# constraint: `ort` (ONNX Runtime, via fastembed) downloads a prebuilt
+# library at build time that needs GCC 13+'s libstdc++ ABI (verified while
+# building the Method 1 Docker image -- Debian bookworm's GCC 12 fails to
+# link, trixie's GCC 14 works). ubuntu-24.04 ships GCC 13, which is why
+# it's pinned below rather than ubuntu-latest/22.04.
+#
+# `ort-sys` is also why `x86_64-apple-darwin` can't cross-compile from an
+# Apple Silicon host either (tried live, for real, against this exact
+# workflow): it ships no prebuilt xcframework/binary for that specific
+# cross pair at all ("no prebuilt binaries available for target
+# x86_64-apple-darwin" building from a macos-14 runner) -- it must build
+# natively on real Intel hardware. `macos-13` (the last plain Intel image)
+# is being fully retired -- a real run against it sat "awaiting a runner"
+# for the full 24h job timeout and never even started -- so this uses
+# `macos-15-intel`, GitHub's dedicated Intel-architecture successor label
+# (announced alongside the macos-13 retirement, supported through August
+# 2027).
 #
 # This hand-written workflow targets the same platform list as
 # [workspace.metadata.dist] in the root Cargo.toml; running `cargo dist
@@ -36,18 +46,8 @@ jobs:
             os: ubuntu-24.04
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-          # GitHub has been retiring `macos-13` (the last Intel-hosted
-          # runner image) -- a real release run against this exact matrix
-          # entry sat "awaiting a runner" for the full 24h job timeout and
-          # never started. `macos-14` is Apple Silicon only, so this target
-          # now cross-compiles from there instead of building natively --
-          # well-established or `rustup target add x86_64-apple-darwin`
-          # plus `cargo build --target` alone is enough, Xcode's own
-          # toolchain on the runner already supports linking for either
-          # Apple Silicon Mach-O target from either host arch.
           - target: x86_64-apple-darwin
-            os: macos-14
-            cross: true
+            os: macos-15-intel
           - target: aarch64-apple-darwin
             os: macos-14
           - target: x86_64-pc-windows-msvc
@@ -56,28 +56,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
       - name: Build
-        # Explicit bash -- this is POSIX `if [ ... ]` syntax, but the
-        # windows-latest runner's default shell is pwsh, which choked
-        # parsing it ("Missing '(' after 'if'") the one time this ran for
-        # real. bash is preinstalled (Git Bash) on GitHub's Windows runners
-        # for exactly this reason.
+        # Explicit bash -- windows-latest's default shell is pwsh, which
+        # choked ("Missing '(' after 'if'") on this step's POSIX syntax the
+        # one time this used to be conditional here. Not conditional
+        # anymore (see the matrix comment above for why cross-compiling
+        # this away turned out not to work at all), but pinned anyway so a
+        # future edit reintroducing shell syntax here doesn't silently
+        # break on Windows again.
         shell: bash
-        run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
-            cargo build --release --target ${{ matrix.target }} --bin agentops --bin agentops-server --bin agentops-mcp-server
-          else
-            cargo build --release --bin agentops --bin agentops-server --bin agentops-mcp-server
-          fi
+        run: cargo build --release --bin agentops --bin agentops-server --bin agentops-mcp-server
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          BIN_DIR=target/release
-          if [ "${{ matrix.cross }}" = "true" ]; then BIN_DIR=target/${{ matrix.target }}/release; fi
-          tar -czf dist/agentops-${{ matrix.target }}.tar.gz -C "$BIN_DIR" agentops agentops-server agentops-mcp-server
+          tar -czf dist/agentops-${{ matrix.target }}.tar.gz -C target/release agentops agentops-server agentops-mcp-server
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
