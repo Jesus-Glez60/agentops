@@ -286,7 +286,21 @@ fn tool_scrape_library(store: &dyn DocbrainStore, db_path: &Path, args: &Value) 
 }
 
 fn run_scrape_job(db_path: PathBuf, slug: String, version: String, docs_url: String, max_pages: usize, job_id: i64) {
-    let Ok(worker_store) = SqliteDocbrainStore::open(&db_path) else { return };
+    // `SqliteDocbrainStore::open` now sets a busy_timeout + WAL mode (see
+    // its own doc comment), so concurrent-write contention here is rare --
+    // but if opening still fails, there's no store to record a Failed
+    // status through, and the job row is left stuck at "running" forever
+    // with zero visibility. Confirmed live during a stress test: two jobs
+    // out of 68 concurrently-launched ones hit exactly this silent-return
+    // path. Can't fix "stuck forever" without a connection, but at least
+    // this is no longer silent.
+    let worker_store = match SqliteDocbrainStore::open(&db_path) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!("run_scrape_job: job {job_id} ({slug}@{version}) failed to open docbrain store at {}: {e:#}", db_path.display());
+            return;
+        }
+    };
     let outcome: Result<String> = (|| {
         let outcomes = docbrain_ingest::scrape_chunk_and_store(&worker_store, &slug, &version, &docs_url, max_pages)?;
         worker_store.add_doc_snapshot(&slug, &version)?;

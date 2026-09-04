@@ -150,6 +150,21 @@ impl SqliteDocbrainStore {
             std::fs::create_dir_all(parent).with_context(|| format!("creating parent dir for {}", path.display()))?;
         }
         let mut conn = Connection::open(path).with_context(|| format!("opening sqlite db at {}", path.display()))?;
+        // Confirmed live during a real stress test: firing many
+        // `scrape_library(background: true)` calls concurrently against one
+        // tenant's file (one thread per job, each its own `Connection::open`)
+        // produced real `database is locked` failures with no default
+        // busy-timeout -- SQLite's default is to fail a lock attempt
+        // immediately rather than wait. `busy_timeout` makes a writer that
+        // finds the file locked retry for up to the given duration instead
+        // of erroring right away; WAL mode additionally lets readers never
+        // block writers and reduces how often writers contend with each
+        // other in the first place. Safe here since this file is only ever
+        // opened by this one process (one `SqliteDocbrainStore` per tenant),
+        // never shared across processes the way a multi-process WAL caveat
+        // would matter for.
+        conn.busy_timeout(std::time::Duration::from_secs(10)).context("setting busy_timeout")?;
+        conn.pragma_update(None, "journal_mode", "WAL").context("enabling WAL mode")?;
         migrations().to_latest(&mut conn).context("running docbrain store migrations")?;
         conn.execute_batch(&vec_table_migration()).context("creating doc_node_vectors virtual table")?;
         Ok(Self { conn })
@@ -634,5 +649,77 @@ mod tests {
         assert_eq!(store.get_job(id).unwrap().unwrap().status, JobStatus::Running);
         store.complete_job(id, JobStatus::Succeeded, "done").unwrap();
         assert_eq!(store.get_job(id).unwrap().unwrap().status, JobStatus::Succeeded);
+    }
+
+    /// Regression test for a real bug: firing many `scrape_library`-style
+    /// background jobs concurrently against one tenant's on-disk file (one
+    /// OS thread per job, each its own `SqliteDocbrainStore::open`) failed
+    /// roughly a third of the time with `database is locked` -- confirmed
+    /// live during a stress test against the actual hosted deployment (68
+    /// concurrent jobs, ~23 failures), which runs on Linux inside Docker.
+    /// `open`'s `busy_timeout` + WAL mode is the standard, correct fix for
+    /// this class of bug (a writer that finds the file locked retries for
+    /// up to the timeout instead of erroring immediately).
+    ///
+    /// **This test does not reproduce the failure locally**: tried both a
+    /// simple multi-insert-per-thread version and this heavier
+    /// `BEGIN IMMEDIATE`-plus-sleep version (and a from-scratch standalone
+    /// repro outside this test harness, same rusqlite version) with the
+    /// busy_timeout/WAL lines above temporarily commented out -- zero
+    /// failures every time on this machine's filesystem (macOS/APFS).
+    /// SQLite's locking implementation is filesystem-dependent, and the
+    /// production failure happened on Linux inside a Docker container
+    /// (likely overlayfs), a meaningfully different lock/fcntl environment.
+    /// Kept anyway as a real concurrent-write exercise (asserts every
+    /// concurrent writer succeeds and all rows land), just not as proof the
+    /// fix is what makes it pass -- that's established by direct reasoning
+    /// about what `busy_timeout` does plus the live production evidence
+    /// above, not by this test.
+    #[test]
+    fn many_concurrent_writers_to_the_same_file_all_succeed_instead_of_hitting_database_is_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docbrain.db");
+        // One initial open to create the file/schema before the concurrent
+        // burst -- otherwise every thread would also race on first-time
+        // migration, a different (and less realistic) contention shape than
+        // the real bug (many already-migrated opens writing concurrently).
+        SqliteDocbrainStore::open(&db_path).unwrap();
+
+        // A `Barrier` forces every thread to start writing at the same
+        // instant, and each holds an explicit `BEGIN IMMEDIATE` write
+        // transaction open across several inserts (with a short sleep
+        // between each) to widen the lock-held window, mirroring how a real
+        // `scrape_library` job holds its write lock across many chunk
+        // inserts rather than one quick autocommit statement.
+        const N: usize = 20;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(N));
+        let handles: Vec<_> = (0..N)
+            .map(|i| {
+                let db_path = db_path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || -> Result<()> {
+                    let store = SqliteDocbrainStore::open(&db_path)?;
+                    barrier.wait();
+                    store.conn.execute("BEGIN IMMEDIATE", [])?;
+                    for j in 0..5 {
+                        store.conn.execute("INSERT INTO libraries (slug, name, docs_url) VALUES (?1, ?2, ?3)", rusqlite::params![format!("lib-{i}-{j}"), format!("Lib {i}-{j}"), "https://example.com/docs"])?;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    store.conn.execute("COMMIT", [])?;
+                    Ok(())
+                })
+            })
+            .collect();
+
+        let mut failures = Vec::new();
+        for (i, h) in handles.into_iter().enumerate() {
+            if let Err(e) = h.join().unwrap() {
+                failures.push((i, e.to_string()));
+            }
+        }
+        assert!(failures.is_empty(), "concurrent writers must not hit 'database is locked' with busy_timeout set: {failures:?}");
+
+        let store = SqliteDocbrainStore::open(&db_path).unwrap();
+        assert_eq!(store.list_libraries().unwrap().len(), N * 5);
     }
 }
