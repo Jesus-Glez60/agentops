@@ -22,6 +22,7 @@ agentops-heavy-consolidate = { path = "../agentops-heavy-consolidate" }
 agentops-heavy-mcp = { path = "../agentops-heavy-mcp" }
 agentops-graph = { path = "../agentops-graph" }
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
+docbrain-mcp = { path = "../../../docbrain-core/crates/docbrain-mcp" }
 agentops-mcp = { path = "../agentops-mcp" }
 agentops-scanner = { path = "../agentops-scanner" }
 agentops-docgen = { path = "../agentops-docgen" }

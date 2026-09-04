@@ -27,6 +27,19 @@
 //! tenant; it's resolved via `indexing::checkout_path` before reaching
 //! `agentops_mcp::call_tool`. This is what stops a remote caller from
 //! probing arbitrary paths on the server's filesystem.
+//!
+//! **`docbrain-mcp`'s tools are also dispatched from here** (library
+//! docs/changelogs -- `list_libraries`, `search_docs`, etc.), mirroring
+//! `agentops-mcp-server`'s local `Dispatch::call_tool`'s "check each tool
+//! table's own name list, `agentops-mcp` -> `docbrain-mcp`" pattern. Unlike
+//! `agentops_mcp`'s tools, these don't take a per-call `path` -- tenant
+//! isolation instead routes to a separate SQLite file per tenant
+//! (`docbrain_db_path_for_org(&state.docbrain_db_dir, Some(&caller.tenant))`),
+//! the same per-tenant-file convention `docs_search_index_handler` already
+//! uses elsewhere in this crate. `agentops-heavy-mcp`'s tools
+//! (`semantic_search` etc.) are deliberately still not exposed here --
+//! that needs its own tenant-safe `SemanticIndex` threading, out of scope
+//! for this fix.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -36,7 +49,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::tenant_repo::{register_repo, resolve_connection_path, TenantCaller};
-use crate::AppState;
+use crate::{docbrain_db_path_for_org, AppState};
 
 /// Not one of `agentops_mcp::tool_specs()` -- see `handle_tools_call`'s
 /// special-casing below for why (it needs `AppState`/tenant access that
@@ -97,6 +110,13 @@ pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, Stat
         "tools/list" => {
             let mut tools = agentops_mcp::list_tools(resolve_access_mode(&state, &caller.tenant));
             tools.push(register_repo_tool_definition());
+            // `docbrain_mcp::ToolDefinition` is a structurally similar but
+            // distinct type from `agentops_mcp::ToolDefinition` -- both
+            // serialize to the same MCP JSON shape, so the merged list is
+            // built as `Value`s rather than trying to share one Rust type
+            // across the two crates.
+            let mut tools: Vec<Value> = tools.into_iter().map(|t| serde_json::to_value(t).unwrap()).collect();
+            tools.extend(docbrain_mcp::list_tools().into_iter().map(|t| serde_json::to_value(t).unwrap()));
             ok(id, json!({ "tools": tools }))
         }
         "tools/call" => handle_tools_call(&state, &caller, id, &request.params).await,
@@ -137,6 +157,24 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
         };
         let message = register_repo(state, &caller.tenant, repo_url);
         return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": false }));
+    }
+
+    if docbrain_mcp::list_tools().iter().any(|t| t.name == name) {
+        let db_path = docbrain_db_path_for_org(&state.docbrain_db_dir, Some(&caller.tenant));
+        let name = name.to_string();
+        let arguments = arguments.clone();
+        let call_result = tokio::task::spawn_blocking(move || {
+            let store = docbrain_graph::SqliteDocbrainStore::open(&db_path)?;
+            Ok::<_, anyhow::Error>(docbrain_mcp::call_tool(&store, &db_path, &name, &arguments))
+        })
+        .await;
+        let result = match call_result {
+            Ok(Ok(Ok(result))) => serde_json::to_value(result).unwrap(),
+            Ok(Ok(Err(refusal))) => json!({ "content": [{ "type": "text", "text": refusal }], "isError": true }),
+            Ok(Err(e)) => json!({ "content": [{ "type": "text", "text": format!("opening docbrain store: {e}") }], "isError": true }),
+            Err(e) => json!({ "content": [{ "type": "text", "text": format!("tool call panicked: {e}") }], "isError": true }),
+        };
+        return ok(id, result);
     }
 
     if let Some(connection_ref) = arguments.get("path").and_then(|v| v.as_str()).map(str::to_string) {

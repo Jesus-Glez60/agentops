@@ -2025,6 +2025,37 @@ mod tests {
         let body = body_json(resp).await;
         let names: Vec<&str> = body["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"status"), "{names:?}");
+        assert!(names.contains(&"list_libraries"), "docbrain-mcp's tools must also be exposed over /mcp: {names:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_dispatches_docbrain_tools_scoped_to_the_callers_own_tenant() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let docbrain_dir = tempfile::tempdir().unwrap();
+        let app = build_router(store, secrets, None, None, None, docbrain_dir.path().to_path_buf(), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("tools/call", json!({ "name": "register_library", "arguments": { "slug": "react", "name": "React", "docs_url": "https://react.dev" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {owner_token}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+
+        // The registering tenant sees it...
+        let mut req = mcp_request("tools/call", json!({ "name": "list_libraries", "arguments": {} }), 2);
+        req.headers_mut().insert("authorization", format!("Bearer {owner_token}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("react"), "{body:?}");
+
+        // ...a different tenant, with its own docbrain SQLite file, does not.
+        let mut req = mcp_request("tools/call", json!({ "name": "list_libraries", "arguments": {} }), 3);
+        req.headers_mut().insert("authorization", format!("Bearer {other_token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(!body["result"]["content"][0]["text"].as_str().unwrap().contains("react"), "a different tenant must not see this tenant's docbrain libraries: {body:?}");
     }
 
     #[tokio::test]
