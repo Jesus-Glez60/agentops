@@ -1206,6 +1206,15 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
         std::fs::read_to_string(&init_result.agents_md_path)?
     };
 
+    // Unconditional, not just inside `init_agents_md`'s branch above:
+    // `write_remote_marker` right below is about to put a live API key at
+    // `.context/agentops-remote.json`, and the AGENTS.md-already-exists
+    // branch (the common re-run case) never calls `init_agents_md` at all
+    // -- would otherwise leave that credential un-gitignored on any repo
+    // that's already been bootstrapped once. Idempotent, safe to call
+    // whether or not `init_agents_md` already ran this same invocation.
+    agentops_mcp::ensure_gitignore_entries(path).context("updating .gitignore")?;
+
     // Written before `distribute_via_ruler` runs -- that fn checks for
     // this marker to skip the stdio `.ruler/mcp.json` entry and re-apply
     // the remote native entries as its own last step, every time it runs

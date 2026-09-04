@@ -16,7 +16,7 @@ mod tools;
 mod watch;
 
 pub use docgen::generate_docs;
-pub use init::{init_agents_md, InitResult};
+pub use init::{ensure_gitignore_entries, init_agents_md, InitResult};
 pub use notes::{add_note, ingest_notes_dir, AddNoteResult};
 pub use protocol::{CallToolResult, ContentBlock, ToolAnnotations, ToolDefinition};
 pub use scan::{graph_db_path, persist, repo_name, scan_and_persist, ScanPersistSummary};

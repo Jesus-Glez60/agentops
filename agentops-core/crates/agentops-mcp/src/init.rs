@@ -42,7 +42,15 @@ pub fn init_agents_md(repo_path: &Path, notes_path_override: Option<&Path>) -> R
 /// `main`. `.agentops/notes/` is deliberately **not** added here: unlike
 /// scan output, notes are real, potentially team-worth-keeping knowledge,
 /// not a regenerable cache.
-fn ensure_gitignore_entries(repo: &Path) -> Result<()> {
+///
+/// `pub`, not just called from `init_agents_md`: `.context/agentops-
+/// remote.json` (a live API key, written by `agentops-cli`'s `connect
+/// --remote`) also lives under `.context/`, and `connect_remote` skips
+/// `init_agents_md` entirely whenever `AGENTS.md` already exists (the
+/// common re-run case) -- calling this directly and unconditionally from
+/// `connect_remote` closes that gap instead of leaving a live credential
+/// un-gitignored on a repo that's already been bootstrapped once.
+pub fn ensure_gitignore_entries(repo: &Path) -> Result<()> {
     let gitignore_path = repo.join(".gitignore");
     let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
 
