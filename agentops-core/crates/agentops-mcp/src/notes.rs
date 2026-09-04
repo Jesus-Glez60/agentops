@@ -59,7 +59,17 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
         agentops_notes::NoteType::Context => "context",
     };
     let tags_yaml = if tags.is_empty() { String::new() } else { format!("tags: [{}]\n", tags.join(", ")) };
-    let content = format!("---\ntitle: \"{title}\"\ntype: {type_str}\n{tags_yaml}---\n\n{body}\n");
+    // YAML double-quoted scalar escaping -- backslash first, then quote, so
+    // an embedded `\` doesn't get double-escaped by the quote-escaping step.
+    // Without this, a title containing a literal `"` (or `\`) produces
+    // frontmatter `walk_vault`'s `serde_saphyr::from_str` parses back to a
+    // *different*, truncated/mangled title than what was written -- the
+    // `this_note.title == title` check just below then finds nothing and
+    // fails with "wrote note but failed to re-parse it", even though the
+    // file itself was written and the note isn't actually lost. Caught live
+    // via a real title containing `#[serde(tag = \"kind\")]`.
+    let title_escaped = title.replace('\\', "\\\\").replace('"', "\\\"");
+    let content = format!("---\ntitle: \"{title_escaped}\"\ntype: {type_str}\n{tags_yaml}---\n\n{body}\n");
     std::fs::write(&file_path, &content)?;
 
     let notes = agentops_notes::walk_vault(&notes_dir, &classifier)?;
@@ -136,6 +146,22 @@ mod tests {
         let gotchas = agentops_graph::GraphStore::nodes_by_kind(&store, &repo, agentops_graph::NodeKind::Gotcha).unwrap();
         assert_eq!(gotchas.len(), 1);
         assert_eq!(gotchas[0].name.as_deref(), Some("Token bug"));
+    }
+
+    #[test]
+    fn add_note_with_a_title_containing_a_literal_quote_and_backslash_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+
+        let title = r#"serde's tag = \"kind\" fails"#;
+        let result = add_note(dir.path(), title, "Body text, nothing special.", Some(agentops_notes::NoteType::Knowledge), &[], None, false).unwrap();
+
+        let store = SqliteGraphStore::open(&graph_db_path(dir.path())).unwrap();
+        let repo = repo_name(dir.path());
+        let notes = agentops_graph::GraphStore::nodes_by_kind(&store, &repo, agentops_graph::NodeKind::Note).unwrap();
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert_eq!(notes[0].name.as_deref(), Some(title), "the re-parsed title must match the original exactly, not a truncated/mangled one");
+        assert!(result.file_path.exists());
     }
 
     #[test]
