@@ -45,7 +45,7 @@
 //! the real deployment's actual Postgres server core count/storage.
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewNode, NewScanHistoryEntry, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, Task, TaskLink, TaskStatus};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -228,11 +228,44 @@ fn row_to_node_version(row: &tokio_postgres::Row) -> NodeVersion {
 const NODE_VERSIONS_COLUMNS: &str = "id, node_id, content, start_line, end_line, valid_from::text AS valid_from, valid_until::text AS valid_until";
 
 fn row_to_session_event(row: &tokio_postgres::Row) -> SessionEvent {
-    SessionEvent { id: row.get("id"), repo: row.get("repo"), session_id: row.get("session_id"), tool_name: row.get("tool_name"), description: row.get("description"), created_at: row.get("created_at") }
+    SessionEvent {
+        id: row.get("id"),
+        repo: row.get("repo"),
+        session_id: row.get("session_id"),
+        tool_name: row.get("tool_name"),
+        description: row.get("description"),
+        node_id: row.get("node_id"),
+        event_kind: row.get("event_kind"),
+        created_at: row.get("created_at"),
+    }
 }
 
 // Same `::text` cast reasoning as EDGES_COLUMNS.
-const SESSION_EVENTS_COLUMNS: &str = "id, repo, session_id, tool_name, description, created_at::text AS created_at";
+const SESSION_EVENTS_COLUMNS: &str = "id, repo, session_id, tool_name, description, node_id, event_kind, created_at::text AS created_at";
+
+fn row_to_session_usage(row: &tokio_postgres::Row) -> SessionUsage {
+    SessionUsage {
+        id: row.get("id"),
+        repo: row.get("repo"),
+        session_id: row.get("session_id"),
+        model: row.get("model"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        cache_read_tokens: row.get("cache_read_tokens"),
+        cache_write_tokens: row.get("cache_write_tokens"),
+        cost_estimate_usd: row.get("cost_estimate_usd"),
+        session_started_at: row.get("session_started_at"),
+        session_ended_at: row.get("session_ended_at"),
+        recorded_at: row.get("recorded_at"),
+    }
+}
+
+// Same `::text` cast reasoning as EDGES_COLUMNS -- session_started_at/
+// session_ended_at/recorded_at are TIMESTAMPTZ in Postgres but TEXT in
+// SQLite, so the shared Rust `SessionUsage` struct needs both backends to
+// hand back plain strings.
+const SESSION_USAGE_COLUMNS: &str = "id, repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, \
+     session_started_at::text AS session_started_at, session_ended_at::text AS session_ended_at, recorded_at::text AS recorded_at";
 
 fn row_to_task(row: &tokio_postgres::Row) -> Task {
     let status: String = row.get("status");
@@ -742,13 +775,13 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
-    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str) -> Result<i64> {
+    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> Result<i64> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
             let row = client
                 .query_one(
-                    "INSERT INTO session_events (repo, session_id, tool_name, description) VALUES ($1, $2, $3, $4) RETURNING id",
-                    &[&repo, &session_id, &tool_name, &description],
+                    "INSERT INTO session_events (repo, session_id, tool_name, description, node_id, event_kind) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+                    &[&repo, &session_id, &tool_name, &description, &node_id, &event_kind],
                 )
                 .await?;
             Ok(row.get(0))
@@ -761,6 +794,68 @@ impl GraphStore for PostgresGraphStore {
             let sql = format!("SELECT {SESSION_EVENTS_COLUMNS} FROM session_events WHERE repo = $1 AND session_id = $2 ORDER BY id ASC");
             let rows = client.query(&sql, &[&repo, &session_id]).await?;
             Ok(rows.iter().map(row_to_session_event).collect())
+        })
+    }
+
+    fn session_events_for_repo(&self, repo: &str, event_kind: Option<&str>) -> Result<Vec<SessionEvent>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = match event_kind {
+                Some(kind) => {
+                    let sql = format!("SELECT {SESSION_EVENTS_COLUMNS} FROM session_events WHERE repo = $1 AND event_kind = $2 ORDER BY id ASC");
+                    client.query(&sql, &[&repo, &kind]).await?
+                }
+                None => {
+                    let sql = format!("SELECT {SESSION_EVENTS_COLUMNS} FROM session_events WHERE repo = $1 ORDER BY id ASC");
+                    client.query(&sql, &[&repo]).await?
+                }
+            };
+            Ok(rows.iter().map(row_to_session_event).collect())
+        })
+    }
+
+    fn upsert_session_usage(&self, usage: NewSessionUsage) -> Result<i64> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = "INSERT INTO session_usage (repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, session_started_at, session_ended_at) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10::timestamptz) \
+                 ON CONFLICT (repo, session_id, model) DO UPDATE SET \
+                    input_tokens = excluded.input_tokens, \
+                    output_tokens = excluded.output_tokens, \
+                    cache_read_tokens = excluded.cache_read_tokens, \
+                    cache_write_tokens = excluded.cache_write_tokens, \
+                    cost_estimate_usd = excluded.cost_estimate_usd, \
+                    session_started_at = excluded.session_started_at, \
+                    session_ended_at = excluded.session_ended_at, \
+                    recorded_at = now() \
+                 RETURNING id";
+            let row = client
+                .query_one(
+                    sql,
+                    &[
+                        &usage.repo,
+                        &usage.session_id,
+                        &usage.model,
+                        &usage.input_tokens,
+                        &usage.output_tokens,
+                        &usage.cache_read_tokens,
+                        &usage.cache_write_tokens,
+                        &usage.cost_estimate_usd,
+                        &usage.session_started_at,
+                        &usage.session_ended_at,
+                    ],
+                )
+                .await?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn session_usage_for_repo(&self, repo: &str) -> Result<Vec<SessionUsage>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {SESSION_USAGE_COLUMNS} FROM session_usage WHERE repo = $1 ORDER BY session_started_at DESC");
+            let rows = client.query(&sql, &[&repo]).await?;
+            Ok(rows.iter().map(row_to_session_usage).collect())
         })
     }
 

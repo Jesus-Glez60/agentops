@@ -263,3 +263,35 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_nodes_natural_key
 -- reference this node") from becoming a full scan.
 CREATE INDEX IF NOT EXISTS idx_node_versions_node_current ON node_versions(node_id) WHERE valid_until IS NULL;
 CREATE INDEX IF NOT EXISTS idx_task_links_node ON task_links(node_id);
+
+-- Usage & knowledge-reuse tracking (Phase 5, 1.0 roadmap, Module 8).
+-- node_id is deliberately not a hard FK, same reasoning as node_versions
+-- above -- the referenced node may later be pruned. event_kind
+-- distinguishes a knowledge "hit" (list_gotchas/get_symbol/related_context/
+-- semantic_search returning a real result) from every pre-existing
+-- write-tool "activity" row, without parsing description.
+ALTER TABLE session_events ADD COLUMN IF NOT EXISTS node_id BIGINT;
+ALTER TABLE session_events ADD COLUMN IF NOT EXISTS event_kind TEXT NOT NULL DEFAULT 'activity';
+CREATE INDEX IF NOT EXISTS idx_session_events_repo_kind ON session_events(repo, event_kind);
+
+-- Per-session token/cost usage (Phase 5, 1.0 roadmap, Module 8), sourced
+-- from `agentops-cli usage sync` parsing a local Claude Code JSONL
+-- transcript -- not derived from any MCP tool call. One row per (repo,
+-- session_id, model); re-syncing a still-growing session file upserts via
+-- idx_session_usage_unique rather than double-counting.
+CREATE TABLE IF NOT EXISTS session_usage (
+    id                  BIGSERIAL PRIMARY KEY,
+    repo                TEXT NOT NULL,
+    session_id          TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    input_tokens        BIGINT NOT NULL DEFAULT 0,
+    output_tokens       BIGINT NOT NULL DEFAULT 0,
+    cache_read_tokens   BIGINT NOT NULL DEFAULT 0,
+    cache_write_tokens  BIGINT NOT NULL DEFAULT 0,
+    cost_estimate_usd   DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+    session_started_at  TIMESTAMPTZ NOT NULL,
+    session_ended_at    TIMESTAMPTZ NOT NULL,
+    recorded_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_usage_unique ON session_usage(repo, session_id, model);
+CREATE INDEX IF NOT EXISTS idx_session_usage_repo_time ON session_usage(repo, session_started_at);

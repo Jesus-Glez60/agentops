@@ -41,6 +41,7 @@ pub mod docs;
 pub mod repos;
 pub mod search;
 pub mod subgraph;
+pub mod usage;
 
 #[derive(Clone)]
 pub(crate) struct AppState {

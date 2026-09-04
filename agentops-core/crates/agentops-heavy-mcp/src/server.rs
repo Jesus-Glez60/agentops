@@ -123,12 +123,26 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["isError"], false, "{v:?}");
 
-        let search_req = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"semantic_search","arguments":{"path": repo_path, "query": "what should I do if the API rate limits me"}}});
+        let search_req = json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"semantic_search","arguments":{"path": repo_path, "query": "what should I do if the API rate limits me", "session_id": "sess-semantic-hit"}}});
         let resp = handle_message(&mut index, &search_req.to_string()).await.unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["result"]["isError"], false, "{v:?}");
         let text = v["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("rate-limit-backoff"), "{text}");
+
+        // Module 8: a real hit was found, and session_id was passed -- must
+        // have recorded a "hit"-kind session_events row against the same
+        // repo, with the top result's node id attached.
+        {
+            use agentops_graph::GraphStore;
+            let db_path = dir.path().join(".context").join("graph.db");
+            let store = agentops_graph::SqliteGraphStore::open(&db_path).unwrap();
+            let events = store.session_events(&repo, "sess-semantic-hit").unwrap();
+            assert_eq!(events.len(), 1, "{events:?}");
+            assert_eq!(events[0].tool_name, "semantic_search");
+            assert_eq!(events[0].event_kind, "hit");
+            assert!(events[0].node_id.is_some(), "{events:?}");
+        }
     }
 
     #[tokio::test]

@@ -19,6 +19,7 @@ members = [
     "agentops-core/crates/agentops-api",
     "agentops-core/crates/agentops-cli",
     "agentops-core/crates/agentops-graph-pg",
+    "agentops-core/crates/agentops-store-open",
     "docbrain-core/crates/docbrain-ingest",
     "docbrain-core/crates/docbrain-graph",
     "docbrain-core/crates/docbrain-mcp",

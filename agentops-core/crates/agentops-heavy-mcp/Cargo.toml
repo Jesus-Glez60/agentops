@@ -15,6 +15,7 @@ tokio.workspace = true
 agentops-heavy-embeddings = { path = "../agentops-heavy-embeddings" }
 agentops-heavy-consolidate = { path = "../agentops-heavy-consolidate" }
 agentops-graph = { path = "../agentops-graph" }
+agentops-store-open = { path = "../agentops-store-open" }
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
 
 [dev-dependencies]

@@ -275,7 +275,9 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/nodes/{node_id}/curation", post(dashboard::set_curation_json))
         .route("/repos/{id}/nodes/{node_id}/graph", get(dashboard::subgraph_json))
         .route("/repos/{id}/graph", get(dashboard::repo_graph_json))
-        .route("/repos/{id}/docs", get(dashboard::docs_json));
+        .route("/repos/{id}/docs", get(dashboard::docs_json))
+        .route("/repos/{id}/usage", get(dashboard::usage_json))
+        .route("/repos/{id}/usage/sync", post(dashboard::usage_sync_json));
     if include_tools {
         router = router.route("/tools", get(heavy_tools_list_handler)).route("/tools/{name}", post(heavy_tools_call_handler));
     }

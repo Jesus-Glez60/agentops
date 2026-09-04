@@ -477,3 +477,31 @@ export const DOCS_SWR_KEY = "/docs";
 export function getDocs(connectionId: string): Promise<DocPage> {
   return heavyFetch<DocPage>(`/repos/${encodeURIComponent(connectionId)}/docs`);
 }
+
+// Usage / knowledge-reuse dashboard (Module 8, CodeBurn-inspired). Mirrors
+// `agentops_api::usage::{UsageTotals, UsageSummary}` exactly -- see that
+// module's doc comment for why `estimated_*` fields are an aggregate
+// estimate, not a per-session measured value, and must always render with
+// visible "estimated" labeling, never as a precise count.
+
+export interface UsageTotals {
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  cost_usd: number;
+}
+
+export interface UsageSummary {
+  repo: string;
+  tokens: UsageTotals;
+  /** Real, exact count of recorded knowledge-reuse "hit" events. */
+  hit_count: number;
+  /** Estimated only -- see this file's section doc comment. */
+  estimated_tokens_saved: number;
+  estimated_cost_saved_usd: number;
+}
+
+export function getRepoUsage(connectionId: string): Promise<UsageSummary> {
+  return heavyFetch<UsageSummary>(`/repos/${encodeURIComponent(connectionId)}/usage`);
+}

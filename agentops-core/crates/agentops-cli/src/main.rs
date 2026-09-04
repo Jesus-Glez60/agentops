@@ -8,6 +8,8 @@
 //! `agentops-ruler-bridge` is still a stub, and `sync-docs` is a separate
 //! follow-up (see the plan).
 
+mod usage;
+
 use std::path::{Path, PathBuf};
 
 use agentops_graph::{GraphStore, NodeKind};
@@ -210,6 +212,11 @@ enum Command {
         #[command(subcommand)]
         action: TaskAction,
     },
+    /// Usage/knowledge-reuse tracking (Module 8, CodeBurn-inspired).
+    Usage {
+        #[command(subcommand)]
+        action: UsageAction,
+    },
     /// Interactive first-run setup wizard for a classic (non-Docker,
     /// non-PM2) terminal deployment — collects the same config a Docker
     /// `.env` or the PM2 `/setup` page would, writes `.env` to the current
@@ -373,6 +380,33 @@ enum TaskAction {
     },
 }
 
+#[derive(Subcommand)]
+enum UsageAction {
+    /// Parses this repo's local Claude Code JSONL session transcripts
+    /// (under `~/.claude/projects/`) and upserts per-session token/cost
+    /// totals into the graph store — safe to re-run against a still-active
+    /// session, since it upserts rather than accumulates. Claude Code
+    /// JSONL only for now (Codex/Cursor/Gemini CLI are future work).
+    Sync {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Override `~/.claude` (mainly for testing against a different
+        /// Claude Code data directory).
+        #[arg(long)]
+        claude_home: Option<PathBuf>,
+        /// Push to a hosted deployment instead of writing to this
+        /// machine's local graph store -- triggers a one-time browser
+        /// device-login and persists the result into
+        /// `.context/agentops-remote.json` (the same marker `agentops
+        /// connect --remote` writes), so a later bare `usage sync` here
+        /// reuses it with no `--remote` needed. Omit this once the repo is
+        /// already connected via `agentops connect --remote` -- that
+        /// marker is picked up automatically either way.
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum TaskStatusArg {
     Todo,
@@ -507,6 +541,9 @@ fn main() -> Result<()> {
             TaskAction::Activity { path, id } => task_activity(&path, id),
             TaskAction::Summarize { path, id } => task_summarize(&path, id),
             TaskAction::SyncLinear { path, limit, push, status_name } => task_sync_linear(&path, limit, push, status_name.as_deref()),
+        },
+        Command::Usage { action } => match action {
+            UsageAction::Sync { path, claude_home, remote } => usage_sync_command(&path, claude_home.as_deref(), remote.as_deref()),
         },
         Command::Init { yes, path } => init(yes, &path),
         Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login } => connect(&path, agents, access_mode, yes, remote, api_key, device_login),
@@ -1553,6 +1590,52 @@ fn task_activity(path: &Path, id: i64) -> Result<()> {
     for e in &events {
         println!("[{}] {}: {}", e.created_at, e.tool_name, e.description);
     }
+    Ok(())
+}
+
+fn usage_sync_command(path: &Path, claude_home: Option<&Path>, remote: Option<&str>) -> Result<()> {
+    let (entries, files_scanned) = usage::collect_usage_entries(path, claude_home)?;
+    if files_scanned == 0 {
+        println!("No Claude Code session files found for {} — nothing to sync.", path.display());
+        return Ok(());
+    }
+    if entries.is_empty() {
+        println!("Scanned {files_scanned} session file(s) but found no usable usage data.");
+        return Ok(());
+    }
+
+    // `--remote` explicitly given: same one-time device-login + connection
+    // resolution `connect_remote` does, then persists the marker so a
+    // later bare `usage sync` here needs no `--remote` again.
+    if let Some(server_url) = remote {
+        let api_key = device_flow_login(server_url)?;
+        let connection_id = resolve_connection_id(path, server_url, &api_key, false)?;
+        write_remote_marker(path, server_url, &connection_id, &api_key)?;
+        let synced = usage::push_usage_remote(server_url, &connection_id, &api_key, &entries)?;
+        println!("Scanned {files_scanned} session file(s), synced {synced} session/model usage row(s) to {server_url} (repo: {connection_id}).");
+        return Ok(());
+    }
+
+    // A repo connected via `agentops connect --remote` has its real graph
+    // store on that server, not this machine's `.context/graph.db` --
+    // writing locally in that case would land in a store nothing ever
+    // reads (the same "check the remote marker first" discipline as
+    // gotchas/notes). Push there instead when the marker exists.
+    if let Some(marker) = read_remote_marker(path) {
+        let synced = usage::push_usage_remote(&marker.server_url, &marker.connection_id, &marker.api_key, &entries)?;
+        println!("Scanned {files_scanned} session file(s), synced {synced} session/model usage row(s) to {} (repo: {}).", marker.server_url, marker.connection_id);
+        return Ok(());
+    }
+
+    // Deliberately not this module's own `open_store` wrapper -- that one
+    // gates on "has this repo ever been scanned", which doesn't apply here:
+    // usage tracking is sourced entirely from local Claude Code JSONL
+    // transcripts, independent of whether `agentops install`/`scan_repo`
+    // has ever run against this repo.
+    let store = agentops_mcp::open_store(path)?;
+    let repo = agentops_mcp::repo_name(path);
+    let sessions_synced = usage::write_usage_locally(store.as_ref(), &repo, &entries)?;
+    println!("Scanned {files_scanned} session file(s), synced {sessions_synced} session/model usage row(s) for {repo}.");
     Ok(())
 }
 

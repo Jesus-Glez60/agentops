@@ -541,14 +541,23 @@ pub struct TaskLink {
     pub relation: String,
 }
 
-/// One notable write action tagged with a caller-supplied `session_id` —
+/// One notable action tagged with a caller-supplied `session_id` —
 /// Module 6's cross-tool session correlation. Not scan-scoped (unlike
 /// `ScanHistoryEntry`, which only exists inside one `scan_repo` call): any
 /// write tool (`scan_repo`, `add_note`, `ingest_notes`, `explain_symbol`)
-/// records one row per call when the caller passes the same `session_id`
-/// across calls, regardless of tool or repo-write-type, so `get_session`
-/// can return one correlated feed spanning multiple MCP/REST clients
-/// working the same session.
+/// records one `"activity"`-kind row per call when the caller passes the
+/// same `session_id` across calls, regardless of tool or repo-write-type,
+/// so `get_session` can return one correlated feed spanning multiple
+/// MCP/REST clients working the same session.
+///
+/// `node_id`/`event_kind` (Module 8, usage/knowledge-reuse tracking): a
+/// read tool (`list_gotchas`/`get_symbol`/`related_context`/
+/// `semantic_search`) that actually returned an existing node records a
+/// `"hit"`-kind row instead, with `node_id` set to the node it reused when
+/// there's a single clear one (`None` for a multi-result listing) — this is
+/// what makes "knowledge was reused" queryable directly instead of parsed
+/// out of `description`'s free text. `event_kind` defaults to `"activity"`
+/// for every pre-existing row/caller.
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub id: i64,
@@ -556,7 +565,48 @@ pub struct SessionEvent {
     pub session_id: String,
     pub tool_name: String,
     pub description: String,
+    pub node_id: Option<i64>,
+    pub event_kind: String,
     pub created_at: String,
+}
+
+/// One local coding session's token/cost usage for one `(repo, session_id,
+/// model)` — Module 8's usage-tracking half. Named distinctly from
+/// `agentops-llm`'s own (unrelated) `Usage` type, which is a single LLM
+/// API call's prompt/completion token count, not a whole session's.
+/// `session_id` here is Claude Code's own session UUID (the JSONL
+/// filename), *not* necessarily the same string a caller passes as
+/// `session_id` to an MCP tool call (`SessionEvent::session_id`) — see
+/// `agentops-api::usage`'s heuristic join for why those two can't be
+/// assumed equal.
+#[derive(Debug, Clone)]
+pub struct NewSessionUsage {
+    pub repo: String,
+    pub session_id: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_estimate_usd: f64,
+    pub session_started_at: String,
+    pub session_ended_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionUsage {
+    pub id: i64,
+    pub repo: String,
+    pub session_id: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub cost_estimate_usd: f64,
+    pub session_started_at: String,
+    pub session_ended_at: String,
+    pub recorded_at: String,
 }
 
 /// The codebase graph port. One adapter today (`SqliteGraphStore`); the
@@ -711,10 +761,33 @@ pub trait GraphStore {
     /// like everything else in this trait, but note `session_events` (unlike
     /// `session_id` returns) is queried by `(repo, session_id)` together:
     /// a session_id is only meaningful within one repo's activity feed.
-    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str) -> Result<i64>;
+    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> Result<i64>;
     /// Every event recorded under `session_id` in `repo`, oldest first —
     /// the correlated feed `get_session` renders.
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>>;
+    /// Every event recorded for `repo` across *every* session_id, optionally
+    /// filtered to one `event_kind` ("hit" or "activity") — unlike
+    /// `session_events` above, not scoped to one caller-chosen session_id.
+    /// `agentops-api::usage`'s dashboard aggregation is the reason this
+    /// exists: a "hit" event's freeform `session_id` can't be assumed to
+    /// match any particular `session_usage` row's real Claude Code session
+    /// UUID, so counting/joining usage has to start from "every hit in this
+    /// repo," not "every hit in one session."
+    fn session_events_for_repo(&self, repo: &str, event_kind: Option<&str>) -> Result<Vec<SessionEvent>>;
+
+    /// Records (or, on a repeat call for the same `(repo, session_id,
+    /// model)`, updates) one local coding session's token/cost usage —
+    /// Module 8's usage-tracking half, sourced from `agentops-cli usage
+    /// sync` parsing a local Claude Code JSONL transcript, not from any MCP
+    /// tool call. Upsert, not insert: a session's JSONL file grows while
+    /// the session is still active, so re-syncing it must replace the
+    /// running total, not add a second row (see the `idx_session_usage_unique`
+    /// unique index this keys on).
+    fn upsert_session_usage(&self, usage: NewSessionUsage) -> Result<i64>;
+    /// Every `SessionUsage` row for `repo`, most recently started first —
+    /// the raw material `agentops-api::usage`'s heuristic join aggregates
+    /// against `session_events`' `"hit"`-kind rows.
+    fn session_usage_for_repo(&self, repo: &str) -> Result<Vec<SessionUsage>>;
 
     /// Creates a native task. For a Linear-sourced task, prefer
     /// `upsert_external_task` instead, which is idempotent on

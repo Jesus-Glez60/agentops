@@ -229,6 +229,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "docbrain-graph",
+ "docbrain-mcp",
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "http-body-util",
@@ -282,6 +283,7 @@ dependencies = [
  "agentops-graph",
  "agentops-heavy-consolidate",
  "agentops-heavy-embeddings",
+ "agentops-store-open",
  "anyhow",
  "docbrain-graph",
  "serde",
@@ -369,6 +371,7 @@ dependencies = [
  "agentops-notes",
  "agentops-retrieval",
  "agentops-scanner",
+ "agentops-store-open",
  "anyhow",
  "candle-core",
  "dirs",
@@ -501,6 +504,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "rusqlite",
+ "tempfile",
+]
+
+[[package]]
+name = "agentops-store-open"
+version = "0.1.0"
+dependencies = [
+ "agentops-graph",
+ "agentops-graph-pg",
+ "anyhow",
  "tempfile",
 ]
 

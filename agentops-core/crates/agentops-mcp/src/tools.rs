@@ -52,19 +52,19 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_gotchas",
-            description: "Lists every Gotcha node recorded for a repo.",
+            description: "Lists every Gotcha node recorded for a repo. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" } }, "required": ["path"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path"] }),
             handler: tool_list_gotchas,
         },
         ToolSpec {
             name: "get_symbol",
-            description: "Looks up a symbol by name (optionally disambiguated by file path).",
+            description: "Looks up a symbol by name (optionally disambiguated by file path). Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
             input_schema: || {
-                json!({ "type": "object", "properties": { "path": { "type": "string" }, "name": { "type": "string" }, "file": { "type": "string" } }, "required": ["path", "name"] })
+                json!({ "type": "object", "properties": { "path": { "type": "string" }, "name": { "type": "string" }, "file": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path", "name"] })
             },
             handler: tool_get_symbol,
         },
@@ -141,10 +141,10 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "related_context",
-            description: "Pattern completion around a symbol (Initiative 4, CLS-inspired retrieval plan): finds symbols elsewhere in the repo that are similar (dense embedding, requires with_embeddings from an earlier scan) or graph-connected (Personalized PageRank over Affects/References edges) to the given symbol, and returns each one's own recorded Gotcha/Decision notes. Read-only, no LLM call — the same recombined context explain_symbol now folds into its prompt automatically, exposed directly so an agent session can ask 'what's associated with this symbol' without triggering a full explanation.",
+            description: "Pattern completion around a symbol (Initiative 4, CLS-inspired retrieval plan): finds symbols elsewhere in the repo that are similar (dense embedding, requires with_embeddings from an earlier scan) or graph-connected (Personalized PageRank over Affects/References edges) to the given symbol, and returns each one's own recorded Gotcha/Decision notes. Read-only, no LLM call — the same recombined context explain_symbol now folds into its prompt automatically, exposed directly so an agent session can ask 'what's associated with this symbol' without triggering a full explanation. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "top_k": { "type": "integer" } }, "required": ["path", "symbol_id"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "top_k": { "type": "integer" }, "session_id": { "type": "string" } }, "required": ["path", "symbol_id"] }),
             handler: tool_related_context,
         },
         ToolSpec {
@@ -329,14 +329,22 @@ fn never_scanned_hint(store: &dyn GraphStore, repo: &str) -> anyhow::Result<Opti
     Ok(if store.latest_scan(repo)?.is_none() { Some(" (this repo has never been scanned — call scan_repo first, then retry)") } else { None })
 }
 
-/// Module 6 (cross-tool session correlation): every write tool that accepts
-/// an optional `session_id` calls this after its own write succeeds. A
-/// missing/absent `session_id` is a normal, expected case (most callers
-/// don't correlate sessions) — a silent no-op, not an error.
-fn maybe_record_session_event(path: &Path, args: &Value, tool_name: &str, description: &str) -> anyhow::Result<()> {
+/// Module 6/8 (cross-tool session correlation + knowledge-reuse tracking):
+/// every write tool that accepts an optional `session_id` calls this after
+/// its own write succeeds, tagged `event_kind: "activity"`; a read tool
+/// that actually returned an existing node calls it tagged `event_kind:
+/// "hit"` with that node's id. A missing/absent `session_id` is a normal,
+/// expected case (most callers don't correlate sessions) — a silent no-op,
+/// not an error. Deliberately one helper for both kinds, not two — a
+/// prior project's near-identical usage-logging feature let its "activity"
+/// and "hit" recording paths diverge into separate helpers with different
+/// call signatures, which caused duplicate logging calls and type
+/// conflicts; collapsing into one signature here avoids that class of bug
+/// entirely rather than fixing it after the fact.
+fn maybe_record_session_event(path: &Path, args: &Value, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> anyhow::Result<()> {
     if let Some(session_id) = get_str(args, "session_id") {
         let store = crate::store::open_store(path)?;
-        store.record_session_event(&repo_name(path), session_id, tool_name, description)?;
+        store.record_session_event(&repo_name(path), session_id, tool_name, description, node_id, event_kind)?;
     }
     Ok(())
 }
@@ -395,6 +403,9 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
         let hint = never_scanned_hint(store.as_ref(), &repo)?.unwrap_or_default();
         return Ok(format!("No gotchas recorded.{hint}"));
     }
+    if let Some(path_str) = get_str(args, "path") {
+        maybe_record_session_event(Path::new(path_str), args, "list_gotchas", &format!("listed {} gotcha(s)", gotchas.len()), None, "hit")?;
+    }
     // Full-prominence first -- every gotcha is still listed (this is
     // permanent knowledge, never hidden), just ranked so a curated-down
     // one doesn't dominate an agent's attention over ones nobody's
@@ -428,6 +439,9 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
         }
     };
     let node = store.get_node(&repo, id)?.ok_or_else(|| anyhow::anyhow!("symbol resolved but node #{id} not found"))?;
+    if let Some(path_str) = get_str(args, "path") {
+        maybe_record_session_event(Path::new(path_str), args, "get_symbol", &format!("looked up symbol {name}"), Some(id), "hit")?;
+    }
 
     let mut out = format!(
         "{} ({}) — {}:{}-{}\n\n{}",
@@ -521,7 +535,7 @@ fn tool_scan_repo(args: &Value) -> anyhow::Result<String> {
         "scanned: {} files, {} symbols, {} dependency edges ({} files pruned, {} symbols pruned)",
         summary.files, summary.symbols, summary.dependency_edges, summary.pruned_files, summary.pruned_symbols
     );
-    maybe_record_session_event(Path::new(path_str), args, "scan_repo", &description)?;
+    maybe_record_session_event(Path::new(path_str), args, "scan_repo", &description, None, "activity")?;
     Ok(format!(
         "Scanned {}: {} files, {} symbols, {} dependency edges ({} files pruned, {} symbols pruned)",
         path_str, summary.files, summary.symbols, summary.dependency_edges, summary.pruned_files, summary.pruned_symbols
@@ -551,7 +565,7 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
         agentops_notes::NoteType::Knowledge => "knowledge",
         agentops_notes::NoteType::Context => "context",
     };
-    maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"))?;
+    maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"), None, "activity")?;
     Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols, {} reinforced).", result.file_path.display(), result.edges_written, result.edges_reinforced))
 }
 
@@ -564,7 +578,7 @@ fn tool_ingest_notes(args: &Value) -> anyhow::Result<String> {
     let summary = crate::notes::ingest_notes_dir(Path::new(path_str), explicit_notes_path.as_deref(), &classifier, &matcher, get_bool(args, "with_embeddings"))?;
 
     let notes_dir = agentops_notes::resolve_notes_path(Path::new(path_str), explicit_notes_path.as_deref());
-    maybe_record_session_event(Path::new(path_str), args, "ingest_notes", &format!("ingested {} note(s) from {}", summary.notes_written, notes_dir.display()))?;
+    maybe_record_session_event(Path::new(path_str), args, "ingest_notes", &format!("ingested {} note(s) from {}", summary.notes_written, notes_dir.display()), None, "activity")?;
     Ok(format!("Ingested {} note(s) from {}, wrote {} edge(s), reinforced {}.", summary.notes_written, notes_dir.display(), summary.edges_written, summary.edges_reinforced))
 }
 
@@ -803,6 +817,9 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
     if results.is_empty() {
         return Ok("No related symbols found.".to_string());
     }
+    if let Some(path_str) = get_str(args, "path") {
+        maybe_record_session_event(Path::new(path_str), args, "related_context", &format!("found {} related item(s)", results.len()), Some(symbol_id), "hit")?;
+    }
     Ok(results
         .iter()
         .map(|m| {
@@ -829,7 +846,7 @@ fn tool_explain_symbol(args: &Value) -> anyhow::Result<String> {
     let definition_id = agentops_llm::explain_symbol(store.as_ref(), &config, &repo, symbol_id)?;
     let definition = store.get_node(&repo, definition_id)?.ok_or_else(|| anyhow::anyhow!("definition node not found after creation"))?;
     if let Some(session_id) = get_str(args, "session_id") {
-        store.record_session_event(&repo, session_id, "explain_symbol", &format!("explained symbol {symbol_id}"))?;
+        store.record_session_event(&repo, session_id, "explain_symbol", &format!("explained symbol {symbol_id}"), None, "activity")?;
     }
     Ok(definition.content.unwrap_or_default())
 }
@@ -1151,6 +1168,41 @@ mod tests {
         assert!(text.contains("scan_repo"), "{text}");
         assert!(text.contains("add_note"), "{text}");
         assert_eq!(text.matches("sess-unrelated").count(), 0, "the other session must not appear: {text}");
+    }
+
+    #[test]
+    fn list_gotchas_and_get_symbol_record_hit_events_when_session_id_is_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let session_id = "sess-hits";
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token bug", "body": "verify_token has a known workaround for a bug." })).unwrap();
+
+        let gotchas_result = call_tool(AccessMode::Advisor, "list_gotchas", &json!({ "path": path, "session_id": session_id })).unwrap();
+        assert!(!gotchas_result.is_error, "{:?}", gotchas_result.content);
+        let symbol_result = call_tool(AccessMode::Advisor, "get_symbol", &json!({ "path": path, "name": "verify_token", "session_id": session_id })).unwrap();
+        assert!(!symbol_result.is_error, "{:?}", symbol_result.content);
+
+        let session_result = call_tool(AccessMode::Advisor, "get_session", &json!({ "path": path, "session_id": session_id })).unwrap();
+        let text = &session_result.content[0].text;
+        assert!(text.contains("list_gotchas"), "{text}");
+        assert!(text.contains("get_symbol"), "{text}");
+    }
+
+    #[test]
+    fn list_gotchas_does_not_record_a_hit_when_session_id_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token bug", "body": "verify_token has a known workaround for a bug." })).unwrap();
+        call_tool(AccessMode::Advisor, "list_gotchas", &json!({ "path": path })).unwrap();
+
+        let session_result = call_tool(AccessMode::Advisor, "get_session", &json!({ "path": path, "session_id": "never-used" })).unwrap();
+        assert!(session_result.content[0].text.contains("No activity recorded"), "{:?}", session_result.content);
     }
 
     /// Module 7's actual differentiator, not the CRUD: a task's own

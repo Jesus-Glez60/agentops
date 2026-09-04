@@ -4,7 +4,6 @@
 //! configured — no advisor-mode distinction, since semantic search has no
 //! write-capable variant to restrict in the first place.
 
-use agentops_graph::SqliteGraphStore;
 use agentops_heavy_embeddings::SemanticIndex;
 use serde_json::{json, Value};
 
@@ -14,13 +13,14 @@ pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "semantic_search",
-            description: "Find the most relevant symbols/gotchas/decisions for a plain-language query, ranked by meaning rather than keyword overlap. Requires semantic_index to have been run for this repo at least once.",
+            description: "Find the most relevant symbols/gotchas/decisions for a plain-language query, ranked by meaning rather than keyword overlap. Requires semantic_index to have been run for this repo at least once. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
                     "query": { "type": "string" },
                     "top_k": { "type": "integer", "description": "Defaults to 5." },
+                    "session_id": { "type": "string" },
                 },
                 "required": ["path", "query"],
             }),
@@ -99,6 +99,21 @@ fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
+/// Module 8 (usage/knowledge-reuse tracking) equivalent of `agentops-mcp`'s
+/// own `maybe_record_session_event` -- duplicated rather than shared,
+/// since pulling in `agentops-mcp` here just for this ~10-line helper
+/// would be a wrong-direction dependency (this crate is a driven adapter
+/// `agentops-mcp` has no business depending on). No-ops when `session_id`
+/// is absent from `args` -- a normal, expected case, not an error.
+fn maybe_record_session_hit(path: &std::path::Path, args: &Value, tool_name: &str, node_id: Option<i64>, description: &str) -> anyhow::Result<()> {
+    if let Some(session_id) = get_str(args, "session_id") {
+        let store = agentops_store_open::open_store(path)?;
+        let repo = agentops_heavy_embeddings::repo_name(path);
+        store.record_session_event(&repo, session_id, tool_name, description, node_id, "hit")?;
+    }
+    Ok(())
+}
+
 async fn tool_semantic_search(index: &mut SemanticIndex, args: &Value) -> anyhow::Result<String> {
     let path = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path' argument"))?;
     let query = get_str(args, "query").ok_or_else(|| anyhow::anyhow!("missing required 'query' argument"))?;
@@ -112,6 +127,10 @@ async fn tool_semantic_search(index: &mut SemanticIndex, args: &Value) -> anyhow
     if hits.is_empty() {
         return Ok("No results — has semantic_index been run for this repo?".to_string());
     }
+    // `SearchHit.id` *is* the source graph node's id (reused deliberately
+    // on re-index, see IndexItem's own doc comment) -- the top hit is the
+    // one clear "reused this" target for a hit event.
+    maybe_record_session_hit(std::path::Path::new(path), args, "semantic_search", Some(hits[0].id as i64), &format!("found {} result(s) for a semantic query", hits.len()))?;
 
     let mut out = String::new();
     for hit in hits {
@@ -136,10 +155,9 @@ async fn tool_semantic_index(index: &mut SemanticIndex, args: &Value) -> anyhow:
     // this isn't just style preference.
     let items = {
         let repo_path = std::path::Path::new(path);
-        let db_path = repo_path.join(".context").join("graph.db");
-        let store = SqliteGraphStore::open(&db_path).map_err(|e| anyhow::anyhow!("opening graph store at {}: {e}", db_path.display()))?;
+        let store = agentops_store_open::open_store(repo_path).map_err(|e| anyhow::anyhow!("opening graph store for {path}: {e}"))?;
         let repo = agentops_heavy_embeddings::repo_name(repo_path);
-        agentops_heavy_embeddings::collect_index_items(&store, &repo)?
+        agentops_heavy_embeddings::collect_index_items(&*store, &repo)?
     };
 
     let count = index.index_items(&items).await?;
@@ -215,11 +233,10 @@ async fn tool_consolidate_model(args: &Value) -> anyhow::Result<String> {
     let path = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path' argument"))?;
 
     let repo_path = std::path::Path::new(path);
-    let db_path = repo_path.join(".context").join("graph.db");
-    let store = SqliteGraphStore::open(&db_path).map_err(|e| anyhow::anyhow!("opening graph store at {}: {e}", db_path.display()))?;
+    let store = agentops_store_open::open_store(repo_path).map_err(|e| anyhow::anyhow!("opening graph store for {path}: {e}"))?;
     let repo = agentops_heavy_embeddings::repo_name(repo_path);
 
-    let report = agentops_heavy_consolidate::consolidate_model(&store, &repo)?;
+    let report = agentops_heavy_consolidate::consolidate_model(&*store, &repo)?;
 
     if !report.attempted {
         return Ok(format!("Skipped: {}", report.reason));

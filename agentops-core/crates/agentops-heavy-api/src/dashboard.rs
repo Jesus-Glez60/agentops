@@ -362,6 +362,101 @@ pub(crate) async fn repo_graph_json(State(state): State<AppState>, user: Option<
     }
 }
 
+/// `GET /repos/{id}/usage` -- Module 8's usage/knowledge-reuse dashboard
+/// card, reusing `agentops_api::usage::usage_summary` exactly (see that
+/// module's doc comment for the aggregation/estimate approach).
+pub(crate) async fn usage_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<agentops_api::usage::UsageSummary>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        Ok(Some(agentops_api::usage::usage_summary(store.as_ref(), &repo)?))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(summary))) => (StatusCode::OK, Json(serde_json::to_value(summary).unwrap())),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct UsageSyncEntry {
+    session_id: String,
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    cost_estimate_usd: f64,
+    session_started_at: String,
+    session_ended_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct UsageSyncBody {
+    entries: Vec<UsageSyncEntry>,
+}
+
+/// `POST /repos/{id}/usage/sync` -- the hosted counterpart to
+/// `agentops-cli usage sync`'s local-store path (`GraphStore::
+/// upsert_session_usage` directly): a repo connected via `agentops connect
+/// --remote` has no local graph store worth writing to, so the CLI pushes
+/// its parsed Claude Code JSONL entries here instead, authenticated with
+/// the same personal API key `connect_remote`'s device-login/`--api-key`
+/// flow already obtained (see `require_api_key_or_session`, which this
+/// router's blanket `.layer()` already applies -- no `/mcp`-only
+/// `require_tenant_auth` needed here, since a personal API key is exactly
+/// what that middleware also accepts).
+pub(crate) async fn usage_sync_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<UsageSyncBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<usize>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        for entry in &body.entries {
+            store.upsert_session_usage(agentops_graph::NewSessionUsage {
+                repo: repo.clone(),
+                session_id: entry.session_id.clone(),
+                model: entry.model.clone(),
+                input_tokens: entry.input_tokens,
+                output_tokens: entry.output_tokens,
+                cache_read_tokens: entry.cache_read_tokens,
+                cache_write_tokens: entry.cache_write_tokens,
+                cost_estimate_usd: entry.cost_estimate_usd,
+                session_started_at: entry.session_started_at.clone(),
+                session_ended_at: entry.session_ended_at.clone(),
+            })?;
+        }
+        Ok(Some(body.entries.len()))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(synced))) => (StatusCode::OK, Json(json!({ "synced": synced }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// `GET /repos/{id}/docs` -- mirrors `agentops-api`'s `docs_json` cache-hit/
 /// miss logic exactly (persisted `doc_pages` row if present, else a
 /// heuristic-only page built on the fly, never persisted from here).
@@ -492,7 +587,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
-    use serde_json::Value;
+    use serde_json::{json, Value};
     use tower::ServiceExt;
 
     use agentops_repo_access::secrets::EnvSecretsProvider;
@@ -615,5 +710,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other_resp.status(), axum::http::StatusCode::NOT_FOUND, "a different tenant must never resolve another tenant's connection id");
+    }
+
+    #[tokio::test]
+    async fn usage_sync_then_usage_json_round_trips_and_never_crosses_tenants() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&other.tenant, other.id, "admin").unwrap();
+
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+
+        let entries = json!({ "entries": [{
+            "session_id": "sess-1",
+            "model": "claude-sonnet-5",
+            "input_tokens": 1000,
+            "output_tokens": 500,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cost_estimate_usd": 1.5,
+            "session_started_at": "2026-09-03T00:00:00Z",
+            "session_ended_at": "2026-09-03T01:00:00Z",
+        }] });
+        let sync_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/repos/{connection_id}/usage/sync"))
+                    .header("authorization", format!("Bearer {owner_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(entries.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sync_resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(body_json(sync_resp).await["synced"], 1);
+
+        let usage_resp = app
+            .clone()
+            .oneshot(Request::builder().uri(format!("/repos/{connection_id}/usage")).header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(usage_resp.status(), axum::http::StatusCode::OK);
+        let usage_body = body_json(usage_resp).await;
+        assert_eq!(usage_body["tokens"]["input_tokens"], 1000, "{usage_body:?}");
+        assert_eq!(usage_body["tokens"]["output_tokens"], 500, "{usage_body:?}");
+
+        let other_resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/repos/{connection_id}/usage/sync"))
+                    .header("authorization", format!("Bearer {other_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(entries.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_resp.status(), axum::http::StatusCode::NOT_FOUND, "a different tenant must never be able to push usage into another tenant's connection");
     }
 }

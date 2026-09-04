@@ -25,6 +25,11 @@ export function ConnectToolSection({ apiUrl, apiUrlIsGuessed }: { apiUrl: string
   // for every user and needs no per-visit setup step in this UI at all.
   const npxCommand = `npx agentops-cli connect --remote ${apiUrl} --agents ${agentsArg}`;
   const curlCommand = `curl -fsSL ${apiUrl}/connect.sh?agents=${agentsArg} | sh`;
+  // Module 8 (usage/knowledge-reuse dashboard): a one-time device-login the
+  // first time, same as the connect command above -- the server URL gets
+  // persisted into that repo's `.context/agentops-remote.json`, so every
+  // later `usage sync` there needs no `--remote` at all.
+  const usageSyncCommand = `npx agentops-cli usage sync --remote ${apiUrl}`;
 
   return (
     <Card className="max-w-[900px]">
@@ -56,6 +61,19 @@ export function ConnectToolSection({ apiUrl, apiUrlIsGuessed }: { apiUrl: string
             <a href={`${apiUrl}/connect.sh?agents=${agentsArg}`} target="_blank" rel="noreferrer" className="inline-block text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
               Preview the script before running it
             </a>
+          </CollapsibleContent>
+        </Collapsible>
+        <Collapsible>
+          <CollapsibleTrigger className="group flex items-center gap-1 text-body text-ink-500 hover:text-ink-300">
+            <ChevronRight className="size-3.5 transition-transform group-data-[state=open]:rotate-90" />
+            Track token usage &amp; knowledge reuse
+          </CollapsibleTrigger>
+          <CollapsibleContent className="space-y-2 pt-2">
+            <p className="text-body text-ink-400">From a connected repo, run this to sync local session token/cost data into its Usage card:</p>
+            <div className="flex items-center gap-2">
+              <code className="flex-1 truncate rounded-md border border-border-strong bg-panel px-3 py-2 text-mono-code text-ink-200">{usageSyncCommand}</code>
+              <CopyButton value={usageSyncCommand} />
+            </div>
           </CollapsibleContent>
         </Collapsible>
       </CardContent>

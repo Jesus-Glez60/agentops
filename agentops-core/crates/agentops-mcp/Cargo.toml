@@ -21,6 +21,7 @@ agentops-agents-md = { path = "../agentops-agents-md" }
 agentops-llm = { path = "../agentops-llm" }
 agentops-embeddings = { path = "../agentops-embeddings" }
 agentops-graph-pg = { path = "../agentops-graph-pg" }
+agentops-store-open = { path = "../agentops-store-open" }
 agentops-retrieval = { path = "../agentops-retrieval" }
 agentops-embeddings-train = { path = "../agentops-embeddings-train" }
 candle-core = "0.8"

@@ -18,7 +18,7 @@ use rusqlite_migration::{Migrations, M};
 
 use agentops_embeddings::EMBEDDING_DIM;
 
-use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewNode, NewScanHistoryEntry, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, Task, TaskLink, TaskStatus};
+use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, Task, TaskLink, TaskStatus};
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 
@@ -289,6 +289,46 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
         "ALTER TABLE nodes ADD COLUMN last_touched_at TEXT NOT NULL DEFAULT '';
         UPDATE nodes SET last_touched_at = CURRENT_TIMESTAMP WHERE last_touched_at = '';",
     ),
+    // Phase 5 (1.0 roadmap), Module 8: usage & knowledge-reuse tracking.
+    // node_id is nullable and deliberately not a hard FK -- same reasoning
+    // as node_versions/task_links: the referenced node may later be pruned.
+    // event_kind is a constant default (safe for ALTER TABLE ADD COLUMN,
+    // unlike a CURRENT_TIMESTAMP-style default -- see the review_status
+    // migration's own history above), distinguishing a knowledge "hit"
+    // (list_gotchas/get_symbol/related_context/semantic_search returning a
+    // real result) from every pre-existing write-tool "activity" row
+    // without parsing description.
+    M::up(
+        "ALTER TABLE session_events ADD COLUMN node_id INTEGER;
+        ALTER TABLE session_events ADD COLUMN event_kind TEXT NOT NULL DEFAULT 'activity';
+        CREATE INDEX IF NOT EXISTS idx_session_events_repo_kind ON session_events(repo, event_kind);",
+    ),
+    // Phase 5 (1.0 roadmap), Module 8: per-session token/cost usage,
+    // sourced from `agentops-cli usage sync` parsing a local Claude Code
+    // JSONL transcript -- not derived from any MCP tool call. One row per
+    // (repo, session_id, model); re-syncing a still-growing session file
+    // upserts via idx_session_usage_unique rather than double-counting.
+    // **Must stay the last entry in this slice** -- rusqlite_migration
+    // tracks progress purely by position, not content (see the note on the
+    // migration above this one).
+    M::up(
+        "CREATE TABLE IF NOT EXISTS session_usage (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo                TEXT NOT NULL,
+            session_id          TEXT NOT NULL,
+            model               TEXT NOT NULL,
+            input_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens       INTEGER NOT NULL DEFAULT 0,
+            cache_read_tokens   INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens  INTEGER NOT NULL DEFAULT 0,
+            cost_estimate_usd   REAL NOT NULL DEFAULT 0.0,
+            session_started_at  TEXT NOT NULL,
+            session_ended_at    TEXT NOT NULL,
+            recorded_at         TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_session_usage_unique ON session_usage(repo, session_id, model);
+        CREATE INDEX IF NOT EXISTS idx_session_usage_repo_time ON session_usage(repo, session_started_at);",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -383,7 +423,26 @@ impl SqliteGraphStore {
             session_id: row.get("session_id")?,
             tool_name: row.get("tool_name")?,
             description: row.get("description")?,
+            node_id: row.get("node_id")?,
+            event_kind: row.get("event_kind")?,
             created_at: row.get("created_at")?,
+        })
+    }
+
+    fn row_to_session_usage(row: &rusqlite::Row) -> rusqlite::Result<SessionUsage> {
+        Ok(SessionUsage {
+            id: row.get("id")?,
+            repo: row.get("repo")?,
+            session_id: row.get("session_id")?,
+            model: row.get("model")?,
+            input_tokens: row.get("input_tokens")?,
+            output_tokens: row.get("output_tokens")?,
+            cache_read_tokens: row.get("cache_read_tokens")?,
+            cache_write_tokens: row.get("cache_write_tokens")?,
+            cost_estimate_usd: row.get("cost_estimate_usd")?,
+            session_started_at: row.get("session_started_at")?,
+            session_ended_at: row.get("session_ended_at")?,
+            recorded_at: row.get("recorded_at")?,
         })
     }
 
@@ -813,10 +872,10 @@ impl GraphStore for SqliteGraphStore {
         Ok(rows.next().transpose()?)
     }
 
-    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str) -> Result<i64> {
+    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO session_events (repo, session_id, tool_name, description, created_at) VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)",
-            rusqlite::params![repo, session_id, tool_name, description],
+            "INSERT INTO session_events (repo, session_id, tool_name, description, node_id, event_kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)",
+            rusqlite::params![repo, session_id, tool_name, description, node_id, event_kind],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -824,6 +883,61 @@ impl GraphStore for SqliteGraphStore {
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>> {
         let mut stmt = self.conn.prepare("SELECT * FROM session_events WHERE repo = ?1 AND session_id = ?2 ORDER BY id ASC")?;
         let rows = stmt.query_map(rusqlite::params![repo, session_id], Self::row_to_session_event)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn session_events_for_repo(&self, repo: &str, event_kind: Option<&str>) -> Result<Vec<SessionEvent>> {
+        match event_kind {
+            Some(kind) => {
+                let mut stmt = self.conn.prepare("SELECT * FROM session_events WHERE repo = ?1 AND event_kind = ?2 ORDER BY id ASC")?;
+                let rows = stmt.query_map(rusqlite::params![repo, kind], Self::row_to_session_event)?;
+                rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+            }
+            None => {
+                let mut stmt = self.conn.prepare("SELECT * FROM session_events WHERE repo = ?1 ORDER BY id ASC")?;
+                let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_session_event)?;
+                rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+            }
+        }
+    }
+
+    fn upsert_session_usage(&self, usage: NewSessionUsage) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO session_usage (repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, session_started_at, session_ended_at, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP) \
+             ON CONFLICT(repo, session_id, model) DO UPDATE SET \
+                input_tokens = excluded.input_tokens, \
+                output_tokens = excluded.output_tokens, \
+                cache_read_tokens = excluded.cache_read_tokens, \
+                cache_write_tokens = excluded.cache_write_tokens, \
+                cost_estimate_usd = excluded.cost_estimate_usd, \
+                session_started_at = excluded.session_started_at, \
+                session_ended_at = excluded.session_ended_at, \
+                recorded_at = CURRENT_TIMESTAMP",
+            rusqlite::params![
+                usage.repo,
+                usage.session_id,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.cost_estimate_usd,
+                usage.session_started_at,
+                usage.session_ended_at,
+            ],
+        )?;
+        let id: i64 = self.conn.query_row(
+            "SELECT id FROM session_usage WHERE repo = ?1 AND session_id = ?2 AND model = ?3",
+            rusqlite::params![usage.repo, usage.session_id, usage.model],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    fn session_usage_for_repo(&self, repo: &str) -> Result<Vec<SessionUsage>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM session_usage WHERE repo = ?1 ORDER BY session_started_at DESC")?;
+        let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_session_usage)?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
@@ -1544,15 +1658,69 @@ mod tests {
     #[test]
     fn session_events_returns_only_the_matching_repo_and_session_in_order() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
-        store.record_session_event("repo-a", "sess-1", "scan_repo", "scanned repo-a").unwrap();
-        store.record_session_event("repo-a", "sess-1", "add_note", "wrote a gotcha").unwrap();
-        store.record_session_event("repo-a", "sess-2", "scan_repo", "a different session").unwrap();
-        store.record_session_event("repo-b", "sess-1", "scan_repo", "same session id, different repo").unwrap();
+        store.record_session_event("repo-a", "sess-1", "scan_repo", "scanned repo-a", None, "activity").unwrap();
+        store.record_session_event("repo-a", "sess-1", "add_note", "wrote a gotcha", None, "activity").unwrap();
+        store.record_session_event("repo-a", "sess-2", "scan_repo", "a different session", None, "activity").unwrap();
+        store.record_session_event("repo-b", "sess-1", "scan_repo", "same session id, different repo", None, "activity").unwrap();
 
         let events = store.session_events("repo-a", "sess-1").unwrap();
         assert_eq!(events.len(), 2, "must exclude other sessions and other repos: {events:?}");
         assert_eq!(events[0].tool_name, "scan_repo", "oldest first");
         assert_eq!(events[1].tool_name, "add_note");
+    }
+
+    #[test]
+    fn session_events_for_repo_filters_by_kind_and_spans_every_session_id() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.record_session_event("repo-a", "sess-1", "scan_repo", "scanned", None, "activity").unwrap();
+        store.record_session_event("repo-a", "sess-2", "list_gotchas", "listed 3 gotcha(s)", None, "hit").unwrap();
+        store.record_session_event("repo-a", "sess-3", "get_symbol", "looked up foo", Some(42), "hit").unwrap();
+        store.record_session_event("repo-b", "sess-1", "list_gotchas", "listed 1 gotcha(s)", None, "hit").unwrap();
+
+        let hits = store.session_events_for_repo("repo-a", Some("hit")).unwrap();
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|e| e.event_kind == "hit"));
+
+        let all = store.session_events_for_repo("repo-a", None).unwrap();
+        assert_eq!(all.len(), 3, "must include the activity row too: {all:?}");
+    }
+
+    fn new_session_usage(repo: &str, session_id: &str, input_tokens: i64) -> NewSessionUsage {
+        NewSessionUsage {
+            repo: repo.into(),
+            session_id: session_id.into(),
+            model: "claude-sonnet-5".into(),
+            input_tokens,
+            output_tokens: 10,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_estimate_usd: 0.01,
+            session_started_at: "2026-09-03T00:00:00Z".into(),
+            session_ended_at: "2026-09-03T01:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn upsert_session_usage_re_syncing_the_same_session_and_model_updates_in_place() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let first_id = store.upsert_session_usage(new_session_usage("repo-a", "sess-1", 100)).unwrap();
+        let second_id = store.upsert_session_usage(new_session_usage("repo-a", "sess-1", 250)).unwrap();
+
+        assert_eq!(first_id, second_id, "re-syncing the same (repo, session_id, model) must update the same row, not insert a second one");
+        let rows = store.session_usage_for_repo("repo-a").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].input_tokens, 250, "must reflect the latest sync, not the first");
+    }
+
+    #[test]
+    fn session_usage_for_repo_excludes_other_repos() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.upsert_session_usage(new_session_usage("repo-a", "sess-1", 100)).unwrap();
+        store.upsert_session_usage(new_session_usage("repo-b", "sess-1", 999)).unwrap();
+
+        let rows = store.session_usage_for_repo("repo-a").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repo, "repo-a");
     }
 
     fn new_task(repo: &str, title: &str) -> NewTask {

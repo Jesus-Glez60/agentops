@@ -746,7 +746,7 @@ mod tests {
     }
 
     fn event(created_at: &str, tool_name: &str, description: &str) -> agentops_graph::SessionEvent {
-        agentops_graph::SessionEvent { id: 0, repo: "demo".into(), session_id: "s1".into(), tool_name: tool_name.into(), description: description.into(), created_at: created_at.into() }
+        agentops_graph::SessionEvent { id: 0, repo: "demo".into(), session_id: "s1".into(), tool_name: tool_name.into(), description: description.into(), node_id: None, event_kind: "activity".into(), created_at: created_at.into() }
     }
 
     #[test]
