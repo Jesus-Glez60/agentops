@@ -14,7 +14,7 @@ serde_json.workspace = true
 agentops-graph = { path = "../agentops-graph" }
 agentops-embeddings = { path = "../agentops-embeddings" }
 candle-core = "0.8"
-candle-nn = "0.8"
+candle-nn = "0.11"
 rand = "0.8"
 
 [dev-dependencies]
