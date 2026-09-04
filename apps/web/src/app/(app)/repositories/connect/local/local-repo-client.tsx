@@ -10,8 +10,10 @@
 //      never be server-indexed or team-shared; show the plain local
 //      `agentops install` command.
 //   2. Remote found, already connected -- show the `agentops connect
-//      --remote` command with a freshly generated personal API key, same
-//      pattern the onboarding checklist uses.
+//      --remote` device-login command, same one `ConnectToolSection`
+//      shows (no API key: an earlier device-authorization refactor moved
+//      every other "connect a coding tool" surface off minting/embedding
+//      a personal API key, but missed this page -- fixed here to match).
 //   3. Remote found, not connected yet -- route to the existing SSH/GitHub
 //      App flow (host-aware: GitHub App only offered for github.com), with
 //      the detected URL/repo carried along so the user doesn't retype it.
@@ -21,7 +23,6 @@ import Link from "next/link";
 import { toast } from "sonner";
 import { ArrowLeft, FolderOpen } from "lucide-react";
 import { getRepos } from "@/lib/api/repos-api";
-import { createApiKey } from "@/lib/api/profile-api";
 import { StepIndicator } from "@/components/repositories/connect-wizard/step-indicator";
 import { CopyButton } from "@/components/shared/copy-button";
 import { Button } from "@/components/ui/button";
@@ -74,8 +75,6 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
   const router = useRouter();
   const [picking, setPicking] = useState(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
-  const [apiKey, setApiKey] = useState<string | null>(null);
-  const [generatingKey, setGeneratingKey] = useState(false);
 
   // Deliberately not computed during render -- `showDirectoryPicker`/secure
   // context are facts about the browser this code is actually running in,
@@ -117,18 +116,6 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
       }
     } finally {
       setPicking(false);
-    }
-  }
-
-  async function generateKey() {
-    setGeneratingKey(true);
-    try {
-      const created = await createApiKey("Coding tool");
-      setApiKey(created.key);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Couldn't generate an API key. Please try again.");
-    } finally {
-      setGeneratingKey(false);
     }
   }
 
@@ -192,22 +179,14 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
               Couldn&apos;t confirm this server&apos;s public API address — guessed <code className="text-mono-code">{apiUrl}</code>. If wrong, set <code className="text-mono-code">AGENTOPS_PUBLIC_API_URL</code> and reload.
             </p>
           )}
-          {apiKey === null ? (
-            <Button size="sm" disabled={generatingKey} onClick={generateKey}>
-              {generatingKey ? "Generating…" : "Generate API key"}
-            </Button>
-          ) : (
-            <>
-              <p className="mb-2 text-mono-code text-ink-500">Copy this now — it won&apos;t be shown again. Installs the CLI if it isn&apos;t already there.</p>
-              <div className="flex items-center gap-2">
-                <code className="flex-1 truncate rounded-md border border-border-strong bg-canvas px-3 py-2 text-mono-code text-ink-200">{`export AGENTOPS_API_KEY=${apiKey} && curl -fsSL ${apiUrl}/connect.sh | sh`}</code>
-                <CopyButton value={`export AGENTOPS_API_KEY=${apiKey} && curl -fsSL ${apiUrl}/connect.sh | sh`} />
-              </div>
-              <a href={`${apiUrl}/connect.sh`} target="_blank" rel="noreferrer" className="mt-2 inline-block text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
-                Preview the script before running it
-              </a>
-            </>
-          )}
+          <p className="mb-2 text-mono-code text-ink-500">Installs the CLI if it isn&apos;t already there, then opens a browser to log in:</p>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 truncate rounded-md border border-border-strong bg-canvas px-3 py-2 text-mono-code text-ink-200">{`npx agentops-cli connect --remote ${apiUrl}`}</code>
+            <CopyButton value={`npx agentops-cli connect --remote ${apiUrl}`} />
+          </div>
+          <a href={`${apiUrl}/connect.sh`} target="_blank" rel="noreferrer" className="mt-2 inline-block text-body text-ink-500 underline underline-offset-2 hover:text-ink-300">
+            Preview the equivalent curl script
+          </a>
         </div>
       )}
 
