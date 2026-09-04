@@ -19,7 +19,7 @@
     "next": "16.2.12",
     "prism-react-renderer": "^2.4.1",
     "radix-ui": "^1.6.7",
-    "react": "19.2.4",
+    "react": "19.2.8",
     "react-dom": "19.2.4",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1",
