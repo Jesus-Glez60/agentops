@@ -189,7 +189,22 @@ struct CratesIoCrate {
     repository: Option<String>,
 }
 
+/// Rust `use` paths only ever contain underscores (`tower_http`), but the
+/// real crates.io slug can be hyphenated (`tower-http`) -- crates.io itself
+/// normalizes hyphens to underscores for the Rust identifier but not the
+/// other way, so a straight lookup of the as-imported name 404s for any
+/// hyphenated crate. Try the name as extracted first, then retry with
+/// underscores turned into hyphens on a genuine "not found" (not on a
+/// network/parse error, which should propagate as-is).
 fn discover_cargo(name: &str) -> Result<Option<DiscoveredLibrary>> {
+    match discover_cargo_exact(name)? {
+        Some(lib) => Ok(Some(lib)),
+        None if name.contains('_') => discover_cargo_exact(&name.replace('_', "-")),
+        None => Ok(None),
+    }
+}
+
+fn discover_cargo_exact(name: &str) -> Result<Option<DiscoveredLibrary>> {
     let url = format!("https://crates.io/api/v1/crates/{name}");
     // crates.io rejects requests with no identifying User-Agent (their
     // documented API etiquette policy) rather than just rate-limiting them.
@@ -388,6 +403,15 @@ mod tests {
         match discover(Ecosystem::Cargo, "serde") {
             Ok(Some(result)) => assert!(result.repo_url.is_some() || result.docs_url.is_some()),
             Ok(None) => panic!("expected 'serde' to exist on crates.io"),
+            Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
+        }
+    }
+
+    #[test]
+    fn discovers_a_hyphenated_crate_from_its_underscored_import_name() {
+        match discover(Ecosystem::Cargo, "tower_http") {
+            Ok(Some(result)) => assert!(result.repo_url.is_some() || result.docs_url.is_some()),
+            Ok(None) => panic!("expected 'tower_http' to resolve to the 'tower-http' crate on crates.io"),
             Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
         }
     }

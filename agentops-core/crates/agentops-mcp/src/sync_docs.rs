@@ -69,8 +69,29 @@ fn record_declared_versions(store: &dyn docbrain_graph::DocbrainStore, repo_path
     let repo_identifier = repo_path.to_string_lossy().to_string();
     let mut recorded = 0u32;
     for dep in &declared {
-        if store.get_library(&dep.name)?.is_some() {
-            store.upsert_repo_library_version(&repo_identifier, &dep.name, &dep.version)?;
+        // Cargo.toml's `[dependencies]` keys are the crate's canonical,
+        // possibly-hyphenated registry name ("tower-http"), but the same
+        // crate gets registered under its underscored `use`-path-derived
+        // slug ("tower_http") by classify_rust/sync_candidates — an exact
+        // match on `dep.name` alone silently misses every hyphenated Rust
+        // crate (a real divergence this project's own recorded knowledge
+        // already warned "the join just never appears" for, at
+        // repo-library-version-tracking-subsystem.md). Try the as-written
+        // name first, then the opposite hyphen/underscore form.
+        let slug = match store.get_library(&dep.name)? {
+            Some(_) => Some(dep.name.clone()),
+            None if dep.name.contains('-') => {
+                let underscored = dep.name.replace('-', "_");
+                store.get_library(&underscored)?.map(|_| underscored)
+            }
+            None if dep.name.contains('_') => {
+                let hyphenated = dep.name.replace('_', "-");
+                store.get_library(&hyphenated)?.map(|_| hyphenated)
+            }
+            None => None,
+        };
+        if let Some(slug) = slug {
+            store.upsert_repo_library_version(&repo_identifier, &slug, &dep.version)?;
             recorded += 1;
         }
     }
@@ -180,6 +201,59 @@ mod tests {
         let usage = store.repos_using_library("next").unwrap();
         assert_eq!(usage.len(), 1);
         assert_eq!(usage[0].declared_version, "16.2.12");
+    }
+
+    #[test]
+    fn manifest_declared_version_is_recorded_for_a_hyphenated_crate_registered_under_its_underscored_slug() {
+        let store = docbrain_graph::SqliteDocbrainStore::open_in_memory().unwrap();
+        use docbrain_graph::DocbrainStore;
+        // sync_candidates registers Rust crates under their underscored
+        // use-path-derived slug ("tower_http"), but Cargo.toml's
+        // [dependencies] key is the canonical, hyphenated registry name
+        // ("tower-http") -- an exact match alone would silently drop this.
+        store.add_library("tower_http", "tower_http", None, None, Some("https://docs.rs/tower-http")).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[dependencies]\ntower-http = \"0.5\"\n").unwrap();
+
+        let recorded = record_declared_versions(&store, dir.path()).unwrap();
+        assert_eq!(recorded, 1);
+
+        let usage = store.repos_using_library("tower_http").unwrap();
+        assert_eq!(usage.len(), 1);
+        assert_eq!(usage[0].declared_version, "0.5");
+    }
+
+    #[test]
+    fn scanning_a_rust_repo_produces_cargo_candidates() {
+        // End-to-end wiring check for the exact bug this was written to fix:
+        // `classify_dependency` used to have no "rust" match arm, so this
+        // loop (sync_docs.rs:41-49) silently produced zero candidates for
+        // every Rust repo, even though scan_repo's Rust import extraction
+        // and docbrain_ingest's Cargo discovery both worked in isolation.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("main.rs"),
+            "use tower_http::cors::CorsLayer;\nuse std::collections::HashMap;\nuse crate::config::Config;\n\nfn main() {}\n",
+        )
+        .unwrap();
+
+        let report = agentops_scanner::scan_repo(dir.path()).unwrap();
+        let mut candidates: BTreeSet<(docbrain_ingest::Ecosystem, String)> = BTreeSet::new();
+        for file in &report.files {
+            let language = file.language.tree_sitter_name();
+            for dep in &file.deps {
+                if let Some(pair) = classify_dependency(language, dep) {
+                    candidates.insert(pair);
+                }
+            }
+        }
+
+        assert!(
+            candidates.contains(&(docbrain_ingest::Ecosystem::Cargo, "tower_http".to_string())),
+            "expected tower_http to be classified as a Cargo candidate, got: {candidates:?}"
+        );
+        assert!(!candidates.iter().any(|(_, name)| name == "std" || name == "crate"), "stdlib/keyword imports must not become candidates");
     }
 
     #[test]

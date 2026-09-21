@@ -1,7 +1,9 @@
 //! Classifies a raw import string into "is this a real third-party
-//! package, and if so which registry/package name" — unchanged in logic
-//! from `main` (no bugs were found here in the rebuild audit), reimplemented
-//! rather than copy-pasted per the clean-rebuild instruction.
+//! package, and if so which registry/package name." The Python/JS logic is
+//! unchanged from `main` (no bugs found there in the rebuild audit);
+//! Rust/Go support was added later — the rebuild audit only exercised the
+//! Python/JS paths, so this gap (a missing match arm) went unnoticed until
+//! a real Rust project's automatic doc sync produced zero results.
 //!
 //! Deliberately takes a plain `&str` language tag rather than depending on
 //! `agentops-scanner`'s `Language` type — this crate has no dependency on
@@ -32,12 +34,18 @@ const NODE_BUILTINS: &[&str] = &[
     "timers", "vm", "worker_threads", "perf_hooks", "module", "async_hooks",
 ];
 
+/// Rust path-expression keywords and stdlib crate roots — a `use`/`mod`
+/// path starting with one of these is never a crates.io package.
+const RUST_KEYWORDS_AND_STDLIB: &[&str] = &["crate", "self", "super", "std", "core", "alloc", "proc_macro", "test"];
+
 /// Classifies one raw dependency string. Returns `None` for relative
 /// imports, stdlib/builtin modules, or an unrecognized language.
 pub fn classify_dependency(language: &str, raw: &str) -> Option<(Ecosystem, String)> {
     match language {
         "python" => classify_python(raw),
         "javascript" | "typescript" => classify_js(raw),
+        "rust" => classify_rust(raw),
+        "go" => classify_go(raw),
         _ => None,
     }
 }
@@ -78,6 +86,24 @@ fn classify_js(raw: &str) -> Option<(Ecosystem, String)> {
     Some((Ecosystem::Npm, package_name))
 }
 
+fn classify_rust(raw: &str) -> Option<(Ecosystem, String)> {
+    let top_level = raw.split("::").next().unwrap_or(raw);
+    if top_level.is_empty() || RUST_KEYWORDS_AND_STDLIB.contains(&top_level) {
+        return None;
+    }
+    Some((Ecosystem::Cargo, top_level.to_string()))
+}
+
+/// Go stdlib packages (`fmt`, `net/http`, ...) have no dot in their first
+/// path segment; third-party module paths always do (`github.com/...`).
+fn classify_go(raw: &str) -> Option<(Ecosystem, String)> {
+    let first_segment = raw.split('/').next().unwrap_or(raw);
+    if first_segment.is_empty() || !first_segment.contains('.') {
+        return None;
+    }
+    Some((Ecosystem::Go, raw.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -106,5 +132,34 @@ mod tests {
             classify_dependency("typescript", "@radix-ui/react-dialog/dist/index"),
             Some((Ecosystem::Npm, "@radix-ui/react-dialog".to_string()))
         );
+    }
+
+    #[test]
+    fn classifies_real_cargo_crates() {
+        assert_eq!(classify_dependency("rust", "tower_http::cors"), Some((Ecosystem::Cargo, "tower_http".to_string())));
+        assert_eq!(classify_dependency("rust", "anyhow::Result"), Some((Ecosystem::Cargo, "anyhow".to_string())));
+        assert_eq!(classify_dependency("rust", "walker"), Some((Ecosystem::Cargo, "walker".to_string())));
+    }
+
+    #[test]
+    fn skips_rust_keywords_and_stdlib() {
+        assert_eq!(classify_dependency("rust", "crate::graph::GraphStore"), None);
+        assert_eq!(classify_dependency("rust", "self::helpers"), None);
+        assert_eq!(classify_dependency("rust", "super::config"), None);
+        assert_eq!(classify_dependency("rust", "std::collections::HashMap"), None);
+    }
+
+    #[test]
+    fn classifies_real_go_modules() {
+        assert_eq!(
+            classify_dependency("go", "github.com/gin-gonic/gin/binding"),
+            Some((Ecosystem::Go, "github.com/gin-gonic/gin/binding".to_string()))
+        );
+    }
+
+    #[test]
+    fn skips_go_stdlib() {
+        assert_eq!(classify_dependency("go", "fmt"), None);
+        assert_eq!(classify_dependency("go", "net/http"), None);
     }
 }

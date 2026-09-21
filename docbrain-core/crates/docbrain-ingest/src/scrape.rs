@@ -25,7 +25,7 @@ use anyhow::{Context, Result};
 use scraper::{ElementRef, Html, Selector};
 use url::Url;
 
-const BOILERPLATE_TAGS: &[&str] = &["nav", "header", "footer", "aside", "script", "style"];
+const BOILERPLATE_TAGS: &[&str] = &["nav", "header", "footer", "aside", "script", "style", "button"];
 const HEADING_TAGS: &[&str] = &["h1", "h2", "h3", "h4"];
 
 /// One scraped page: its Markdown-ish text, an optional title pulled from
@@ -285,7 +285,19 @@ fn extract_page(html: &str) -> ScrapedPage {
         if let Some(element) = node.value().as_element() {
             if HEADING_TAGS.contains(&element.name()) {
                 let el_ref = ElementRef::wrap(node).expect("element node wraps to ElementRef");
-                let text = clean_text(&el_ref.text().collect::<String>());
+                // `.text()` collects every descendant text node unconditionally,
+                // including ones under a boilerplate element nested inside the
+                // heading (e.g. rustdoc's `<button>Copy item path</button>`
+                // inside `<h1>`) -- filter those out too, not just top-level
+                // boilerplate siblings.
+                let text = clean_text(
+                    &el_ref
+                        .descendants()
+                        .filter(|d| d.value().is_text())
+                        .filter(|d| !d.ancestors().any(|a| a.value().as_element().is_some_and(|e| BOILERPLATE_TAGS.contains(&e.name()))))
+                        .filter_map(|d| d.value().as_text().map(|t| t.to_string()))
+                        .collect::<String>(),
+                );
                 if !text.is_empty() {
                     let level: usize = element.name()[1..].parse().unwrap_or(2);
                     markdown.push_str(&"#".repeat(level));
@@ -520,6 +532,25 @@ mod tests {
             }
             None => eprintln!("skipping network-dependent assertion: nextjs.org's llms.txt not reachable right now"),
         }
+    }
+
+    // Real rustdoc/docs.rs HTML (fetched live from docs.rs/tokio/latest/tokio/)
+    // -- regression coverage for the claim, made downstream by real project
+    // usage, that docbrain "can't parse rustdoc pages at all." It turns out
+    // rustdoc pages do have a `<main>` (wrapping `<section id="main-content">`)
+    // and a real `<nav class="sidebar">` (already stripped by BOILERPLATE_TAGS
+    // as an ordinary `nav`) -- `extract_page`'s existing selector chain
+    // already handles this shape correctly. This test exists to catch a
+    // regression, not to fix a reproducing bug (none was found against
+    // current code and current docs.rs markup).
+    #[test]
+    fn extracts_real_docs_rs_rustdoc_page_content() {
+        let html = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/testdata/docs_rs_tokio.html")).unwrap();
+        let page = extract_page(&html);
+        assert!(page.markdown.len() > 5000, "expected substantial content, got {} chars", page.markdown.len());
+        assert!(page.markdown.contains("# Crate"), "expected the crate-level heading to survive");
+        assert!(page.markdown.contains("asynchronous"), "expected real prose from the crate description");
+        assert!(!page.markdown.contains("Copy item path"), "rustdoc's copy-path button chrome must be stripped");
     }
 
     // Regression test for a real, confirmed case: nextjs.org's root
