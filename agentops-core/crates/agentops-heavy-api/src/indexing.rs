@@ -89,30 +89,32 @@ impl AppState {
 /// `<tenant>/<connection_id>` layout this used to have. That layout broke
 /// tenant isolation for every consumer of `agentops_mcp::scan::repo_name`
 /// (which only ever reads a path's *final* component to derive the
-/// Postgres `repo` key) -- including deep inside `agentops-mcp::scan::persist`
-/// and `agentops_mcp::call_tool`'s dispatch, neither of which has a tenant
-/// parameter to thread through, since both are shared with the genuinely
-/// single-tenant CLI/stdio path. Two different tenants each naming a
-/// connection `"repo-1"` (allowed -- `ConnectionStore`'s primary key is
-/// `(tenant, id)`, not `id` alone) collided their entire code graph under
-/// one shared key.
+/// Postgres `repo` key, which the frontend also renders directly as
+/// human-readable text -- `ActivityEvent.repo`/`GotchaSummary.repo`, see
+/// `activity-ticker.tsx`/`gotchas/page.tsx`) -- including deep inside
+/// `agentops-mcp::scan::persist` and `agentops_mcp::call_tool`'s dispatch,
+/// neither of which has a tenant parameter to thread through, since both
+/// are shared with the genuinely single-tenant CLI/stdio path. Two
+/// different tenants each naming a connection `"repo-1"` (allowed --
+/// `ConnectionStore`'s primary key is `(tenant, id)`, not `id` alone)
+/// collided their entire code graph under one shared key.
 ///
-/// Hashing `(tenant, connection_id)` into the directory name -- rather than
-/// a literal `format!("{tenant}--{connection_id}")` join -- sidesteps
-/// needing to prove neither value can ever contain whatever delimiter was
-/// chosen (tenant ids are opaque random strings; connection ids are
-/// user-influenced slugs, not verified delimiter-safe). This is a checkout
-/// cache directory name, not a stored identifier -- unrelated to `repo_name`
-/// consumers wanting a human-readable value.
+/// `{connection_id}--{tenant}`, not a hash: real production tenant ids are
+/// always exactly 32 hex characters (`agentops_accounts::new_random_id`, 16
+/// random bytes hex-encoded) -- a **fixed, known length** appended as the
+/// suffix makes this injective regardless of what characters
+/// `connection_id` itself contains, for any two real tenant ids (two
+/// different (connection_id, tenant) pairs can only produce the same
+/// joined string if their last 32 characters -- necessarily both full
+/// tenant ids -- are equal, which forces the remaining prefixes, and
+/// therefore the connection ids, to be equal too). No need to verify
+/// `connection_id` is delimiter-safe, and it stays visible as a readable
+/// prefix rather than being hashed away. (No length assertion here --
+/// this crate's own tests widely use short literal tenant strings as
+/// fixtures, not real ids; the proof is about production `User.tenant`
+/// values, which `resolve_tenant` is the only path that produces.)
 pub(crate) fn checkout_path(repo_checkouts_dir: &std::path::Path, tenant: &str, connection_id: &str) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(tenant.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(connection_id.as_bytes());
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
-    repo_checkouts_dir.join(hex)
+    repo_checkouts_dir.join(format!("{connection_id}--{tenant}"))
 }
 
 /// 16 random bytes, hex-encoded -- same shape as `team.rs`'s
@@ -574,6 +576,25 @@ mod tests {
         // final path component, and that's exactly what a colliding
         // Postgres `repo` key would have been derived from.
         assert_ne!(agentops_mcp::repo_name(&a), agentops_mcp::repo_name(&b));
+    }
+
+    /// The general injectivity proof in `checkout_path`'s doc comment
+    /// depends on real tenant ids having a fixed 32-hex-char length --
+    /// this proves the case that actually matters (a connection id that
+    /// itself contains the `--` delimiter) using realistic-length ids, not
+    /// just the short, trivially-distinct fixture strings the test above
+    /// uses.
+    #[test]
+    fn checkout_path_stays_unambiguous_even_when_connection_id_contains_the_delimiter() {
+        let dir = std::path::Path::new("/tmp/agentops-repo-checkouts");
+        let tenant_a = "a".repeat(32);
+        let tenant_b = "b".repeat(32);
+        // Crafted so a naive split-on-"--" could misparse: "foo--repo-1" + tenant_b
+        // has the same shape as "foo" + "--" + "repo-1--" + tenant_b would if
+        // connection_id and tenant were confused for each other.
+        let a = checkout_path(dir, &tenant_a, "foo--repo-1");
+        let b = checkout_path(dir, &tenant_b, "foo");
+        assert_ne!(a, b, "a connection id containing the delimiter must not be able to collide with a different (shorter connection id, different tenant) pair");
     }
 }
 #[derive(Debug, Deserialize, Default)]
