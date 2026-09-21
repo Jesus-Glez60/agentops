@@ -25,3 +25,12 @@ Summarize any relevant prior gotchas, decisions, or notes found before
 proceeding, so this session builds on what's already known instead of
 silently rediscovering or contradicting it. If nothing relevant is found,
 say so in one line and proceed.
+
+While working, if you need documentation for a library or crate that isn't
+answered by `get_docs`/`search_docs` (empty results, or the library isn't
+registered at all), do not fall back to a third-party documentation tool or
+your own training knowledge as the first move — call `discover_library` (or
+`register_library` if discovery doesn't resolve it) and `scrape_library`
+yourself. Do this even when not explicitly asked to fetch docs — a doc gap
+found mid-task is not a reason to guess or switch tools, it's a reason to
+fill the gap.

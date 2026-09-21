@@ -125,7 +125,10 @@ pub fn generate(root: &Path, opts: &GenerateOptions) -> String {
              project's own recorded knowledge first — via MCP tools like `list_gotchas`, \
              `get_symbol`, and `related_context` if available, or by reading the Markdown files \
              directly at the path above otherwise. A past fix or decision recorded here answers \
-             the question faster than rediscovering it through general code search.\n\n\
+             the question faster than rediscovering it through general code search. Scope the \
+             check to the specific symbols, files, or libraries the current task touches, not \
+             just a generic glance at what's recorded — do this even when the task looks simple \
+             or unrelated to past work.\n\n\
              New gotchas, decisions, and other project knowledge learned while working here \
              should be recorded at the path above — via the `add_note` MCP tool if available, \
              or as a Markdown file with `title`/`type`/`tags` frontmatter directly in that \
@@ -259,5 +262,6 @@ mod tests {
         let content = generate(dir.path(), &opts);
         assert!(content.contains("Before researching a bug"), "must instruct checking existing notes before re-researching from scratch");
         assert!(content.contains("list_gotchas"), "should name the actual MCP read tools to check first");
+        assert!(content.contains("Scope the check to the specific symbols"), "must instruct task-scoped checking, not just a generic glance");
     }
 }
