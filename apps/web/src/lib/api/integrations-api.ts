@@ -5,19 +5,7 @@
 // share this one file since they're structurally identical -- same request
 // shapes, same response shapes -- just different base paths and audiences.
 
-async function heavyFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`/api/heavy${path}`, {
-    ...init,
-    headers: { ...(init.body ? { "Content-Type": "application/json" } : {}), ...init.headers },
-    cache: "no-store",
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    const message = data && typeof data === "object" && typeof data.error === "string" ? data.error : `request to ${path} failed with ${res.status}`;
-    throw new Error(message);
-  }
-  return data as T;
-}
+import { heavyFetch } from "@/lib/api/heavy-fetch";
 
 export interface IntegrationSummary {
   provider: string;
