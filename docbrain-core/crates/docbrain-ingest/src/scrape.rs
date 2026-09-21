@@ -56,7 +56,16 @@ pub fn scrape_docs(url: &str, max_pages: usize) -> Result<Vec<ScrapedPage>> {
     let html = fetch(url)?;
     let mut pages = vec![scrape_one_page(url, &html)];
 
-    if max_pages > 1 {
+    // Code-hosting sites aren't documentation sites: their sub-pages beyond
+    // the landing page (commit history, file browser, issues) are mostly
+    // React SPA views that return a JS-app-shell placeholder on a plain
+    // HTML fetch, not real content -- confirmed live, a `max_pages: 200`
+    // crawl of a bare GitHub repo URL produced ~1625 chunks of "Uh oh!
+    // There was an error while loading" and commit-history noise instead of
+    // documentation. `docs_url` should only ever be a code-hosting URL as a
+    // last resort (`discover_cargo` prefers docs.rs; this guards the
+    // remaining path, e.g. a manually `register_library`-registered repo).
+    if max_pages > 1 && !is_code_hosting_host(&base) {
         let links = fetch_llms_txt_links(&base).unwrap_or_else(|| same_scope_links(&html, &base));
         for link in links.into_iter().take(max_pages - 1) {
             match fetch(link.as_str()) {
@@ -336,6 +345,15 @@ fn clean_text(raw: &str) -> String {
     raw.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Known code-hosting hosts (same three `derive_go_repo_url` in
+/// `discover.rs` already treats as forge hosts, for consistency) whose
+/// sub-pages are never worth crawling as documentation.
+const CODE_HOSTING_HOSTS: &[&str] = &["github.com", "gitlab.com", "bitbucket.org"];
+
+fn is_code_hosting_host(url: &Url) -> bool {
+    url.host_str().is_some_and(|h| CODE_HOSTING_HOSTS.contains(&h))
+}
+
 /// Same-origin links whose path starts with `base`'s own path — keeps a
 /// shallow crawl inside the same docs section instead of wandering off to a
 /// marketing site's blog/pricing pages that happen to share a domain.
@@ -419,6 +437,27 @@ mod tests {
         "#;
         let page = extract_page(html);
         assert!(!page.markdown.contains("nav text"));
+    }
+
+    #[test]
+    fn recognizes_known_code_hosting_hosts() {
+        assert!(is_code_hosting_host(&Url::parse("https://github.com/tokio-rs/axum").unwrap()));
+        assert!(is_code_hosting_host(&Url::parse("https://gitlab.com/foo/bar").unwrap()));
+        assert!(is_code_hosting_host(&Url::parse("https://bitbucket.org/foo/bar").unwrap()));
+        assert!(!is_code_hosting_host(&Url::parse("https://docs.rs/axum").unwrap()));
+        assert!(!is_code_hosting_host(&Url::parse("https://tokio.rs").unwrap()));
+    }
+
+    // Network-dependent, matching this crate's established practice of
+    // verifying against a real site rather than a mock -- confirms the
+    // actual bug this fixes: a github.com URL with a high max_pages used
+    // to follow same_scope_links into ~1625 chunks of repo-browser chrome.
+    #[test]
+    fn scrape_docs_never_follows_links_on_a_code_hosting_host() {
+        match scrape_docs("https://github.com/tokio-rs/axum", 200) {
+            Ok(pages) => assert_eq!(pages.len(), 1, "must stay at the landing page regardless of max_pages on a code-hosting host"),
+            Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
+        }
     }
 
     #[test]

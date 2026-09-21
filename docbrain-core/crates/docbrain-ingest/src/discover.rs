@@ -182,8 +182,6 @@ struct CratesIoCrate {
     #[serde(default)]
     description: Option<String>,
     #[serde(default)]
-    homepage: Option<String>,
-    #[serde(default)]
     documentation: Option<String>,
     #[serde(default)]
     repository: Option<String>,
@@ -219,9 +217,18 @@ fn discover_cargo_exact(name: &str) -> Result<Option<DiscoveredLibrary>> {
     Ok(Some(DiscoveredLibrary {
         name: name.to_string(),
         description: parsed.krate.description,
-        // docs.rs (the `documentation` field) over the crate's homepage --
-        // that's the actual generated API reference, not a marketing page.
-        docs_url: parsed.krate.documentation.or(parsed.krate.homepage),
+        // Prefer the crate's explicit `documentation` field when set, but
+        // don't fall through to `homepage`/a GitHub repo just because it's
+        // empty -- docs.rs itself states "All libraries published to
+        // crates.io are documented," so a docs.rs URL is always a real,
+        // already-correctly-parseable fallback (confirmed live: crates with
+        // no `documentation` field, e.g. axum/tower-http/rustls, still 200
+        // at docs.rs). No further fallback to `homepage` is needed: this
+        // function only reaches here after crates.io itself already
+        // confirmed the crate is published, and docs.rs's own guarantee
+        // covers every published crate -- `homepage` would be unreachable
+        // dead code, not a real safety net.
+        docs_url: parsed.krate.documentation.or_else(|| Some(format!("https://docs.rs/{name}"))),
         repo_url: parsed.krate.repository,
     }))
 }
@@ -403,6 +410,18 @@ mod tests {
         match discover(Ecosystem::Cargo, "serde") {
             Ok(Some(result)) => assert!(result.repo_url.is_some() || result.docs_url.is_some()),
             Ok(None) => panic!("expected 'serde' to exist on crates.io"),
+            Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
+        }
+    }
+
+    #[test]
+    fn defaults_docs_url_to_docs_rs_when_the_crate_has_no_documentation_field() {
+        // axum has no `documentation` field on crates.io (confirmed live) --
+        // this is the concrete case that used to fall back to its GitHub
+        // homepage instead of its real, already-indexed docs.rs page.
+        match discover(Ecosystem::Cargo, "axum") {
+            Ok(Some(result)) => assert_eq!(result.docs_url.as_deref(), Some("https://docs.rs/axum")),
+            Ok(None) => panic!("expected 'axum' to exist on crates.io"),
             Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
         }
     }
