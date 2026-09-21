@@ -1714,8 +1714,9 @@ mod tests {
         }
         assert_eq!(final_status, "succeeded", "indexing job against a real local repo must reach succeeded");
 
-        assert!(checkouts_dir.join("acme").join("widgets").join("README.md").exists(), "the job must actually clone into its checkout dir");
-        assert!(checkouts_dir.join("acme").join("widgets").join("repo-map.md").exists(), "the docgen stage must actually write repo-map.md");
+        let expected_checkout = crate::indexing::checkout_path(&checkouts_dir, "acme", "widgets");
+        assert!(expected_checkout.join("README.md").exists(), "the job must actually clone into its checkout dir");
+        assert!(expected_checkout.join("repo-map.md").exists(), "the docgen stage must actually write repo-map.md");
 
         let _ = std::fs::remove_dir_all(&bare_repo);
         let _ = std::fs::remove_dir_all(&checkouts_dir);

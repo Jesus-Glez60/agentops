@@ -85,8 +85,34 @@ impl AppState {
 /// without ever needing to canonicalize a not-yet-existing path up front
 /// (whose fallback behavior -- the raw path string -- is exactly the
 /// raw-path-vs-canonicalized-name mismatch a prior live-tested bug hit).
+/// A flat, single directory-component checkout path, not the two-level
+/// `<tenant>/<connection_id>` layout this used to have. That layout broke
+/// tenant isolation for every consumer of `agentops_mcp::scan::repo_name`
+/// (which only ever reads a path's *final* component to derive the
+/// Postgres `repo` key) -- including deep inside `agentops-mcp::scan::persist`
+/// and `agentops_mcp::call_tool`'s dispatch, neither of which has a tenant
+/// parameter to thread through, since both are shared with the genuinely
+/// single-tenant CLI/stdio path. Two different tenants each naming a
+/// connection `"repo-1"` (allowed -- `ConnectionStore`'s primary key is
+/// `(tenant, id)`, not `id` alone) collided their entire code graph under
+/// one shared key.
+///
+/// Hashing `(tenant, connection_id)` into the directory name -- rather than
+/// a literal `format!("{tenant}--{connection_id}")` join -- sidesteps
+/// needing to prove neither value can ever contain whatever delimiter was
+/// chosen (tenant ids are opaque random strings; connection ids are
+/// user-influenced slugs, not verified delimiter-safe). This is a checkout
+/// cache directory name, not a stored identifier -- unrelated to `repo_name`
+/// consumers wanting a human-readable value.
 pub(crate) fn checkout_path(repo_checkouts_dir: &std::path::Path, tenant: &str, connection_id: &str) -> PathBuf {
-    repo_checkouts_dir.join(tenant).join(connection_id)
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(tenant.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(connection_id.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    repo_checkouts_dir.join(hex)
 }
 
 /// 16 random bytes, hex-encoded -- same shape as `team.rs`'s
@@ -518,6 +544,38 @@ pub async fn retry_indexing(State(state): State<AppState>, user: Option<axum::Ex
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for a real, confirmed bug: `checkout_path` used to
+    // build a two-level `<tenant>/<connection_id>` directory, but
+    // `agentops_mcp::scan::repo_name` only ever reads a path's *final*
+    // component to derive the Postgres `repo` isolation key -- so two
+    // tenants each naming a connection `"repo-1"` (allowed --
+    // `ConnectionStore`'s primary key is `(tenant, id)`, not `id` alone)
+    // collided their entire code graph under one shared key. This is the
+    // direct proof the hashed, flat directory name closes that collision.
+    #[test]
+    fn checkout_path_never_collides_across_tenants_sharing_a_connection_id() {
+        let dir = std::path::Path::new("/tmp/agentops-repo-checkouts");
+        let a = checkout_path(dir, "tenant-a", "repo-1");
+        let b = checkout_path(dir, "tenant-b", "repo-1");
+        assert_ne!(a, b, "two different tenants naming a connection the same thing must never resolve to the same checkout path");
+
+        // Same (tenant, connection_id) must still be deterministic --
+        // reindexing an existing connection needs to find its own prior
+        // checkout, not silently start cloning into a new directory every time.
+        let a_again = checkout_path(dir, "tenant-a", "repo-1");
+        assert_eq!(a, a_again, "the same (tenant, connection_id) pair must always resolve to the same checkout path");
+
+        // Also confirms the collision is closed at the repo_name() level,
+        // not just the path level -- since repo_name() only reads the
+        // final path component, and that's exactly what a colliding
+        // Postgres `repo` key would have been derived from.
+        assert_ne!(agentops_mcp::repo_name(&a), agentops_mcp::repo_name(&b));
+    }
+}
 #[derive(Debug, Deserialize, Default)]
 pub struct BranchesQuery {
     #[serde(default)]

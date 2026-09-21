@@ -196,6 +196,7 @@ pub struct DispatchResult {
 /// so the equivalent guarantee now lives at the enrollment layer instead of
 /// being re-checked here.
 pub fn handle_verified_payload(
+    tenant: &str,
     team_config: &AutoKickoffTeamConfig,
     linear_config: &agentops_linear::LinearConfig,
     payload: &serde_json::Value,
@@ -231,7 +232,20 @@ pub fn handle_verified_payload(
     let title = payload.pointer("/data/title").and_then(|v| v.as_str()).unwrap_or("(untitled)");
     let session_id = format!("linear-auto-kickoff-{identifier}");
 
-    let repo = agentops_mcp::repo_name(&team_config.repo_path);
+    // Tenant-prefixed so this task row can't collide with another tenant's
+    // task under the same key (`repo_path` is an arbitrary client-supplied
+    // path at enrollment time -- see `enroll_auto_kickoff_handler` -- with
+    // no validation that it's a path this tenant actually owns, unlike
+    // `checkout_path`'s connections, which are now hashed per-(tenant,
+    // connection_id)). NOTE: `scan_and_persist` below still derives its own
+    // unprefixed repo key internally from the raw path -- it has no
+    // tenant-override parameter, since it's shared with the single-tenant
+    // CLI/stdio path -- so the *scanned nodes/edges* this call writes are
+    // NOT covered by this prefix and can still collide if two tenants
+    // literally enroll the same filesystem path. Tracked as a known,
+    // separate remaining gap (needs enrollment-time path ownership
+    // validation, not a call-site fix), not silently treated as closed.
+    let repo = format!("{tenant}/{}", agentops_mcp::repo_name(&team_config.repo_path));
     agentops_mcp::scan_and_persist(&team_config.repo_path, true).context("auto-kickoff scan_repo")?;
 
     // Doc-pull is a soft-fail step, same discipline as `sync_candidates`'s
@@ -314,11 +328,12 @@ async fn linear_webhook_handler(State(state): State<Arc<WebhookState>>, headers:
     // the same "Cannot start a runtime from within a runtime" panic this
     // codebase has already hit three times elsewhere (`/mcp`,
     // `agentops-api`'s `/tools/{name}`, `indexing.rs`'s `run_job`).
+    let tenant_for_task = tenant.clone();
     let team_config_for_task = team_config.clone();
     let linear_config_for_task = linear_config.clone();
     let payload_for_task = payload.clone();
     let pg_store_for_task = state.pg_store.clone();
-    let dispatch = tokio::task::spawn_blocking(move || handle_verified_payload(&team_config_for_task, &linear_config_for_task, &payload_for_task, pg_store_for_task.as_ref())).await;
+    let dispatch = tokio::task::spawn_blocking(move || handle_verified_payload(&tenant_for_task, &team_config_for_task, &linear_config_for_task, &payload_for_task, pg_store_for_task.as_ref())).await;
 
     match dispatch {
         Ok(Ok(result)) => {
@@ -735,7 +750,7 @@ mod tests {
         let linear_config = agentops_linear::LinearConfig { api_key: "unused".into(), api_url: "http://127.0.0.1:1".into() };
         let payload = issue_payload("some-other-team", "user-1", "create", false);
 
-        let result = handle_verified_payload(&team, &linear_config, &payload, None).unwrap();
+        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None).unwrap();
         assert!(!result.dispatched);
         assert_eq!(result.reason, "payload team id does not match the verified webhook's team");
     }
@@ -748,7 +763,7 @@ mod tests {
         // update, but no `updatedFrom.assigneeId` — some unrelated field changed.
         let payload = issue_payload("team-1", "user-1", "update", false);
 
-        let result = handle_verified_payload(&team, &linear_config, &payload, None).unwrap();
+        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None).unwrap();
         assert!(!result.dispatched);
         assert_eq!(result.reason, "not a new assignment");
     }
@@ -767,12 +782,16 @@ mod tests {
         let linear_config = agentops_linear::LinearConfig { api_key: "unused".into(), api_url: server.uri() };
         let payload = issue_payload("team-1", "user-1", "create", false);
 
-        let result = handle_verified_payload(&team, &linear_config, &payload, None).unwrap();
+        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None).unwrap();
         assert!(result.dispatched, "{result:?}");
 
         let store = agentops_mcp::open_store(dir.path()).unwrap();
         let repo = agentops_mcp::repo_name(dir.path());
-        let tasks = store.list_tasks(&repo).unwrap();
+        // The task row is tenant-prefixed (see handle_verified_payload's
+        // comment on why); the scan itself is not, since scan_and_persist
+        // still derives its own key from the raw path internally.
+        let tenant_prefixed_repo = format!("tenant-a/{repo}");
+        let tasks = store.list_tasks(&tenant_prefixed_repo).unwrap();
         assert_eq!(tasks.len(), 1, "{tasks:?}");
         assert_eq!(tasks[0].external_id.as_deref(), Some("ENG-1"));
         assert_eq!(tasks[0].session_id.as_deref(), Some("linear-auto-kickoff-ENG-1"));
