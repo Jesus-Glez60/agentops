@@ -1,14 +1,17 @@
-// Typed client for docbrain-api's /libraries routes. Types mirror
-// docbrain-graph's Library/RepoLibraryUsage response shapes exactly; see
-// docbrain-core/crates/docbrain-graph/src/lib.rs for the Rust source of
-// truth. Same base URL/port as agentops-api.ts now (the merged
-// agentops-server process) -- docbrain-api's routes are nested under
-// /docbrain there (its own /tools/{name} would otherwise collide with
-// agentops-api's at the same path; see agentops-server's lib.rs doc
-// comment), so every path below is prefixed accordingly.
-import { apiFetch } from "@/lib/api/fetcher";
-
-const AGENTOPS_API_URL = process.env.NEXT_PUBLIC_AGENTOPS_API_URL ?? "http://127.0.0.1:8420";
+// Typed client for the Libraries screen -- same /api/heavy/* proxy pattern
+// as repos-api.ts/team-api.ts/profile-api.ts (see profile-api.ts's doc
+// comment for why: session token must stay server-side). Used to call
+// docbrain-api's /docbrain/libraries* directly from the browser with no
+// auth at all (a public NEXT_PUBLIC_AGENTOPS_API_URL, unauthenticated by
+// tenant) -- that backend router shares one global docbrain store across
+// every tenant on the hosted server; these routes now live in
+// agentops-heavy-api instead (see libraries_http.rs's module doc comment),
+// resolved per-tenant on every request the same way `/mcp`/`/repos` already
+// were. Types still mirror docbrain-graph's Library/RepoLibraryUsage
+// response shapes exactly; see docbrain-core/crates/docbrain-graph/src/lib.rs
+// for the Rust source of truth -- the JSON shape these new routes return is
+// unchanged, only how they're reached and tenant-scoped.
+import { heavyFetch } from "@/lib/api/heavy-fetch";
 
 export const LIBRARIES_SWR_KEY = "/libraries";
 
@@ -48,12 +51,12 @@ export interface LibraryDetail {
 }
 
 export async function getLibraries(): Promise<Library[]> {
-  const { libraries } = await apiFetch<{ libraries: Library[] }>(AGENTOPS_API_URL, "/docbrain/libraries");
+  const { libraries } = await heavyFetch<{ libraries: Library[] }>("/libraries");
   return libraries;
 }
 
 export async function getLibrary(slug: string): Promise<LibraryDetail> {
-  return apiFetch<LibraryDetail>(AGENTOPS_API_URL, `/docbrain/libraries/${encodeURIComponent(slug)}`);
+  return heavyFetch<LibraryDetail>(`/libraries/${encodeURIComponent(slug)}`);
 }
 
 interface ToolResult {
@@ -62,7 +65,7 @@ interface ToolResult {
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<{ isError: boolean; text: string }> {
-  const result = await apiFetch<ToolResult>(AGENTOPS_API_URL, `/docbrain/tools/${name}`, { method: "POST", body: JSON.stringify(args) });
+  const result = await heavyFetch<ToolResult>(`/libraries/tools/${name}`, { method: "POST", body: JSON.stringify(args) });
   return { isError: result.isError, text: result.content[0]?.text ?? "" };
 }
 

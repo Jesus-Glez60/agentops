@@ -47,6 +47,7 @@ mod accounts_integrations;
 mod dashboard;
 mod github_app_routes;
 mod indexing;
+mod libraries_http;
 mod linear_webhook;
 mod mcp_http;
 mod team;
@@ -277,7 +278,10 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/graph", get(dashboard::repo_graph_json))
         .route("/repos/{id}/docs", get(dashboard::docs_json))
         .route("/repos/{id}/usage", get(dashboard::usage_json))
-        .route("/repos/{id}/usage/sync", post(dashboard::usage_sync_json));
+        .route("/repos/{id}/usage/sync", post(dashboard::usage_sync_json))
+        .route("/libraries", get(libraries_http::list_libraries_json))
+        .route("/libraries/tools/{name}", post(libraries_http::call_library_tool_json))
+        .route("/libraries/{slug}", get(libraries_http::get_library_json));
     if include_tools {
         router = router.route("/tools", get(heavy_tools_list_handler)).route("/tools/{name}", post(heavy_tools_call_handler));
     }
@@ -1269,6 +1273,7 @@ mod tests {
     use super::*;
     use agentops_graph::GraphStore as _;
     use agentops_repo_access::secrets::EnvSecretsProvider;
+    use docbrain_graph::DocbrainStore as _;
     use axum::body::Body;
     use axum::http::Request;
     use http_body_util::BodyExt;
@@ -2057,6 +2062,56 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         let body = body_json(resp).await;
         assert!(!body["result"]["content"][0]["text"].as_str().unwrap().contains("react"), "a different tenant must not see this tenant's docbrain libraries: {body:?}");
+    }
+
+    // Regression test for the bug that motivated moving these routes out of
+    // `docbrain-api`: `agentops-server` used to mount `docbrain-api`'s
+    // router with one global, non-tenant `SqliteDocbrainStore` opened once
+    // at process startup, so every tenant on the hosted server shared one
+    // docbrain database -- the frontend's Libraries page showed stale/wrong
+    // data while `/mcp` tool calls (already correctly tenant-scoped) showed
+    // real data for the same org. This proves the new `GET /libraries` REST
+    // route is scoped exactly like `/mcp` already was, not a second,
+    // differently-broken implementation.
+    #[tokio::test]
+    async fn get_libraries_is_scoped_to_the_callers_own_tenant() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (_, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        let docbrain_dir = tempfile::tempdir().unwrap();
+        let app = build_router(store, secrets, None, None, None, docbrain_dir.path().to_path_buf(), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
+
+        // Seed a library directly in the owner tenant's own docbrain
+        // SQLite file (`docbrain_db_path_for_org`, the same per-tenant path
+        // the route under test resolves) -- a doc_snapshot is required, not
+        // just `add_library`, since `list_libraries_json` deliberately
+        // filters to libraries with real ingested content (see that
+        // handler's own comment); this avoids a real network scrape in a
+        // unit test.
+        {
+            let db_path = docbrain_db_path_for_org(docbrain_dir.path(), Some(&owner.tenant));
+            let owner_store = docbrain_graph::SqliteDocbrainStore::open(&db_path).unwrap();
+            owner_store.add_library("react", "React", None, None, Some("https://react.dev")).unwrap();
+            owner_store.add_doc_snapshot("react", "19.0.0").unwrap();
+        }
+
+        let owner_list = app.clone().oneshot(Request::builder().uri("/libraries").header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(owner_list.status(), StatusCode::OK);
+        let owner_body = body_json(owner_list).await;
+        assert!(
+            owner_body["libraries"].as_array().unwrap().iter().any(|l| l["slug"] == "react"),
+            "the registering tenant must see its own library over REST: {owner_body:?}"
+        );
+
+        let other_list = app.oneshot(Request::builder().uri("/libraries").header("authorization", format!("Bearer {other_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(other_list.status(), StatusCode::OK);
+        let other_body = body_json(other_list).await;
+        assert!(
+            !other_body["libraries"].as_array().unwrap().iter().any(|l| l["slug"] == "react"),
+            "a different tenant must not see this tenant's libraries over REST: {other_body:?}"
+        );
     }
 
     #[tokio::test]

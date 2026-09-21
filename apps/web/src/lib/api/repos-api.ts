@@ -2,19 +2,7 @@
 // pattern as team-api.ts/profile-api.ts (see profile-api.ts's doc comment
 // for why: session token must stay server-side).
 
-async function heavyFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`/api/heavy${path}`, {
-    ...init,
-    headers: { ...(init.body ? { "Content-Type": "application/json" } : {}), ...init.headers },
-    cache: "no-store",
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    const message = data && typeof data === "object" && typeof data.error === "string" ? data.error : `request to ${path} failed with ${res.status}`;
-    throw new Error(message);
-  }
-  return data as T;
-}
+import { heavyFetch } from "@/lib/api/heavy-fetch";
 
 export const REPOS_SWR_KEY = "/repos";
 

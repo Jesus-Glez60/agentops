@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input";
 import { ScopeSelector } from "@/components/search/scope-selector";
 import { CopyButton } from "@/components/shared/copy-button";
 import { EmptyState } from "@/components/shared/empty-state";
+import { displayRepoName } from "@/lib/utils";
 import { NodeDetailSections } from "@/components/shared/node-detail-sections";
 import { CurationReasonDialog } from "@/components/gotchas/curation-reason-dialog";
 import { mapWithConcurrency } from "@/lib/concurrency";
@@ -190,11 +191,11 @@ export default function GotchasPage() {
               )}
             >
               <BucketBadge bucket={bucketOf(gotcha)} />
-              <p className="text-section font-medium text-ink-100">{gotcha.name ?? gotcha.path ?? `${gotcha.repo}#${gotcha.id}`}</p>
+              <p className="text-section font-medium text-ink-100">{gotcha.name ?? gotcha.path ?? `${displayRepoName(gotcha.repo)}#${gotcha.id}`}</p>
               {gotcha.snippet && <p className="line-clamp-2 text-body text-ink-500">{gotcha.snippet}</p>}
               <div className="flex items-center gap-2 text-mono-path text-ink-500">
                 <GitBranch className="size-3" />
-                {gotcha.repo}
+                {displayRepoName(gotcha.repo)}
                 {gotcha.path && (
                   <>
                     <span className="text-border-strong">·</span>

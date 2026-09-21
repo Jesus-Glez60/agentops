@@ -7,6 +7,7 @@ import { SearchIcon, SearchX, Workflow } from "lucide-react";
 import { getNodeDetail, getRepos, REPOS_SWR_KEY, search, type ConnectedNode, type NodeKind } from "@/lib/api/repos-api";
 import { getRecentSearches, pushRecentSearch } from "@/lib/recent-searches";
 import { kindLabel } from "@/lib/node-detail-formatting";
+import { displayRepoName } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { SearchFilters } from "@/components/search/search-filters";
@@ -196,7 +197,7 @@ function SearchPageInner() {
                 key={`${result.repo}:${result.id}`}
                 kind={result.kind}
                 kindLabel={kindLabel(result.kind)}
-                title={result.name ?? result.path ?? `${result.repo}#${result.id}`}
+                title={result.name ?? result.path ?? `${displayRepoName(result.repo)}#${result.id}`}
                 snippet={result.snippet ?? ""}
                 score={result.similarity}
                 selected={selected?.repo === result.repo && selected?.id === result.id}

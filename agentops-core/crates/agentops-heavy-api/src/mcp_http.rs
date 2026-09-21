@@ -144,6 +144,28 @@ fn resolve_access_mode(state: &AppState, tenant: &str) -> agentops_mcp::AccessMo
         .unwrap_or(state.mode)
 }
 
+/// Opens the caller's own per-tenant docbrain store
+/// (`docbrain_db_path_for_org`) fresh, inside `spawn_blocking`, and
+/// dispatches one docbrain tool call against it. Shared by `/mcp`'s
+/// `tools/call` dispatch and `libraries_http.rs`'s REST tool-call route —
+/// extracted so there's exactly one place that opens a per-tenant docbrain
+/// store for a tool call, not two copies of the same idiom.
+pub(crate) async fn call_docbrain_tool(state: &AppState, tenant: &str, name: &str, arguments: Value) -> Value {
+    let db_path = docbrain_db_path_for_org(&state.docbrain_db_dir, Some(tenant));
+    let name = name.to_string();
+    let call_result = tokio::task::spawn_blocking(move || {
+        let store = docbrain_graph::SqliteDocbrainStore::open(&db_path)?;
+        Ok::<_, anyhow::Error>(docbrain_mcp::call_tool(&store, &db_path, &name, &arguments))
+    })
+    .await;
+    match call_result {
+        Ok(Ok(Ok(result))) => serde_json::to_value(result).unwrap(),
+        Ok(Ok(Err(refusal))) => json!({ "content": [{ "type": "text", "text": refusal }], "isError": true }),
+        Ok(Err(e)) => json!({ "content": [{ "type": "text", "text": format!("opening docbrain store: {e}") }], "isError": true }),
+        Err(e) => json!({ "content": [{ "type": "text", "text": format!("tool call panicked: {e}") }], "isError": true }),
+    }
+}
+
 async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, params: &Value) -> Value {
     let Some(name) = params.get("name").and_then(|v| v.as_str()) else {
         return err(id, INVALID_PARAMS, "missing 'name' in tools/call params");
@@ -160,20 +182,7 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     }
 
     if docbrain_mcp::list_tools().iter().any(|t| t.name == name) {
-        let db_path = docbrain_db_path_for_org(&state.docbrain_db_dir, Some(&caller.tenant));
-        let name = name.to_string();
-        let arguments = arguments.clone();
-        let call_result = tokio::task::spawn_blocking(move || {
-            let store = docbrain_graph::SqliteDocbrainStore::open(&db_path)?;
-            Ok::<_, anyhow::Error>(docbrain_mcp::call_tool(&store, &db_path, &name, &arguments))
-        })
-        .await;
-        let result = match call_result {
-            Ok(Ok(Ok(result))) => serde_json::to_value(result).unwrap(),
-            Ok(Ok(Err(refusal))) => json!({ "content": [{ "type": "text", "text": refusal }], "isError": true }),
-            Ok(Err(e)) => json!({ "content": [{ "type": "text", "text": format!("opening docbrain store: {e}") }], "isError": true }),
-            Err(e) => json!({ "content": [{ "type": "text", "text": format!("tool call panicked: {e}") }], "isError": true }),
-        };
+        let result = call_docbrain_tool(state, &caller.tenant, name, arguments.clone()).await;
         return ok(id, result);
     }
 

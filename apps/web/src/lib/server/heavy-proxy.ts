@@ -19,7 +19,7 @@ import { getSessionToken } from "@/lib/auth/session";
 // routes the CLI calls directly (never through this session-authed proxy,
 // which requires a token before forwarding anything); only the browser's
 // Approve/Deny click on `/cli-auth` goes through here.
-const ALLOWED_PREFIXES = ["auth/me", "auth/sessions", "auth/2fa", "auth/api-keys", "auth/cli/device/approve", "team", "invites", "repos", "integrations", "gotchas", "local-search", "activity"];
+const ALLOWED_PREFIXES = ["auth/me", "auth/sessions", "auth/2fa", "auth/api-keys", "auth/cli/device/approve", "team", "invites", "repos", "integrations", "gotchas", "local-search", "activity", "libraries"];
 
 export function isAllowedPath(path: string): boolean {
   return ALLOWED_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));

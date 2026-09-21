@@ -36,6 +36,14 @@ describe("isAllowedPath", () => {
     expect(isAllowedPath("gotchas")).toBe(true);
     expect(isAllowedPath("local-search")).toBe(true);
     expect(isAllowedPath("activity")).toBe(true);
+    // Same regression shape as the three above: libraries-api.ts used to
+    // call docbrain-api directly (a public, unauthenticated
+    // NEXT_PUBLIC_AGENTOPS_API_URL) rather than through this proxy at all,
+    // which is what let that backend route go un-tenant-scoped for as long
+    // as it did. Now routed through here like everything else.
+    expect(isAllowedPath("libraries")).toBe(true);
+    expect(isAllowedPath("libraries/react")).toBe(true);
+    expect(isAllowedPath("libraries/tools/discover_library")).toBe(true);
   });
 
   it("rejects anything not on the allowlist, including prefix look-alikes", () => {

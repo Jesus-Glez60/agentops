@@ -1,26 +1,13 @@
-// Typed client for the Profile screen -- unlike libraries-api.ts/agentops-api.ts,
-// these calls go through this app's own /api/heavy/* proxy (see
-// heavy-proxy.ts's doc comment), not straight to a backend, since
-// agentops-heavy-api requires a bearer session token that must never reach
-// the browser.
+// Typed client for the Profile screen -- unlike agentops-api.ts (the local,
+// single-operator scan registry with no session concept), these calls go
+// through this app's own /api/heavy/* proxy (see heavy-proxy.ts's doc
+// comment), not straight to a backend, since agentops-heavy-api requires a
+// bearer session token that must never reach the browser.
 import type { SessionUser } from "@/lib/auth/types";
+import { heavyFetch } from "@/lib/api/heavy-fetch";
 
 /** Matches the existing `getMe`-equivalent backend path -- there's no separate `/profile` route, `/auth/me` already returns the full profile. */
 export const PROFILE_SWR_KEY = "/auth/me";
-
-async function heavyFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`/api/heavy${path}`, {
-    ...init,
-    headers: { ...(init.body ? { "Content-Type": "application/json" } : {}), ...init.headers },
-    cache: "no-store",
-  });
-  const data = await res.json().catch(() => null);
-  if (!res.ok) {
-    const message = data && typeof data === "object" && typeof data.error === "string" ? data.error : `request to ${path} failed with ${res.status}`;
-    throw new Error(message);
-  }
-  return data as T;
-}
 
 export function getProfile(): Promise<SessionUser> {
   return heavyFetch<SessionUser>(PROFILE_SWR_KEY);

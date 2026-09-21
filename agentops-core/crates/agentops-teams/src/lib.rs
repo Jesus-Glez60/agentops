@@ -175,6 +175,7 @@ pub const CAP_GRAPH_VIEW: &str = "graph.view";
 pub const CAP_GOTCHAS_VIEW: &str = "gotchas.view";
 pub const CAP_GOTCHAS_COMMENT: &str = "gotchas.comment";
 pub const CAP_GOTCHAS_RESOLVE: &str = "gotchas.resolve";
+pub const CAP_LIBRARIES_VIEW: &str = "libraries.view";
 pub const CAP_API_KEYS_PERSONAL: &str = "api_keys.personal";
 pub const CAP_API_KEYS_ORG: &str = "api_keys.org";
 pub const CAP_TEAM_MANAGE_MEMBERS: &str = "team.manage_members";
@@ -196,6 +197,7 @@ pub const PERMISSIONS_MATRIX: &[Capability] = &[
     Capability { key: CAP_GOTCHAS_VIEW, feature_area: "Gotchas", label: "View gotcha list & detail", allowed_roles: &["admin", "member", "viewer"] },
     Capability { key: CAP_GOTCHAS_COMMENT, feature_area: "Gotchas", label: "Comment on gotchas", allowed_roles: &["admin", "member"] },
     Capability { key: CAP_GOTCHAS_RESOLVE, feature_area: "Gotchas", label: "Resolve or dismiss gotchas", allowed_roles: &["admin", "member"] },
+    Capability { key: CAP_LIBRARIES_VIEW, feature_area: "Libraries", label: "View library docs & version tracking", allowed_roles: &["admin", "member", "viewer"] },
     Capability { key: CAP_API_KEYS_PERSONAL, feature_area: "API & Keys", label: "Generate personal API keys", allowed_roles: &["admin", "member"] },
     Capability { key: CAP_API_KEYS_ORG, feature_area: "API & Keys", label: "View & revoke org-wide API keys", allowed_roles: &["admin"] },
     Capability { key: CAP_TEAM_MANAGE_MEMBERS, feature_area: "Team & Billing", label: "Invite & remove members", allowed_roles: &["admin"] },
