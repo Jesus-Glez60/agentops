@@ -19,6 +19,19 @@ static GO_QUOTED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#""([^"]+)""#).
 static RUST_USE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?use\s+([\w:]+)").unwrap());
 static RUST_MOD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;").unwrap());
 
+/// Fully-qualified path *expressions* anywhere in the file body, not just
+/// `use` lines — confirmed via live testing against this actual repo's own
+/// `agentops-server` crate: it wires the whole app together
+/// (`agentops_api::build_router_without_dashboard_routes(...)`,
+/// `agentops_heavy_api::build_full_router(...)`) via inline qualified calls
+/// with exactly one `use` statement in the whole crate. Without this, the
+/// file that most connects the workspace's crates together was nearly
+/// invisible in the dependency graph. Lowercase-leading first segment
+/// (`[a-z_]`) deliberately excludes `Type::method` paths (types are
+/// PascalCase by convention) to stay module/crate-shaped, matching what
+/// `resolve_rust_dep` knows how to resolve anyway.
+static RUST_QUALIFIED_PATH: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([a-z_][a-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+)\b").unwrap());
+
 /// Only the quoted form (`#include "foo.h"`) — conventionally a
 /// repo-relative/project header, so a plausible dependency-edge target.
 /// The angle-bracket form (`#include <vector>`) is a system/external
@@ -57,6 +70,9 @@ pub fn extract_deps(language: Language, source: &str) -> Vec<String> {
         Language::Rust => {
             let mut deps: Vec<String> = RUST_USE.captures_iter(source).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())).collect();
             deps.extend(RUST_MOD.captures_iter(source).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())));
+            deps.extend(RUST_QUALIFIED_PATH.captures_iter(source).filter_map(|c| c.get(1).map(|m| m.as_str().to_string())));
+            deps.sort();
+            deps.dedup();
             deps
         }
 
@@ -105,6 +121,27 @@ mod tests {
         assert!(deps.contains(&"anyhow::Result".to_string()), "found: {deps:?}");
         assert!(deps.contains(&"walker".to_string()), "found: {deps:?}");
         assert!(deps.contains(&"ast_extract".to_string()), "found: {deps:?}");
+    }
+
+    /// Regression test for a confirmed real gap: `agentops-server` wires
+    /// the whole app together via inline fully-qualified calls like
+    /// `agentops_api::build_router_without_dashboard_routes(...)`, with
+    /// barely any `use` statements — those calls used to be invisible to
+    /// dependency extraction entirely, not just unresolved.
+    #[test]
+    fn extracts_inline_fully_qualified_rust_calls_not_just_use_lines() {
+        let src = "pub async fn run() -> anyhow::Result<()> {\n    let router = agentops_api::build_router_without_dashboard_routes(mode, key, path);\n    Ok(())\n}\n";
+        let deps = extract_deps(Language::Rust, src);
+        assert!(deps.contains(&"agentops_api::build_router_without_dashboard_routes".to_string()), "found: {deps:?}");
+    }
+
+    #[test]
+    fn does_not_mistake_a_type_path_call_for_a_module_path() {
+        // `Type::method` (PascalCase first segment) is a type-associated
+        // call, not a module path — must not be extracted as a dependency.
+        let src = "let s = String::from(\"x\");\nlet v = Vec::new();\n";
+        let deps = extract_deps(Language::Rust, src);
+        assert!(deps.is_empty(), "found: {deps:?}");
     }
 
     #[test]

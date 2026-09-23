@@ -56,11 +56,12 @@ pub fn rank_files(repo_root: &Path, files: &[ScannedFile]) -> Vec<(PathBuf, f64)
 /// module paths exclusively, and its TS code uses the `@/...` tsconfig
 /// alias exclusively; neither starts with `.`. Both are now resolved too.
 pub fn resolve_dependency_edges(repo_root: &Path, files: &[ScannedFile]) -> Vec<(PathBuf, PathBuf)> {
+    let workspace_crates = build_workspace_crate_map(repo_root, files);
     let mut edges = Vec::new();
     for f in files {
         for dep in &f.deps {
             let target = resolve_relative_dep(&f.path, dep, files)
-                .or_else(|| matches!(f.language, Language::Rust).then(|| resolve_rust_dep(&f.path, dep, files)).flatten())
+                .or_else(|| matches!(f.language, Language::Rust).then(|| resolve_rust_dep(&f.path, dep, files, &workspace_crates)).flatten())
                 .or_else(|| matches!(f.language, Language::TypeScript | Language::JavaScript).then(|| resolve_ts_alias_dep(repo_root, &f.path, dep, files)).flatten());
             if let Some(target) = target {
                 edges.push((f.path.clone(), target));
@@ -68,6 +69,31 @@ pub fn resolve_dependency_edges(repo_root: &Path, files: &[ScannedFile]) -> Vec<
         }
     }
     edges
+}
+
+/// Maps each in-workspace Rust crate's `[package] name` (as it appears in a
+/// `use` path, i.e. hyphens normalized to underscores) to that crate's `src`
+/// directory — lets `resolve_rust_dep` resolve `use other_crate::Thing`
+/// across crate boundaries, not just within the importing file's own crate.
+/// Built once per scan from the *scanned* Rust files' own crate roots
+/// (`rust_crate_root`), not a filesystem walk, so it never looks outside
+/// what was already scanned. A crate root whose `Cargo.toml` is missing or
+/// unparseable contributes nothing, same best-effort spirit as the rest of
+/// this module.
+fn build_workspace_crate_map(repo_root: &Path, files: &[ScannedFile]) -> HashMap<String, PathBuf> {
+    let mut crate_roots: Vec<PathBuf> = files.iter().filter(|f| matches!(f.language, Language::Rust)).filter_map(|f| rust_crate_root(&f.path)).collect();
+    crate_roots.sort();
+    crate_roots.dedup();
+
+    crate_roots
+        .into_iter()
+        .filter_map(|root| {
+            let content = std::fs::read_to_string(repo_root.join(&root).join("Cargo.toml")).ok()?;
+            let table = content.parse::<toml::Table>().ok()?;
+            let name = table.get("package")?.get("name")?.as_str()?;
+            Some((name.replace('-', "_"), root.join("src")))
+        })
+        .collect()
 }
 
 /// Same-file symbol-to-symbol references, AST-precise: for each symbol
@@ -102,18 +128,29 @@ pub fn resolve_same_file_symbol_references(symbols: &[Symbol]) -> Vec<(usize, us
 }
 
 /// Resolves a Rust `use crate::...`/`use super::...`/`use self::...`
-/// dependency string, or a bare `mod foo;` module name, against the
-/// scanned file set. Best-effort: tries the longest module-path prefix
-/// first (the tail of a `use` path is usually an imported item name, e.g.
-/// `GraphStore` in `crate::graph::GraphStore`, not itself a file), falling
-/// back to shorter prefixes; external crates (`std::...`, `serde::...`)
-/// don't match `crate`/`super`/`self` and have more than one segment, so
-/// they're deliberately never guessed at.
-fn resolve_rust_dep(from: &Path, dep: &str, files: &[ScannedFile]) -> Option<PathBuf> {
+/// dependency string, a bare `mod foo;` module name, or a `use
+/// other_workspace_crate::...` path, against the scanned file set.
+/// Best-effort: tries the longest module-path prefix first (the tail of a
+/// `use` path is usually an imported item name, e.g. `GraphStore` in
+/// `crate::graph::GraphStore`, not itself a file), falling back to shorter
+/// prefixes; a first segment that isn't `crate`/`super`/`self` and isn't a
+/// known in-workspace crate name (from `workspace_crates`) is a true
+/// external crate (`std::...`, `serde::...`) and is deliberately never
+/// guessed at.
+fn resolve_rust_dep(from: &Path, dep: &str, files: &[ScannedFile], workspace_crates: &HashMap<String, PathBuf>) -> Option<PathBuf> {
     let segments: Vec<&str> = dep.split("::").collect();
 
-    let (base_dir, module_segments): (PathBuf, &[&str]) = match segments.first() {
-        Some(&"crate") => (rust_crate_root(from)?.join("src"), &segments[1..]),
+    // Whether a total path-segment-match miss should still fall back to
+    // `base_dir`'s own root file (`lib.rs`/`mod.rs`/`main.rs`) — true for
+    // every branch that names an actual module *path*, where the tail is
+    // commonly just an item re-exported at that module's root (e.g. `use
+    // other_crate::PublicStruct;`, the overwhelmingly common shape for a
+    // crate's public API). False for the bare `mod foo;` branch, where a
+    // miss means the module file genuinely doesn't exist among the scanned
+    // files — falling back there would misattribute the edge to the
+    // declaring file's own module root instead of admitting no match.
+    let (base_dir, module_segments, root_fallback): (PathBuf, &[&str], bool) = match segments.first() {
+        Some(&"crate") => (rust_crate_root(from)?.join("src"), &segments[1..], true),
         Some(&"super") => {
             let mut dir = rust_parent_module_dir(from)?;
             let mut segs = &segments[1..];
@@ -121,18 +158,28 @@ fn resolve_rust_dep(from: &Path, dep: &str, files: &[ScannedFile]) -> Option<Pat
                 dir = dir.parent()?.to_path_buf();
                 segs = &segs[1..];
             }
-            (dir, segs)
+            (dir, segs, true)
         }
-        Some(&"self") => (rust_module_base_dir(from), &segments[1..]),
+        Some(&"self") => (rust_module_base_dir(from), &segments[1..], true),
         // A bare `mod foo;` module name has no `::` at all — resolve
         // relative to the declaring file's own directory (siblings).
-        _ if segments.len() == 1 => (from.parent()?.to_path_buf(), &segments[..]),
+        _ if segments.len() == 1 => (from.parent()?.to_path_buf(), &segments[..], false),
+        Some(&first) if segments.len() > 1 && workspace_crates.contains_key(first) => (workspace_crates[first].clone(), &segments[1..], true),
         _ => return None,
     };
 
     for len in (1..=module_segments.len()).rev() {
         let rel = module_segments[..len].join("/");
         for candidate in [base_dir.join(format!("{rel}.rs")), base_dir.join(&rel).join("mod.rs")] {
+            let normalized = normalize(&candidate);
+            if let Some(found) = files.iter().find(|f| normalize(&f.path) == normalized) {
+                return Some(found.path.clone());
+            }
+        }
+    }
+
+    if root_fallback && !module_segments.is_empty() {
+        for candidate in [base_dir.join("lib.rs"), base_dir.join("mod.rs"), base_dir.join("main.rs")] {
             let normalized = normalize(&candidate);
             if let Some(found) = files.iter().find(|f| normalize(&f.path) == normalized) {
                 return Some(found.path.clone());
@@ -392,16 +439,23 @@ mod tests {
     }
 
     #[test]
-    fn resolves_rust_super_path_from_a_nested_module() {
+    fn resolves_rust_super_path_to_an_item_at_the_parent_modules_root_file() {
         let files = vec![
             rust_file("mycrate/src/lib.rs", &[]),
             rust_file("mycrate/src/graph/mod.rs", &["super::lib_helper"]),
         ];
-        // `super::lib_helper` from `src/graph/mod.rs` resolves to a sibling
-        // of `lib.rs` in `src/` — `lib_helper.rs` doesn't exist here, so
-        // this just confirms no panic and no wrong edge is guessed.
+        // No sibling `lib_helper.rs` exists — `lib_helper` is the far more
+        // common case of an item defined directly inside `lib.rs`, so the
+        // root-file fallback should land there instead of giving up.
         let edges = resolve_dependency_edges(Path::new("."), &files);
-        assert!(edges.is_empty());
+        assert_eq!(edges, vec![(PathBuf::from("mycrate/src/graph/mod.rs"), PathBuf::from("mycrate/src/lib.rs"))], "found: {edges:?}");
+    }
+
+    #[test]
+    fn super_path_still_produces_no_edge_when_no_root_file_exists_either() {
+        let files = vec![rust_file("mycrate/src/graph/mod.rs", &["super::lib_helper"])];
+        let edges = resolve_dependency_edges(Path::new("."), &files);
+        assert!(edges.is_empty(), "found: {edges:?}");
     }
 
     #[test]
@@ -430,5 +484,69 @@ mod tests {
         ];
         let edges = resolve_dependency_edges(root, &files);
         assert_eq!(edges, vec![(PathBuf::from("src/app.ts"), PathBuf::from("src/lib/utils.ts"))], "found: {edges:?}");
+    }
+
+    /// Regression test for a confirmed real gap: in a Cargo workspace, a
+    /// `use other_crate::Thing` import across crate boundaries used to be
+    /// silently dropped as if it were `std`/`serde` — every sibling crate
+    /// rendered as a disconnected island in the knowledge graph even though
+    /// they reference each other constantly. `crate-b`'s package name uses
+    /// a hyphen (as Cargo requires) while its `use` path uses an
+    /// underscore, matching real Rust conventions.
+    #[test]
+    fn resolves_use_paths_into_other_workspace_crates() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/crate-a/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/crate-b/src")).unwrap();
+        std::fs::write(root.join("crates/crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\n").unwrap();
+        std::fs::write(root.join("crates/crate-b/Cargo.toml"), "[package]\nname = \"crate-b\"\n").unwrap();
+
+        // Same "longest module-path prefix, tail is the imported item
+        // name" shape as `resolves_rust_use_crate_and_mod_paths`'s
+        // `crate::graph::GraphStore` -- `thing` is the submodule file,
+        // `Thing` the item defined inside it.
+        let files = vec![
+            rust_file("crates/crate-a/src/lib.rs", &["crate_b::thing::Thing"]),
+            rust_file("crates/crate-b/src/lib.rs", &[]),
+            rust_file("crates/crate-b/src/thing.rs", &[]),
+        ];
+        let edges = resolve_dependency_edges(root, &files);
+        assert!(edges.contains(&(PathBuf::from("crates/crate-a/src/lib.rs"), PathBuf::from("crates/crate-b/src/thing.rs"))), "found: {edges:?}");
+    }
+
+    /// The actual dominant real-world shape, confirmed live against this
+    /// repo's own workspace: `use other_crate::PublicItem;` where
+    /// `PublicItem` is defined directly in the other crate's `lib.rs`, not
+    /// in its own submodule file — a plain path-segment match alone (as in
+    /// the `thing::Thing` test above) never finds this, only the root-file
+    /// fallback does.
+    #[test]
+    fn resolves_use_path_to_an_item_defined_at_another_crates_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/crate-a/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/crate-b/src")).unwrap();
+        std::fs::write(root.join("crates/crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\n").unwrap();
+        std::fs::write(root.join("crates/crate-b/Cargo.toml"), "[package]\nname = \"crate-b\"\n").unwrap();
+
+        let files = vec![rust_file("crates/crate-a/src/lib.rs", &["crate_b::PublicItem"]), rust_file("crates/crate-b/src/lib.rs", &[])];
+        let edges = resolve_dependency_edges(root, &files);
+        assert_eq!(edges, vec![(PathBuf::from("crates/crate-a/src/lib.rs"), PathBuf::from("crates/crate-b/src/lib.rs"))], "found: {edges:?}");
+    }
+
+    #[test]
+    fn external_rust_crates_still_unresolved_alongside_a_real_workspace() {
+        // Same setup as the cross-crate test, but the dep string names
+        // something that isn't any workspace crate's package name — must
+        // still not produce a guessed edge.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("crates/crate-a/src")).unwrap();
+        std::fs::write(root.join("crates/crate-a/Cargo.toml"), "[package]\nname = \"crate-a\"\n").unwrap();
+
+        let files = vec![rust_file("crates/crate-a/src/lib.rs", &["serde::Deserialize"])];
+        let edges = resolve_dependency_edges(root, &files);
+        assert!(edges.is_empty(), "found: {edges:?}");
     }
 }
