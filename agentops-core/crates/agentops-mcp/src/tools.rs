@@ -64,7 +64,7 @@ fn tool_specs() -> Vec<ToolSpec> {
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
             input_schema: || {
-                json!({ "type": "object", "properties": { "path": { "type": "string" }, "name": { "type": "string" }, "file": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path", "name"] })
+                json!({ "type": "object", "properties": { "path": { "type": "string" }, "name": { "type": "string" }, "file": { "type": "string" }, "session_id": { "type": "string" }, "max_chars": { "type": "integer", "description": "Truncation budget for returned content (default 4000). Truncated content includes a node id — pass it to fetch_content for the rest." } }, "required": ["path", "name"] })
             },
             handler: tool_get_symbol,
         },
@@ -136,7 +136,7 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "Explains a symbol via the Anthropic API and persists the result as a Definition node linked to it. Requires AGENTOPS_ANTHROPIC_API_KEY. Costs a real API call — never run automatically during a scan. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
             access: AccessMode::Full,
             annotations: ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: false, open_world_hint: true },
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "session_id": { "type": "string" } }, "required": ["path", "symbol_id"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "session_id": { "type": "string" }, "max_chars": { "type": "integer", "description": "Truncation budget for the returned explanation (default 4000)." } }, "required": ["path", "symbol_id"] }),
             handler: tool_explain_symbol,
         },
         ToolSpec {
@@ -144,8 +144,16 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "Pattern completion around a symbol (Initiative 4, CLS-inspired retrieval plan): finds symbols elsewhere in the repo that are similar (dense embedding, requires with_embeddings from an earlier scan) or graph-connected (Personalized PageRank over Affects/References edges) to the given symbol, and returns each one's own recorded Gotcha/Decision notes. Read-only, no LLM call — the same recombined context explain_symbol now folds into its prompt automatically, exposed directly so an agent session can ask 'what's associated with this symbol' without triggering a full explanation. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "top_k": { "type": "integer" }, "session_id": { "type": "string" } }, "required": ["path", "symbol_id"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "top_k": { "type": "integer" }, "session_id": { "type": "string" }, "max_chars": { "type": "integer", "description": "Truncation budget for each note's text (default 4000)." } }, "required": ["path", "symbol_id"] }),
             handler: tool_related_context,
+        },
+        ToolSpec {
+            name: "fetch_content",
+            description: "Fetches the full, untruncated content of a node whose id was surfaced (truncated) by get_symbol, explain_symbol, related_context, or a search hit. Use when a truncated result looks relevant and you need the rest. Optionally scope to a char range with offset/limit for very large content.",
+            access: AccessMode::Advisor,
+            annotations: READ_ONLY,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "id": { "type": "integer" }, "offset": { "type": "integer" }, "limit": { "type": "integer" } }, "required": ["path", "id"] }),
+            handler: tool_fetch_content,
         },
         ToolSpec {
             name: "get_session",
@@ -310,6 +318,12 @@ fn get_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
+/// The per-call truncation budget for content that flows through
+/// `budget::cap` — `max_chars` in `args` overrides the shared default.
+fn max_chars(args: &Value) -> usize {
+    args.get("max_chars").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(crate::budget::DEFAULT_CHAR_BUDGET)
+}
+
 fn repo_context(args: &Value) -> anyhow::Result<(Box<dyn GraphStore>, String)> {
     let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
     let path = Path::new(path_str);
@@ -443,6 +457,7 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
         maybe_record_session_event(Path::new(path_str), args, "get_symbol", &format!("looked up symbol {name}"), Some(id), "hit")?;
     }
 
+    let capped_content = crate::budget::cap(node.content.as_deref().unwrap_or(""), max_chars(args), id);
     let mut out = format!(
         "{} ({}) — {}:{}-{}\n\n{}",
         node.name.as_deref().unwrap_or(name),
@@ -450,7 +465,7 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
         node.path.as_deref().unwrap_or("?"),
         node.start_line.unwrap_or(0),
         node.end_line.unwrap_or(0),
-        node.content.as_deref().unwrap_or("")
+        capped_content.text
     );
 
     // Codebrain-2's payoff: a gotcha/decision recorded against this exact
@@ -494,7 +509,8 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
                 } else {
                     String::new()
                 };
-                let entry = format!("- {}: {}{}{}", note.name.as_deref().unwrap_or("(untitled)"), note.content.as_deref().unwrap_or(""), staleness, reduced);
+                let capped_note = crate::budget::cap(note.content.as_deref().unwrap_or(""), max_chars(args), edge.src_id);
+                let entry = format!("- {}: {}{}{}", note.name.as_deref().unwrap_or("(untitled)"), capped_note.text, staleness, reduced);
                 match note.kind {
                     NodeKind::Gotcha => gotchas.push(entry),
                     NodeKind::Decision => decisions.push(entry),
@@ -511,6 +527,23 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
     }
 
     Ok(out)
+}
+
+/// Companion to `budget::cap` — every truncated tool response points here by
+/// id so an agent can retrieve what was cut off, instead of the response
+/// simply being unbounded to begin with.
+fn tool_fetch_content(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let id = args.get("id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'id'"))?;
+    let node = store.get_node(&repo, id)?.ok_or_else(|| anyhow::anyhow!("node #{id} not found in repo {repo:?}"))?;
+    let content = node.content.unwrap_or_default();
+
+    let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let limit = args.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+    let chars: Vec<char> = content.chars().collect();
+    let end = limit.map(|l| (offset + l).min(chars.len())).unwrap_or(chars.len());
+    let slice: String = chars.get(offset.min(chars.len())..end.max(offset.min(chars.len()))).unwrap_or_default().iter().collect();
+    Ok(slice)
 }
 
 fn tool_get_changelog(args: &Value) -> anyhow::Result<String> {
@@ -830,7 +863,15 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
             let notes = if m.notes.is_empty() {
                 String::new()
             } else {
-                let rendered = m.notes.iter().map(|(kind, title, text, _, _)| format!("    - [{kind:?}] {title}: {text}")).collect::<Vec<_>>().join("\n");
+                let rendered = m
+                    .notes
+                    .iter()
+                    .map(|(id, kind, title, text, _, _)| {
+                        let capped = crate::budget::cap(text, max_chars(args), *id);
+                        format!("    - [{kind:?}] {title}: {}", capped.text)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 format!("\n{rendered}")
             };
             format!("- {} ({via}){}{notes}", m.node.name.as_deref().unwrap_or("(untitled)"), m.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
@@ -848,7 +889,8 @@ fn tool_explain_symbol(args: &Value) -> anyhow::Result<String> {
     if let Some(session_id) = get_str(args, "session_id") {
         store.record_session_event(&repo, session_id, "explain_symbol", &format!("explained symbol {symbol_id}"), None, "activity")?;
     }
-    Ok(definition.content.unwrap_or_default())
+    let capped = crate::budget::cap(definition.content.as_deref().unwrap_or(""), max_chars(args), definition_id);
+    Ok(capped.text)
 }
 
 #[cfg(test)]
@@ -1050,6 +1092,49 @@ mod tests {
         call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
         let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "untouched" })).unwrap();
         assert!(!result.content[0].text.contains("Known gotchas affecting this symbol"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn get_symbol_truncates_large_content_and_fetch_content_returns_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        // 5000 chars of body, well past the default 4000-char budget.
+        let body = "x".repeat(5000);
+        std::fs::write(dir.path().join("main.py"), format!("def big():\n    \"\"\"{body}\"\"\"\n    pass\n")).unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "big" })).unwrap();
+        let text = &result.content[0].text;
+        assert!(text.contains("truncated"), "{text}");
+        assert!(text.len() < body.len(), "response should be shorter than the untruncated body");
+
+        // Pull the id out of the truncation note and fetch the rest.
+        let id_str = text.split("fetch_content with id ").nth(1).and_then(|s| s.split_whitespace().next()).expect("truncation note must include an id");
+        let id: i64 = id_str.parse().unwrap();
+        let full = call_tool(AccessMode::Full, "fetch_content", &json!({ "path": path, "id": id })).unwrap();
+        assert!(!full.is_error, "{:?}", full.content);
+        assert!(full.content[0].text.contains(&body), "fetch_content must return the untruncated content");
+    }
+
+    #[test]
+    fn get_symbol_respects_a_max_chars_override() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def small():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        let result = call_tool(AccessMode::Full, "get_symbol", &json!({ "path": path, "name": "small", "max_chars": 5 })).unwrap();
+        assert!(result.content[0].text.contains("truncated"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn fetch_content_errors_clearly_for_an_unknown_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+
+        let result = call_tool(AccessMode::Full, "fetch_content", &json!({ "path": path, "id": 999999 })).unwrap();
+        assert!(result.is_error, "{:?}", result.content);
     }
 
     /// A repeatedly-reinforced gotcha must outrank a once-matched one when

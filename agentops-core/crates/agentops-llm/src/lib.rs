@@ -208,7 +208,7 @@ fn build_prompt(
                 agentops_retrieval::PatternCompletionSource::Graph(s) => format!("graph-connected, {s:.4} PageRank mass"),
             };
             prompt.push_str(&format!("- {} ({via}):\n", m.node.name.as_deref().unwrap_or("<unnamed>")));
-            for (kind, title, text, _, _) in &m.notes {
+            for (_id, kind, title, text, _, _) in &m.notes {
                 prompt.push_str(&format!("  - [{kind:?}] {title}: {text}\n"));
             }
         }

@@ -99,6 +99,22 @@ fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
 
+/// Duplicate of `agentops-mcp::budget`'s truncation helper -- same
+/// wrong-direction-dependency reasoning as `maybe_record_session_hit` right
+/// below: this crate must not pull in `agentops-mcp` just for a ~15-line
+/// function. Caps `text` to `DEFAULT_CHAR_BUDGET` chars on a UTF-8 boundary,
+/// pointing the caller at `fetch_content` (agentops-mcp's tool) via `id` --
+/// `SearchHit.id` is already the source graph node's id (see
+/// `tool_semantic_search`'s own doc comment), so no new id scheme is needed.
+const DEFAULT_CHAR_BUDGET: usize = 4000;
+
+fn cap(text: &str, id: i64) -> String {
+    match text.char_indices().nth(DEFAULT_CHAR_BUDGET) {
+        None => text.to_string(),
+        Some((byte_idx, _)) => format!("{}\n… [truncated — call fetch_content with id {id} for the full content]", &text[..byte_idx]),
+    }
+}
+
 /// Module 8 (usage/knowledge-reuse tracking) equivalent of `agentops-mcp`'s
 /// own `maybe_record_session_event` -- duplicated rather than shared,
 /// since pulling in `agentops-mcp` here just for this ~10-line helper
@@ -139,7 +155,7 @@ async fn tool_semantic_search(index: &mut SemanticIndex, args: &Value) -> anyhow
         if let Some(p) = &hit.path {
             out.push_str(&format!("      {p}\n"));
         }
-        out.push_str(&format!("      {}\n\n", hit.text.lines().next().unwrap_or("")));
+        out.push_str(&format!("      {}\n\n", cap(&hit.text, hit.id as i64)));
     }
     Ok(out)
 }
@@ -194,7 +210,7 @@ async fn tool_search_docs(index: &mut SemanticIndex, args: &Value) -> anyhow::Re
         let topic = hit.name.as_deref().unwrap_or("(untitled)");
         let version = hit.path.as_deref().unwrap_or("(unknown version)");
         out.push_str(&format!("{:.3}  {slug}@{version} — {topic}\n", hit.score));
-        out.push_str(&format!("      {}\n\n", hit.text.lines().next().unwrap_or("")));
+        out.push_str(&format!("      {}\n\n", cap(&hit.text, hit.id as i64)));
     }
     Ok(out)
 }

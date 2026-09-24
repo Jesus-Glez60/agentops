@@ -8,6 +8,7 @@
 //! `agentops-ruler-bridge` is still a stub, and `sync-docs` is a separate
 //! follow-up (see the plan).
 
+mod hook_capture;
 mod usage;
 
 use std::path::{Path, PathBuf};
@@ -274,7 +275,18 @@ enum Command {
         /// default choice.
         #[arg(long, conflicts_with = "api_key")]
         device_login: bool,
+        /// Also install a Claude Code `PostToolUse` hook that captures any
+        /// tool output too large to be worth inlining into context (redacted,
+        /// stored as a searchable node — see `hook-capture`). Claude Code only
+        /// in this first pass; ignored for other --agents.
+        #[arg(long)]
+        with_hooks: bool,
     },
+    /// Internal: invoked by a Claude Code `PostToolUse` hook (installed via
+    /// `connect --with-hooks`), not meant to be run by hand. Reads the
+    /// hook's JSON payload from stdin.
+    #[command(hide = true)]
+    HookCapture,
     /// One-off: copy one repo's entire local SQLite graph store into a
     /// Postgres-backed `PostgresGraphStore` (e.g. a server-hosted
     /// deployment). Not part of normal operation — `AGENTOPS_DATABASE_URL`
@@ -546,7 +558,8 @@ fn main() -> Result<()> {
             UsageAction::Sync { path, claude_home, remote } => usage_sync_command(&path, claude_home.as_deref(), remote.as_deref()),
         },
         Command::Init { yes, path } => init(yes, &path),
-        Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login } => connect(&path, agents, access_mode, yes, remote, api_key, device_login),
+        Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login, with_hooks } => connect(&path, agents, access_mode, yes, remote, api_key, device_login, with_hooks),
+        Command::HookCapture => hook_capture::run(),
         Command::MigrateGraph { from, to, repo, wipe_target } => migrate_graph(&from, &to, &repo, wipe_target),
     }
 }
@@ -876,9 +889,9 @@ fn select_agents(mut agents: Vec<String>, yes: bool) -> Result<Vec<String>> {
     if yes {
         anyhow::bail!("--yes requires --agents to also be set (nothing to connect non-interactively otherwise)");
     }
-    let named = ["claude", "cursor", "codex", "gemini-cli"];
-    let labels = ["Claude Code", "Cursor", "Codex CLI", "Gemini CLI"];
-    let defaults = [true, true, false, false];
+    let named = ["claude", "cursor", "codex", "gemini-cli", "windsurf"];
+    let labels = ["Claude Code", "Cursor", "Codex CLI", "Gemini CLI", "Windsurf"];
+    let defaults = [true, true, false, false, false];
     let selected = dialoguer::MultiSelect::new().with_prompt("Which coding tool(s) do you want to connect? (space to toggle, enter to confirm)").items(&labels).defaults(&defaults).interact()?;
     agents.extend(selected.into_iter().map(|i| named[i].to_string()));
 
@@ -891,7 +904,7 @@ fn select_agents(mut agents: Vec<String>, yes: bool) -> Result<Vec<String>> {
     Ok(agents)
 }
 
-fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool) -> Result<()> {
+fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool, with_hooks: bool) -> Result<()> {
     // Whether to use local/stdio vs. remote/HTTP is not inferable from
     // anything about this invocation on its own (a solo dev can self-host
     // on their own separate personal server too) -- ask directly rather
@@ -921,6 +934,9 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
         if agents.is_empty() {
             println!("No agents selected — nothing to do.");
             return Ok(());
+        }
+        if with_hooks {
+            maybe_install_claude_hooks(path, &agents)?;
         }
         return connect_remote(path, &server_url, api_key, &agents, yes, device_login);
     }
@@ -958,6 +974,10 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
     let access_mode_str = if matches!(access_mode, AccessModeArg::Full) { "full" } else { "advisor" };
     distribute_via_ruler(path, &agents_md_content, &agents, access_mode_str);
 
+    if with_hooks {
+        maybe_install_claude_hooks(path, &agents)?;
+    }
+
     println!("\nConnected: {}", agents.join(", "));
     for agent_id in &agents {
         match mcp_config_location(agent_id) {
@@ -967,6 +987,50 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
     }
 
     Ok(())
+}
+
+/// `--with-hooks` support, Claude Code only in this first pass (see
+/// `hook_capture`'s module doc comment for why). No-ops quietly for any
+/// other agent id — `--with-hooks` describes intent ("capture large tool
+/// output for whichever selected agent supports it"), not a hard requirement
+/// that every agent in `--agents` has hook support.
+fn maybe_install_claude_hooks(path: &Path, agents: &[String]) -> Result<()> {
+    if !agents.iter().any(|a| a == "claude") {
+        return Ok(());
+    }
+    let settings_path = path.join(".claude").join("settings.json");
+    write_claude_post_tool_use_hook(&settings_path)?;
+    println!("  claude: installed a PostToolUse hook at {} (captures large tool output into agentops — see the fetch_content/semantic_search MCP tools).", settings_path.display());
+    Ok(())
+}
+
+/// Merges (never overwrites) a `PostToolUse` hook entry into a project-level
+/// `.claude/settings.json`, pointing at `agentops hook-capture` — same
+/// read-modify-write-preserving-unrelated-keys shape `write_json_mcp_entry`
+/// already established for `.mcp.json`-style files, applied to the `hooks`
+/// object instead of `mcpServers`. Project-level, not user-level like the
+/// MCP registration above: hooks are inherently project-scoped (they fire
+/// per repo Claude Code is working in), unlike a global MCP server entry.
+fn write_claude_post_tool_use_hook(settings_path: &Path) -> Result<()> {
+    let mut root: serde_json::Value = if settings_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(settings_path).with_context(|| format!("reading {}", settings_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let root_obj = root.as_object_mut().expect("just normalized to an object above");
+    let hooks = root_obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
+    if !hooks.is_object() {
+        *hooks = serde_json::json!({});
+    }
+    hooks.as_object_mut().expect("just normalized to an object above").insert("PostToolUse".to_string(), serde_json::json!({ "command": "agentops hook-capture" }));
+
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(settings_path, serde_json::to_string_pretty(&root)?).with_context(|| format!("writing {}", settings_path.display()))
 }
 
 /// `.context/agentops-remote.json` -- persists a repo's "coding tools here
@@ -1239,18 +1303,18 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
 
 /// Writes/refreshes the `"agentops"` entry directly in each target agent's
 /// own native MCP config file, deliberately bypassing Ruler for this one
-/// entry: each of the four vendors uses a genuinely different remote-MCP
-/// schema (Claude Code needs an explicit `"type":"http"`; Cursor doesn't;
+/// entry: several vendors use a genuinely different remote-MCP schema
+/// (Claude Code needs an explicit `"type":"http"`; Cursor and Windsurf don't;
 /// Codex CLI uses a separate `bearer_token_env_var` key, not string
 /// interpolation; Gemini CLI's header env-var substitution isn't confirmed
 /// by its own docs) -- verified against each vendor's own current docs
-/// individually, matching this codebase's established "verify empirically,
-/// don't assume" convention, rather than trusting a single generic entry
-/// translated by a pinned, unverified-for-this-case Ruler version to get
-/// all four right. Read-modify-write: any *other* MCP server already
-/// configured in these files is preserved untouched. Any agent id outside
-/// this table (Ruler-supported but not one of the four with a known
-/// remote schema) is skipped with a note in `connect_remote`'s own
+/// individually where possible, matching this codebase's established
+/// "verify empirically, don't assume" convention, rather than trusting a
+/// single generic entry translated by a pinned, unverified-for-this-case
+/// Ruler version to get every vendor right. Read-modify-write: any *other*
+/// MCP server already configured in these files is preserved untouched. Any
+/// agent id outside this table (Ruler-supported but with no known remote
+/// schema here) is skipped with a note in `connect_remote`'s own
 /// closing summary -- its prompt-pack distribution via Ruler still works,
 /// just not an automatic remote MCP entry.
 /// Each vendor's USER-level (not project-level) MCP config file, per each
@@ -1271,6 +1335,18 @@ fn user_level_mcp_config_path(agent_id: &str) -> Option<PathBuf> {
         "cursor" => Some(home.join(".cursor").join("mcp.json")),
         "codex" => Some(home.join(".codex").join("config.toml")),
         "gemini-cli" => Some(home.join(".gemini").join("settings.json")),
+        // Windsurf's own docs (fetched directly, not assumed): the MCP
+        // config opened via Cascade's "Configure" button is
+        // `~/.codeium/windsurf/mcp_config.json` (macOS/Linux) or
+        // `%USERPROFILE%\.codeium\windsurf\mcp_config.json` (Windows) --
+        // `dirs::home_dir()` already resolves the right base on all three.
+        // Not independently confirmed the way Claude Code/Cursor were
+        // (no Windsurf install on hand to test against, same limitation
+        // documented on the Gemini header-substitution gotcha) -- if a user
+        // reports this path wrong, that gotcha's "verify empirically, don't
+        // assume" method (a stub server, or just checking the file lands)
+        // applies here too.
+        "windsurf" => Some(home.join(".codeium").join("windsurf").join("mcp_config.json")),
         _ => None,
     }
 }
@@ -1874,6 +1950,7 @@ mod tests {
         assert!(user_level_mcp_config_path("cursor").unwrap().ends_with(".cursor/mcp.json"));
         assert!(user_level_mcp_config_path("codex").unwrap().ends_with(".codex/config.toml"));
         assert!(user_level_mcp_config_path("gemini-cli").unwrap().ends_with(".gemini/settings.json"));
+        assert!(user_level_mcp_config_path("windsurf").unwrap().ends_with(".codeium/windsurf/mcp_config.json"));
         assert!(user_level_mcp_config_path("some-other-ruler-agent").is_none());
     }
 
@@ -1895,6 +1972,32 @@ mod tests {
         assert_eq!(parsed["otherTopLevelSetting"], true, "unrelated top-level settings must survive: {parsed}");
         assert_eq!(parsed["mcpServers"]["agentops"]["command"], "agentops-mcp-server");
         assert_eq!(parsed["mcpServers"]["agentops"]["env"]["AGENTOPS_ACCESS_MODE"], "advisor");
+    }
+
+    #[test]
+    fn write_claude_post_tool_use_hook_creates_the_file_and_parent_dir_when_neither_exists_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join(".claude").join("settings.json");
+
+        write_claude_post_tool_use_hook(&settings_path).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture");
+    }
+
+    #[test]
+    fn write_claude_post_tool_use_hook_merges_without_clobbering_other_hooks_or_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, r#"{"hooks":{"SessionStart":{"command":"some-other-tool"}},"otherTopLevelSetting":true}"#).unwrap();
+
+        write_claude_post_tool_use_hook(&settings_path).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(parsed["hooks"]["SessionStart"]["command"], "some-other-tool", "a pre-existing, unrelated hook must survive: {parsed}");
+        assert_eq!(parsed["otherTopLevelSetting"], true, "unrelated top-level settings must survive: {parsed}");
+        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture");
     }
 
     #[test]

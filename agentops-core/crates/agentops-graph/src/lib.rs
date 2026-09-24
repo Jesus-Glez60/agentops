@@ -44,6 +44,14 @@ pub enum NodeKind {
     /// `content` is a one-liner explanation, and would misread a
     /// `DocSection`'s much longer flattened text the same way.
     DocSection,
+    /// Captured output of a client's own tool call (shell, `gh`, etc.),
+    /// written by `agentops-cli hook-capture`'s Claude Code `PostToolUse`
+    /// hook when that output exceeds `agentops_mcp::budget::DEFAULT_CHAR_BUDGET`
+    /// -- same "give it a stable node id, let nodes_fts/search_hybrid/
+    /// fetch_content reach it" treatment `DocSection` already established,
+    /// applied to session-wide tool output instead of generated docs.
+    /// `path` is `"tool_output:{session_id}:{n}"`, `name` is the tool name.
+    ToolOutput,
 }
 
 impl NodeKind {
@@ -56,6 +64,7 @@ impl NodeKind {
             NodeKind::Definition => "definition",
             NodeKind::Note => "note",
             NodeKind::DocSection => "doc_section",
+            NodeKind::ToolOutput => "tool_output",
         }
     }
 
@@ -67,6 +76,7 @@ impl NodeKind {
             "definition" => NodeKind::Definition,
             "note" => NodeKind::Note,
             "doc_section" => NodeKind::DocSection,
+            "tool_output" => NodeKind::ToolOutput,
             _ => NodeKind::Symbol,
         }
     }
@@ -1176,7 +1186,7 @@ mod tests {
     /// by adding `DocSection`.
     #[test]
     fn node_kind_db_str_round_trips_for_every_variant() {
-        for kind in [NodeKind::Symbol, NodeKind::File, NodeKind::Gotcha, NodeKind::Decision, NodeKind::Definition, NodeKind::Note, NodeKind::DocSection] {
+        for kind in [NodeKind::Symbol, NodeKind::File, NodeKind::Gotcha, NodeKind::Decision, NodeKind::Definition, NodeKind::Note, NodeKind::DocSection, NodeKind::ToolOutput] {
             assert_eq!(NodeKind::from_db_str(kind.as_db_str()), kind);
         }
     }

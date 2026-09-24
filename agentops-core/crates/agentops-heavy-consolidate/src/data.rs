@@ -43,7 +43,7 @@ fn build_prompt(symbol: &Node, related_context: &[agentops_retrieval::PatternCom
     if !with_notes.is_empty() {
         user_turn.push_str("\nPossibly related context from similar symbols elsewhere in this repo:\n");
         for m in with_notes {
-            for (kind, title, text, _, _) in &m.notes {
+            for (_id, kind, title, text, _, _) in &m.notes {
                 user_turn.push_str(&format!("- [{kind:?}] {title}: {text}\n"));
             }
         }

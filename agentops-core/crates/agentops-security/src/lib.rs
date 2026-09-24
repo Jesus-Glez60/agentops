@@ -34,6 +34,15 @@ const RULES: &[Rule] = &[
         name: "generic-credential-assignment",
         pattern: r#"(?i)(api[_-]?key|secret|token|password|passwd)\s*[:=]\s*['"][A-Za-z0-9_\-/+=]{16,}['"]"#,
     },
+    // Same shape as generic-credential-assignment but for *unquoted*
+    // `KEY=value` lines — the format `env`/`printenv` output and shell
+    // debug dumps actually use, which the quoted rule above never matches.
+    // Anchored per-line (`(?m)^...$`) to avoid matching a credential-named
+    // identifier used mid-expression in ordinary code.
+    Rule {
+        name: "unquoted-env-credential-assignment",
+        pattern: r"(?im)^\s*[A-Za-z_][A-Za-z0-9_]*(api[_-]?key|secret|token|password|passwd)[A-Za-z0-9_]*\s*=\s*[A-Za-z0-9_\-/+=]{16,}\s*$",
+    },
 ];
 
 static COMPILED: LazyLock<Vec<(&'static str, Regex)>> = LazyLock::new(|| {
@@ -129,6 +138,15 @@ mod tests {
         let r = redact(r#"const apiKey = "sk_live_abcdef1234567890ABCDEF";"#);
         assert!(r.redacted_count >= 1);
         assert!(!r.text.contains("sk_live_abcdef1234567890ABCDEF"));
+    }
+
+    #[test]
+    fn redacts_an_unquoted_env_dump_style_credential() {
+        let r = redact("PATH=/usr/bin\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLE\nHOME=/root");
+        assert_eq!(r.redacted_count, 1);
+        assert!(r.text.contains("[REDACTED:unquoted-env-credential-assignment]"));
+        assert!(!r.text.contains("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLE"));
+        assert!(r.text.contains("PATH=/usr/bin"), "unrelated lines must be left alone");
     }
 
     #[test]

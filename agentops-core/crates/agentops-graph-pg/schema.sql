@@ -187,7 +187,10 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS prominence TEXT NOT NULL DEFAULT 'ful
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 
 -- Initiative 2 (CLS-inspired retrieval plan) adds NodeKind::DocSection and
--- EdgeRelation::Covers -- both CHECK constraints need widening.
+-- EdgeRelation::Covers -- both CHECK constraints need widening. Widened
+-- again for NodeKind::ToolOutput (session-wide hook-capture, Stream C of
+-- the Context Mode gap-closing plan) -- same reasoning, no SQLite equivalent
+-- exists to catch a missed widening here.
 -- `nodes_kind_check`/`edges_relation_check` are Postgres's default
 -- auto-generated names for the unnamed inline CHECKs in the original
 -- `CREATE TABLE` statements above (`<table>_<column>_check`).
@@ -213,7 +216,7 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 -- CONSTRAINT` + narrower re-`ADD` pair is not safe to keep around once
 -- superseded) -- never a full literal migration history.
 ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_kind_check;
-ALTER TABLE nodes ADD CONSTRAINT nodes_kind_check CHECK (kind IN ('symbol', 'file', 'gotcha', 'decision', 'definition', 'note', 'doc_section'));
+ALTER TABLE nodes ADD CONSTRAINT nodes_kind_check CHECK (kind IN ('symbol', 'file', 'gotcha', 'decision', 'definition', 'note', 'doc_section', 'tool_output'));
 
 ALTER TABLE edges DROP CONSTRAINT IF EXISTS edges_relation_check;
 ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depends_on', 'documents', 'affects', 'references', 'covers'));

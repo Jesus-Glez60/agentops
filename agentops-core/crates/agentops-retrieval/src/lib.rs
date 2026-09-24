@@ -427,7 +427,10 @@ pub enum PatternCompletionSource {
 pub struct PatternCompletionMatch {
     pub node: Node,
     pub via: PatternCompletionSource,
-    pub notes: Vec<(NodeKind, String, String, agentops_graph::NodeProminence, Option<String>)>,
+    /// `(note_id, kind, title, body, prominence, curation_reason)` — the
+    /// leading id lets a caller cap the body text and still point back to
+    /// the full note via `fetch_content`.
+    pub notes: Vec<(i64, NodeKind, String, String, agentops_graph::NodeProminence, Option<String>)>,
 }
 
 /// Pattern completion around `seed_id` -- GENESIS's episodic recombination
@@ -499,7 +502,7 @@ pub fn pattern_complete(store: &dyn GraphStore, embedder: &dyn Embedder, repo: &
             .filter(|e| e.relation == EdgeRelation::Affects)
             .filter_map(|e| store.get_node(repo, e.src_id).ok().flatten())
             .filter(|n| matches!(n.kind, NodeKind::Gotcha | NodeKind::Decision))
-            .map(|n| (n.kind, n.name.clone().unwrap_or_default(), n.content.clone().unwrap_or_default(), n.prominence, n.curation_reason.clone()))
+            .map(|n| (n.id, n.kind, n.name.clone().unwrap_or_default(), n.content.clone().unwrap_or_default(), n.prominence, n.curation_reason.clone()))
             .collect();
         results.push(PatternCompletionMatch { node, via, notes });
     }
@@ -803,7 +806,7 @@ mod tests {
         let results = pattern_complete(&store, &LocalEmbedder, "demo", seed, 5).unwrap();
         let found = results.iter().find(|m| m.node.id == connected).unwrap();
         assert_eq!(found.notes.len(), 1);
-        assert_eq!(found.notes[0].1, "watch out");
+        assert_eq!(found.notes[0].2, "watch out");
     }
 
     #[test]
