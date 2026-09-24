@@ -11,6 +11,7 @@ mod notes;
 mod protocol;
 pub mod scan;
 mod server;
+pub mod session_guide;
 mod store;
 mod sync_docs;
 mod tools;

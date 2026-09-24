@@ -156,6 +156,14 @@ fn tool_specs() -> Vec<ToolSpec> {
             handler: tool_fetch_content,
         },
         ToolSpec {
+            name: "get_session_guide",
+            description: "A prioritized, size-budgeted summary of one session (active task, files modified, decisions, unresolved errors, git ops, external references, secret-exposure warnings) — for orienting quickly, unlike get_session's full unbounded dump. Same data Claude Code's SessionStart hook injects automatically after a compaction/resume, exposed here so an agent can pull it on demand too.",
+            access: AccessMode::Advisor,
+            annotations: READ_ONLY,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path", "session_id"] }),
+            handler: tool_get_session_guide,
+        },
+        ToolSpec {
             name: "get_session",
             description: "Returns the correlated cross-tool activity feed for one session_id in a repo — every scan_repo/add_note/ingest_notes/explain_symbol call that was made with that same session_id, oldest first. Empty if session_id was never passed to any write tool for this repo.",
             access: AccessMode::Advisor,
@@ -598,7 +606,11 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
         agentops_notes::NoteType::Knowledge => "knowledge",
         agentops_notes::NoteType::Context => "context",
     };
-    maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"), None, "activity")?;
+    // Decisions get their own event_kind (feeds get_session_guide's
+    // "Decisions" section) — everything else stays the generic "activity"
+    // this call already recorded before that guide existed.
+    let event_kind = if result.note_type == agentops_notes::NoteType::Decision { "decision" } else { "activity" };
+    maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"), None, event_kind)?;
     Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols, {} reinforced).", result.file_path.display(), result.edges_written, result.edges_reinforced))
 }
 
@@ -755,6 +767,21 @@ fn tool_get_session(args: &Value) -> anyhow::Result<String> {
         return Ok(format!("No activity recorded for session '{session_id}' in {repo}."));
     }
     Ok(events.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, e.description)).collect::<Vec<_>>().join("\n"))
+}
+
+/// The prioritized, size-budgeted counterpart to `get_session`'s flat
+/// unbounded dump — same underlying `session_events`, but shaped for
+/// "orient me quickly" rather than "show me everything." Shares its
+/// implementation with `agentops-cli`'s `SessionStart` hook handler via
+/// `crate::session_guide::build`, so both stay in sync.
+fn tool_get_session_guide(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let session_id = get_str(args, "session_id").ok_or_else(|| anyhow::anyhow!("missing required 'session_id'"))?;
+    let guide = crate::session_guide::build(store.as_ref(), &repo, session_id)?;
+    if guide.is_empty() {
+        return Ok(format!("No activity recorded for session '{session_id}' in {repo}."));
+    }
+    Ok(guide)
 }
 
 fn tool_end_session(args: &Value) -> anyhow::Result<String> {

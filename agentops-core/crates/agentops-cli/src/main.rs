@@ -282,11 +282,14 @@ enum Command {
         #[arg(long)]
         with_hooks: bool,
     },
-    /// Internal: invoked by a Claude Code `PostToolUse` hook (installed via
+    /// Internal: invoked by a Claude Code hook (installed via
     /// `connect --with-hooks`), not meant to be run by hand. Reads the
-    /// hook's JSON payload from stdin.
+    /// hook's JSON payload from stdin; --event selects which hook fired.
     #[command(hide = true)]
-    HookCapture,
+    HookCapture {
+        #[arg(long, default_value = "posttooluse")]
+        event: String,
+    },
     /// One-off: copy one repo's entire local SQLite graph store into a
     /// Postgres-backed `PostgresGraphStore` (e.g. a server-hosted
     /// deployment). Not part of normal operation — `AGENTOPS_DATABASE_URL`
@@ -559,7 +562,7 @@ fn main() -> Result<()> {
         },
         Command::Init { yes, path } => init(yes, &path),
         Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login, with_hooks } => connect(&path, agents, access_mode, yes, remote, api_key, device_login, with_hooks),
-        Command::HookCapture => hook_capture::run(),
+        Command::HookCapture { event } => hook_capture::run(&event),
         Command::MigrateGraph { from, to, repo, wipe_target } => migrate_graph(&from, &to, &repo, wipe_target),
     }
 }
@@ -994,24 +997,43 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
 /// other agent id — `--with-hooks` describes intent ("capture large tool
 /// output for whichever selected agent supports it"), not a hard requirement
 /// that every agent in `--agents` has hook support.
+/// Installs the full AgentOps hook suite for Claude Code: `PostToolUse`
+/// (large-output capture, shipped first), plus `PostToolUseFailure`
+/// ("error" category), `UserPromptSubmit` ("user_intent" category),
+/// `SessionStart` (renders the session-resume guide on compact/resume), and
+/// `PreToolUse` (proactive secret-exposure warning, never blocking). One
+/// `--event` per hook so `hook_capture::run` can dispatch without sniffing
+/// payload shape.
 fn maybe_install_claude_hooks(path: &Path, agents: &[String]) -> Result<()> {
     if !agents.iter().any(|a| a == "claude") {
         return Ok(());
     }
     let settings_path = path.join(".claude").join("settings.json");
-    write_claude_post_tool_use_hook(&settings_path)?;
-    println!("  claude: installed a PostToolUse hook at {} (captures large tool output into agentops — see the fetch_content/semantic_search MCP tools).", settings_path.display());
+    const HOOKS: &[(&str, &str)] = &[
+        ("PostToolUse", "posttooluse"),
+        ("PostToolUseFailure", "posttoolusefailure"),
+        ("UserPromptSubmit", "userpromptsubmit"),
+        ("SessionStart", "sessionstart"),
+        ("PreToolUse", "pretooluse"),
+    ];
+    for (event_name, event_flag) in HOOKS {
+        write_claude_hook(&settings_path, event_name, &format!("agentops hook-capture --event {event_flag}"))?;
+    }
+    println!("  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse — see the get_session_guide/fetch_content/semantic_search MCP tools).", settings_path.display());
     Ok(())
 }
 
-/// Merges (never overwrites) a `PostToolUse` hook entry into a project-level
-/// `.claude/settings.json`, pointing at `agentops hook-capture` — same
-/// read-modify-write-preserving-unrelated-keys shape `write_json_mcp_entry`
-/// already established for `.mcp.json`-style files, applied to the `hooks`
-/// object instead of `mcpServers`. Project-level, not user-level like the
-/// MCP registration above: hooks are inherently project-scoped (they fire
-/// per repo Claude Code is working in), unlike a global MCP server entry.
-fn write_claude_post_tool_use_hook(settings_path: &Path) -> Result<()> {
+/// Merges (never overwrites) one hook entry into a project-level
+/// `.claude/settings.json` — same read-modify-write-preserving-unrelated-
+/// keys shape `write_json_mcp_entry` already established for `.mcp.json`-
+/// style files, applied to the `hooks` object instead of `mcpServers`.
+/// Project-level, not user-level like the MCP registration above: hooks are
+/// inherently project-scoped (they fire per repo Claude Code is working
+/// in), unlike a global MCP server entry. Called once per hook event
+/// (`maybe_install_claude_hooks` loops it) — each call only ever touches
+/// its own `event_name` key, leaving every other hook (ours or a user's own)
+/// untouched.
+fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str) -> Result<()> {
     let mut root: serde_json::Value = if settings_path.exists() {
         serde_json::from_str(&std::fs::read_to_string(settings_path).with_context(|| format!("reading {}", settings_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
     } else {
@@ -1025,7 +1047,7 @@ fn write_claude_post_tool_use_hook(settings_path: &Path) -> Result<()> {
     if !hooks.is_object() {
         *hooks = serde_json::json!({});
     }
-    hooks.as_object_mut().expect("just normalized to an object above").insert("PostToolUse".to_string(), serde_json::json!({ "command": "agentops hook-capture" }));
+    hooks.as_object_mut().expect("just normalized to an object above").insert(event_name.to_string(), serde_json::json!({ "command": command }));
 
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -1975,29 +1997,49 @@ mod tests {
     }
 
     #[test]
-    fn write_claude_post_tool_use_hook_creates_the_file_and_parent_dir_when_neither_exists_yet() {
+    fn write_claude_hook_creates_the_file_and_parent_dir_when_neither_exists_yet() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");
 
-        write_claude_post_tool_use_hook(&settings_path).unwrap();
+        write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse").unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture");
+        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture --event posttooluse");
     }
 
     #[test]
-    fn write_claude_post_tool_use_hook_merges_without_clobbering_other_hooks_or_settings() {
+    fn write_claude_hook_merges_without_clobbering_other_hooks_or_settings() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         std::fs::write(&settings_path, r#"{"hooks":{"SessionStart":{"command":"some-other-tool"}},"otherTopLevelSetting":true}"#).unwrap();
 
-        write_claude_post_tool_use_hook(&settings_path).unwrap();
+        write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse").unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(parsed["hooks"]["SessionStart"]["command"], "some-other-tool", "a pre-existing, unrelated hook must survive: {parsed}");
         assert_eq!(parsed["otherTopLevelSetting"], true, "unrelated top-level settings must survive: {parsed}");
-        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture");
+        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture --event posttooluse");
+    }
+
+    #[test]
+    fn maybe_install_claude_hooks_installs_the_full_suite() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join(".claude").join("settings.json");
+
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()]).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse")] {
+            assert_eq!(parsed["hooks"][event]["command"], format!("agentops hook-capture --event {flag}"), "{event}: {parsed}");
+        }
+    }
+
+    #[test]
+    fn maybe_install_claude_hooks_is_a_noop_when_claude_is_not_among_the_selected_agents() {
+        let dir = tempfile::tempdir().unwrap();
+        maybe_install_claude_hooks(dir.path(), &["cursor".to_string()]).unwrap();
+        assert!(!dir.path().join(".claude").join("settings.json").exists());
     }
 
     #[test]
