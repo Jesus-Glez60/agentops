@@ -10,7 +10,7 @@
 //! pattern-matching, and are out of scope for this pass (see the plan this
 //! was built from).
 
-use agentops_graph::GraphStore;
+use agentops_graph::{GraphStore, NodeKind, NodeProminence};
 
 use crate::budget::cap_sections;
 
@@ -52,6 +52,52 @@ pub fn build(store: &dyn GraphStore, repo: &str, session_id: &str) -> anyhow::Re
         ("Git ops", last_n("git_op", 5)),
         ("External references", last_n("external_reference", 5)),
         ("Secret-exposure warnings", last_n("secret_exposure_warning", 3)),
+    ];
+
+    Ok(cap_sections(&sections, GUIDE_CHAR_BUDGET))
+}
+
+/// Repo-level fallback for a session with no activity yet (a brand-new
+/// session, or `SessionStart` firing on `source: "startup"`) — `build`
+/// alone has nothing to show at that point, but the repo itself usually
+/// already has scan history and recorded gotchas/decisions worth surfacing
+/// immediately, without the agent spending its own tokens on separate
+/// `status`/`list_gotchas` calls to get the same picture.
+///
+/// Reuses `list_gotchas`' live full-prominence-first sort (`tools.rs`'s
+/// `tool_list_gotchas`), not `status`'s precomputed `repo_state.top_gotcha_ids`
+/// — simpler, and doesn't depend on `repo_state` having been populated
+/// (checked both existing patterns before picking one, they differ).
+pub fn build_repo_briefing(store: &dyn GraphStore, repo: &str) -> anyhow::Result<String> {
+    let scan_section = match store.latest_scan(repo)? {
+        Some(scan) => format!("{repo} — last scan {}: files +{} ~{} -{}, symbols +{} ~{} -{}", scan.started_at, scan.files_added, scan.files_changed, scan.files_removed, scan.symbols_added, scan.symbols_changed, scan.symbols_removed),
+        None => String::new(),
+    };
+    // Never scanned — nothing else here would have any content either.
+    if scan_section.is_empty() {
+        return Ok(String::new());
+    }
+
+    let excerpt_section = |kind: NodeKind| -> anyhow::Result<String> {
+        let mut nodes = store.nodes_by_kind(repo, kind)?;
+        nodes.sort_by_key(|n| n.prominence == NodeProminence::Reduced);
+        Ok(nodes
+            .iter()
+            .take(5)
+            .map(|n| {
+                let name = n.name.as_deref().unwrap_or("(untitled)");
+                let excerpt = n.content.as_deref().unwrap_or("").lines().next().unwrap_or("");
+                format!("- {name}: {excerpt}")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"))
+    };
+
+    let sections: Vec<(&str, String)> = vec![
+        ("Repo", scan_section),
+        ("Top gotchas", excerpt_section(NodeKind::Gotcha)?),
+        ("Top decisions", excerpt_section(NodeKind::Decision)?),
+        ("More knowledge", "See AGENTS.md and this repo's notes (list_gotchas/related_context/get_symbol) for the full picture — this is a short briefing, not the whole graph.".to_string()),
     ];
 
     Ok(cap_sections(&sections, GUIDE_CHAR_BUDGET))
@@ -108,5 +154,28 @@ mod tests {
         assert!(guide.contains("## Task"));
         assert!(guide.contains("Fix the login bug"));
         assert!(guide.contains("in_progress"));
+    }
+
+    #[test]
+    fn repo_briefing_is_empty_for_a_never_scanned_repo() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let briefing = build_repo_briefing(&store, "demo").unwrap();
+        assert_eq!(briefing, "");
+    }
+
+    #[test]
+    fn repo_briefing_surfaces_scan_stats_and_gotchas_for_a_fresh_session() {
+        use agentops_graph::{NewNode, NewScanHistoryEntry, ScanChange};
+
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let symbol_id = store.add_node(NewNode { kind: NodeKind::Symbol, repo: "demo".into(), path: Some("src/auth.rs".into()), name: Some("login".into()), container: None, start_line: None, end_line: None, content: Some("fn login() {}".into()) }).unwrap();
+        store.record_scan("demo", &[NewScanHistoryEntry { node_id: symbol_id, kind: NodeKind::Symbol, path: Some("src/auth.rs".into()), name: Some("login".into()), change: ScanChange::Added }]).unwrap();
+        store.add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some("Watch out".into()), container: None, start_line: None, end_line: None, content: Some("Edge case in the login flow.".into()) }).unwrap();
+
+        let briefing = build_repo_briefing(&store, "demo").unwrap();
+        assert!(briefing.contains("## Repo"), "{briefing}");
+        assert!(briefing.contains("symbols +1"), "{briefing}");
+        assert!(briefing.contains("## Top gotchas"), "{briefing}");
+        assert!(briefing.contains("Watch out"), "{briefing}");
     }
 }

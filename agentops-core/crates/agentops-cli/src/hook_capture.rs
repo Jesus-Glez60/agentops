@@ -331,8 +331,11 @@ fn process_session_start(input: &str) -> Result<()> {
     // startup/resume/clear/compact/fork. AgentOps never needs a `PreCompact`
     // hook (unlike a competitor's design) because `session_events` already
     // persists durably and incrementally throughout the session -- gating
-    // here is the only "checkpoint" logic needed.
-    if !matches!(payload.source.as_deref(), Some("compact") | Some("resume")) {
+    // here is the only "checkpoint" logic needed. `startup` is included
+    // (unlike this hook's first version) so a brand-new session also gets
+    // primed -- there's nothing yet to resume, but `build_repo_briefing`'s
+    // fallback below still has real repo-level context to offer.
+    if !matches!(payload.source.as_deref(), Some("compact") | Some("resume") | Some("startup")) {
         return Ok(());
     }
     let (Some(cwd), Some(session_id)) = (payload.cwd.as_deref(), payload.session_id.as_deref()) else {
@@ -343,6 +346,7 @@ fn process_session_start(input: &str) -> Result<()> {
     let store = agentops_mcp::open_store(repo_path)?;
     let repo = agentops_mcp::repo_name(repo_path);
     let guide = agentops_mcp::session_guide::build(store.as_ref(), &repo, session_id)?;
+    let guide = if guide.is_empty() { agentops_mcp::session_guide::build_repo_briefing(store.as_ref(), &repo)? } else { guide };
     if guide.is_empty() {
         return Ok(());
     }
@@ -580,6 +584,24 @@ mod tests {
         let payload = serde_json::json!({ "source": "startup", "session_id": "sess-12", "cwd": path }).to_string();
 
         // Must not error even though nothing has been scanned/recorded yet.
+        process_session_start(&payload).unwrap();
+    }
+
+    #[test]
+    fn session_start_on_startup_primes_a_scanned_repo_via_the_fallback_briefing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let store = agentops_mcp::open_store(dir.path()).unwrap();
+        let repo = agentops_mcp::repo_name(dir.path());
+        store.add_node(NewNode { kind: NodeKind::Gotcha, repo: repo.clone(), path: None, name: Some("Watch out".into()), container: None, start_line: None, end_line: None, content: Some("A real gotcha.".into()) }).unwrap();
+        store.record_scan(&repo, &[]).unwrap();
+
+        let payload = serde_json::json!({ "source": "startup", "session_id": "sess-13", "cwd": path }).to_string();
+
+        // Doesn't error, and (unlike the never-scanned case above) actually
+        // has something to prime the fresh session with -- can't easily
+        // assert on stdout here without capturing it, so this just confirms
+        // the fallback path executes cleanly against a real scanned repo.
         process_session_start(&payload).unwrap();
     }
 }

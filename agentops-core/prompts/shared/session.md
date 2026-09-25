@@ -8,29 +8,29 @@ URL first (this registers it as pending — a human still needs to finish
 connecting it from Repositories → Connect a repository before it can be
 scanned/indexed), then retry the original call with the same `path`.
 
-Before starting substantial work on the current task, first confirm this
-repo is actually registered with AgentOps — call `status`. If it reports
-"no scans recorded yet," this repo has never been scanned: call `scan_repo`
-immediately, before anything else. AgentOps's MCP server is registered
-once, globally, for every repo on this machine — nothing else marks a repo
-as connected, so this check is the only way to know whether one is.
+Before starting substantial work on the current task, call `get_session_guide`
+first with whatever session_id is available — one cheap, already-budgeted
+call that covers repo scan status and top gotchas/decisions (falling back to
+that repo-level briefing automatically when there's no session activity yet,
+e.g. a brand-new session). If it reports there's no scan history at all,
+this repo has never been scanned: call `scan_repo` immediately, before
+anything else. AgentOps's MCP server is registered once, globally, for
+every repo on this machine — nothing else marks a repo as connected, so
+this check is the only way to know whether one is.
 
 Once the repo is registered (or was already), check this project's
-already-recorded knowledge next — call `list_gotchas`, `related_context`,
-or `get_symbol` against the specific code you're about to touch, or
-`search`/`semantic_search` for the topic generally if nothing more specific
-applies.
+already-recorded knowledge for anything specific to the task at hand —
+call `list_gotchas`, `related_context`, or `get_symbol` against the
+specific code you're about to touch, or `search`/`semantic_search` for the
+topic generally if nothing more specific applies. `get_session_guide`'s
+briefing is a starting orientation, not a substitute for this targeted
+check.
 
 Summarize any relevant prior gotchas, decisions, or notes found before
 proceeding, so this session builds on what's already known instead of
 silently rediscovering or contradicting it. If nothing relevant is found,
 say so in one line and proceed.
 
-While working, if you need documentation for a library or crate that isn't
-answered by `get_docs`/`search_docs` (empty results, or the library isn't
-registered at all), do not fall back to a third-party documentation tool or
-your own training knowledge as the first move — call `discover_library` (or
-`register_library` if discovery doesn't resolve it) and `scrape_library`
-yourself. Do this even when not explicitly asked to fetch docs — a doc gap
-found mid-task is not a reason to guess or switch tools, it's a reason to
-fill the gap.
+While working, if you need documentation for a library or crate — see the
+`library-docs` skill for the exact lookup order; don't fall back to a
+third-party documentation tool or training knowledge as the first move.

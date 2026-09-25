@@ -778,10 +778,18 @@ fn tool_get_session_guide(args: &Value) -> anyhow::Result<String> {
     let (store, repo) = repo_context(args)?;
     let session_id = get_str(args, "session_id").ok_or_else(|| anyhow::anyhow!("missing required 'session_id'"))?;
     let guide = crate::session_guide::build(store.as_ref(), &repo, session_id)?;
-    if guide.is_empty() {
-        return Ok(format!("No activity recorded for session '{session_id}' in {repo}."));
+    if !guide.is_empty() {
+        return Ok(guide);
     }
-    Ok(guide)
+    // No activity under this session_id yet (a brand-new session) -- fall
+    // back to a repo-level briefing (scan stats, top gotchas/decisions)
+    // instead of a bare "nothing here," so a cold start still gets something
+    // useful in this one call.
+    let briefing = crate::session_guide::build_repo_briefing(store.as_ref(), &repo)?;
+    if !briefing.is_empty() {
+        return Ok(briefing);
+    }
+    Ok(format!("No activity recorded for session '{session_id}' in {repo}, and no scan history either — call scan_repo first."))
 }
 
 fn tool_end_session(args: &Value) -> anyhow::Result<String> {
@@ -1533,5 +1541,30 @@ mod tests {
         let result = call_tool(AccessMode::Full, "get_session", &json!({ "path": path, "session_id": "never-used" })).unwrap();
         assert!(!result.is_error);
         assert!(result.content[0].text.contains("No activity recorded"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn get_session_guide_falls_back_to_a_repo_briefing_for_a_fresh_session() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Watch out", "body": "A real gotcha to show up in the briefing.", "note_type": "gotcha" })).unwrap();
+
+        let result = call_tool(AccessMode::Full, "get_session_guide", &json!({ "path": path, "session_id": "never-used" })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("## Repo"), "{:?}", result.content);
+        assert!(result.content[0].text.contains("Watch out"), "{:?}", result.content);
+    }
+
+    #[test]
+    fn get_session_guide_reports_clearly_when_nothing_exists_at_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+
+        let result = call_tool(AccessMode::Full, "get_session_guide", &json!({ "path": path, "session_id": "never-used" })).unwrap();
+        assert!(!result.is_error);
+        assert!(result.content[0].text.contains("call scan_repo first"), "{:?}", result.content);
     }
 }

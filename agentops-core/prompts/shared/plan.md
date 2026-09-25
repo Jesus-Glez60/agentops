@@ -7,9 +7,17 @@ the design: does it need to exist at all, is it already in this codebase
 the standard library cover it, does a native platform feature cover it,
 does an already-installed dependency cover it. If a dependency is the reuse
 target but its docs aren't available (`get_docs`/`search_docs` come up
-empty), discover/register/scrape it yourself before continuing — see the
-`session` skill's doc-gap instruction, this is the moment that gap is most
-likely to surface.
+empty), see the `library-docs` skill for the lookup order — this is the
+moment that gap is most likely to surface.
+
+If any part of this task is delegated to a spawned subagent (an Explore
+pass, a design sub-task), its prompt must tell it to check this project's
+own recorded knowledge first — `get_session_guide`/`related_context`/
+`list_gotchas` scoped to whatever files, symbols, or topic it's assigned —
+before it starts grepping or reading raw source. A subagent that starts
+cold re-derives, at real token cost, exactly what this project's own tools
+already have indexed; the same reuse-first instinct this skill requires of
+you applies to whatever you delegate.
 
 Before finalizing the plan, always check for gotchas or decisions relevant
 to *this task's* topic, symbols, or libraries — via `related_context` or
