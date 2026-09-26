@@ -80,18 +80,18 @@ pub fn build_router(mode: AccessMode, api_key_hash: Option<String>, manifest_pat
 /// per merged service (`Router::merge` panics on a duplicate route).
 ///
 /// Includes the dashboard routes (`/activity`, `/local-search`, `/gotchas`,
-/// `/repos/{name}/nodes/{id}*`, `/repos/{name}/graph`, `/repos/{name}/docs`)
-/// — see [`build_router_without_dashboard_routes`] for the merged-server
-/// variant that excludes them.
+/// `/repos/{name}/nodes/{id}*`, `/repos/{name}/graph`, `/repos/{name}/docs`,
+/// `/repos/{name}/usage`) — see [`build_router_without_dashboard_routes`]
+/// for the merged-server variant that excludes them.
 pub fn build_router_without_health(mode: AccessMode, api_key_hash: Option<String>, manifest_path: PathBuf) -> Router {
     build_router_with_dashboard_flag(mode, api_key_hash, manifest_path, true)
 }
 
-/// Same as [`build_router_without_health`] minus the eight single-operator
+/// Same as [`build_router_without_health`] minus the nine single-operator
 /// "dashboard" routes (`/activity`, `/local-search`, `/gotchas`,
 /// `/repos/{name}/nodes/{id}`, `/repos/{name}/nodes/{id}/curation`,
 /// `/repos/{name}/nodes/{id}/graph`, `/repos/{name}/graph`,
-/// `/repos/{name}/docs`) — these read from `agentops-manifest`'s local
+/// `/repos/{name}/docs`, `/repos/{name}/usage`) — these read from `agentops-manifest`'s local
 /// `~/.agentops/manifest.json`, which a tenant-scoped hosted deployment
 /// never populates. `agentops-heavy-api` registers tenant-scoped routes at
 /// these exact same paths (resolved via `ConnectionStore` instead of the
@@ -124,7 +124,9 @@ fn build_router_with_dashboard_flag(mode: AccessMode, api_key_hash: Option<Strin
             .route("/repos/{name}/docs", get(docs::docs_json))
             .route("/activity", get(repos::activity_json))
             .route("/local-search", get(search::search_json))
-            .route("/gotchas", get(repos::gotchas_json));
+            .route("/gotchas", get(repos::gotchas_json))
+            .route("/repos/{name}/usage", get(repos::usage_json))
+            .route("/repos/{name}/hotspots", get(repos::hotspots_json));
     }
     router
         .layer(middleware::from_fn_with_state(state.clone(), require_api_key))

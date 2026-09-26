@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{GraphStore, Node, NodeKind, NodeProminence};
+use agentops_graph::{detect_hotspots, GraphStore, Node, NodeKind, NodeProminence};
 use agentops_manifest::ManifestEntry;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
@@ -309,15 +309,20 @@ pub struct GotchasQuery {
     repos: Option<String>,
 }
 
-pub const GOTCHA_BUCKETS: [&str; 3] = ["needs_curation", "kept", "reduced"];
+pub const GOTCHA_BUCKETS: [&str; 4] = ["needs_curation", "kept", "reduced", "pinned"];
 
-/// The three real curation states a gotcha can be in -- never a fourth
+/// The four real curation states a gotcha can be in -- never a fifth
 /// "closed" one. Caller must validate `bucket` against `GOTCHA_BUCKETS`
 /// first; an unrecognized bucket here just matches nothing. `pub` -- reused
-/// by `agentops-heavy-api`'s tenant-scoped `GET /gotchas`.
+/// by `agentops-heavy-api`'s tenant-scoped `GET /gotchas`. A pinned node is
+/// always curated too (`set_curation` always sets `curated = true`
+/// regardless of prominence), but `"kept"`'s `prominence == Full` check
+/// already excludes it naturally -- callers pick one bucket string per
+/// call, so there's no ordering/precedence concern between arms here.
 pub fn matches_bucket(node: &Node, bucket: &str) -> bool {
     match bucket {
         "needs_curation" => !node.curated,
+        "pinned" => node.prominence == NodeProminence::Pinned,
         "kept" => node.curated && node.prominence == NodeProminence::Full,
         "reduced" => node.prominence == NodeProminence::Reduced,
         _ => false,
@@ -376,6 +381,64 @@ pub(crate) async fn gotchas_json(State(state): State<AppState>, Query(q): Query<
 
     match result {
         Ok(Ok(gotchas)) => (StatusCode::OK, Json(json!({ "gotchas": gotchas }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+/// `GET /repos/{name}/usage` — single-operator mirror of
+/// `agentops-heavy-api::dashboard::usage_json`, minus tenant resolution
+/// (this mode has no tenants -- `agentops-manifest`'s local
+/// `~/.agentops/manifest.json` is the only source of truth). Path
+/// resolution mirrors `search::node_detail_json` exactly (unknown repo/path
+/// both 404, not a generic error). Reuses `crate::usage::usage_summary`
+/// exactly, per that module's own doc comment -- no logic duplicated.
+pub(crate) async fn usage_json(State(state): State<AppState>, AxumPath(repo_name): AxumPath<String>) -> (StatusCode, Json<Value>) {
+    let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::usage::UsageSummary>> {
+        let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
+        let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
+        let path = PathBuf::from(&entry.path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
+        Ok(Some(crate::usage::usage_summary(store.as_ref(), &repo_name)?))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(summary))) => (StatusCode::OK, Json(serde_json::to_value(summary).unwrap())),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+/// `GET /repos/{name}/hotspots` — Graphify-inspired "god node" detection
+/// (`agentops_graph::detect_hotspots`): over-connected nodes in the repo's
+/// own graph, each annotated with its community from a single-pass
+/// modularity grouping. Path resolution mirrors `usage_json`/
+/// `search::node_detail_json` exactly.
+pub(crate) async fn hotspots_json(State(state): State<AppState>, AxumPath(repo_name): AxumPath<String>) -> (StatusCode, Json<Value>) {
+    let manifest_path = state.manifest_path.clone();
+    let pg_store = state.pg_store.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<agentops_graph::Hotspot>>> {
+        let entries = agentops_manifest::list_scanned_repos_at(&manifest_path)?;
+        let Some(entry) = find_by_name(&entries, &repo_name) else { return Ok(None) };
+        let path = PathBuf::from(&entry.path);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let store = agentops_mcp::resolve_store(pg_store.as_ref(), &path)?;
+        Ok(Some(detect_hotspots(store.as_ref(), &repo_name)?))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(hotspots))) => (StatusCode::OK, Json(json!({ "hotspots": hotspots }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo" }))),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
     }
@@ -644,5 +707,49 @@ mod tests {
     fn read_branch_is_none_for_a_path_with_no_git_dir_at_all() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(read_branch(dir.path()), None);
+    }
+
+    #[tokio::test]
+    async fn usage_route_reports_real_recorded_usage_for_a_scanned_repo() {
+        use agentops_graph::NewSessionUsage;
+
+        let dir = tempfile::tempdir().unwrap();
+        agentops_mcp::scan_and_persist(dir.path(), false).unwrap();
+        let manifest_path = manifest_path();
+        agentops_manifest::record_scan_at(&manifest_path, dir.path()).unwrap();
+        let name = agentops_mcp::repo_name(dir.path());
+
+        let store = agentops_mcp::open_store(dir.path()).unwrap();
+        store
+            .upsert_session_usage(NewSessionUsage {
+                repo: name.clone(),
+                session_id: "sess-1".into(),
+                model: "claude-sonnet-5".into(),
+                input_tokens: 1000,
+                output_tokens: 500,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
+                cost_estimate_usd: 1.5,
+                session_started_at: "2026-09-25T00:00:00Z".into(),
+                session_ended_at: "2026-09-25T01:00:00Z".into(),
+            })
+            .unwrap();
+
+        let app = test_app(manifest_path);
+        let resp = app.oneshot(Request::builder().uri(format!("/repos/{name}/usage")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["repo"], name);
+        assert_eq!(body["tokens"]["input_tokens"], 1000);
+        assert_eq!(body["tokens"]["output_tokens"], 500);
+        assert_eq!(body["tokens"]["cost_usd"], 1.5);
+    }
+
+    #[tokio::test]
+    async fn usage_route_404s_for_an_unknown_repo() {
+        let manifest_path = manifest_path();
+        let app = test_app(manifest_path);
+        let resp = app.oneshot(Request::builder().uri("/repos/does-not-exist/usage").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -232,6 +232,7 @@ fn parse_prominence(s: &str) -> Option<NodeProminence> {
     match s {
         "full" => Some(NodeProminence::Full),
         "reduced" => Some(NodeProminence::Reduced),
+        "pinned" => Some(NodeProminence::Pinned),
         _ => None,
     }
 }
