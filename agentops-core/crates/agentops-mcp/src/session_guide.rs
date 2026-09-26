@@ -21,6 +21,53 @@ use crate::budget::cap_sections;
 /// meant to be skimmed at a glance, not a full result set).
 pub const GUIDE_CHAR_BUDGET: usize = 2000;
 
+/// Sort key for a 3-way `NodeProminence` ordering (lower sorts first):
+/// `Pinned` (a human's standing directive) ahead of `Full`, `Reduced` last.
+/// Replaces an earlier 2-variant `prominence == Reduced` boolean trick that
+/// no longer expresses a 3-way order now that `Pinned` exists.
+fn prominence_sort_rank(p: NodeProminence) -> u8 {
+    match p {
+        NodeProminence::Pinned => 0,
+        NodeProminence::Full => 1,
+        NodeProminence::Reduced => 2,
+    }
+}
+
+/// Sticky-pin context: nodes a human has explicitly pinned
+/// (`NodeProminence::Pinned`), meant to be injected on every `SessionStart`
+/// *and* every `UserPromptSubmit` -- unlike `build`/`build_repo_briefing`
+/// (session-activity/scan-derived, only meaningful at resume/compact), a
+/// pin is a standing directive the agent should never lose sight of
+/// mid-session, so this is called from both hook handlers
+/// (`agentops-cli::hook_capture`). Returns an empty string when there are
+/// no pins -- same "nothing to show is the normal case" contract as `build`.
+pub fn build_pinned_context(store: &dyn GraphStore, repo: &str) -> anyhow::Result<String> {
+    let mut pinned = store.nodes_pinned(repo)?;
+    if pinned.is_empty() {
+        return Ok(String::new());
+    }
+    // Stable order across calls regardless of underlying query order, so
+    // the injected block doesn't reshuffle every turn.
+    pinned.sort_by_key(|n| n.id);
+
+    let body = pinned
+        .iter()
+        .map(|n| {
+            let name = n.name.as_deref().unwrap_or("(untitled)");
+            let excerpt = n.content.as_deref().unwrap_or("").lines().next().unwrap_or("");
+            format!("- [{}] {name}: {excerpt} (id {})", n.kind.as_db_str(), n.id)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // Name+excerpt only, not full content -- a caller wanting the full body
+    // already has `fetch_content` by node id (same excerpt-only pattern as
+    // `build_repo_briefing`'s `excerpt_section`, not `process_post_tool_use`'s
+    // full-capture pattern).
+    let sections: [(&str, String); 1] = [("Pinned", body)];
+    Ok(cap_sections(&sections, GUIDE_CHAR_BUDGET))
+}
+
 /// Builds the guide for `session_id` in `repo`. Returns an empty string if
 /// there's nothing to show (never an error for "no activity yet" — that's
 /// the normal case for a brand-new session).
@@ -80,7 +127,7 @@ pub fn build_repo_briefing(store: &dyn GraphStore, repo: &str) -> anyhow::Result
 
     let excerpt_section = |kind: NodeKind| -> anyhow::Result<String> {
         let mut nodes = store.nodes_by_kind(repo, kind)?;
-        nodes.sort_by_key(|n| n.prominence == NodeProminence::Reduced);
+        nodes.sort_by_key(|n| prominence_sort_rank(n.prominence));
         Ok(nodes
             .iter()
             .take(5)
@@ -154,6 +201,29 @@ mod tests {
         assert!(guide.contains("## Task"));
         assert!(guide.contains("Fix the login bug"));
         assert!(guide.contains("in_progress"));
+    }
+
+    #[test]
+    fn pinned_context_is_empty_with_no_pins() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let ctx = build_pinned_context(&store, "demo").unwrap();
+        assert_eq!(ctx, "");
+    }
+
+    #[test]
+    fn pinned_context_surfaces_a_pinned_gotcha_but_not_an_unpinned_one() {
+        use agentops_graph::NewNode;
+
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let pinned_id = store.add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some("Always remember".into()), container: None, start_line: None, end_line: None, content: Some("Never bypass the redaction gate.".into()) }).unwrap();
+        store.add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some("Unrelated".into()), container: None, start_line: None, end_line: None, content: Some("Some other note.".into()) }).unwrap();
+        store.set_curation("demo", pinned_id, NodeProminence::Pinned, None).unwrap();
+
+        let ctx = build_pinned_context(&store, "demo").unwrap();
+        assert!(ctx.contains("## Pinned"), "{ctx}");
+        assert!(ctx.contains("Always remember"), "{ctx}");
+        assert!(ctx.contains("Never bypass the redaction gate."), "{ctx}");
+        assert!(!ctx.contains("Unrelated"), "{ctx}");
     }
 
     #[test]

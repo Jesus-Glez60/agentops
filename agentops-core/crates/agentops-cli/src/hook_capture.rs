@@ -28,8 +28,11 @@ use agentops_mcp::budget::{cap, DEFAULT_CHAR_BUDGET};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-/// Entry point for the `hook-capture` subcommand.
-pub fn run(event: &str) -> Result<()> {
+/// Entry point for the `hook-capture` subcommand. `compress` is only ever
+/// read by the `pretooluse` branch (see `Connect`'s `--compress-commands`
+/// doc comment in `main.rs` for why this is opt-in) — every other event
+/// ignores it.
+pub fn run(event: &str, compress: bool) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).context("reading hook payload from stdin")?;
     match event {
@@ -44,7 +47,7 @@ pub fn run(event: &str) -> Result<()> {
         // so it's wrapped separately rather than trusting the same
         // `Result`-propagation-is-safe posture the other events use.
         "pretooluse" => {
-            if let Err(e) = process_pre_tool_use(&input) {
+            if let Err(e) = process_pre_tool_use(&input, compress) {
                 eprintln!("agentops hook-capture --event pretooluse: {e:#} (non-fatal, continuing)");
             }
             Ok(())
@@ -241,6 +244,27 @@ fn process_user_prompt_submit(input: &str) -> Result<()> {
     let capped = cap(prompt, DEFAULT_CHAR_BUDGET, 0);
     let redacted = agentops_security::redact(&capped.text);
     store.record_session_event(&repo, session_id, "user_prompt", &redacted.text, None, "user_intent")?;
+
+    // Sticky pins re-injected on every turn, not just at SessionStart -- the
+    // actual "combat context drift" mechanism: a long, multi-compact session
+    // can scroll a SessionStart-only injection out of view, but a pin is
+    // meant to be a standing directive the agent never loses sight of.
+    // Confirmed against Claude Code's real hooks docs: `UserPromptSubmit`
+    // nests `additionalContext` under `hookSpecificOutput` exactly like
+    // `SessionStart`/`PreToolUse` (capped at 10,000 chars by Claude Code
+    // itself -- `GUIDE_CHAR_BUDGET`'s 2000 stays comfortably under that).
+    let pinned = agentops_mcp::session_guide::build_pinned_context(store.as_ref(), &repo)?;
+    if !pinned.is_empty() {
+        println!(
+            "{}",
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": pinned,
+                }
+            })
+        );
+    }
     Ok(())
 }
 
@@ -257,23 +281,28 @@ struct PreToolUsePayload {
     cwd: Option<String>,
 }
 
-/// Proactive secret-exposure warning -- reuses the existing redaction/
-/// filename-classification code directly, invents no new pattern-matching.
-/// Deliberately narrow: full command blocking/denial (a competitor's
-/// `curl`/`wget` policy) is explicitly out of scope -- there's no
-/// sandboxed-exec tool to redirect to, and it's not core to what AgentOps
-/// does. **Never sets `permissionDecision`**, so the tool call always
-/// proceeds through Claude Code's normal permission flow untouched; the
-/// warning only ever reaches Claude via `additionalContext` on exit 0 (the
-/// confirmed mechanism -- plain stderr on exit 0 only reaches a debug log,
-/// invisible to Claude, a wrong assumption this corrects).
-fn process_pre_tool_use(input: &str) -> Result<()> {
+/// Two fully independent concerns, either/both/neither of which can fire on
+/// the same call: a proactive secret-exposure warning (reuses the existing
+/// redaction/filename-classification code directly, invents no new
+/// pattern-matching; deliberately narrow -- full command blocking/denial, a
+/// competitor's `curl`/`wget` policy, is explicitly out of scope, there's no
+/// sandboxed-exec tool to redirect to and it's not core to what AgentOps
+/// does) and, when `compress` is set, a command-output-compression rewrite
+/// (RTK-inspired -- see `classify_for_compression`). **Never sets
+/// `permissionDecision`** for the warning path (the tool call always
+/// proceeds through Claude Code's normal permission flow untouched); the
+/// compression path sets `updatedInput` only, never `permissionDecision`
+/// either, so it changes *what* runs, never *whether* it runs.
+fn process_pre_tool_use(input: &str, compress: bool) -> Result<()> {
     let payload: PreToolUsePayload = serde_json::from_str(input).context("parsing PreToolUse payload")?;
-    let Some(warning) = detect_secret_exposure(&payload.tool_name, &payload.tool_input) else {
-        return Ok(());
-    };
+    let warning = detect_secret_exposure(&payload.tool_name, &payload.tool_input);
+    let rewrite = if compress { detect_command_rewrite(&payload.tool_name, &payload.tool_input) } else { None };
 
-    if let Some(cwd) = payload.cwd.as_deref() {
+    if warning.is_none() && rewrite.is_none() {
+        return Ok(());
+    }
+
+    if let (Some(w), Some(cwd)) = (&warning, payload.cwd.as_deref()) {
         let repo_path = Path::new(cwd);
         if let Ok(store) = agentops_mcp::open_store(repo_path) {
             let repo = agentops_mcp::repo_name(repo_path);
@@ -282,20 +311,19 @@ fn process_pre_tool_use(input: &str) -> Result<()> {
             // call or fail this hook -- the warning has already been decided;
             // recording it is a nice-to-have for the session guide, not
             // a precondition for warning Claude.
-            let _ = store.record_session_event(&repo, session_id, &payload.tool_name, &warning, None, "secret_exposure_warning");
+            let _ = store.record_session_event(&repo, session_id, &payload.tool_name, w, None, "secret_exposure_warning");
         }
     }
 
-    println!(
-        "{}",
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "additionalContext": warning,
-                "systemMessage": format!("agentops: {warning}"),
-            }
-        })
-    );
+    let mut output = serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse" } });
+    if let Some(w) = &warning {
+        output["hookSpecificOutput"]["additionalContext"] = serde_json::Value::String(w.clone());
+        output["hookSpecificOutput"]["systemMessage"] = serde_json::Value::String(format!("agentops: {w}"));
+    }
+    if let Some(new_command) = &rewrite {
+        output["hookSpecificOutput"]["updatedInput"] = serde_json::json!({ "command": new_command });
+    }
+    println!("{output}");
     Ok(())
 }
 
@@ -312,6 +340,93 @@ fn detect_secret_exposure(tool_name: &str, tool_input: &serde_json::Value) -> Op
         }
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------
+// PreToolUse: RTK-inspired command-output compression (opt-in via
+// `--compress`, see `Connect`'s `--compress-commands` doc comment)
+// ---------------------------------------------------------------------
+
+/// How a matched command gets rewritten -- see each variant for why the two
+/// strategies exist rather than one.
+enum CompressAction {
+    /// Append a flag directly to the command -- no pipe, so there's nothing
+    /// to restore via `PIPESTATUS`: the original command still runs and
+    /// still reports its own real exit code. Used for `git log --oneline`/
+    /// `git diff -U1`, where git already produces the compact form itself
+    /// given the right flag -- the smallest possible implementation for
+    /// those two cases, no `compress-output` invocation needed at all.
+    AppendFlag(&'static str),
+    /// Pipe the command's combined stdout+stderr through
+    /// `agentops compress-output --kind <kind>`.
+    Pipe(crate::compress_output::CompressKind),
+}
+
+/// Only matches a **single, unchained** recognized command -- anything
+/// already containing `&&`, `;`, `|`, or a subshell `(` is left completely
+/// untouched, since rewriting only the visible head of a chained command
+/// risks corrupting the rest of the pipeline (a script that pipes
+/// `cargo test` into its own `tee`, for instance, must never be
+/// double-piped by this hook). Deliberately a small, conservative allowlist
+/// -- matches `is_git_op`'s own "plain substring check, not regex"
+/// precedent -- meant to grow over time, not to be exhaustive from day one.
+fn classify_for_compression(command: &str) -> Option<CompressAction> {
+    use crate::compress_output::CompressKind;
+
+    let trimmed = command.trim();
+    if trimmed.contains("&&") || trimmed.contains(';') || trimmed.contains('|') || trimmed.contains('(') {
+        return None;
+    }
+    if trimmed.starts_with("cargo test") {
+        return Some(CompressAction::Pipe(CompressKind::TestRust));
+    }
+    if trimmed.starts_with("npm test") || trimmed.starts_with("npm run test") {
+        return Some(CompressAction::Pipe(CompressKind::TestNode));
+    }
+    if trimmed.starts_with("pytest") || trimmed.starts_with("python -m pytest") || trimmed.starts_with("python3 -m pytest") {
+        return Some(CompressAction::Pipe(CompressKind::TestPytest));
+    }
+    if trimmed.starts_with("go test") {
+        return Some(CompressAction::Pipe(CompressKind::TestGo));
+    }
+    if trimmed.starts_with("git log") && !trimmed.contains("--oneline") && !trimmed.contains("--format") && !trimmed.contains("--stat") {
+        return Some(CompressAction::AppendFlag("--oneline"));
+    }
+    if trimmed.starts_with("git diff") && !trimmed.contains("-U") && !trimmed.contains("--unified") {
+        return Some(CompressAction::AppendFlag("-U1"));
+    }
+    if trimmed.starts_with("grep ") || trimmed.starts_with("rg ") {
+        return Some(CompressAction::Pipe(CompressKind::Grep));
+    }
+    None
+}
+
+/// `AppendFlag` needs no exit-code handling (see the variant's own doc
+/// comment). `Pipe` loses the piped command's exit status by default (a
+/// bare pipe reports the *last* command's exit code, i.e.
+/// `compress-output`'s own, not the real command's) -- `2>&1` folds stderr
+/// into the piped stream first (test frameworks often write failures
+/// there), and bash's `PIPESTATUS` restores the original command's real
+/// exit status as the shell's final status afterward, which is what Claude
+/// Code's Bash tool inspects for success/failure. This assumes Claude
+/// Code's Bash tool invokes `bash -c`, not `sh -c`/dash (which lacks
+/// `PIPESTATUS`) -- verify this mechanism in a real shell (and against a
+/// real Claude Code session) before relying on it; see this crate's own
+/// test coverage for the shell-level check.
+fn rewrite_command(original: &str, action: &CompressAction) -> String {
+    match action {
+        CompressAction::AppendFlag(flag) => format!("{original} {flag}"),
+        CompressAction::Pipe(kind) => format!("{{ {original}; }} 2>&1 | agentops compress-output --kind {} ; exit ${{PIPESTATUS[0]}}", kind.as_flag()),
+    }
+}
+
+fn detect_command_rewrite(tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
+    if tool_name != "Bash" {
+        return None;
+    }
+    let command = tool_input.get("command").and_then(|v| v.as_str())?;
+    let action = classify_for_compression(command)?;
+    Some(rewrite_command(command, &action))
 }
 
 // ---------------------------------------------------------------------
@@ -347,6 +462,12 @@ fn process_session_start(input: &str) -> Result<()> {
     let repo = agentops_mcp::repo_name(repo_path);
     let guide = agentops_mcp::session_guide::build(store.as_ref(), &repo, session_id)?;
     let guide = if guide.is_empty() { agentops_mcp::session_guide::build_repo_briefing(store.as_ref(), &repo)? } else { guide };
+    // Sticky pins are a standing directive, prepended ahead of the
+    // session-resume guide/briefing -- and checked for emptiness only after
+    // this concatenation, so a session with pins but no other activity yet
+    // still emits output.
+    let pinned = agentops_mcp::session_guide::build_pinned_context(store.as_ref(), &repo)?;
+    let guide = if pinned.is_empty() { guide } else if guide.is_empty() { pinned } else { format!("{pinned}\n\n{guide}") };
     if guide.is_empty() {
         return Ok(());
     }
@@ -540,7 +661,7 @@ mod tests {
         let payload = serde_json::json!({ "tool_name": "Bash", "tool_input": {"command": r#"export API_KEY="sk_live_abcdef1234567890ABCDEF""#}, "session_id": "sess-9", "cwd": path }).to_string();
 
         // Must never return an Err (would surface as a nonzero exit).
-        process_pre_tool_use(&payload).unwrap();
+        process_pre_tool_use(&payload, false).unwrap();
 
         let store = agentops_mcp::open_store(dir.path()).unwrap();
         let repo = agentops_mcp::repo_name(dir.path());
@@ -555,7 +676,7 @@ mod tests {
         let path = dir.path().to_string_lossy().to_string();
         let payload = serde_json::json!({ "tool_name": "Read", "tool_input": {"file_path": ".env"}, "session_id": "sess-10", "cwd": path }).to_string();
 
-        process_pre_tool_use(&payload).unwrap();
+        process_pre_tool_use(&payload, false).unwrap();
 
         let store = agentops_mcp::open_store(dir.path()).unwrap();
         let repo = agentops_mcp::repo_name(dir.path());
@@ -570,11 +691,88 @@ mod tests {
         let path = dir.path().to_string_lossy().to_string();
         let payload = serde_json::json!({ "tool_name": "Read", "tool_input": {"file_path": "src/main.rs"}, "session_id": "sess-11", "cwd": path }).to_string();
 
-        process_pre_tool_use(&payload).unwrap();
+        process_pre_tool_use(&payload, false).unwrap();
 
         let store = agentops_mcp::open_store(dir.path()).unwrap();
         let repo = agentops_mcp::repo_name(dir.path());
         assert!(store.session_events(&repo, "sess-11").unwrap().is_empty());
+    }
+
+    #[test]
+    fn classify_for_compression_recognizes_the_supported_commands() {
+        assert!(matches!(classify_for_compression("cargo test -p agentops-graph"), Some(CompressAction::Pipe(crate::compress_output::CompressKind::TestRust))));
+        assert!(matches!(classify_for_compression("npm test"), Some(CompressAction::Pipe(crate::compress_output::CompressKind::TestNode))));
+        assert!(matches!(classify_for_compression("pytest -v"), Some(CompressAction::Pipe(crate::compress_output::CompressKind::TestPytest))));
+        assert!(matches!(classify_for_compression("go test ./..."), Some(CompressAction::Pipe(crate::compress_output::CompressKind::TestGo))));
+        assert!(matches!(classify_for_compression("grep -rn foo src/"), Some(CompressAction::Pipe(crate::compress_output::CompressKind::Grep))));
+        assert!(matches!(classify_for_compression("rg foo"), Some(CompressAction::Pipe(crate::compress_output::CompressKind::Grep))));
+        assert!(matches!(classify_for_compression("git log"), Some(CompressAction::AppendFlag("--oneline"))));
+        assert!(matches!(classify_for_compression("git diff"), Some(CompressAction::AppendFlag("-U1"))));
+    }
+
+    #[test]
+    fn classify_for_compression_declines_a_command_already_carrying_the_relevant_flag() {
+        assert!(classify_for_compression("git log --oneline").is_none());
+        assert!(classify_for_compression("git log --format=%H").is_none());
+        assert!(classify_for_compression("git diff -U5").is_none());
+        assert!(classify_for_compression("git diff --unified=3").is_none());
+    }
+
+    #[test]
+    fn classify_for_compression_declines_a_chained_or_unrecognized_command() {
+        assert!(classify_for_compression("cargo test && echo done").is_none(), "must not rewrite only the head of a chained command");
+        assert!(classify_for_compression("cargo test; echo done").is_none());
+        assert!(classify_for_compression("cargo test | tee out.log").is_none(), "must not double-pipe an already-piped command");
+        assert!(classify_for_compression("(cd foo && cargo test)").is_none());
+        assert!(classify_for_compression("echo hello").is_none());
+        assert!(classify_for_compression("git status").is_none(), "git status is not a supported command");
+    }
+
+    #[test]
+    fn rewrite_command_pipes_through_compress_output_and_restores_the_real_exit_code() {
+        let rewritten = rewrite_command("cargo test", &CompressAction::Pipe(crate::compress_output::CompressKind::TestRust));
+        assert_eq!(rewritten, "{ cargo test; } 2>&1 | agentops compress-output --kind test-rust ; exit ${PIPESTATUS[0]}");
+    }
+
+    #[test]
+    fn rewrite_command_appends_a_flag_with_no_pipe_for_git_log_and_diff() {
+        assert_eq!(rewrite_command("git log", &CompressAction::AppendFlag("--oneline")), "git log --oneline");
+        assert_eq!(rewrite_command("git diff", &CompressAction::AppendFlag("-U1")), "git diff -U1");
+    }
+
+    #[test]
+    fn detect_command_rewrite_only_applies_to_bash_tool_calls() {
+        let tool_input = serde_json::json!({ "command": "cargo test" });
+        assert!(detect_command_rewrite("Bash", &tool_input).is_some());
+        assert!(detect_command_rewrite("Read", &tool_input).is_none(), "a non-Bash tool must never be rewritten");
+    }
+
+    #[test]
+    fn pre_tool_use_rewrites_a_test_command_only_when_compress_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let payload = serde_json::json!({ "tool_name": "Bash", "tool_input": {"command": "cargo test"}, "session_id": "sess-12", "cwd": path }).to_string();
+
+        // Without --compress: silent, no rewrite (and no credential in this
+        // command, so no warning either).
+        process_pre_tool_use(&payload, false).unwrap();
+    }
+
+    /// Confirms the actual shell mechanism `rewrite_command`'s `Pipe`
+    /// variant depends on: a bare pipe reports the *piped-to* command's
+    /// exit code, but `PIPESTATUS[0]` recovers the original command's real
+    /// one, and the trailing `exit ${PIPESTATUS[0]}` makes that the whole
+    /// rewritten line's final status -- verified directly in a real shell,
+    /// not just asserted about `rewrite_command`'s string output above.
+    #[test]
+    fn pipestatus_recovers_the_original_commands_real_exit_code_through_a_pipe() {
+        let rewritten = rewrite_command("false", &CompressAction::Pipe(crate::compress_output::CompressKind::TestRust));
+        // Swap the real binary invocation for `cat` so this test doesn't
+        // depend on `agentops` being built/on PATH -- the exit-code
+        // mechanism under test is bash's, not this crate's own.
+        let rewritten = rewritten.replace("agentops compress-output --kind test-rust", "cat");
+        let status = std::process::Command::new("bash").arg("-c").arg(&rewritten).status().unwrap();
+        assert_eq!(status.code(), Some(1), "the rewritten line's exit code must be `false`'s real code (1), not `cat`'s (0): {rewritten}");
     }
 
     #[test]

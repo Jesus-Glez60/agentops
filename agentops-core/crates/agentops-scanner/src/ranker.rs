@@ -359,11 +359,11 @@ mod tests {
     use crate::types::Language;
 
     fn file(path: &str, deps: &[&str]) -> ScannedFile {
-        ScannedFile { path: PathBuf::from(path), language: Language::TypeScript, symbols: vec![], deps: deps.iter().map(|s| s.to_string()).collect(), chunks: vec![], used_tree_sitter: false }
+        ScannedFile { path: PathBuf::from(path), language: Language::TypeScript, symbols: vec![], deps: deps.iter().map(|s| s.to_string()).collect(), chunks: vec![], used_tree_sitter: false, macro_invocation_sites: vec![] }
     }
 
     fn rust_file(path: &str, deps: &[&str]) -> ScannedFile {
-        ScannedFile { path: PathBuf::from(path), language: Language::Rust, symbols: vec![], deps: deps.iter().map(|s| s.to_string()).collect(), chunks: vec![], used_tree_sitter: false }
+        ScannedFile { path: PathBuf::from(path), language: Language::Rust, symbols: vec![], deps: deps.iter().map(|s| s.to_string()).collect(), chunks: vec![], used_tree_sitter: false, macro_invocation_sites: vec![] }
     }
 
     fn symbol(name: &str, references: &[&str]) -> Symbol {
@@ -479,8 +479,8 @@ mod tests {
         std::fs::write(root.join("src/app.ts"), "import { cn } from '@/lib/utils';\n").unwrap();
 
         let files = vec![
-            ScannedFile { path: PathBuf::from("src/app.ts"), language: Language::TypeScript, symbols: vec![], deps: vec!["@/lib/utils".to_string()], chunks: vec![], used_tree_sitter: false },
-            ScannedFile { path: PathBuf::from("src/lib/utils.ts"), language: Language::TypeScript, symbols: vec![], deps: vec![], chunks: vec![], used_tree_sitter: false },
+            ScannedFile { path: PathBuf::from("src/app.ts"), language: Language::TypeScript, symbols: vec![], deps: vec!["@/lib/utils".to_string()], chunks: vec![], used_tree_sitter: false, macro_invocation_sites: vec![] },
+            ScannedFile { path: PathBuf::from("src/lib/utils.ts"), language: Language::TypeScript, symbols: vec![], deps: vec![], chunks: vec![], used_tree_sitter: false, macro_invocation_sites: vec![] },
         ];
         let edges = resolve_dependency_edges(root, &files);
         assert_eq!(edges, vec![(PathBuf::from("src/app.ts"), PathBuf::from("src/lib/utils.ts"))], "found: {edges:?}");

@@ -16,9 +16,10 @@ mod ranker;
 mod types;
 mod walker;
 
+pub use ast_extract::extract_symbols;
 pub use manifest::{extract_declared_dependencies, DeclaredDependency};
 pub use ranker::{rank_files, resolve_dependency_edges, resolve_same_file_symbol_references};
-pub use types::{Chunk, ChunkKind, Language, ScannedFile, Symbol};
+pub use types::{Chunk, ChunkKind, Language, MacroInvocationSite, ScannedFile, Symbol};
 pub use walker::watchable_dirs;
 
 use std::path::Path;
@@ -40,6 +41,7 @@ pub fn scan_repo(root: &Path) -> anyhow::Result<ScanReport> {
         };
 
         let (mut symbols, used_tree_sitter) = ast_extract::extract_symbols(language, &source);
+        let macro_invocation_sites = ast_extract::collect_macro_invocation_sites(language, &source);
 
         // Tracked uniformly across all five languages now that all five
         // have a real regex fallback — `main` only tracked this for Go
@@ -64,7 +66,7 @@ pub fn scan_repo(root: &Path) -> anyhow::Result<ScanReport> {
         }
 
         let rel_path = abs_path.strip_prefix(root).unwrap_or(&abs_path).to_path_buf();
-        files.push(ScannedFile { path: rel_path, language, symbols, deps, chunks, used_tree_sitter });
+        files.push(ScannedFile { path: rel_path, language, symbols, deps, chunks, used_tree_sitter, macro_invocation_sites });
     }
 
     Ok(ScanReport { files, redacted_count, fallback_gap_files })

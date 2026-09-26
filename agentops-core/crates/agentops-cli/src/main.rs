@@ -9,6 +9,7 @@
 //! follow-up (see the plan).
 
 mod hook_capture;
+mod compress_output;
 mod usage;
 
 use std::path::{Path, PathBuf};
@@ -43,6 +44,16 @@ enum Command {
         /// default.
         #[arg(long)]
         with_embeddings: bool,
+        /// Also runs an opt-in rust-analyzer-backed macro-expansion pass,
+        /// adding symbols for item-level macro invocations (`foo!(...);`)
+        /// Tree-sitter itself can never see through. Best-effort: degrades
+        /// silently to nothing if `rust-analyzer` isn't installed (`rustup
+        /// component add rust-analyzer`) or a given invocation doesn't
+        /// expand (e.g. a `#[derive(...)]`, confirmed not supported by this
+        /// mechanism). Real per-scan latency cost (spawns a whole
+        /// rust-analyzer process) — off by default.
+        #[arg(long)]
+        with_lsp: bool,
         /// Skip prompt-pack distribution via Ruler entirely.
         #[arg(long)]
         no_ruler: bool,
@@ -281,6 +292,17 @@ enum Command {
         /// in this first pass; ignored for other --agents.
         #[arg(long)]
         with_hooks: bool,
+        /// Also rewrite known-noisy Bash commands (test runners, `git diff`/
+        /// `log`, `grep`/`rg`) via `PreToolUse`'s `updatedInput` so their
+        /// output is compressed *before* it reaches context, instead of only
+        /// being captured after the fact once it's already oversized. A
+        /// separate opt-in from `--with-hooks`: every hook `--with-hooks`
+        /// installs only ever *observes* (captures, warns, redacts) — this
+        /// one changes the literal command that executes, a materially
+        /// bigger trust boundary, so it's never bundled into the default
+        /// hook suite. Requires --with-hooks; Claude Code only.
+        #[arg(long, requires = "with_hooks")]
+        compress_commands: bool,
     },
     /// Internal: invoked by a Claude Code hook (installed via
     /// `connect --with-hooks`), not meant to be run by hand. Reads the
@@ -289,6 +311,22 @@ enum Command {
     HookCapture {
         #[arg(long, default_value = "posttooluse")]
         event: String,
+        /// Only meaningful for `--event pretooluse` -- see `Connect`'s
+        /// `--compress-commands` doc comment. Baked into the installed hook
+        /// command line itself by `maybe_install_claude_hooks`, not read
+        /// from any separate config, so a hook invocation is fully
+        /// self-describing.
+        #[arg(long)]
+        compress: bool,
+    },
+    /// Internal: reads a command's raw output from stdin, compresses it
+    /// according to `--kind`, and writes the compressed result to stdout —
+    /// invoked as one stage of a `PreToolUse`-rewritten command's pipeline
+    /// (see `hook_capture::rewrite_command`), never run by hand.
+    #[command(hide = true)]
+    CompressOutput {
+        #[arg(long, value_enum)]
+        kind: compress_output::CompressKind,
     },
     /// One-off: copy one repo's entire local SQLite graph store into a
     /// Postgres-backed `PostgresGraphStore` (e.g. a server-hosted
@@ -514,8 +552,8 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Install { path, notes_path, dry_run, with_embeddings, no_ruler, agents } => {
-            install(&path, notes_path.as_deref(), dry_run, with_embeddings, no_ruler, &agents)
+        Command::Install { path, notes_path, dry_run, with_embeddings, with_lsp, no_ruler, agents } => {
+            install(&path, notes_path.as_deref(), dry_run, with_embeddings, with_lsp, no_ruler, &agents)
         }
         Command::Status { path } => status(&path),
         Command::Repos => repos(),
@@ -561,8 +599,9 @@ fn main() -> Result<()> {
             UsageAction::Sync { path, claude_home, remote } => usage_sync_command(&path, claude_home.as_deref(), remote.as_deref()),
         },
         Command::Init { yes, path } => init(yes, &path),
-        Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login, with_hooks } => connect(&path, agents, access_mode, yes, remote, api_key, device_login, with_hooks),
-        Command::HookCapture { event } => hook_capture::run(&event),
+        Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands } => connect(&path, agents, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands),
+        Command::HookCapture { event, compress } => hook_capture::run(&event, compress),
+        Command::CompressOutput { kind } => compress_output::run(kind),
         Command::MigrateGraph { from, to, repo, wipe_target } => migrate_graph(&from, &to, &repo, wipe_target),
     }
 }
@@ -790,9 +829,9 @@ fn start_web_frontend_if_present(path: &Path) {
     }
 }
 
-fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embeddings: bool, no_ruler: bool, agents: &[String]) -> Result<()> {
+fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embeddings: bool, with_lsp: bool, no_ruler: bool, agents: &[String]) -> Result<()> {
     println!("Scanning {}...", path.display());
-    let report = agentops_scanner::scan_repo(path).context("scanning repo")?;
+    let mut report = agentops_scanner::scan_repo(path).context("scanning repo")?;
     println!("Found {} files. {} secret(s) redacted.", report.files.len(), report.redacted_count);
     if !report.fallback_gap_files.is_empty() {
         println!("WARNING: no symbols extracted (parse failed, regex fallback also found none) for {} file(s): {:?}", report.fallback_gap_files.len(), report.fallback_gap_files);
@@ -803,6 +842,11 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embedding
         println!("--dry-run: would write to {} and AGENTS.md", agentops_mcp::describe_backend(path));
         println!("Top-ranked files: {:?}", ranked.iter().take(5.min(ranked.len())).map(|(p, _)| p).collect::<Vec<_>>());
         return Ok(());
+    }
+
+    if with_lsp {
+        println!("Running opt-in rust-analyzer macro-expansion pass (best-effort)...");
+        agentops_mcp::enrich_with_macro_expansions(path, &mut report, std::time::Duration::from_secs(60), std::time::Duration::from_secs(30));
     }
 
     let summary = agentops_mcp::persist(path, &report, with_embeddings).context("persisting scan to graph store")?;
@@ -907,7 +951,7 @@ fn select_agents(mut agents: Vec<String>, yes: bool) -> Result<Vec<String>> {
     Ok(agents)
 }
 
-fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool, with_hooks: bool) -> Result<()> {
+fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool, with_hooks: bool, compress_commands: bool) -> Result<()> {
     // Whether to use local/stdio vs. remote/HTTP is not inferable from
     // anything about this invocation on its own (a solo dev can self-host
     // on their own separate personal server too) -- ask directly rather
@@ -939,7 +983,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
             return Ok(());
         }
         if with_hooks {
-            maybe_install_claude_hooks(path, &agents)?;
+            maybe_install_claude_hooks(path, &agents, compress_commands)?;
         }
         return connect_remote(path, &server_url, api_key, &agents, yes, device_login);
     }
@@ -959,7 +1003,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
         println!("This repo hasn't been scanned yet — MCP tools need a populated graph (.context/graph.db) to return anything useful.");
         let run_install = yes || dialoguer::Confirm::new().with_prompt("Run a scan now (`agentops install`-equivalent)?").default(true).interact()?;
         if run_install {
-            install(path, None, false, false, true, &[])?; // no_ruler: true -- this function handles Ruler distribution itself, right after
+            install(path, None, false, false, false, true, &[])?; // with_lsp: false (this implicit scan-if-needed path never forces it on); no_ruler: true -- this function handles Ruler distribution itself, right after
         } else {
             println!("Continuing without scanning — MCP tools will return little until you run `agentops install`.");
         }
@@ -978,7 +1022,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
     distribute_via_ruler(path, &agents_md_content, &agents, access_mode_str);
 
     if with_hooks {
-        maybe_install_claude_hooks(path, &agents)?;
+        maybe_install_claude_hooks(path, &agents, compress_commands)?;
     }
 
     println!("\nConnected: {}", agents.join(", "));
@@ -1004,7 +1048,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
 /// `PreToolUse` (proactive secret-exposure warning, never blocking). One
 /// `--event` per hook so `hook_capture::run` can dispatch without sniffing
 /// payload shape.
-fn maybe_install_claude_hooks(path: &Path, agents: &[String]) -> Result<()> {
+fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands: bool) -> Result<()> {
     if !agents.iter().any(|a| a == "claude") {
         return Ok(());
     }
@@ -1017,9 +1061,18 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String]) -> Result<()> {
         ("PreToolUse", "pretooluse"),
     ];
     for (event_name, event_flag) in HOOKS {
-        write_claude_hook(&settings_path, event_name, &format!("agentops hook-capture --event {event_flag}"))?;
+        // `--compress` is only meaningful for `--event pretooluse` (see
+        // `hook_capture::process_pre_tool_use`), but baking it only into
+        // that one command line is simplest and keeps every other event's
+        // command exactly as before -- no shared flag/env var needed.
+        let extra_flag = if compress_commands && *event_name == "PreToolUse" { " --compress" } else { "" };
+        write_claude_hook(&settings_path, event_name, &format!("agentops hook-capture --event {event_flag}{extra_flag}"))?;
     }
-    println!("  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse — see the get_session_guide/fetch_content/semantic_search MCP tools).", settings_path.display());
+    let compress_note = if compress_commands { ", command-output compression enabled" } else { "" };
+    println!(
+        "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse{compress_note} — see the get_session_guide/fetch_content/semantic_search MCP tools).",
+        settings_path.display()
+    );
     Ok(())
 }
 
@@ -2027,7 +2080,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");
 
-        maybe_install_claude_hooks(dir.path(), &["claude".to_string()]).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse")] {
@@ -2038,8 +2091,21 @@ mod tests {
     #[test]
     fn maybe_install_claude_hooks_is_a_noop_when_claude_is_not_among_the_selected_agents() {
         let dir = tempfile::tempdir().unwrap();
-        maybe_install_claude_hooks(dir.path(), &["cursor".to_string()]).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["cursor".to_string()], false).unwrap();
         assert!(!dir.path().join(".claude").join("settings.json").exists());
+    }
+
+    #[test]
+    fn maybe_install_claude_hooks_appends_compress_only_to_pretooluse_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join(".claude").join("settings.json");
+
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], true).unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(parsed["hooks"]["PreToolUse"]["command"], "agentops hook-capture --event pretooluse --compress");
+        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture --event posttooluse", "compress must not leak onto unrelated hook events");
+        assert_eq!(parsed["hooks"]["SessionStart"]["command"], "agentops hook-capture --event sessionstart");
     }
 
     #[test]

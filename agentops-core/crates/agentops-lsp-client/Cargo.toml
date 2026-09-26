@@ -1,0 +1,19 @@
+[package]
+name = "agentops-lsp-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "agentops_lsp_client"
+
+[dependencies]
+anyhow.workspace = true
+async-lsp.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["time"] }
+tokio-util.workspace = true
+tower = { version = "0.5", features = ["util"] }
+
+[dev-dependencies]
+tempfile = "3"

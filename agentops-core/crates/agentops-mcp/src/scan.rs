@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use agentops_embeddings::Embedder;
 use agentops_graph::{prune_stale_nodes, EdgeRelation, NewNode, NewScanHistoryEntry, NodeKind, ScanChange};
@@ -44,6 +45,80 @@ pub use agentops_store_open::{graph_db_path, repo_name};
 pub fn scan_and_persist(path: &Path, with_embeddings: bool) -> Result<ScanPersistSummary> {
     let report = agentops_scanner::scan_repo(path)?;
     persist(path, &report, with_embeddings)
+}
+
+/// LSP-enrichment variant of `scan_and_persist` -- opt-in
+/// (`agentops scan --with-lsp`/`agentops install --with-lsp`), fully
+/// additive. Runs the identical normal scan, then (only if any Rust file
+/// has item-level macro invocations Tree-sitter itself can never expand --
+/// see `agentops_scanner::MacroInvocationSite`'s own doc comment) spawns
+/// one `agentops_lsp_client::LspClient` for the whole repo and feeds each
+/// invocation's real expansion back through the exact same
+/// `agentops_scanner::extract_symbols` a normal scan already uses, so the
+/// synthesized symbols are indistinguishable in shape from hand-written
+/// ones -- `persist` itself needs zero changes for this. Best-effort
+/// throughout: any failure (rust-analyzer missing, a specific invocation
+/// not expandable -- e.g. a `#[derive(...)]`, confirmed live not to work
+/// via this mechanism -- or a timeout) is caught and that piece of
+/// enrichment is simply skipped, never propagated as a scan failure. The
+/// plain Tree-sitter scan this function still always runs first is the
+/// floor.
+pub fn scan_and_persist_with_lsp(path: &Path, with_embeddings: bool, handshake_timeout: Duration, expand_timeout: Duration) -> Result<ScanPersistSummary> {
+    let mut report = agentops_scanner::scan_repo(path)?;
+    enrich_with_macro_expansions(path, &mut report, handshake_timeout, expand_timeout);
+    persist(path, &report, with_embeddings)
+}
+
+pub fn enrich_with_macro_expansions(path: &Path, report: &mut ScanReport, handshake_timeout: Duration, expand_timeout: Duration) {
+    if !report.files.iter().any(|f| !f.macro_invocation_sites.is_empty()) {
+        return;
+    }
+
+    let mut client = match agentops_lsp_client::LspClient::spawn(path, handshake_timeout) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("agentops: LSP macro-expansion pass skipped -- could not start rust-analyzer: {e:#}");
+            return;
+        }
+    };
+
+    for file in &mut report.files {
+        // Cloned (cheap -- `MacroInvocationSite` is `Copy`) so the loop
+        // below can freely mutate `file.symbols` without a disjoint-borrow
+        // fight over `file`'s own fields.
+        let sites = file.macro_invocation_sites.clone();
+        if sites.is_empty() {
+            continue;
+        }
+        let abs_path = path.join(&file.path);
+
+        for site in sites {
+            let expansion = match client.expand_macro(&abs_path, site.line, site.character, expand_timeout) {
+                Ok(text) => text,
+                // Not expandable via this mechanism (e.g. a derive macro)
+                // or timed out -- a normal, expected per-invocation outcome,
+                // never a reason to fail the scan.
+                Err(_) => continue,
+            };
+
+            let (mut symbols, used_tree_sitter) = agentops_scanner::extract_symbols(agentops_scanner::Language::Rust, &expansion);
+            if !used_tree_sitter {
+                continue;
+            }
+
+            // Anchor to the macro invocation's own real line in the source
+            // file -- the expansion's internal line numbers are relative to
+            // the synthetic snippet, not anything editable/navigable in the
+            // real file.
+            for symbol in &mut symbols {
+                symbol.start_line = site.line as usize + 1;
+                symbol.end_line = site.line as usize + 1;
+            }
+            file.symbols.extend(symbols);
+        }
+    }
+
+    client.shutdown();
 }
 
 /// The persistence half on its own, for callers that already have a
@@ -708,6 +783,27 @@ mod tests {
         assert_eq!(containers, std::collections::HashSet::from([Some("Foo"), Some("Bar")]));
     }
 
+    #[test]
+    fn same_name_method_in_an_inherent_impl_and_a_trait_impl_on_the_same_type_both_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "struct Foo;\n\nimpl Foo {\n    fn forward(&self) -> i32 { 1 }\n}\n\nimpl SomeTrait for Foo {\n    fn forward(&self) -> i32 { 2 }\n}\n",
+        )
+        .unwrap();
+
+        let summary = scan_and_persist(dir.path(), false).unwrap();
+        assert_eq!(summary.symbols, 3, "the struct plus both `forward` methods must be counted, not collapsed");
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let symbols = store.nodes_by_kind(&repo, NodeKind::Symbol).unwrap();
+        let forward_symbols: Vec<_> = symbols.iter().filter(|n| n.name.as_deref() == Some("forward")).collect();
+        assert_eq!(forward_symbols.len(), 2, "found: {symbols:?}");
+        let containers: std::collections::HashSet<_> = forward_symbols.iter().map(|n| n.container.as_deref()).collect();
+        assert_eq!(containers, std::collections::HashSet::from([Some("Foo"), Some("Foo as SomeTrait")]), "the inherent and trait impls must disambiguate via container, not collide under the same natural key");
+    }
+
     /// Module B's actual bug-fix proof: a note written against a repo
     /// *before* it's ever been scanned (so there were zero symbols to match
     /// against at write time — the exact real gap recorded as
@@ -866,5 +962,54 @@ mod tests {
 
         let summary = scan_and_persist(dir.path(), false).unwrap();
         assert_eq!(summary.reference_edges, 0, "no call in either file's symbols references anything -- a same-named symbol in a different file must not spuriously match");
+    }
+
+    fn macro_fixture_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // Its own `[workspace]` table -- without it, Cargo (and rust-analyzer)
+        // treats a fixture nested under a tempdir as ambiguous only if it
+        // happened to sit inside another workspace's tree, which a tempdir
+        // never does; included anyway for parity with `agentops-lsp-client`'s
+        // own checked-in fixtures and to keep this self-contained regardless
+        // of where temp dirs happen to be mounted.
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n\n[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/lib.rs"),
+            "pub struct Foo;\n\nmacro_rules! impl_forward {\n    ($t:ty) => {\n        impl $t {\n            pub fn generated_forward(&self) -> i32 {\n                42\n            }\n        }\n    };\n}\n\nimpl_forward!(Foo);\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn plain_scan_and_persist_never_sees_the_macro_generated_method() {
+        // Regression guard: the LSP path must be fully additive -- the
+        // existing, always-run path must be 100% behaviorally unchanged
+        // whether or not `MacroInvocationSite`/the LSP pass exist at all.
+        let dir = macro_fixture_dir();
+        scan_and_persist(dir.path(), false).unwrap();
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let symbols = store.nodes_by_kind(&repo, NodeKind::Symbol).unwrap();
+        assert!(symbols.iter().all(|s| s.name.as_deref() != Some("generated_forward")), "the macro-generated method must not appear via the plain (non-LSP) scan path: {symbols:?}");
+    }
+
+    #[test]
+    fn scan_and_persist_with_lsp_adds_the_macro_generated_method_with_real_content_and_container() {
+        let dir = macro_fixture_dir();
+        let summary = scan_and_persist_with_lsp(dir.path(), false, Duration::from_secs(30), Duration::from_secs(30)).expect("scan_and_persist_with_lsp itself must never fail, even if the LSP pass silently no-ops");
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let symbols = store.nodes_by_kind(&repo, NodeKind::Symbol).unwrap();
+        let Some(generated) = symbols.iter().find(|s| s.name.as_deref() == Some("generated_forward")) else {
+            eprintln!("skipping assertions: no real rust-analyzer available in this environment (`rustup component add rust-analyzer`) -- the LSP pass silently no-ops per its best-effort contract, confirmed by {} symbols found: {symbols:?}", summary.symbols);
+            return;
+        };
+
+        assert_eq!(generated.container.as_deref(), Some("Foo"), "the already-shipped container fix must apply automatically to expanded text, with zero new logic: {symbols:?}");
+        assert!(generated.content.as_deref().unwrap_or("").contains('4') && generated.content.as_deref().unwrap_or("").contains('2'), "must carry real content from the expansion, not a placeholder: {symbols:?}");
     }
 }

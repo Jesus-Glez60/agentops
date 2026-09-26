@@ -24,6 +24,7 @@ agentops-graph-pg = { path = "../agentops-graph-pg" }
 agentops-store-open = { path = "../agentops-store-open" }
 agentops-retrieval = { path = "../agentops-retrieval" }
 agentops-embeddings-train = { path = "../agentops-embeddings-train" }
+agentops-lsp-client = { path = "../agentops-lsp-client" }
 candle-core = "0.8"
 notify-debouncer-full.workspace = true
 docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }

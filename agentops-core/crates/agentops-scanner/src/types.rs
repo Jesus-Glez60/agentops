@@ -105,4 +105,24 @@ pub struct ScannedFile {
     /// fallback was used (which may itself have found zero symbols — see
     /// `ScanReport::fallback_gap_files`).
     pub used_tree_sitter: bool,
+    /// Item-level Rust macro invocations (`foo!(...);` used as a top-level
+    /// or module/impl-level item, never one nested inside a function/
+    /// closure body) this scan found but couldn't itself expand — Tree-
+    /// sitter only ever sees a macro invocation's call-site syntax, never
+    /// what it expands to. Always collected during a normal scan (cheap --
+    /// no LSP round trip here), consumed only by the opt-in LSP pass (see
+    /// `agentops-lsp-client`/`agentops-mcp`'s macro-expansion orchestration)
+    /// that turns each site into a real `expandMacro` request. Empty for
+    /// every non-Rust language.
+    pub macro_invocation_sites: Vec<MacroInvocationSite>,
+}
+
+/// One item-level macro invocation site, in the 0-indexed line/character
+/// convention LSP positions use directly (unlike `Symbol::start_line`,
+/// which is 1-indexed) -- callers hand these straight to
+/// `agentops_lsp_client::LspClient::expand_macro` with no translation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct MacroInvocationSite {
+    pub line: u32,
+    pub character: u32,
 }

@@ -21,7 +21,7 @@ pub use docgen::generate_docs;
 pub use init::{ensure_gitignore_entries, init_agents_md, InitResult};
 pub use notes::{add_note, ingest_notes_dir, AddNoteResult};
 pub use protocol::{CallToolResult, ContentBlock, ToolAnnotations, ToolDefinition};
-pub use scan::{graph_db_path, persist, repo_name, scan_and_persist, ScanPersistSummary};
+pub use scan::{enrich_with_macro_expansions, graph_db_path, persist, repo_name, scan_and_persist, scan_and_persist_with_lsp, ScanPersistSummary};
 pub use agentops_graph_pg::PostgresGraphStore;
 pub use store::{describe_backend, open_shared_postgres_store, open_store, resolve_store, with_shared_postgres_store};
 pub use sync_docs::{sync_docs, SyncDocsSummary};

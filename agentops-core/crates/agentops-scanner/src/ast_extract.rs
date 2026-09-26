@@ -4,7 +4,7 @@ use std::sync::LazyLock;
 use regex::Regex;
 use tree_sitter_language_pack::Node;
 
-use crate::types::{Language, Symbol};
+use crate::types::{Language, MacroInvocationSite, Symbol};
 
 /// Node kinds tree-sitter uses for "definition-like" constructs, per
 /// language. The identifier is read from each definition node's `name`
@@ -116,6 +116,57 @@ pub fn extract_symbols(language: Language, source: &str) -> (Vec<Symbol>, bool) 
     }
 }
 
+/// Finds every item-level Rust macro invocation (`foo!(...);` used as a
+/// top-level, module-level, or impl-level item -- never one nested inside a
+/// function/closure body) -- Rust-only, empty for every other language.
+/// Tree-sitter's `macro_invocation` node kind is shared by both item-level
+/// and expression/statement-level uses (`impl_forward!(Foo);` at the top of
+/// a file and `println!("hi")` inside a function body parse to the exact
+/// same node kind with the exact same immediate parent kind,
+/// `expression_statement`, confirmed live) -- the actual distinguishing
+/// signal is whether any ancestor between the invocation and the file root
+/// is a `block` (a function/closure body). No `block` ancestor at all means
+/// item-level, confirmed live against both a top-level invocation and one
+/// nested inside a `mod`.
+pub fn collect_macro_invocation_sites(language: Language, source: &str) -> Vec<MacroInvocationSite> {
+    if language != Language::Rust {
+        return Vec::new();
+    }
+    let Some(mut parser) = tree_sitter_language_pack::get_parser(language.tree_sitter_name()).ok() else {
+        return Vec::new();
+    };
+    let Some(tree) = parser.parse(source) else {
+        return Vec::new();
+    };
+
+    let mut sites = Vec::new();
+    collect_macro_invocation_sites_from(&tree.root_node(), &mut sites);
+    sites
+}
+
+fn collect_macro_invocation_sites_from(node: &Node, out: &mut Vec<MacroInvocationSite>) {
+    if node.kind() == "macro_invocation" && is_item_level(node) {
+        let start = node.start_position();
+        out.push(MacroInvocationSite { line: start.row as u32, character: start.column as u32 });
+    }
+    for i in 0..node.child_count() {
+        if let Some(child) = node.child(i as u32) {
+            collect_macro_invocation_sites_from(&child, out);
+        }
+    }
+}
+
+fn is_item_level(node: &Node) -> bool {
+    let mut current = node.parent();
+    while let Some(p) = current {
+        if p.kind() == "block" {
+            return false;
+        }
+        current = p.parent();
+    }
+    true
+}
+
 fn try_tree_sitter(language: Language, source: &str) -> Option<Vec<Symbol>> {
     let mut parser = tree_sitter_language_pack::get_parser(language.tree_sitter_name()).ok()?;
     let tree = parser.parse(source)?;
@@ -178,9 +229,32 @@ fn collect_definitions(language: Language, node: &Node, src: &str, kinds: &[&str
         });
     }
 
-    let child_scope = match container_scope_field(&node.kind()) {
-        Some(field) => node.child_by_field_name(field).map(|n| node_text(src, &n).to_string()),
-        None => None,
+    // `impl_item` gets special treatment, not the generic single-field
+    // lookup below: tree-sitter's Rust grammar already exposes a syntactic
+    // `trait` field for `impl Trait for Type` blocks (confirmed live by
+    // parsing real source with this workspace's own pinned grammar version
+    // — no type-checking needed, it's plain syntax) alongside the existing
+    // `type` (Self type) field `container_scope_field` already reads. Two
+    // impl blocks on the *same* type -- one inherent, one a trait impl --
+    // previously both produced an identical `container` (the bare type
+    // name), so a same-named method on each silently collided into one
+    // graph node under the natural key. Folding the trait name in when
+    // present (`"Foo as SomeTrait"` vs. plain `"Foo"`) disambiguates them
+    // with no schema change: `container` is already free-text and already
+    // part of the natural key in both backends.
+    let child_scope = if node.kind() == "impl_item" {
+        let type_name = node.child_by_field_name("type").map(|n| node_text(src, &n).to_string());
+        let trait_name = node.child_by_field_name("trait").map(|n| node_text(src, &n).to_string());
+        match (type_name, trait_name) {
+            (Some(t), Some(tr)) => Some(format!("{t} as {tr}")),
+            (Some(t), None) => Some(t),
+            (None, _) => None,
+        }
+    } else {
+        match container_scope_field(&node.kind()) {
+            Some(field) => node.child_by_field_name(field).map(|n| node_text(src, &n).to_string()),
+            None => None,
+        }
     };
     let child_scope = child_scope.as_deref().or(scope);
 
@@ -660,5 +734,29 @@ mod tests {
         let names: Vec<&str> = symbols.iter().map(|s| s.name.as_str()).collect();
         assert!(names.contains(&"Foo"), "found: {names:?}");
         assert!(names.contains(&"Bar"), "found: {names:?}");
+    }
+
+    #[test]
+    fn collect_macro_invocation_sites_finds_an_item_level_invocation_but_not_an_expression_level_one() {
+        let src = "impl_forward!(Foo);\n\nfn main() {\n    println!(\"hi\");\n    let x = vec![1, 2, 3];\n}\n\nmod inner {\n    impl_forward!(Bar);\n}\n";
+        let sites = collect_macro_invocation_sites(Language::Rust, src);
+        // Exactly the two item-level invocations (line 0: top-level
+        // `impl_forward!(Foo)`; line 8 (0-indexed): the one nested inside
+        // `mod inner`) -- never `println!`/`vec!` inside `main`'s body.
+        assert_eq!(sites.len(), 2, "found: {sites:?}");
+        let lines: std::collections::HashSet<u32> = sites.iter().map(|s| s.line).collect();
+        assert_eq!(lines, std::collections::HashSet::from([0, 8]), "found: {sites:?}");
+    }
+
+    #[test]
+    fn collect_macro_invocation_sites_is_empty_for_a_file_with_no_item_level_macro_invocations() {
+        let src = "fn main() {\n    println!(\"hi\");\n}\n";
+        assert!(collect_macro_invocation_sites(Language::Rust, src).is_empty());
+    }
+
+    #[test]
+    fn collect_macro_invocation_sites_is_empty_for_non_rust_languages() {
+        let src = "console.log('hi');\n";
+        assert!(collect_macro_invocation_sites(Language::TypeScript, src).is_empty());
     }
 }

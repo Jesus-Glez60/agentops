@@ -36,6 +36,7 @@ members = [
     "agentops-core/crates/agentops-heavy-consolidate",
     "agentops-core/crates/agentops-server",
     "agentops-core/crates/agentops-mcp-server",
+    "agentops-core/crates/agentops-lsp-client",
 ]
 
 [workspace.package]
@@ -50,6 +51,14 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "net", "sync"] }
+# LSP pilot (agentops-lsp-client): `tokio-util`'s `compat` feature bridges
+# tokio::process's ChildStdout/ChildStdin into the `futures::AsyncRead`/
+# `AsyncWrite` traits async-lsp's transport expects -- verified live this
+# session, replaces the alternative of adding a second, independent
+# async-runtime crate (`async-process`, used by async-lsp's own canonical
+# example) purely for its process-spawning compatibility.
+tokio-util = { version = "0.7", features = ["compat"] }
+async-lsp = { version = "0.2", features = ["tokio"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 rusqlite_migration = "2"
 petgraph = "0.6"
