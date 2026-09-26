@@ -6,6 +6,7 @@ import useSWR from "swr";
 import {
   getNodeDetail,
   getRepoGraph,
+  getRepoHotspots,
   getRepos,
   getSubgraph,
   REPOS_SWR_KEY,
@@ -48,6 +49,7 @@ function GraphPageInner() {
   const [mode, setMode] = useState<GraphMode>("local");
   const [depth, setDepth] = useState(2);
   const [kinds, setKinds] = useState<NodeKind[]>([]);
+  const [showHotspots, setShowHotspots] = useState(false);
   // Decoupled from the seed -- clicking a node just inspects it in the
   // right panel; re-centering the graph is a separate explicit action
   // ("Center here"), so a single click doesn't disorient the layout.
@@ -61,6 +63,11 @@ function GraphPageInner() {
   );
   const { data: repoGraph } = useSWR(repoName && !seed ? ["repo-graph", repoName, kinds] : null, () => getRepoGraph(repoName!, kinds));
   const graphData = seed ? seedSubgraph : repoGraph;
+
+  // Only fetched while the overlay is actually on -- no point paying for a
+  // request whose result would just be discarded.
+  const { data: hotspotsResponse } = useSWR(repoName && showHotspots ? ["hotspots", repoName] : null, () => getRepoHotspots(repoName!));
+  const hotspotDegreeById = showHotspots && hotspotsResponse ? new Map(hotspotsResponse.hotspots.map((h) => [h.node_id, h.degree])) : undefined;
 
   const { data: detail } = useSWR(selected ? ["node", selected.repo, selected.id] : null, () => getNodeDetail(selected!.repo, selected!.id));
   const { data: seedDetail } = useSWR(seed ? ["node", seed.repo, seed.id] : null, () => getNodeDetail(seed!.repo, seed!.id));
@@ -123,10 +130,18 @@ function GraphPageInner() {
       />
 
       <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-4">
-        <GraphFilterPanel kinds={kinds} onToggleKind={toggleKind} depth={depth} onDepthChange={setDepth} showDepth={seed !== null} />
+        <GraphFilterPanel
+          kinds={kinds}
+          onToggleKind={toggleKind}
+          depth={depth}
+          onDepthChange={setDepth}
+          showDepth={seed !== null}
+          showHotspots={showHotspots}
+          onToggleHotspots={() => setShowHotspots((v) => !v)}
+        />
 
         <div className="relative flex min-h-0 flex-1">
-          <GraphCanvas subgraph={graphData} seedDetail={seedDetail} onNodeClick={selectNodeById} onNodeDoubleClick={(id) => setSeedId(id)} />
+          <GraphCanvas subgraph={graphData} seedDetail={seedDetail} onNodeClick={selectNodeById} onNodeDoubleClick={(id) => setSeedId(id)} hotspotDegreeById={hotspotDegreeById} />
           <GraphStatusCaption repo={repoName} branch={branch} mode={seed ? mode : null} depth={seed ? depth : null} />
           {graphData?.truncated && (
             <div className="pointer-events-none absolute left-1/2 top-3 -translate-x-1/2 rounded-md border border-curation-needs-curation/40 bg-canvas/90 px-3 py-1 text-mono-code text-curation-needs-curation">

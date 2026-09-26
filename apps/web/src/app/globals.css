@@ -72,6 +72,10 @@
   --node-gotcha: var(--amber-500);
   --node-decision: var(--teal-400);
   --node-note: var(--blue-500);
+  /* Graph hotspot overlay -- orthogonal to node kind (any kind can be
+     flagged), so this is its own token rather than reusing --node-gotcha's
+     amber for an unrelated meaning. */
+  --node-hotspot: var(--amber-500);
 
   --health-healthy: var(--green-400);
   --health-scanning: var(--blue-500);
@@ -86,6 +90,7 @@
   --curation-needs-curation: var(--amber-500);
   --curation-kept: var(--green-400);
   --curation-reduced: var(--ink-500);
+  --curation-pinned: var(--blue-500);
 
   --radius: 0.5rem;
 }
@@ -136,6 +141,7 @@
   --color-node-gotcha: var(--node-gotcha);
   --color-node-decision: var(--node-decision);
   --color-node-note: var(--node-note);
+  --color-node-hotspot: var(--node-hotspot);
 
   --color-health-healthy: var(--health-healthy);
   --color-health-scanning: var(--health-scanning);
@@ -150,6 +156,7 @@
   --color-curation-needs-curation: var(--curation-needs-curation);
   --color-curation-kept: var(--curation-kept);
   --color-curation-reduced: var(--curation-reduced);
+  --color-curation-pinned: var(--curation-pinned);
 
   --color-background: var(--background);
   --color-foreground: var(--foreground);

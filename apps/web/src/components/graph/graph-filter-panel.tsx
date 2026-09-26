@@ -26,6 +26,8 @@ export function GraphFilterPanel({
   depth,
   onDepthChange,
   showDepth = true,
+  showHotspots,
+  onToggleHotspots,
 }: {
   /** Empty means "no filter" (all kinds shown) -- same convention `search`/`getGotchas` already use. */
   kinds: NodeKind[];
@@ -34,6 +36,9 @@ export function GraphFilterPanel({
   onDepthChange: (depth: number) => void;
   /** Depth is a BFS-around-a-seed concept -- hidden in whole-repo mode, where there's no seed to measure distance from. */
   showDepth?: boolean;
+  /** Graph hotspot overlay toggle -- not seed-dependent, unlike depth, so always shown. */
+  showHotspots: boolean;
+  onToggleHotspots: () => void;
 }) {
   return (
     <div className="flex w-48 shrink-0 flex-col gap-4 rounded-lg border border-border-strong bg-panel p-3">
@@ -59,6 +64,15 @@ export function GraphFilterPanel({
           </div>
         </div>
       )}
+
+      <div className="flex flex-col gap-1.5">
+        <p className="text-label uppercase tracking-wide text-ink-500">Overlays</p>
+        <label className="flex items-center gap-2 text-body text-ink-300">
+          <Checkbox checked={showHotspots} onCheckedChange={onToggleHotspots} />
+          <span className="size-2 shrink-0 rounded-full bg-node-hotspot" />
+          Hotspots
+        </label>
+      </div>
     </div>
   );
 }

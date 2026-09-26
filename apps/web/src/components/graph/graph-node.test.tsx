@@ -60,4 +60,14 @@ describe("GraphNode", () => {
   it.each(ALL_KINDS)("renders without crashing for every NodeKind, including %s", (kind) => {
     expect(() => renderNode({ kind, kindLabel: kind })).not.toThrow();
   });
+
+  it("shows a degree badge when hotspotDegree is set", () => {
+    renderNode({ hotspotDegree: 42 });
+    expect(screen.getByText("42")).toBeInTheDocument();
+  });
+
+  it("shows no badge when hotspotDegree is undefined (overlay off, or not a hotspot)", () => {
+    renderNode({ hotspotDegree: undefined });
+    expect(screen.queryByTitle(/Over-connected/)).not.toBeInTheDocument();
+  });
 });

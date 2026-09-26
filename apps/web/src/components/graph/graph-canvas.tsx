@@ -74,11 +74,15 @@ function GraphCanvasInner({
   seedDetail,
   onNodeClick,
   onNodeDoubleClick,
+  hotspotDegreeById,
 }: {
   subgraph: GraphPayload | undefined;
   seedDetail: NodeDetail | undefined;
   onNodeClick: (id: number) => void;
   onNodeDoubleClick: (id: number) => void;
+  /** `undefined` when the hotspot overlay is off -- a node's degree by id,
+   * only for nodes `GET /repos/{name}/hotspots` actually flagged. */
+  hotspotDegreeById: Map<number, number> | undefined;
 }) {
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
@@ -102,6 +106,7 @@ function GraphCanvasInner({
         kindLabel: kindLabel(n.kind),
         prominence: n.prominence,
         isSeed: n.id === subgraph.seed_id,
+        hotspotDegree: hotspotDegreeById?.get(n.id),
       },
     }));
 
@@ -134,7 +139,7 @@ function GraphCanvasInner({
     setNodes([...flowNodes, ...annotationNodes]);
     setEdges(flowEdges);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [subgraph, seedDetail]);
+  }, [subgraph, seedDetail, hotspotDegreeById]);
 
   return (
     <ReactFlow
@@ -165,6 +170,7 @@ export function GraphCanvas(props: {
   seedDetail: NodeDetail | undefined;
   onNodeClick: (id: number) => void;
   onNodeDoubleClick: (id: number) => void;
+  hotspotDegreeById: Map<number, number> | undefined;
 }) {
   return (
     <div className="relative flex-1 overflow-hidden rounded-lg border border-border-strong bg-canvas">

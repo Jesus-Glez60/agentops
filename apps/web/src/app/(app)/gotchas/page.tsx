@@ -3,7 +3,7 @@
 import { useState } from "react";
 import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
-import { CheckCircle2, FileCode, GitBranch, Pencil, RotateCcw, SearchIcon, TriangleAlert } from "lucide-react";
+import { CheckCircle2, FileCode, GitBranch, Pencil, Pin, RotateCcw, SearchIcon, TriangleAlert } from "lucide-react";
 import {
   getGotchas,
   getNodeDetail,
@@ -29,17 +29,25 @@ import { cn } from "@/lib/utils";
 const BUCKET_TABS: { label: string; value: GotchaBucket | "all" }[] = [
   { label: "All", value: "all" },
   { label: "Needs curation", value: "needs_curation" },
+  { label: "Pinned", value: "pinned" },
   { label: "Kept", value: "kept" },
   { label: "Reduced", value: "reduced" },
 ];
 
+// `Pinned` checked first -- a pinned gotcha is also `curated` (`set_curation`
+// always sets it, regardless of prominence), so it would otherwise also
+// match "kept"'s condition. `Pinned` is the stronger signal and should own
+// the bucket exclusively, matching `agentops_api::repos::matches_bucket`'s
+// own arm ordering.
 function bucketOf(gotcha: Pick<GotchaSummary, "curated" | "prominence">): GotchaBucket {
+  if (gotcha.prominence === "Pinned") return "pinned";
   if (!gotcha.curated) return "needs_curation";
   return gotcha.prominence === "Reduced" ? "reduced" : "kept";
 }
 
 const BUCKET_BADGE: Record<GotchaBucket, { label: string; className: string }> = {
   needs_curation: { label: "Needs curation", className: "border-curation-needs-curation/40 bg-curation-needs-curation/10 text-curation-needs-curation" },
+  pinned: { label: "Pinned", className: "border-curation-pinned/40 bg-curation-pinned/10 text-curation-pinned" },
   kept: { label: "Kept", className: "border-curation-kept/40 bg-curation-kept/10 text-curation-kept" },
   reduced: { label: "Reduced", className: "border-curation-reduced/40 text-curation-reduced" },
 };
@@ -65,6 +73,7 @@ export default function GotchasPage() {
 
   const scoped = (gotchas ?? []).filter((g) => repoScope.length === 0 || repoScope.includes(g.repo));
   const needsCurationCount = scoped.filter((g) => bucketOf(g) === "needs_curation").length;
+  const pinnedCount = scoped.filter((g) => bucketOf(g) === "pinned").length;
   const keptCount = scoped.filter((g) => bucketOf(g) === "kept").length;
   const reducedCount = scoped.filter((g) => bucketOf(g) === "reduced").length;
 
@@ -132,8 +141,9 @@ export default function GotchasPage() {
 
   return (
     <div className="flex h-full flex-col gap-4 p-6">
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-4 gap-4">
         <StatBox label="Needs curation" value={needsCurationCount} valueClassName="text-curation-needs-curation" />
+        <StatBox label="Pinned" value={pinnedCount} valueClassName="text-curation-pinned" />
         <StatBox label="Kept" value={keptCount} valueClassName="text-curation-kept" />
         <StatBox label="Reduced" value={reducedCount} valueClassName="text-curation-reduced" />
       </div>
@@ -230,12 +240,20 @@ export default function GotchasPage() {
                         Keep as permanent knowledge
                       </Button>
                     )}
-                    {detail.prominence !== "Reduced" ? (
-                      <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setReduceTarget("selected")}>
-                        <TriangleAlert className="size-3.5" />
-                        Reduce prominence
+                    {/* No reason dialog for Pin/Unpin -- mirrors the Full
+                        path, not the Reduced one. */}
+                    {detail.prominence === "Pinned" ? (
+                      <Button size="sm" variant="outline" className="gap-1.5" onClick={() => applyCuration("Full", null)}>
+                        <Pin className="size-3.5" />
+                        Unpin
                       </Button>
                     ) : (
+                      <Button size="sm" className="gap-1.5 bg-curation-pinned/15 text-curation-pinned hover:bg-curation-pinned/25" variant="ghost" onClick={() => applyCuration("Pinned", null)}>
+                        <Pin className="size-3.5" />
+                        Pin
+                      </Button>
+                    )}
+                    {detail.prominence === "Reduced" ? (
                       <>
                         <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setReduceTarget("selected")}>
                           <Pencil className="size-3.5" />
@@ -246,7 +264,12 @@ export default function GotchasPage() {
                           Restore full prominence
                         </Button>
                       </>
-                    )}
+                    ) : detail.prominence !== "Pinned" ? (
+                      <Button size="sm" variant="outline" className="gap-1.5" onClick={() => setReduceTarget("selected")}>
+                        <TriangleAlert className="size-3.5" />
+                        Reduce prominence
+                      </Button>
+                    ) : null}
                     <CopyButton value={`${detail.repo}:${detail.kind}:${detail.id}`} label="Copy ID" />
                   </div>
                 </div>

@@ -242,7 +242,7 @@ export type NodeKind = "Symbol" | "File" | "Gotcha" | "Decision" | "Definition" 
 
 // Same bare-variant-name convention as NodeKind. Curation only ever
 // reorders a gotcha's prominence -- there is no "closed"/hidden state.
-export type NodeProminence = "Full" | "Reduced";
+export type NodeProminence = "Full" | "Reduced" | "Pinned";
 
 export interface SearchResult {
   repo: string;
@@ -325,7 +325,7 @@ export interface GotchaSummary {
 }
 
 /** `needs_curation` (nobody's looked at it), `kept` (curated, still Full prominence), or `reduced` (curated down, always paired with a reason). */
-export type GotchaBucket = "needs_curation" | "kept" | "reduced";
+export type GotchaBucket = "needs_curation" | "kept" | "reduced" | "pinned";
 
 export function getGotchas(bucket?: GotchaBucket): Promise<GotchaSummary[]> {
   const params = bucket ? `?bucket=${bucket}` : "";
@@ -492,4 +492,25 @@ export interface UsageSummary {
 
 export function getRepoUsage(connectionId: string): Promise<UsageSummary> {
   return heavyFetch<UsageSummary>(`/repos/${encodeURIComponent(connectionId)}/usage`);
+}
+
+// Graph hotspot / "god node" detection (Graphify-inspired). Mirrors
+// `agentops_graph::Hotspot` exactly. `community` is returned but
+// deliberately unused by the v1 overlay -- there's no existing "color by
+// cluster" concept in this app yet, and community ids aren't stable
+// identifiers across rescans, so building new coloring infra for them
+// isn't worth it for a first pass (see the graph page's own hotspot-overlay
+// comment for the full reasoning).
+export interface Hotspot {
+  node_id: number;
+  degree: number;
+  community: number;
+}
+
+export interface HotspotsResponse {
+  hotspots: Hotspot[];
+}
+
+export function getRepoHotspots(connectionId: string): Promise<HotspotsResponse> {
+  return heavyFetch<HotspotsResponse>(`/repos/${encodeURIComponent(connectionId)}/hotspots`);
 }
