@@ -9,6 +9,7 @@ name = "agentops_graph"
 
 [dependencies]
 anyhow.workspace = true
+petgraph.workspace = true
 rusqlite.workspace = true
 rusqlite_migration.workspace = true
 serde.workspace = true

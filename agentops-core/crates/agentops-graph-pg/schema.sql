@@ -186,6 +186,13 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curated BOOLEAN NOT NULL DEFAULT fals
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS prominence TEXT NOT NULL DEFAULT 'full';
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 
+-- Sticky-pin context: NodeProminence::Pinned is a free-TEXT value (no CHECK
+-- constraint on this column, unlike kind/relation -- see the widening note
+-- below), so it needs no schema change beyond this index. `nodes_pinned`
+-- runs on every SessionStart and UserPromptSubmit hook invocation, so it
+-- gets its own index rather than a full-table scan.
+CREATE INDEX IF NOT EXISTS idx_nodes_repo_prominence ON nodes(repo, prominence);
+
 -- Initiative 2 (CLS-inspired retrieval plan) adds NodeKind::DocSection and
 -- EdgeRelation::Covers -- both CHECK constraints need widening. Widened
 -- again for NodeKind::ToolOutput (session-wide hook-capture, Stream C of

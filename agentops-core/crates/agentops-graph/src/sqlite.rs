@@ -308,9 +308,6 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     // JSONL transcript -- not derived from any MCP tool call. One row per
     // (repo, session_id, model); re-syncing a still-growing session file
     // upserts via idx_session_usage_unique rather than double-counting.
-    // **Must stay the last entry in this slice** -- rusqlite_migration
-    // tracks progress purely by position, not content (see the note on the
-    // migration above this one).
     M::up(
         "CREATE TABLE IF NOT EXISTS session_usage (
             id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -329,6 +326,16 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
         CREATE UNIQUE INDEX IF NOT EXISTS idx_session_usage_unique ON session_usage(repo, session_id, model);
         CREATE INDEX IF NOT EXISTS idx_session_usage_repo_time ON session_usage(repo, session_started_at);",
     ),
+    // Sticky-pin context: `nodes_pinned` runs on every SessionStart and
+    // every UserPromptSubmit hook invocation, so it gets its own index
+    // rather than relying on a full-table scan of `prominence` (an
+    // unindexed free-TEXT column -- see `NodeProminence`'s own doc comment
+    // for why no CHECK-constraint widening migration was needed here,
+    // unlike `NodeKind`/`EdgeRelation`). Purely additive/idempotent.
+    // **Must stay the last entry in this slice** -- rusqlite_migration
+    // tracks progress purely by position, not content (see the note on the
+    // migration above the session_usage one).
+    M::up("CREATE INDEX IF NOT EXISTS idx_nodes_repo_prominence ON nodes(repo, prominence);"),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -502,6 +509,12 @@ impl GraphStore for SqliteGraphStore {
     fn nodes_by_kind(&self, repo: &str, kind: NodeKind) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE repo = ?1 AND kind = ?2")?;
         let rows = stmt.query_map(rusqlite::params![repo, kind.as_db_str()], Self::row_to_node)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn nodes_pinned(&self, repo: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE repo = ?1 AND prominence = 'pinned'")?;
+        let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_node)?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 

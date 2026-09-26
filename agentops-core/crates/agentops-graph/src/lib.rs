@@ -15,7 +15,9 @@
 //! implementable behind this exact port without redesigning call sites.
 
 mod sqlite;
+pub mod community;
 
+pub use community::{detect_hotspots, node_degrees, Hotspot};
 pub use sqlite::SqliteGraphStore;
 
 use std::collections::HashMap;
@@ -86,11 +88,23 @@ impl NodeKind {
 /// as_db_str/from_db_str-backed-TEXT-column pattern as `TaskStatus`.
 /// Curation never removes/hides a gotcha (it's permanent knowledge an
 /// agent needs to keep seeing) -- `Reduced` only lowers how prominently it
-/// ranks, always paired with a `curation_reason` explaining why.
+/// ranks, always paired with a `curation_reason` explaining why. `Pinned`
+/// ranks at full weight *and* is additionally eligible for
+/// `GraphStore::nodes_pinned` -- the sticky-context feature that
+/// auto-injects a human-curated standing directive into every
+/// `SessionStart`/`UserPromptSubmit` hook, rather than relying on an agent
+/// to remember to call `list_gotchas` on its own. Stored as free `TEXT`
+/// with no CHECK constraint in either backend (confirmed: only `NodeKind`/
+/// `EdgeRelation` got a CHECK), so adding this variant needs no SQL
+/// migration -- only these Rust match arms, plus every other exhaustive
+/// match on this enum across the workspace (let `cargo build`'s
+/// non-exhaustive-match errors be the checklist; never add a wildcard arm
+/// here, since that's the whole safety net for not missing a call site).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeProminence {
     Full,
     Reduced,
+    Pinned,
 }
 
 impl NodeProminence {
@@ -98,26 +112,29 @@ impl NodeProminence {
         match self {
             NodeProminence::Full => "full",
             NodeProminence::Reduced => "reduced",
+            NodeProminence::Pinned => "pinned",
         }
     }
 
     pub fn from_db_str(s: &str) -> Self {
         match s {
             "reduced" => NodeProminence::Reduced,
+            "pinned" => NodeProminence::Pinned,
             _ => NodeProminence::Full,
         }
     }
 }
 
 /// Ranking-only multiplier for a `Reduced`-prominence node's relevance
-/// score -- 1.0 (no change) for `Full`. Never apply this to a value that's
-/// also displayed as a "real" number (raw cosine similarity, BM25/RRF
-/// fused score, KNN distance) -- multiply a copy used only as a sort key,
-/// so the number shown to a human or agent stays truthful.
+/// score -- 1.0 (no change) for `Full`/`Pinned`. Never apply this to a
+/// value that's also displayed as a "real" number (raw cosine similarity,
+/// BM25/RRF fused score, KNN distance) -- multiply a copy used only as a
+/// sort key, so the number shown to a human or agent stays truthful.
 pub fn prominence_rank_multiplier(prominence: NodeProminence) -> f64 {
     match prominence {
         NodeProminence::Full => 1.0,
         NodeProminence::Reduced => 0.1,
+        NodeProminence::Pinned => 1.0,
     }
 }
 
@@ -634,6 +651,12 @@ pub trait GraphStore {
     fn add_node(&self, node: NewNode) -> Result<i64>;
     fn get_node(&self, repo: &str, id: i64) -> Result<Option<Node>>;
     fn nodes_by_kind(&self, repo: &str, kind: NodeKind) -> Result<Vec<Node>>;
+    /// All nodes across every kind with `prominence == Pinned` in `repo` --
+    /// backs the sticky-pin "always inject" context feature. Unlike
+    /// `nodes_by_kind`, this is kind-agnostic: a pinned node can be a
+    /// `Gotcha`, `Decision`, `Note`, or any other kind a human chose to
+    /// keep permanently visible.
+    fn nodes_pinned(&self, repo: &str) -> Result<Vec<Node>>;
     fn all_nodes(&self, repo: &str) -> Result<Vec<Node>>;
     /// Natural-key lookup — identity is `(repo, kind, path, name,
     /// container)`, `NULL` path/name/container compared with `IS` so two
