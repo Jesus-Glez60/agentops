@@ -9,6 +9,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { BASE_PATH } from "@/lib/base-path";
 
 /** Owner-only section at the bottom of the Members tab -- `team.is_owner`
  * is the same server-computed field the Team Management "Integrations" tab
@@ -116,7 +117,7 @@ function DeleteOrganizationRow({ tenant }: { tenant: string }) {
       // The session's tenant has changed server-side -- every tenant-scoped
       // cache in the app is now stale, a full navigation is the only
       // correct way to land in the fresh org.
-      window.location.href = "/";
+      window.location.href = BASE_PATH;
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Couldn't delete the organization. Please try again.");
       setDeleting(false);

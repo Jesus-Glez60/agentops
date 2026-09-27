@@ -10,6 +10,7 @@ import { getGithubAppInstallUrl, getGithubAppInstallations, GITHUB_APP_INSTALLAT
 import { StepIndicator } from "@/components/repositories/connect-wizard/step-indicator";
 import { InstallationRepoPicker } from "@/components/repositories/installation-repo-picker";
 import { Button } from "@/components/ui/button";
+import { withBasePath } from "@/lib/base-path";
 import { cn } from "@/lib/utils";
 
 /** Short stable codes the backend redirects with on `github_app_callback` failure -- see `github_app_routes.rs`'s `redirect_to_frontend` call sites. */
@@ -130,7 +131,7 @@ function ChooseMethodView() {
 
   async function handleContinue() {
     if (selected === "ssh") {
-      window.location.href = "/repositories/connect/ssh";
+      window.location.href = withBasePath("/repositories/connect/ssh");
       return;
     }
     setContinuing(true);

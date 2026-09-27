@@ -3,6 +3,7 @@
 // token must stay server-side).
 
 import { heavyFetch } from "@/lib/api/heavy-fetch";
+import { withBasePath } from "@/lib/base-path";
 
 export const TEAM_SWR_KEY = "/team";
 
@@ -96,7 +97,7 @@ export function cancelTeamInvite(id: number): Promise<void> {
 }
 
 export function inviteUrl(token: string): string {
-  return `${window.location.origin}/invite/${token}`;
+  return `${window.location.origin}${withBasePath(`/invite/${token}`)}`;
 }
 
 export function acceptInvite(token: string): Promise<{ tenant: string; role: string }> {

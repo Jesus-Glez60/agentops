@@ -387,8 +387,10 @@ async fn cli_device_start(State(state): State<AccountsState>, Json(req): Json<Cl
     let result = { state.accounts.lock().unwrap().create_device_auth_code(&req.device_name) };
     match result {
         Ok((device_code, user_code, expires_in)) => {
-            let verification_uri = format!("{web_app_url}/cli-auth");
-            let verification_uri_complete = format!("{web_app_url}/cli-auth?code={user_code}");
+            // The frontend's Next.js basePath lives under /suite -- keep in
+            // sync with basePath in apps/web/next.config.ts.
+            let verification_uri = format!("{web_app_url}/suite/cli-auth");
+            let verification_uri_complete = format!("{web_app_url}/suite/cli-auth?code={user_code}");
             (
                 StatusCode::OK,
                 Json(json!({
@@ -1663,7 +1665,7 @@ mod tests {
         let start_response = app.clone().oneshot(HttpRequest::post("/auth/cli/device").header("content-type", "application/json").body(Body::from(r#"{"device_name":"Jesus's MacBook"}"#)).unwrap()).await.unwrap();
         assert_eq!(start_response.status(), StatusCode::OK);
         let start_body = body_json(start_response).await;
-        assert!(start_body["verification_uri_complete"].as_str().unwrap().starts_with("http://localhost:3000/cli-auth?code="));
+        assert!(start_body["verification_uri_complete"].as_str().unwrap().starts_with("http://localhost:3000/suite/cli-auth?code="));
         let device_code = start_body["device_code"].as_str().unwrap().to_string();
         let user_code = start_body["user_code"].as_str().unwrap().to_string();
 

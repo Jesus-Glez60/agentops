@@ -187,9 +187,14 @@ pub struct CallbackQuery {
 /// body here is a dead end the user can't act on. `state.web_app_url`
 /// being unset (a same-origin self-hosted deployment that never set it)
 /// falls back to a relative path, which still works there.
+///
+/// `path_and_query` is app-relative (e.g. `/repositories/connect?...`) --
+/// the frontend's Next.js `basePath` lives under `/suite`, so it's prefixed
+/// here rather than at each call site. Keep in sync with `basePath` in
+/// apps/web/next.config.ts.
 fn redirect_to_frontend(state: &AppState, path_and_query: &str) -> Response {
     let base = state.web_app_url.as_deref().unwrap_or("");
-    Redirect::to(&format!("{base}{path_and_query}")).into_response()
+    Redirect::to(&format!("{base}/suite{path_and_query}")).into_response()
 }
 
 /// `GET /repos/github-app/callback` -- GitHub redirects the browser here
