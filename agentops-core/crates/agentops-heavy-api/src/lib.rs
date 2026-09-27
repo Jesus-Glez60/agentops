@@ -56,6 +56,23 @@ pub use accounts_integrations::build_accounts_integrations_router;
 pub use linear_webhook::{AutoKickoffTeamConfig, SeenDeliveries};
 pub use team::build_team_router;
 
+/// Single source of truth for the paired frontend's Next.js `basePath` --
+/// `accounts_integrations::cli_device_start` and
+/// `github_app_routes::redirect_to_frontend` both used to hardcode `/suite`
+/// independently, with only a comment asking whoever changes one to update
+/// the other (and `apps/web/next.config.ts` independently again). Reading
+/// the same `AGENTOPS_WEB_APP_BASE_PATH` env var here — which
+/// `next.config.ts` also reads via its `env` config, under the identical
+/// name — means both sides of the frontend/backend split move together by
+/// changing one deployment value instead of editing code in two languages.
+/// Defaults to `/suite` (today's committed default) when unset, same
+/// pattern as `mode`/`install_state_secret` above: not threaded through
+/// `build_router*`'s already-at-the-argument-limit signature, read directly
+/// by the two call sites that need it.
+pub(crate) fn web_app_base_path() -> String {
+    std::env::var("AGENTOPS_WEB_APP_BASE_PATH").unwrap_or_else(|_| "/suite".to_string())
+}
+
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<Mutex<ConnectionStore>>,

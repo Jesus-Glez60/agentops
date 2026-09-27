@@ -189,12 +189,13 @@ pub struct CallbackQuery {
 /// falls back to a relative path, which still works there.
 ///
 /// `path_and_query` is app-relative (e.g. `/repositories/connect?...`) --
-/// the frontend's Next.js `basePath` lives under `/suite`, so it's prefixed
-/// here rather than at each call site. Keep in sync with `basePath` in
-/// apps/web/next.config.ts.
+/// the frontend's Next.js `basePath` is prefixed here rather than at each
+/// call site. See `crate::web_app_base_path`'s doc comment for why this
+/// reads an env var instead of a hardcoded string.
 fn redirect_to_frontend(state: &AppState, path_and_query: &str) -> Response {
     let base = state.web_app_url.as_deref().unwrap_or("");
-    Redirect::to(&format!("{base}/suite{path_and_query}")).into_response()
+    let base_path = crate::web_app_base_path();
+    Redirect::to(&format!("{base}{base_path}{path_and_query}")).into_response()
 }
 
 /// `GET /repos/github-app/callback` -- GitHub redirects the browser here

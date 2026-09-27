@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AuthClientError, loginWithPassword, completeLogin2fa, logout, signupWithPassword } from "@/lib/auth/client";
+import { BASE_PATH } from "@/lib/base-path";
 
 describe("auth client", () => {
   const fetchMock = vi.fn();
@@ -19,7 +20,7 @@ describe("auth client", () => {
     const user = await loginWithPassword("dev@example.com", "pw");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/auth/login",
+      `${BASE_PATH}/api/auth/login`,
       expect.objectContaining({ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ email: "dev@example.com", password: "pw" }) }),
     );
     expect(user).toEqual({ id: 1, email: "dev@example.com", first_name: "Ada", last_name: "Lovelace", tenant: "abc" });
@@ -31,7 +32,7 @@ describe("auth client", () => {
     await signupWithPassword("Ada", "Lovelace", "new@example.com", "pw");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/auth/signup",
+      `${BASE_PATH}/api/auth/signup`,
       expect.objectContaining({ method: "POST", body: JSON.stringify({ first_name: "Ada", last_name: "Lovelace", email: "new@example.com", password: "pw" }) }),
     );
   });
@@ -54,7 +55,7 @@ describe("auth client", () => {
 
     await logout();
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/auth/logout", { method: "POST" });
+    expect(fetchMock).toHaveBeenCalledWith(`${BASE_PATH}/api/auth/logout`, { method: "POST" });
   });
 
   it("loginWithPassword returns a TwoFactorChallenge (not a SessionUser) when the backend 202s", async () => {
@@ -72,7 +73,7 @@ describe("auth client", () => {
     const user = await completeLogin2fa("raw-challenge-token", "123456");
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/auth/login/2fa",
+      `${BASE_PATH}/api/auth/login/2fa`,
       expect.objectContaining({ method: "POST", body: JSON.stringify({ challenge_token: "raw-challenge-token", code: "123456" }) }),
     );
     expect(user).toEqual({ id: 1, email: "dev@example.com", tenant: "abc" });

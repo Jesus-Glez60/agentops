@@ -387,10 +387,9 @@ async fn cli_device_start(State(state): State<AccountsState>, Json(req): Json<Cl
     let result = { state.accounts.lock().unwrap().create_device_auth_code(&req.device_name) };
     match result {
         Ok((device_code, user_code, expires_in)) => {
-            // The frontend's Next.js basePath lives under /suite -- keep in
-            // sync with basePath in apps/web/next.config.ts.
-            let verification_uri = format!("{web_app_url}/suite/cli-auth");
-            let verification_uri_complete = format!("{web_app_url}/suite/cli-auth?code={user_code}");
+            let base_path = crate::web_app_base_path();
+            let verification_uri = format!("{web_app_url}{base_path}/cli-auth");
+            let verification_uri_complete = format!("{web_app_url}{base_path}/cli-auth?code={user_code}");
             (
                 StatusCode::OK,
                 Json(json!({
