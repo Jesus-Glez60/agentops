@@ -3,8 +3,10 @@
 // same-origin Next.js proxy, never agentops-heavy-api directly. Extracted
 // from three identical copies (repos-api.ts, team-api.ts, profile-api.ts)
 // once a fourth consumer (libraries-api.ts) needed the exact same thing.
+import { withBasePath } from "@/lib/base-path";
+
 export async function heavyFetch<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`/api/heavy${path}`, {
+  const res = await fetch(withBasePath(`/api/heavy${path}`), {
     ...init,
     headers: { ...(init.body ? { "Content-Type": "application/json" } : {}), ...init.headers },
     cache: "no-store",

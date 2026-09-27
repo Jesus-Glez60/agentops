@@ -16,6 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from "@/components/ui/card";
+import { withBasePath } from "@/lib/base-path";
 
 function randomHex(bytes: number): string {
   const arr = new Uint8Array(bytes);
@@ -39,7 +40,7 @@ export default function SetupPage() {
     setErrors([]);
     setPending(true);
     try {
-      const res = await fetch("/api/bootstrap/config", {
+      const res = await fetch(withBasePath("/api/bootstrap/config"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

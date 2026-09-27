@@ -248,7 +248,7 @@ export interface InvitePreview {
 
 /** Unauthenticated -- goes through /api/invites/{token}, not /api/heavy/* (which always requires a session). See that route's doc comment. */
 export async function getInvitePreview(token: string): Promise<InvitePreview> {
-  const res = await fetch(`/api/invites/${encodeURIComponent(token)}`, { cache: "no-store" });
+  const res = await fetch(withBasePath(`/api/invites/${encodeURIComponent(token)}`), { cache: "no-store" });
   const data = await res.json().catch(() => null);
   if (!res.ok) {
     const message = data && typeof data === "object" && typeof data.error === "string" ? data.error : "This invite link is invalid or has expired.";

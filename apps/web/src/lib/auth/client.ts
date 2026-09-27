@@ -4,6 +4,7 @@
 // instead of inlining fetch, so a future "or continue with…" method can be
 // added here without restructuring the forms themselves.
 import type { SessionUser, TwoFactorChallenge } from "@/lib/auth/types";
+import { withBasePath } from "@/lib/base-path";
 
 export class AuthClientError extends Error {
   constructor(message: string) {
@@ -13,7 +14,7 @@ export class AuthClientError extends Error {
 }
 
 async function postAuth(path: string, body: Record<string, string>): Promise<Record<string, unknown>> {
-  const res = await fetch(path, {
+  const res = await fetch(withBasePath(path), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -46,5 +47,5 @@ export async function signupWithPassword(firstName: string, lastName: string, em
 }
 
 export async function logout(): Promise<void> {
-  await fetch("/api/auth/logout", { method: "POST" });
+  await fetch(withBasePath("/api/auth/logout"), { method: "POST" });
 }
