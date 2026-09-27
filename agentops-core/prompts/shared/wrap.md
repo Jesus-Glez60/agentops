@@ -22,5 +22,14 @@ uncommitted changes — delegate to the `ponytail-auditor` subagent if
 available, otherwise perform the same check directly (see
 `ponytail-audit`'s own instructions).
 
-Report: notes saved (with exact paths), and the audit result (violations
-found, or a one-line confirmation of none).
+Then run the same council pass `audit-plan` uses, against this session's
+`git diff` instead of plan text: spawn five `plan-council-member` subagents
+in parallel (Skeptic, Simplifier, Completeness-checker, Outsider,
+Opportunity-hunter), each blind to the other four, then spawn one
+`plan-council-chair` with the diff and all five critiques attached for a
+consensus verdict. Fall back to performing each pass yourself in sequence
+if these subagents aren't available.
+
+Report: notes saved (with exact paths), the ladder-audit result (violations
+found, or a one-line confirmation of none), and the council's consensus
+verdict (clear, or the consolidated required changes).
