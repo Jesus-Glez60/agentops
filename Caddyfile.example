@@ -1,9 +1,12 @@
-# NOTE: this example only proxies the API (8420); it does not route the web
-# app at all. If you also expose the web UI here, it now lives under /suite
-# (its Next.js basePath) with the site root reserved for a future separate
-# marketing app, e.g.:
-#   reverse_proxy /suite/* app:3000
-#   reverse_proxy / marketing:4321   # once a marketing app exists
+# The web app lives under /suite (its Next.js basePath -- see
+# apps/web/next.config.ts) and the marketing app (apps/marketing, see the
+# `marketing` service in docker-compose.yml) owns the site root. The API
+# (8420) is intentionally NOT routed here by default -- same reasoning as
+# deploy/k8s/ingress.yaml: the frontend reaches it over localhost inside
+# the container, so external routing is only needed for direct
+# API-key-authed access from outside. Uncomment /api-external for that.
 your-domain.example.com {
-	reverse_proxy app:8420
+	reverse_proxy /suite/* app:3000
+	reverse_proxy / marketing:4321
+	# reverse_proxy /api-external/* app:8420
 }

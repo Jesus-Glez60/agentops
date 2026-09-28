@@ -1,0 +1,103 @@
+---
+const NEEDS = ['Managed suite', 'Custom solution', 'Pricing quote'];
+// Read at build time (Node context, no PUBLIC_ prefix needed) and inline as
+// a data attribute -- the client script can't read non-PUBLIC_-prefixed env
+// vars directly (Astro/Vite only exposes PUBLIC_* to the browser bundle).
+const apiBase = import.meta.env.AGENTOPS_PUBLIC_API_URL ?? 'https://api.agentops.dedyn.io';
+---
+<div class="contact-form" data-api-base={apiBase} style="flex:1.4 1 420px;min-width:0;padding:28px;border-radius:18px;border:1px solid var(--border-0);background:var(--bg-2)">
+  <form class="contact-form-fields" style="display:flex;flex-direction:column;gap:18px">
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <span style="font-size:13px;color:var(--text-2)">I&rsquo;m interested in</span>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        {NEEDS.map((n, i) => (
+          <button
+            type="button"
+            class="need-pill"
+            data-need={n}
+            aria-pressed={i === 0 ? 'true' : 'false'}
+            style={`font:inherit;font-size:14px;cursor:pointer;padding:9px 16px;border-radius:999px;border:1px solid ${i === 0 ? 'var(--accent-primary)' : 'var(--border-1)'};background:${i === 0 ? 'rgba(203,166,247,0.15)' : 'transparent'};color:${i === 0 ? 'var(--accent-primary)' : 'var(--text-1)'}`}
+          >
+            {n}
+          </button>
+        ))}
+      </div>
+      <input type="hidden" name="need" value={NEEDS[0]} class="need-input" />
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:14px">
+      <label style="display:flex;flex-direction:column;gap:8px;font-size:13px;color:var(--text-2)">
+        Work email
+        <input required type="email" name="email" placeholder="you@company.com" style="font:inherit;font-size:15px;padding:12px 14px;border-radius:10px;border:1px solid var(--border-1);background:var(--bg-0);color:var(--text-0);outline:none" />
+      </label>
+      <label style="display:flex;flex-direction:column;gap:8px;font-size:13px;color:var(--text-2)">
+        Company
+        <input required type="text" name="company" placeholder="Company name" style="font:inherit;font-size:15px;padding:12px 14px;border-radius:10px;border:1px solid var(--border-1);background:var(--bg-0);color:var(--text-0);outline:none" />
+      </label>
+    </div>
+    <label style="display:flex;flex-direction:column;gap:8px;font-size:13px;color:var(--text-2)">
+      Team size and what you&rsquo;d like
+      <textarea required name="message" rows="4" placeholder="e.g. 40 engineers, 12 repos, want it hosted in our AWS account" style="font:inherit;font-size:15px;padding:12px 14px;border-radius:10px;border:1px solid var(--border-1);background:var(--bg-0);color:var(--text-0);outline:none;resize:vertical"></textarea>
+    </label>
+    <p class="contact-error" style="display:none;margin:0;font-size:14px;color:var(--accent-red)">Something went wrong sending that &mdash; please try again or email us directly.</p>
+    <button type="submit" class="contact-submit" style="align-self:flex-start;font:inherit;font-weight:700;font-size:15px;cursor:pointer;padding:13px 24px;border-radius:999px;border:0;background:var(--accent-primary);color:var(--bg-0)">
+      Send request
+    </button>
+  </form>
+  <div class="contact-sent" style="display:none;flex-direction:column;gap:10px;padding:20px 0">
+    <span style="font-size:22px;font-weight:700;color:var(--accent-green)">Request sent.</span>
+    <span style="font-size:15px;color:var(--text-2)">We&rsquo;ll reply to your work email.</span>
+  </div>
+</div>
+
+<script>
+  const root = document.querySelector<HTMLElement>('.contact-form');
+  if (root) {
+    const apiBase = root.dataset.apiBase ?? '';
+    const pills = root.querySelectorAll<HTMLButtonElement>('.need-pill');
+    const needInput = root.querySelector<HTMLInputElement>('.need-input');
+    for (const pill of pills) {
+      pill.addEventListener('click', () => {
+        for (const p of pills) {
+          const active = p === pill;
+          p.setAttribute('aria-pressed', active ? 'true' : 'false');
+          p.style.border = `1px solid ${active ? 'var(--accent-primary)' : 'var(--border-1)'}`;
+          p.style.background = active ? 'rgba(203,166,247,0.15)' : 'transparent';
+          p.style.color = active ? 'var(--accent-primary)' : 'var(--text-1)';
+        }
+        if (needInput) needInput.value = pill.dataset.need ?? '';
+      });
+    }
+
+    const form = root.querySelector<HTMLFormElement>('.contact-form-fields');
+    const errorEl = root.querySelector<HTMLElement>('.contact-error');
+    const sentEl = root.querySelector<HTMLElement>('.contact-sent');
+
+    form?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (errorEl) errorEl.style.display = 'none';
+      const data = new FormData(form);
+      const submitBtn = form.querySelector<HTMLButtonElement>('.contact-submit');
+      if (submitBtn) submitBtn.disabled = true;
+
+      try {
+        const res = await fetch(`${apiBase}/contact-leads`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            need: data.get('need'),
+            email: data.get('email'),
+            company: data.get('company'),
+            message: data.get('message'),
+          }),
+        });
+        if (!res.ok) throw new Error(`request failed: ${res.status}`);
+        form.style.display = 'none';
+        if (sentEl) sentEl.style.display = 'flex';
+      } catch {
+        if (errorEl) errorEl.style.display = 'block';
+      } finally {
+        if (submitBtn) submitBtn.disabled = false;
+      }
+    });
+  }
+</script>

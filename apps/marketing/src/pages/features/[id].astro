@@ -1,0 +1,293 @@
+---
+import Layout from '../../layouts/Layout.astro';
+import KnowledgeGraph from '../../components/KnowledgeGraph.tsx';
+import { FEATURES, getFeature, type Feature } from '../../data/features';
+
+export function getStaticPaths() {
+  return FEATURES.map((f) => ({ params: { id: f.id } }));
+}
+
+const { id } = Astro.params;
+const feature = getFeature(id as string) as Feature;
+const idx = FEATURES.findIndex((f) => f.id === feature.id);
+const prev = FEATURES[(idx - 1 + FEATURES.length) % FEATURES.length];
+const next = FEATURES[(idx + 1) % FEATURES.length];
+---
+<Layout title={`AgentOps — ${feature.name}`} description={feature.line} sheetLabel={`F-${feature.n} ${feature.name}`}>
+<main>
+  <section style="border-bottom:1px solid var(--border-0);background-image:linear-gradient(#252536 1px,transparent 1px),linear-gradient(90deg,#252536 1px,transparent 1px);background-size:40px 40px;background-position:-1px -1px">
+    <div style="max-width:1320px;margin:0 auto;padding:40px 32px 64px;display:flex;flex-direction:column;gap:40px">
+      <div style="display:flex;gap:10px;font-family:var(--font-mono);font-size:12px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-2);flex-wrap:wrap">
+        <a href="/#feature-index" style="color:var(--text-2);text-decoration:underline;text-underline-offset:3px">Index</a><span>/</span><span style="color:var(--text-0)">Sheet F-{feature.n} &middot; {feature.name}</span>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:48px;align-items:flex-end">
+        <div style="flex:1.4 1 460px;display:flex;flex-direction:column;gap:22px;min-width:0">
+          <span style="font-family:var(--font-mono);font-size:clamp(64px,9vw,128px);line-height:.85;font-weight:500;letter-spacing:-0.04em;color:var(--accent-orange)">{feature.n}</span>
+          <h1 style="margin:0;font-size:clamp(44px,5.4vw,76px);line-height:0.98;letter-spacing:-0.035em;font-weight:800">{feature.name}</h1>
+          <p style="margin:0;font-size:20px;line-height:1.45;color:var(--text-1);max-width:34em;text-wrap:pretty">{feature.line}</p>
+        </div>
+        <div style="flex:1 1 340px;border-top:1px solid var(--border-0);min-width:0">
+          {feature.points.map((p, i) => (
+            <div style="display:grid;grid-template-columns:28px minmax(0,1fr);gap:12px;padding:16px 0;border-bottom:1px solid var(--border-1);font-size:15.5px;line-height:1.5">
+              <span style="font-family:var(--font-mono);font-size:12px;color:var(--accent-orange);padding-top:3px">0{i + 1}</span>
+              <span>{p}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section style="border-bottom:1px solid var(--border-0);background:var(--bg-2)">
+    <div style="max-width:1320px;margin:0 auto;padding:56px 32px;display:flex;flex-direction:column;gap:14px">
+      <span style="font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-2)">Fig. F-{feature.n} &mdash; stylized view of the screen</span>
+      <div style="background:var(--bg-0);border:1px solid var(--border-0);color:var(--text-0);font-size:13px;box-shadow:0 40px 80px -30px rgba(0,0,0,0.65);overflow:hidden">
+        <div style="height:40px;border-bottom:1px solid var(--border-0);background:var(--bg-2);display:flex;align-items:center;gap:14px;padding:0 16px;font-family:var(--font-mono);font-size:11px;color:var(--text-3)">
+          <span style="width:8px;height:8px;background:var(--accent-orange);transform:rotate(45deg)"></span>
+          <span>agentops</span><span>/</span><span style="color:var(--text-2)">{feature.name}</span>
+          <span style="margin-left:auto;display:flex;align-items:center;gap:6px"><span style="width:6px;height:6px;border-radius:50%;background:var(--accent-green)"></span>agentops &middot; main &middot; healthy</span>
+        </div>
+
+        {feature.id === 'search' && (
+          <div style="padding:24px;display:flex;flex-wrap:wrap;gap:24px">
+            <div style="flex:2 1 460px;display:flex;flex-direction:column;gap:14px;min-width:0">
+              <div style="display:flex;align-items:center;gap:12px;background:var(--bg-2);border:1px solid var(--border-1);border-radius:8px;padding:12px 14px">
+                <span style="color:var(--text-3)">&#8981;</span>
+                <span style="flex:1;font-size:15px">how does read-only mode hide write tools</span>
+                <span style="width:1.5px;height:16px;background:var(--accent-blue);animation:aoBlink 1s infinite"></span>
+                <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-3);border:1px solid var(--border-1);border-radius:4px;padding:2px 6px">dense &middot; bm25 &middot; exact &middot; ppr</span>
+              </div>
+              <div style="display:flex;gap:6px;font-size:12px">
+                <span style="padding:4px 10px;border-radius:999px;background:#262637;border:1px solid var(--border-1)">All &middot; 14</span>
+                <span style="padding:4px 10px;border-radius:999px;color:var(--text-2)">Symbols &middot; 9</span>
+                <span style="padding:4px 10px;border-radius:999px;color:var(--text-2)">Gotchas &middot; 1</span>
+                <span style="padding:4px 10px;border-radius:999px;color:var(--text-2)">Decisions &middot; 2</span>
+                <span style="padding:4px 10px;border-radius:999px;color:var(--text-2)">Notes &middot; 2</span>
+              </div>
+              <div style="border:1px solid var(--border-0);border-radius:8px;overflow:hidden">
+                <div style="padding:14px 16px;border-bottom:1px solid var(--border-0);display:flex;flex-direction:column;gap:6px;background:var(--bg-2)">
+                  <div style="display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:600;color:var(--bg-0);background:var(--accent-green);border-radius:4px;padding:1px 6px">STRONG</span><span style="font-family:var(--font-mono);font-size:13px">read_only_filter</span><span style="font-family:var(--font-mono);font-size:11px;color:var(--text-3)">agentops-mcp/src/protocol.rs</span></div>
+                  <span style="color:var(--text-2);line-height:1.5">Drops tools whose annotations mark them write-capable before the tool list is returned.</span>
+                  <div style="display:flex;gap:8px;align-items:center;font-size:12px;color:var(--accent-teal)"><span style="width:7px;height:7px;background:var(--accent-teal);transform:rotate(45deg)"></span>Decision attached: filter tools at list time, not call time</div>
+                </div>
+                <div style="padding:14px 16px;border-bottom:1px solid var(--border-0);display:flex;flex-direction:column;gap:6px">
+                  <div style="display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:600;color:var(--bg-0);background:var(--accent-green);border-radius:4px;padding:1px 6px">STRONG</span><span style="font-family:var(--font-mono);font-size:13px">list_tools</span><span style="font-family:var(--font-mono);font-size:11px;color:var(--text-3)">agentops-mcp/src/protocol.rs</span></div>
+                  <span style="color:var(--text-2);line-height:1.5">Builds the tool list sent to the agent. Calls read_only_filter when the server is in read-only mode.</span>
+                </div>
+                <div style="padding:14px 16px;border-bottom:1px solid var(--border-0);display:flex;flex-direction:column;gap:6px">
+                  <div style="display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:600;color:var(--bg-0);background:var(--accent-blue);border-radius:4px;padding:1px 6px">RELATED</span><span style="font-family:var(--font-mono);font-size:13px">ToolRegistry</span><span style="font-family:var(--font-mono);font-size:11px;color:var(--text-3)">agentops-mcp/src/protocol.rs</span></div>
+                  <span style="color:var(--text-2);line-height:1.5">Reached by graph expansion from list_tools.</span>
+                </div>
+                <div style="padding:14px 16px;display:flex;flex-direction:column;gap:6px">
+                  <div style="display:flex;gap:10px;align-items:center"><span style="font-size:10px;font-weight:600;color:var(--text-0);background:var(--border-1);border-radius:4px;padding:1px 6px">SUPPORTING</span><span style="font-family:var(--font-mono);font-size:13px">route_mcp</span><span style="font-family:var(--font-mono);font-size:11px;color:var(--text-3)">agentops-server/src/main.rs</span></div>
+                </div>
+              </div>
+            </div>
+            <div style="flex:1 1 280px;display:flex;flex-direction:column;gap:12px;min-width:0">
+              <span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3)">Tier 1 &middot; gist</span>
+              <div style="background:var(--bg-2);border:1px solid var(--border-0);border-radius:8px;padding:16px;line-height:1.6;color:var(--text-2)">Write-capable tools are removed from <span style="color:var(--text-0)">tools/list</span> in read-only mode, so the agent is never told they exist. See read_only_filter.</div>
+              <span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3)">Tier 2 &middot; detail</span>
+              <div style="border:1px dashed var(--border-1);border-radius:8px;padding:16px;color:var(--text-3);line-height:1.5">Full source, callers and attached notes load only when the agent asks.</div>
+            </div>
+          </div>
+        )}
+
+        {feature.id === 'graph' && <KnowledgeGraph client:visible dark={true} />}
+
+        {feature.id === 'docs-viewer' && (
+          <div style="display:flex;flex-wrap:wrap;min-height:420px">
+            <div style="flex:0 1 260px;padding:20px;border-right:1px solid var(--border-0);background:var(--bg-2);display:flex;flex-direction:column;gap:4px">
+              <span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);margin-bottom:8px">Ranked by dependency centrality</span>
+              <div style="display:flex;gap:10px;padding:7px 10px;border-radius:6px;background:#262637"><span style="font-family:var(--font-mono);color:var(--accent-orange);width:18px">01</span>Retrieval</div>
+              <div style="display:flex;gap:10px;padding:7px 10px;color:var(--text-2)"><span style="font-family:var(--font-mono);color:var(--text-3);width:18px">02</span>Graph store</div>
+              <div style="display:flex;gap:10px;padding:7px 10px;color:var(--text-2)"><span style="font-family:var(--font-mono);color:var(--text-3);width:18px">03</span>MCP surface</div>
+              <div style="display:flex;gap:10px;padding:7px 10px;color:var(--text-2)"><span style="font-family:var(--font-mono);color:var(--text-3);width:18px">04</span>Scanner</div>
+              <div style="display:flex;gap:10px;padding:7px 10px;color:var(--text-2)"><span style="font-family:var(--font-mono);color:var(--text-3);width:18px">05</span>Embeddings</div>
+              <div style="display:flex;gap:10px;padding:7px 10px;color:var(--text-2)"><span style="font-family:var(--font-mono);color:var(--text-3);width:18px">06</span>Notes &amp; vault</div>
+              <div style="display:flex;gap:10px;padding:7px 10px;color:var(--text-2)"><span style="font-family:var(--font-mono);color:var(--text-3);width:18px">07</span>Consolidation</div>
+              <div style="padding:7px 10px;color:var(--text-3)">+ 7 more</div>
+            </div>
+            <div style="flex:1 1 440px;padding:28px 32px;display:flex;flex-direction:column;gap:16px;min-width:0">
+              <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-3)">agentops-core/crates/agentops-retrieval</span>
+              <span style="font-size:24px;font-weight:700;letter-spacing:-0.01em">Retrieval</span>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:11px">
+                <span style="padding:3px 8px;border-radius:4px;background:#262637;color:var(--accent-orange)">centrality #1</span>
+                <span style="padding:3px 8px;border-radius:4px;background:#262637;color:var(--text-2)">7 symbols</span>
+                <span style="padding:3px 8px;border-radius:4px;background:#262637;color:var(--text-2)">1 gotcha</span>
+              </div>
+              <p style="margin:0;color:var(--text-2);line-height:1.65;max-width:52em">Fuses four ranked lists &mdash; dense, BM25, exact-name and personalized PageRank &mdash; into one result set. Everything an agent searches for passes through here, which is why it ranks first.</p>
+              <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:12px">
+                <div style="border:1px solid var(--border-0);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:8px"><span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3)">Depended on by</span><span style="font-family:var(--font-mono);font-size:12px;color:var(--text-2);line-height:1.7">server &middot; mcp &middot; consolidate &middot; docgen</span></div>
+                <div style="border:1px solid var(--border-0);border-radius:8px;padding:14px;display:flex;flex-direction:column;gap:8px"><span style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3)">Depends on</span><span style="font-family:var(--font-mono);font-size:12px;color:var(--text-2);line-height:1.7">graph &middot; embeddings &middot; notes</span></div>
+              </div>
+              <div style="border-left:2px solid var(--accent-orange);padding:4px 0 4px 14px;color:var(--text-2);line-height:1.5"><span style="color:var(--accent-orange)">Gotcha &middot;</span> personalized_pagerank &mdash; strip self-loops before iterating.</div>
+            </div>
+          </div>
+        )}
+
+        {feature.id === 'gotchas' && (
+          <div style="padding:0 24px 24px">
+            <div style="display:flex;gap:4px;border-bottom:1px solid var(--border-0);margin-bottom:18px;overflow-x:auto">
+              <span style="padding:14px 14px 12px;border-bottom:2px solid var(--accent-orange);display:flex;gap:8px;white-space:nowrap">Needs curation <span style="color:var(--accent-orange)">3</span></span>
+              <span style="padding:14px 14px 12px;color:var(--text-2);display:flex;gap:8px;white-space:nowrap">Pinned <span style="color:var(--accent-blue)">2</span></span>
+              <span style="padding:14px 14px 12px;color:var(--text-2);display:flex;gap:8px;white-space:nowrap">Kept <span style="color:var(--accent-green)">11</span></span>
+              <span style="padding:14px 14px 12px;color:var(--text-2);display:flex;gap:8px;white-space:nowrap">Reduced <span style="color:var(--text-3)">4</span></span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:14px">
+              {[
+                { t: 'Strip self-loops before iterating PPR', d: 'A self-edge from a recursive symbol pins rank mass on itself and the scores never settle.', sym: 'personalized_pagerank', src: 'from vault' },
+                { t: 'Vault frontmatter dates are local time', d: 'Ingested notes compare against UTC scan times; convert before ordering.', sym: 'ingest_vault', src: 'from agent' },
+                { t: 'Held-out set must never overlap training notes', d: 'Otherwise the gate measures memorization and every candidate looks like an improvement.', sym: 'eval_holdout', src: 'from review' },
+              ].map((g) => (
+                <div style="background:var(--bg-2);border:1px solid var(--border-0);border-radius:8px;padding:16px;display:flex;flex-direction:column;gap:10px">
+                  <div style="display:flex;justify-content:space-between;font-size:10px;letter-spacing:.08em;text-transform:uppercase"><span style="color:var(--accent-orange)">Needs curation</span><span style="color:var(--text-3)">{g.src}</span></div>
+                  <span style="font-size:15px;font-weight:600;line-height:1.35">{g.t}</span>
+                  <span style="color:var(--text-2);line-height:1.55">{g.d}</span>
+                  <span style="align-self:flex-start;font-family:var(--font-mono);font-size:11px;background:#262637;border:1px solid var(--border-1);border-radius:4px;padding:3px 7px;color:var(--accent-lavender)">&#8618; {g.sym}</span>
+                  <div style="display:flex;gap:6px;margin-top:4px;font-size:12px">
+                    <span style="padding:5px 10px;border-radius:6px;background:var(--accent-green);color:var(--bg-0);font-weight:600">Keep</span>
+                    <span style="padding:5px 10px;border-radius:6px;border:1px solid var(--border-1)">Pin</span>
+                    <span style="padding:5px 10px;border-radius:6px;border:1px solid var(--border-1);color:var(--text-3)">Reduce</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {feature.id === 'libraries' && (
+          <div style="padding:24px;display:flex;flex-direction:column;gap:16px">
+            <div style="display:flex;gap:10px;flex-wrap:wrap">
+              <div style="flex:1 1 300px;display:flex;align-items:center;gap:10px;background:var(--bg-2);border:1px solid var(--border-1);border-radius:8px;padding:10px 14px;color:var(--text-3)">&#8981; <span>Search docs across 6 libraries</span></div>
+              <span style="padding:10px 14px;border-radius:8px;background:var(--accent-blue);color:var(--bg-0);font-weight:600">Register library</span>
+              <span style="padding:10px 14px;border-radius:8px;border:1px solid var(--border-1);color:var(--text-2);font-family:var(--font-mono);font-size:12px">sync-docs</span>
+            </div>
+            <div style="border:1px solid var(--border-0);border-radius:8px;overflow-x:auto">
+              <div style="display:grid;grid-template-columns:minmax(160px,1.4fr) 110px 110px minmax(160px,1.2fr);min-width:560px">
+                <span style="padding:10px 14px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);border-bottom:1px solid var(--border-0)">Library</span>
+                <span style="padding:10px 14px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);border-bottom:1px solid var(--border-0)">Installed</span>
+                <span style="padding:10px 14px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);border-bottom:1px solid var(--border-0)">Pages</span>
+                <span style="padding:10px 14px;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3);border-bottom:1px solid var(--border-0)">Status</span>
+                {[
+                  { name: 'tokio', v: '1.40.0', pages: '412', s: 'Scraped', c: 'var(--accent-green)' },
+                  { name: 'axum', v: '0.7.9', pages: '188', s: 'Scraped', c: 'var(--accent-green)' },
+                  { name: 'serde', v: '1.0.210', pages: '96', s: 'Scraped', c: 'var(--accent-green)' },
+                  { name: 'next', v: '15.1.3', pages: '—', s: 'Scraping', c: 'var(--accent-blue)' },
+                  { name: 'react', v: '19.0.0', pages: '—', s: 'Queued', c: 'var(--text-3)' },
+                  { name: 'agentops', v: 'self', pages: '64', s: 'Registered on first boot', c: 'var(--accent-orange)' },
+                ].map((l) => (
+                  <>
+                    <span style="padding:12px 14px;border-bottom:1px solid var(--border-0);font-family:var(--font-mono);font-size:13px">{l.name}</span>
+                    <span style="padding:12px 14px;border-bottom:1px solid var(--border-0);font-family:var(--font-mono);font-size:12px;color:var(--text-2)">{l.v}</span>
+                    <span style="padding:12px 14px;border-bottom:1px solid var(--border-0);font-family:var(--font-mono);font-size:12px;color:var(--text-2)">{l.pages}</span>
+                    <span style={`padding:12px 14px;border-bottom:1px solid var(--border-0);display:flex;align-items:center;gap:8px;color:var(--text-2)`}><span style={`width:7px;height:7px;border-radius:50%;background:${l.c}`}></span>{l.s}</span>
+                  </>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {feature.id === 'connect' && (
+          <div style="padding:28px 24px;display:flex;flex-direction:column;gap:20px">
+            <div style="display:flex;gap:10px;align-items:center;font-size:12px;color:var(--text-3)">
+              <span style="width:22px;height:22px;border-radius:50%;background:var(--accent-blue);color:var(--bg-0);display:flex;align-items:center;justify-content:center;font-weight:600">1</span><span style="color:var(--text-0)">Method</span>
+              <span style="flex:0 0 32px;height:1px;background:var(--border-1)"></span>
+              <span style="width:22px;height:22px;border-radius:50%;border:1px solid var(--border-1);display:flex;align-items:center;justify-content:center">2</span><span>Credentials</span>
+              <span style="flex:0 0 32px;height:1px;background:var(--border-1)"></span>
+              <span style="width:22px;height:22px;border-radius:50%;border:1px solid var(--border-1);display:flex;align-items:center;justify-content:center">3</span><span>First scan</span>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px">
+              {[
+                { t: 'Local install', d: 'Scan the checkout on this machine. No remote, no credentials.', tag: 'npx agentops-cli install', selected: true },
+                { t: 'SSH deploy key', d: 'Give the server read access to one repository with a deploy key.', tag: 'per-repo key', selected: false },
+                { t: 'GitHub App', d: 'Install the app and authorize with OAuth. No SSH key to manage.', tag: 'OAuth', selected: false },
+              ].map((o) => (
+                <div style={`background:var(--bg-2);border:1px solid ${o.selected ? 'var(--accent-blue)' : 'var(--border-1)'};border-radius:10px;padding:18px;display:flex;flex-direction:column;gap:10px`}>
+                  <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:15px;font-weight:600">{o.t}</span><span style={`width:14px;height:14px;border-radius:50%;border:1.5px solid ${o.selected ? 'var(--accent-blue)' : 'var(--border-1)'};background:${o.selected ? 'var(--accent-blue)' : 'transparent'}`}></span></div>
+                  <span style="color:var(--text-2);line-height:1.5">{o.d}</span>
+                  <span style="font-family:var(--font-mono);font-size:11px;color:var(--text-3)">{o.tag}</span>
+                </div>
+              ))}
+            </div>
+            <div style="background:var(--bg-2);border:1px solid var(--border-0);border-radius:8px;padding:14px 16px;font-family:var(--font-mono);font-size:12px;color:var(--text-2);line-height:1.6">Solo self-host: install scans locally; connect registers a stdio MCP server against it.</div>
+          </div>
+        )}
+
+        {feature.id === 'team' && (
+          <div style="padding:24px;display:flex;flex-wrap:wrap;gap:24px">
+            <div style="flex:1.3 1 420px;display:flex;flex-direction:column;gap:12px;min-width:0">
+              <div style="display:flex;justify-content:space-between;align-items:center"><span style="font-size:15px;font-weight:600">Members &middot; 4</span><span style="padding:7px 12px;border-radius:6px;background:var(--accent-blue);color:var(--bg-0);font-weight:600;font-size:12px">Invite</span></div>
+              <div style="border:1px solid var(--border-0);border-radius:8px;overflow:hidden">
+                {[
+                  { i: 'MR', n: 'Mara Ruiz', e: 'mara@team.dev', r: 'Owner', c: 'var(--accent-orange)' },
+                  { i: 'JT', n: 'Jon Tanaka', e: 'jon@team.dev', r: 'Admin', c: 'var(--accent-blue)' },
+                  { i: 'AP', n: 'Ada Pérez', e: 'ada@team.dev', r: 'Member', c: 'var(--text-2)' },
+                  { i: '··', n: 'Invite pending', e: 'sam@team.dev', r: 'Member', c: 'var(--text-3)' },
+                ].map((m) => (
+                  <div style="display:flex;align-items:center;gap:12px;padding:12px 14px;border-bottom:1px solid var(--border-0)">
+                    <span style="width:28px;height:28px;border-radius:50%;background:#262637;border:1px solid var(--border-1);display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--text-2)">{m.i}</span>
+                    <div style="flex:1;display:flex;flex-direction:column;gap:2px;min-width:0"><span>{m.n}</span><span style="font-size:11px;color:var(--text-3)">{m.e}</span></div>
+                    <span style={`font-size:11px;padding:3px 8px;border-radius:4px;background:#262637;color:${m.c}`}>{m.r}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+            <div style="flex:1 1 320px;display:flex;flex-direction:column;gap:12px;min-width:0">
+              <span style="font-size:15px;font-weight:600">Audit log</span>
+              <div style="border:1px solid var(--border-0);border-radius:8px;padding:6px 14px;font-family:var(--font-mono);font-size:11.5px">
+                {[
+                  { t: '09:41', e: 'mara invited sam@team.dev as Member' },
+                  { t: '09:12', e: 'jon created API key “laptop-cursor”' },
+                  { t: '08:57', e: 'repo agentops rescanned · 1,248 symbols' },
+                  { t: '08:30', e: 'ada kept gotcha on ingest_vault' },
+                  { t: 'Mon', e: 'mara set signup mode to invite-only' },
+                ].map((a) => (
+                  <div style="display:grid;grid-template-columns:44px minmax(0,1fr);gap:10px;padding:9px 0;border-bottom:1px solid var(--border-0);line-height:1.45"><span style="color:var(--text-3)">{a.t}</span><span style="color:var(--text-2)">{a.e}</span></div>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  </section>
+
+  <section style="border-bottom:1px solid var(--border-0)">
+    <div style="max-width:1320px;margin:0 auto;padding:56px 32px;display:flex;flex-wrap:wrap;gap:32px;align-items:stretch">
+      <div style="flex:1.4 1 420px;display:flex;flex-direction:column;gap:12px;min-width:0">
+        <span style="font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--text-2)">From the terminal</span>
+        <div style="background:var(--bg-0);color:var(--text-0);padding:18px 20px;font-family:var(--font-mono);font-size:13.5px;line-height:1.8;overflow-x:auto">
+          {feature.cmds.map((c) => (
+            <div style="white-space:pre"><span style="color:var(--accent-orange)">$ </span>{c}</div>
+          ))}
+        </div>
+        <span style="font-size:14px;color:var(--text-2);line-height:1.5">{feature.cmdNote}</span>
+      </div>
+      <div style="flex:1 1 320px;display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--border-0);min-width:0">
+        <a href={`/features/${prev.id}/`} style="padding:22px;display:flex;flex-direction:column;gap:8px;border-right:1px solid var(--border-0);color:var(--text-0)">
+          <span style="font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;opacity:.7">&larr; {prev.n}</span>
+          <span style="font-size:20px;font-weight:700;letter-spacing:-0.01em">{prev.name}</span>
+        </a>
+        <a href={`/features/${next.id}/`} style="padding:22px;display:flex;flex-direction:column;gap:8px;text-align:right;color:var(--text-0)">
+          <span style="font-family:var(--font-mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;opacity:.7">{next.n} &rarr;</span>
+          <span style="font-size:20px;font-weight:700;letter-spacing:-0.01em">{next.name}</span>
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <section style="border-bottom:1px solid var(--border-0)">
+    <div style="max-width:1320px;margin:0 auto;padding:28px 32px;display:flex;flex-wrap:wrap;gap:8px 0">
+      {FEATURES.map((s) => (
+        <a
+          href={`/features/${s.id}/`}
+          style={`font-family:var(--font-mono);font-size:12px;padding:8px 14px;border:1px solid var(--border-0);margin-right:-1px;background:${s.id === feature.id ? 'var(--accent-primary)' : 'transparent'};color:${s.id === feature.id ? 'var(--bg-0)' : 'var(--text-0)'}`}
+        >
+          {s.n} {s.name}
+        </a>
+      ))}
+    </div>
+  </section>
+</main>
+</Layout>

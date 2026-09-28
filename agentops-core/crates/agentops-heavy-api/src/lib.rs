@@ -44,6 +44,7 @@ use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnect
 use agentops_teams::TeamStore;
 
 mod accounts_integrations;
+mod contact_routes;
 mod dashboard;
 mod github_app_routes;
 mod indexing;
@@ -670,7 +671,7 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
     app = app.merge(build_team_router(accounts_for_teams, teams, repos_for_teams, credentials_for_teams, docbrain_db_dir));
     println!("Team Management live: GET /team, GET /team/members, PATCH/DELETE /team/members/{{id}}, GET/PUT /team/repo-access, POST /team/delete-organization.");
 
-    Ok(app.merge(health_router()))
+    Ok(app.merge(health_router()).merge(contact_routes::contact_router()))
 }
 
 /// Binds `addr` and serves [`build_full_router`]'s output until the process

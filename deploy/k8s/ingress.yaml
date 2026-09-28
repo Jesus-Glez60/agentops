@@ -5,11 +5,11 @@
 # want direct API-key-authed access from outside the cluster. Uncomment
 # the second rule below for that.
 #
-# The web app now lives under /suite (its Next.js basePath -- see
-# apps/web/next.config.ts) so the site root is reserved for a separate
-# marketing app. Until that marketing app exists, `/` has no backend here
-# and will 404 -- add its rule below (must come after /suite so nginx-ingress's
-# longest-prefix match picks /suite first) once it ships.
+# The web app lives under /suite (its Next.js basePath -- see
+# apps/web/next.config.ts); the marketing app (apps/marketing, see
+# marketing-deployment.yaml/marketing-service.yaml in this directory) owns
+# the site root. Its rule comes after /suite so nginx-ingress's
+# longest-prefix match picks /suite first.
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -35,10 +35,10 @@ spec:
           #       name: agentops
           #       port:
           #         name: api
-          # - path: /                       # future marketing app (e.g. Astro), added when it ships
-          #   pathType: Prefix
-          #   backend:
-          #     service:
-          #       name: marketing
-          #       port:
-          #         name: web
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: marketing
+                port:
+                  name: web

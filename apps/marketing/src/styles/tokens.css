@@ -1,0 +1,82 @@
+:root {
+  /* Backgrounds */
+  --bg-0: #11111b;
+  --bg-1: #1e1e2e;
+  --bg-2: #181825;
+
+  /* Text */
+  --text-0: #cdd6f4;
+  --text-1: #bac2de;
+  --text-2: #a6adc8;
+  --text-3: #7f849c;
+  --text-4: #6c7086;
+
+  /* Borders */
+  --border-0: #313244;
+  --border-1: #45475a;
+  --border-2: #585b70;
+  --border-3: #9399b2;
+
+  /* Accents */
+  --accent-primary: #cba6f7;
+  --accent-pink: #f5c2e7;
+  --accent-orange: #fab387;
+  --accent-teal: #94e2d5;
+  --accent-blue: #89b4fa;
+  --accent-lavender: #b4befe;
+  --accent-yellow: #f9e2af;
+  --accent-green: #a6e3a1;
+  --accent-red: #f38ba8;
+
+  --font-sans: 'Schibsted Grotesk', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-1);
+  color: var(--text-0);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+a {
+  color: var(--text-0);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--accent-primary);
+}
+
+::selection {
+  background: var(--border-1);
+}
+
+@keyframes aoPulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.9;
+  }
+  100% {
+    transform: scale(2.6);
+    opacity: 0;
+  }
+}
+
+@keyframes aoBlink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}

@@ -1,0 +1,27 @@
+---
+interface Props {
+  text: string;
+}
+const { text } = Astro.props;
+---
+<button class="copy-btn" data-copy-text={text} style="font:inherit;font-size:12px;border-radius:999px;background:var(--border-0);color:var(--text-0);border:0;padding:7px 14px;cursor:pointer">
+  copy
+</button>
+
+<script>
+  for (const btn of document.querySelectorAll<HTMLButtonElement>('.copy-btn')) {
+    btn.addEventListener('click', async () => {
+      const text = btn.dataset.copyText ?? '';
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch {
+        // clipboard permission denied -- fall through, still show feedback
+      }
+      const original = btn.textContent;
+      btn.textContent = 'copied';
+      setTimeout(() => {
+        btn.textContent = original;
+      }, 1400);
+    });
+  }
+</script>

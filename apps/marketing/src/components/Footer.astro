@@ -1,0 +1,42 @@
+---
+import { DEPLOY_URL } from '../lib/external-links';
+
+interface Props {
+  sheetLabel?: string;
+}
+const { sheetLabel = '' } = Astro.props;
+---
+<footer style="background:var(--bg-0);border-top:1px solid var(--border-0)">
+  <div style="max-width:1320px;margin:0 auto;padding:56px 32px 40px;display:flex;flex-direction:column;gap:40px">
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:32px">
+      <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
+        <span style="font-weight:700;font-size:18px;color:var(--text-0)">AgentOps</span>
+        <span style="font-size:14px;line-height:1.5;color:var(--text-2)">Open source, MIT or Apache-2.0. Free for individuals and teams who self-host.</span>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
+        <span style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3)">Product</span>
+        <a href="/#feature-index" style="font-size:15px;color:var(--text-1)">Features</a>
+        <a href="https://docs.agentops.dedyn.io/" target="_blank" rel="noopener" style="font-size:15px;color:var(--text-1)">Documentation</a>
+        <a href="/llms.txt" style="font-size:15px;color:var(--text-1)">For agents: /llms.txt</a>
+        <a href={DEPLOY_URL} target="_blank" rel="noopener" style="font-size:15px;color:var(--text-1)">Deploy it yourself</a>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
+        <span style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3)">Source</span>
+        <a href="https://github.com/Jesus-Glez60/agentops" target="_blank" rel="noopener" style="font-size:15px;color:var(--text-1)">GitHub repository &#8599;</a>
+        <a href="https://www.npmjs.com/package/agentops-cli" target="_blank" rel="noopener" style="font-size:15px;color:var(--text-1)">npm: agentops-cli &#8599;</a>
+        <a href="https://github.com/Jesus-Glez60/agentops/issues/new" target="_blank" rel="noopener" style="font-size:15px;color:var(--text-1)">Report a bug &#8599;</a>
+        <a href="https://github.com/Jesus-Glez60/agentops/security/advisories/new" target="_blank" rel="noopener" style="font-size:15px;color:var(--text-1)">Report a vulnerability &#8599;</a>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:12px;min-width:0">
+        <span style="font-family:var(--font-mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--text-3)">Companies</span>
+        <a href="/pricing/" style="font-size:15px;color:var(--text-1)">Plans &amp; pricing</a>
+        <a href="/pricing/" style="font-size:15px;color:var(--text-1)">Managed suite</a>
+        <a href="/pricing/" style="font-size:15px;color:var(--text-1)">Custom solutions</a>
+      </div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;padding-top:24px;border-top:1px solid var(--border-0);font-family:var(--font-mono);font-size:12px;color:var(--text-3)">
+      <span>{sheetLabel}</span>
+      <span>Documented by its own docbrain</span>
+    </div>
+  </div>
+</footer>

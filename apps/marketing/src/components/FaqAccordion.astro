@@ -1,0 +1,35 @@
+---
+const FAQ: [string, string][] = [
+  ['Is it actually free?', 'Yes. It’s a single open-core product with no price gate, dual-licensed MIT or Apache-2.0. You run it on your own infrastructure.'],
+  ['Does my code leave my network?', 'Not from the core. The scanning engine has a zero-network-access guarantee verified at build time. Richer hosted capabilities — semantic search, AI interpretation, multi-team support — live in a separately-bounded tier.'],
+  ['Which languages does the scanner understand?', 'AST-aware scanning for Python, JavaScript/TypeScript, Go, Rust, C++ and C#.'],
+  ['Which agents work with it?', 'The interactive picker offers Claude Code, Cursor, Codex CLI and Gemini CLI. Through Ruler, connect --agents <id> also covers Copilot, Windsurf, Aider, Zed and more. Any agent that speaks MCP can use the tools directly.'],
+  ['What does read-only mode actually do?', 'Write-capable tools are removed from the list the agent receives. The agent isn’t asked to avoid them; it never learns they exist.'],
+  ['“It gets better at my repo” sounds like marketing.', 'It’s a specific mechanism: a small model is fine-tuned locally on your curated notes, and a new version only replaces the current one if it doesn’t regress retrieval on a held-out eval.'],
+  ['Do I need Postgres?', 'No. SQLite is the default and needs no extra service. Postgres is opt-in.'],
+];
+---
+<div class="faq" style="flex:2.4 1 520px;border-top:1px solid var(--border-0)">
+  {FAQ.map(([q, a]) => (
+    <div class="faq-item" style="border-bottom:1px solid var(--border-0)">
+      <button class="faq-toggle" style="all:unset;box-sizing:border-box;width:100%;cursor:pointer;display:flex;justify-content:space-between;gap:24px;align-items:baseline;padding:22px 0">
+        <span style="font-size:clamp(18px,1.8vw,22px);font-weight:600;letter-spacing:-0.01em;line-height:1.3">{q}</span>
+        <span class="faq-sign" style="font-family:var(--font-mono);font-size:18px;flex:none">+</span>
+      </button>
+      <p class="faq-answer" style="margin:0;padding:0 48px 24px 0;font-size:16px;line-height:1.6;color:var(--text-1);max-width:44em;text-wrap:pretty;display:none">{a}</p>
+    </div>
+  ))}
+</div>
+
+<script>
+  for (const item of document.querySelectorAll<HTMLElement>('.faq-item')) {
+    const toggle = item.querySelector<HTMLButtonElement>('.faq-toggle');
+    const answer = item.querySelector<HTMLElement>('.faq-answer');
+    const sign = item.querySelector<HTMLElement>('.faq-sign');
+    toggle?.addEventListener('click', () => {
+      const open = answer?.style.display === 'block';
+      if (answer) answer.style.display = open ? 'none' : 'block';
+      if (sign) sign.textContent = open ? '+' : '–';
+    });
+  }
+</script>

@@ -1,0 +1,30 @@
+# Static Astro build, served by `serve` (see apps/marketing/Dockerfile).
+# No persistent volume, no secrets -- it's a static site plus one
+# unauthenticated backend call (POST /contact-leads on the main API),
+# unlike deployment.yaml's app which needs the data PVC and master key.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: marketing
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: marketing
+  template:
+    metadata:
+      labels:
+        app: marketing
+    spec:
+      containers:
+        - name: marketing
+          image: agentops-marketing:latest
+          ports:
+            - name: web
+              containerPort: 4321
+          readinessProbe:
+            httpGet:
+              path: /
+              port: web
+            initialDelaySeconds: 5
+            periodSeconds: 10

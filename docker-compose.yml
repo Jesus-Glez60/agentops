@@ -19,6 +19,34 @@ services:
       - ./secrets:/run/secrets:ro
     restart: unless-stopped
 
+  # The marketing site (apps/marketing) -- separate static app serving the
+  # site root `/`, while `app` above serves `/suite`. Not started by
+  # `docker compose up` alone; add it to your reverse proxy (Caddyfile.example)
+  # once you're routing the public site through this compose file.
+  #
+  # Build args matter here: apps/marketing/Dockerfile bakes
+  # AGENTOPS_PUBLIC_API_URL into the static build (the contact form's
+  # fetch() runs in the VISITOR's browser, so this must be a real publicly
+  # reachable URL -- a Docker-internal hostname like `app:8420` will not
+  # resolve there). The Dockerfile's own default points at the hosted
+  # api.agentops.dedyn.io, which is correct for AgentOps's own public
+  # deployment but WRONG for a self-host: silently reusing it would send a
+  # self-hoster's contact-form leads to the vendor's API instead of their
+  # own. There's no safe generic default here (it depends on your public
+  # domain), so this deliberately has NO fallback -- `docker compose build`
+  # fails loudly with an unset-variable error until you set
+  # AGENTOPS_PUBLIC_API_URL in .env to wherever your own API is publicly
+  # reachable (e.g. https://your-domain.example.com/api-external, per the
+  # commented-out route in Caddyfile.example/deploy/k8s/ingress.yaml).
+  marketing:
+    build:
+      context: ./apps/marketing
+      args:
+        AGENTOPS_PUBLIC_API_URL: ${AGENTOPS_PUBLIC_API_URL:?set this to your publicly-reachable API URL before building the marketing image -- see the comment above}
+    ports:
+      - "4321:4321"
+    restart: unless-stopped
+
   postgres:
     # Pinned by digest, not the floating `pg16` tag -- Postgres pool/batching
     # plan, Phase 3: the HNSW vector index migration needs pgvector >=0.5.0,
