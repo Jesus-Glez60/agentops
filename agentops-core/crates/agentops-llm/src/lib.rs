@@ -9,11 +9,15 @@
 //! (`NoteClassifier`) — both live here rather than in `agentops-notes`
 //! itself so that crate never gains a network dependency.
 
+mod tokens;
+
 use std::path::{Path, PathBuf};
 
 use agentops_graph::{upsert_node, EdgeRelation, GraphStore, ModuleLabel, NewNode, Node, NodeKind, NodeProminence};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use tokens::{count_tokens, truncate_to_tokens};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -28,6 +32,14 @@ const DEFAULT_MAX_TOKENS: u32 = 1024;
 /// `build_prompt`'s own "must have at least one note" check anyway, so this
 /// is deliberately generous rather than tightly tuned.
 const PATTERN_COMPLETE_K: usize = 5;
+/// Input-token ceiling for `build_prompt`'s assembled prompt (counted via
+/// `tokens::count_tokens`, `cl100k_base` as a practical proxy — see that
+/// module's doc comment). A conservative, tunable starting point in the
+/// same spirit as `docbrain-ingest/src/chunk.rs`'s `MAX_CHUNK_TOKENS`: not
+/// a value with special significance, just comfortably under every current
+/// Claude model's context window (including the smallest), so one budget
+/// works regardless of which tier `AnthropicConfig` selected.
+const MAX_PROMPT_INPUT_TOKENS: usize = 60_000;
 
 /// Anthropic API configuration — `AGENTOPS_ANTHROPIC_API_KEY` follows the
 /// `AGENTOPS_<SUBSYSTEM>_<PURPOSE>` env var convention.
@@ -190,26 +202,34 @@ fn send_messages(config: &AnthropicConfig, prompt: &str, output_config: Option<O
 /// content or sibling symbols' source directly — both cost and
 /// prompt-injection surface scale with what's included here; `related`
 /// only ever contributes another symbol's *notes*, never its raw source.
+///
+/// Token-budgeted against `MAX_PROMPT_INPUT_TOKENS`: `render_symbol_block`
+/// is tried first at full size, then with `agentops_scanner::
+/// compress_symbol_source` applied (only kept if it actually reduces the
+/// token count — a short body with a long doc-comment sometimes doesn't),
+/// then with `related_with_notes` entries dropped from the tail (they're
+/// already similarity/PageRank-ordered by `pattern_complete`), and finally,
+/// if still over budget, the symbol block itself is hard-truncated at the
+/// token level. `existing_notes` are never reduced -- they're the smallest
+/// category here and load-bearing for "don't contradict recorded
+/// decisions" -- but the whole prompt's count includes them at every step,
+/// so a pathological giant note still shows up in the final count rather
+/// than being silently invisible to the budget.
 fn build_prompt(
     symbol: &Node,
     dep_paths: &[String],
     existing_notes: &[(NodeKind, String, String, NodeProminence, Option<String>)],
     related: &[agentops_retrieval::PatternCompletionMatch],
 ) -> String {
-    let mut prompt = format!(
-        "You are documenting a codebase. Explain concisely what this symbol does and why it might exist, for a developer or AI agent reading the code for the first time.\n\n\
-         Symbol: {}\nFile: {}\n\n```\n{}\n```\n",
-        symbol.name.as_deref().unwrap_or("<unnamed>"),
-        symbol.path.as_deref().unwrap_or("<unknown>"),
-        symbol.content.as_deref().unwrap_or(""),
-    );
+    let name = symbol.name.as_deref().unwrap_or("<unnamed>");
+    let path = symbol.path.as_deref().unwrap_or("<unknown>");
+    let full_source = symbol.content.as_deref().unwrap_or("");
 
-    if !dep_paths.is_empty() {
-        prompt.push_str(&format!("\nThis file depends on: {}\n", dep_paths.join(", ")));
-    }
+    let dep_section = if dep_paths.is_empty() { String::new() } else { format!("\nThis file depends on: {}\n", dep_paths.join(", ")) };
 
+    let mut notes_section = String::new();
     if !existing_notes.is_empty() {
-        prompt.push_str("\nKnown notes already recorded against this symbol (acknowledge these if relevant, don't contradict them):\n");
+        notes_section.push_str("\nKnown notes already recorded against this symbol (acknowledge these if relevant, don't contradict them):\n");
         for (kind, title, text, prominence, reason) in existing_notes {
             // A curated-down note is still shown (it may still be
             // relevant), just flagged so the model weighs it as lower
@@ -220,11 +240,69 @@ fn build_prompt(
             } else {
                 String::new()
             };
-            prompt.push_str(&format!("- [{kind:?}] {title}: {text}{demoted}\n"));
+            notes_section.push_str(&format!("- [{kind:?}] {title}: {text}{demoted}\n"));
         }
     }
 
     let related_with_notes: Vec<&agentops_retrieval::PatternCompletionMatch> = related.iter().filter(|m| !m.notes.is_empty()).collect();
+
+    // Step 0: full source, all related context.
+    let candidate = render_prompt(name, path, full_source, &dep_section, &notes_section, &related_with_notes);
+    if count_tokens(&candidate) <= MAX_PROMPT_INPUT_TOKENS {
+        return candidate;
+    }
+
+    // Step 1: compress the symbol's source (signature kept, body elided),
+    // but only if that actually reduces its token count -- a short body
+    // with a long doc-comment sometimes doesn't compress smaller.
+    let compressed_source = symbol
+        .path
+        .as_deref()
+        .and_then(|p| Path::new(p).extension())
+        .and_then(|ext| ext.to_str())
+        .and_then(agentops_scanner::Language::from_extension)
+        .map(|lang| agentops_scanner::compress_symbol_source(full_source, lang))
+        .filter(|compressed| count_tokens(compressed) < count_tokens(full_source));
+    let source = compressed_source.as_deref().unwrap_or(full_source);
+    let candidate = render_prompt(name, path, source, &dep_section, &notes_section, &related_with_notes);
+    if count_tokens(&candidate) <= MAX_PROMPT_INPUT_TOKENS {
+        return candidate;
+    }
+
+    // Step 2: drop related-context entries from the tail (already
+    // similarity/PageRank-ordered by `pattern_complete`) one at a time.
+    for keep in (0..related_with_notes.len()).rev() {
+        let candidate = render_prompt(name, path, source, &dep_section, &notes_section, &related_with_notes[..keep]);
+        if count_tokens(&candidate) <= MAX_PROMPT_INPUT_TOKENS {
+            return candidate;
+        }
+    }
+
+    // Step 3: every reduction so far exhausted and still over budget --
+    // hard-truncate the symbol block itself at the token level as a last
+    // resort, keeping everything else (`existing_notes` are never reduced,
+    // see the doc comment above; there's no related context left to drop).
+    const TRUNCATION_MARKER: &str = "\n... [truncated]";
+    // A small fixed safety margin: BPE merges can span the join point
+    // between `truncated_source` and the surrounding template text, so the
+    // final re-tokenized count isn't guaranteed to equal the sum of its
+    // parts' counts exactly.
+    const RETOKENIZATION_SAFETY_MARGIN: usize = 64;
+    let non_symbol_tokens = count_tokens(&render_prompt(name, path, "", &dep_section, &notes_section, &[])) + count_tokens(TRUNCATION_MARKER) + RETOKENIZATION_SAFETY_MARGIN;
+    let budget_for_source = MAX_PROMPT_INPUT_TOKENS.saturating_sub(non_symbol_tokens);
+    let truncated_source = truncate_to_tokens(source, budget_for_source);
+    render_prompt(name, path, &format!("{truncated_source}{TRUNCATION_MARKER}"), &dep_section, &notes_section, &[])
+}
+
+fn render_prompt(name: &str, path: &str, source: &str, dep_section: &str, notes_section: &str, related_with_notes: &[&agentops_retrieval::PatternCompletionMatch]) -> String {
+    let mut prompt = format!(
+        "You are documenting a codebase. Explain concisely what this symbol does and why it might exist, for a developer or AI agent reading the code for the first time.\n\n\
+         Symbol: {name}\nFile: {path}\n\n```\n{source}\n```\n"
+    );
+
+    prompt.push_str(dep_section);
+    prompt.push_str(notes_section);
+
     if !related_with_notes.is_empty() {
         // Only symbols that actually carry their own notes are worth
         // spending prompt budget on -- a pattern-completed symbol with no
@@ -694,6 +772,135 @@ mod tests {
         let prompt = build_prompt(&node, &[], &[(NodeKind::Gotcha, "niche issue".into(), "rare edge case".into(), NodeProminence::Reduced, Some("only affects old Linux envs".into()))], &[]);
         assert!(prompt.contains("lower confidence"), "{prompt}");
         assert!(prompt.contains("only affects old Linux envs"), "{prompt}");
+    }
+
+    /// A synthetic Rust function whose body alone is `n` statements long --
+    /// large enough to blow `MAX_PROMPT_INPUT_TOKENS` on its own once
+    /// wrapped in a real function signature, standing in for a real
+    /// oversized symbol (e.g. `agentops-mcp/src/scan.rs`'s 881-line
+    /// `persist`) without needing to check one into this crate's fixtures.
+    fn oversized_rust_source(n: usize) -> String {
+        let mut body = String::new();
+        for i in 0..n {
+            body.push_str(&format!("    let x{i} = compute_something_moderately_named(i, {i});\n"));
+        }
+        format!("pub fn oversized_symbol(i: usize) -> usize {{\n{body}    x0\n}}\n")
+    }
+
+    #[test]
+    fn build_prompt_compresses_an_oversized_symbol_under_budget_instead_of_truncating() {
+        let source = oversized_rust_source(4000);
+        assert!(count_tokens(&source) > MAX_PROMPT_INPUT_TOKENS, "fixture must actually be oversized to exercise the reduction ladder");
+
+        let node = Node {
+            id: 1,
+            kind: NodeKind::Symbol,
+            repo: "demo".into(),
+            path: Some("src/big.rs".into()),
+            name: Some("oversized_symbol".into()),
+            container: None,
+            start_line: Some(1),
+            end_line: Some(4002),
+            content: Some(source),
+            curated: false,
+            prominence: NodeProminence::Full,
+            curation_reason: None,
+            last_touched_at: None,
+        };
+        let prompt = build_prompt(&node, &[], &[], &[]);
+
+        assert!(count_tokens(&prompt) <= MAX_PROMPT_INPUT_TOKENS, "prompt should fit under budget: {} tokens", count_tokens(&prompt));
+        assert!(prompt.contains("pub fn oversized_symbol(i: usize) -> usize {"), "signature should survive compression: {prompt}");
+        assert!(!prompt.contains("compute_something_moderately_named"), "body should have been elided by compression, not truncation: {prompt}");
+        assert!(!prompt.contains("[truncated]"), "a realistic oversized symbol should be handled by compression, not need the truncation fallback: {prompt}");
+    }
+
+    /// A synthetic Rust struct with `n` fields -- `compress_symbol_source`
+    /// deliberately never touches struct/class/trait bodies (their fields
+    /// are the useful payload, not implementation detail -- see
+    /// `compress.rs::leaves_struct_definitions_unchanged`), so a struct this
+    /// large stays exactly this large through the whole reduction ladder
+    /// and forces the truncation fallback to actually be exercised.
+    fn oversized_rust_struct_source(n: usize) -> String {
+        let mut fields = String::new();
+        for i in 0..n {
+            fields.push_str(&format!("    pub field_with_a_moderately_long_name_{i}: usize,\n"));
+        }
+        format!("pub struct OversizedStruct {{\n{fields}}}\n")
+    }
+
+    #[test]
+    fn build_prompt_falls_back_to_truncation_when_even_compression_is_not_enough() {
+        // A struct, not a function: compression never touches struct
+        // bodies (see `oversized_rust_struct_source`'s doc comment above),
+        // so this is the fixture that actually forces the truncation
+        // fallback rather than being fully absorbed by compression.
+        let source = oversized_rust_struct_source(60_000);
+        assert!(count_tokens(&source) > MAX_PROMPT_INPUT_TOKENS * 5, "fixture must be far larger than budget to force the truncation fallback");
+
+        let node = Node {
+            id: 1,
+            kind: NodeKind::Symbol,
+            repo: "demo".into(),
+            path: Some("src/huge.rs".into()),
+            name: Some("oversized_symbol".into()),
+            container: None,
+            start_line: Some(1),
+            end_line: Some(400_002),
+            content: Some(source),
+            curated: false,
+            prominence: NodeProminence::Full,
+            curation_reason: None,
+            last_touched_at: None,
+        };
+        let prompt = build_prompt(&node, &[], &[], &[]);
+
+        assert!(count_tokens(&prompt) <= MAX_PROMPT_INPUT_TOKENS, "prompt should still fit under budget: {} tokens", count_tokens(&prompt));
+        assert!(prompt.contains("[truncated]"), "an unrealistically giant symbol should hit the truncation fallback: {prompt}");
+    }
+
+    #[test]
+    fn build_prompt_drops_related_context_from_the_tail_before_truncating_source() {
+        let source = oversized_rust_source(4000);
+        let node = Node {
+            id: 1,
+            kind: NodeKind::Symbol,
+            repo: "demo".into(),
+            path: Some("src/big.rs".into()),
+            name: Some("oversized_symbol".into()),
+            container: None,
+            start_line: Some(1),
+            end_line: Some(4002),
+            content: Some(source),
+            curated: false,
+            prominence: NodeProminence::Full,
+            curation_reason: None,
+            last_touched_at: None,
+        };
+
+        let make_match = |name: &str| agentops_retrieval::PatternCompletionMatch {
+            node: Node {
+                id: 2,
+                kind: NodeKind::Symbol,
+                repo: "demo".into(),
+                path: Some("src/other.rs".into()),
+                name: Some(name.to_string()),
+                container: None,
+                start_line: Some(1),
+                end_line: Some(1),
+                content: Some("fn other() {}".into()),
+                curated: false,
+                prominence: NodeProminence::Full,
+                curation_reason: None,
+                last_touched_at: None,
+            },
+            via: agentops_retrieval::PatternCompletionSource::Similar(0.9),
+            notes: vec![(3, NodeKind::Gotcha, format!("note about {name}"), "some recorded knowledge here".into(), NodeProminence::Full, None)],
+        };
+        let related = vec![make_match("sibling_a"), make_match("sibling_b")];
+
+        let prompt = build_prompt(&node, &[], &[], &related);
+        assert!(count_tokens(&prompt) <= MAX_PROMPT_INPUT_TOKENS, "prompt should fit under budget: {} tokens", count_tokens(&prompt));
     }
 
     #[test]

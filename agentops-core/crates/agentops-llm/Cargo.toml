@@ -13,9 +13,11 @@ agentops-graph = { path = "../agentops-graph" }
 agentops-notes = { path = "../agentops-notes" }
 agentops-retrieval = { path = "../agentops-retrieval" }
 agentops-embeddings = { path = "../agentops-embeddings" }
+agentops-scanner = { path = "../agentops-scanner" }
 serde.workspace = true
 serde_json.workspace = true
 ureq = { version = "3", features = ["json"] }
+tiktoken-rs.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
