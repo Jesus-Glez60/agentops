@@ -1,7 +1,7 @@
 ---
 name: plan-council-member
 description: "One voice in a five-member critique council spawned against a plan or diff. The caller assigns one of five fixed personas (Skeptic, Simplifier, Completeness-checker, Outsider, Opportunity-hunter) in the spawn prompt; this file defines the shared behavior all five follow. Read-only, independent — never told what the other four members found. Spawned in parallel by audit-plan and wrap, never invoked standalone."
-model: inherit
+model: haiku
 tools: Read, Grep, Bash
 ---
 
