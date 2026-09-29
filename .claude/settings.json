@@ -1,0 +1,21 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__agentops__add_note",
+      "mcp__agentops__ingest_notes"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PROJECT_DIR}/.claude/hooks/block-local-notes.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}

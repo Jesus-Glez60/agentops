@@ -130,10 +130,15 @@ pub fn generate(root: &Path, opts: &GenerateOptions) -> String {
              just a generic glance at what's recorded — do this even when the task looks simple \
              or unrelated to past work.\n\n\
              New gotchas, decisions, and other project knowledge learned while working here \
-             should be recorded at the path above — via the `add_note` MCP tool if available, \
-             or as a Markdown file with `title`/`type`/`tags` frontmatter directly in that \
-             folder otherwise. This applies whether or not the folder already has anything in \
-             it.\n\n"
+             should be recorded at the path above. First check whether `.context/agentops-remote.json` \
+             exists in this repo: if it does, this repo is connected to a real AgentOps server and \
+             the `add_note`/`ingest_notes` MCP tool is always reachable and always the correct way to \
+             record a note — never write a Markdown file directly in that case, even if the MCP tool \
+             isn't available to whatever agent/subagent is doing the recording (escalate to one that \
+             has it, don't fall back to a file write). Only when `.context/agentops-remote.json` is \
+             absent — no remote connection exists at all — should a new note be written as a Markdown \
+             file with `title`/`type`/`tags` frontmatter directly in that folder. This applies whether \
+             or not the folder already has anything in it.\n\n"
         ));
     }
 
@@ -229,6 +234,24 @@ mod tests {
         let with = generate(dir.path(), &opts);
         assert!(with.contains("NOTES_PATH: /repo/.agentops/notes"));
         assert!(with.contains("add_note"));
+    }
+
+    /// Confirms the fix for a real recurring bug: earlier wording said
+    /// "via `add_note` if available, or a Markdown file... otherwise",
+    /// which repeatedly led agents (especially subagents with no way to
+    /// judge "availability" themselves) to write local Markdown files in
+    /// repos that were actually connected to a real remote AgentOps
+    /// server, where `add_note` was always reachable. The instruction must
+    /// name the actual, checkable signal -- the `.context/agentops-remote.json`
+    /// marker -- instead of the vague, agent-judgment-dependent "if
+    /// available".
+    #[test]
+    fn write_back_instructions_key_off_the_remote_marker_not_vague_availability() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = GenerateOptions { notes_path: Some("/repo/.agentops/notes".to_string()), ..Default::default() };
+        let content = generate(dir.path(), &opts);
+        assert!(content.contains(".context/agentops-remote.json"), "must name the concrete, checkable remote-connection signal");
+        assert!(!content.contains("add_note` MCP tool if available"), "must not reintroduce the vague 'if available' phrasing that caused the bug");
     }
 
     /// Phase 6b, Extension 3 (corrected design): AgentOps doesn't create

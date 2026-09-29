@@ -12,10 +12,12 @@ through this list first. A wrap that produces zero or one note after a
 multi-step session is a sign this review was skipped, not a sign nothing
 happened.
 
-Then run the notes sweep from `docs/vault-protocol.md`'s "Session end"
-step: capture anything not already written incrementally as its own note,
-via `add_note` or by delegating to the `vault-archivist` subagent if
-available.
+Then run the notes sweep: capture anything not already written
+incrementally as its own note. Check `.context/agentops-remote.json`
+first — if it exists, use `add_note`/`ingest_notes` (directly, or by
+delegating to the `vault-archivist` subagent if available; never a direct
+file write in this case). Only write a local Markdown file under
+`NOTES_PATH` if that marker is absent.
 
 Then run the reuse-before-writing audit against all of this session's
 uncommitted changes — delegate to the `ponytail-auditor` subagent if

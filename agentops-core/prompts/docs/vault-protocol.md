@@ -35,12 +35,18 @@ it not been caught, it's worth a note.
 
 1. **ALWAYS read `AGENTS.md`** before writing a note. Extract the exact `NOTES_PATH`.
 2. **NEVER write to a path that differs from `NOTES_PATH`** in `AGENTS.md`.
-3. **Prefer the `add_note` MCP tool over a direct file write.** It validates,
-   classifies (if `note_type` is omitted), and ingests atomically — a
-   hand-typed frontmatter file can't guarantee any of that.
-4. **Only write the file directly if no MCP connection to this project's
-   AgentOps server is available.** In that case the file still needs valid
-   YAML frontmatter (see template below) and must live under `NOTES_PATH`.
+3. **Check `.context/agentops-remote.json` before writing anything.** If it
+   exists, this repo is connected to a real remote AgentOps server and
+   `add_note`/`ingest_notes` is always reachable — use it, always, with no
+   exceptions for "the tool seemed unavailable." It validates, classifies
+   (if `note_type` is omitted), and ingests atomically — a hand-typed
+   frontmatter file can't guarantee any of that, and a local write in a
+   remote-connected repo just produces an orphaned note nobody's dashboard
+   will ever see.
+4. **Only write the file directly if `.context/agentops-remote.json` is
+   absent** — no remote connection exists at all. In that case the file
+   still needs valid YAML frontmatter (see template below) and must live
+   under `NOTES_PATH`.
 5. **If `AGENTS.md` is missing or has no `NOTES_PATH`**: STOP. Ask the user
    for the path, or offer to run the AGENTS.md generator. Do not guess a
    path, and never fall back to a path from a different project or a prior
