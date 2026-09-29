@@ -210,11 +210,14 @@ fn send_messages(config: &AnthropicConfig, prompt: &str, output_config: Option<O
 /// then with `related_with_notes` entries dropped from the tail (they're
 /// already similarity/PageRank-ordered by `pattern_complete`), and finally,
 /// if still over budget, the symbol block itself is hard-truncated at the
-/// token level. `existing_notes` are never reduced -- they're the smallest
-/// category here and load-bearing for "don't contradict recorded
-/// decisions" -- but the whole prompt's count includes them at every step,
-/// so a pathological giant note still shows up in the final count rather
-/// than being silently invisible to the budget.
+/// token level. `existing_notes` are normally never reduced -- they're the
+/// smallest category here and load-bearing for "don't contradict recorded
+/// decisions" -- but this function still *guarantees* its return value
+/// never exceeds `MAX_PROMPT_INPUT_TOKENS`: in the rare case where a
+/// symbol has accumulated a pathologically large recorded note history
+/// large enough that even an emptied-out symbol source doesn't bring the
+/// total under budget, `existing_notes` are truncated too as a final
+/// fallback rather than the budget being silently violated.
 fn build_prompt(
     symbol: &Node,
     dep_paths: &[String],
@@ -291,7 +294,24 @@ fn build_prompt(
     let non_symbol_tokens = count_tokens(&render_prompt(name, path, "", &dep_section, &notes_section, &[])) + count_tokens(TRUNCATION_MARKER) + RETOKENIZATION_SAFETY_MARGIN;
     let budget_for_source = MAX_PROMPT_INPUT_TOKENS.saturating_sub(non_symbol_tokens);
     let truncated_source = truncate_to_tokens(source, budget_for_source);
-    render_prompt(name, path, &format!("{truncated_source}{TRUNCATION_MARKER}"), &dep_section, &notes_section, &[])
+    let candidate = render_prompt(name, path, &format!("{truncated_source}{TRUNCATION_MARKER}"), &dep_section, &notes_section, &[]);
+    if count_tokens(&candidate) <= MAX_PROMPT_INPUT_TOKENS {
+        return candidate;
+    }
+
+    // Step 4: `existing_notes` alone (never reduced by steps 0-3, see this
+    // function's doc comment) are large enough that even an emptied-out
+    // symbol source still leaves the prompt over budget -- truncate
+    // `notes_section` too, as the true last resort. This is what keeps the
+    // "never reduced" claim in the doc comment from being a silent lie: it
+    // holds for every symbol except the rare one with a pathologically
+    // large recorded note history, and even then the function still
+    // guarantees its own contract (staying under `MAX_PROMPT_INPUT_TOKENS`)
+    // rather than silently violating it.
+    let skeleton_tokens = count_tokens(&render_prompt(name, path, "", &dep_section, "", &[])) + count_tokens(TRUNCATION_MARKER) + RETOKENIZATION_SAFETY_MARGIN;
+    let budget_for_notes = MAX_PROMPT_INPUT_TOKENS.saturating_sub(skeleton_tokens);
+    let truncated_notes = format!("{}{TRUNCATION_MARKER}", truncate_to_tokens(&notes_section, budget_for_notes));
+    render_prompt(name, path, &format!("{truncated_source}{TRUNCATION_MARKER}"), &dep_section, &truncated_notes, &[])
 }
 
 fn render_prompt(name: &str, path: &str, source: &str, dep_section: &str, notes_section: &str, related_with_notes: &[&agentops_retrieval::PatternCompletionMatch]) -> String {
@@ -901,6 +921,38 @@ mod tests {
 
         let prompt = build_prompt(&node, &[], &[], &related);
         assert!(count_tokens(&prompt) <= MAX_PROMPT_INPUT_TOKENS, "prompt should fit under budget: {} tokens", count_tokens(&prompt));
+    }
+
+    #[test]
+    fn build_prompt_truncates_existing_notes_when_they_alone_exceed_budget() {
+        // A small, ordinary symbol -- the point is that `existing_notes`
+        // alone, not the symbol source, is what's oversized here. Before
+        // Step 4 existed, this returned a prompt over MAX_PROMPT_INPUT_TOKENS
+        // with no signal, since `existing_notes` were never reduced.
+        let node = Node {
+            id: 1,
+            kind: NodeKind::Symbol,
+            repo: "demo".into(),
+            path: Some("src/small.rs".into()),
+            name: Some("small_symbol".into()),
+            container: None,
+            start_line: Some(1),
+            end_line: Some(3),
+            content: Some("pub fn small_symbol() -> i32 {\n    42\n}\n".into()),
+            curated: false,
+            prominence: NodeProminence::Full,
+            curation_reason: None,
+            last_touched_at: None,
+        };
+
+        let huge_note_text = "this note describes a very subtle interaction between two systems in exhaustive detail ".repeat(6000);
+        let existing_notes = vec![(NodeKind::Decision, "a sprawling decision record".to_string(), huge_note_text, NodeProminence::Full, None)];
+        assert!(count_tokens(&existing_notes[0].2) > MAX_PROMPT_INPUT_TOKENS, "fixture note must itself be oversized to exercise Step 4");
+
+        let prompt = build_prompt(&node, &[], &existing_notes, &[]);
+
+        assert!(count_tokens(&prompt) <= MAX_PROMPT_INPUT_TOKENS, "prompt must never exceed budget even when existing_notes alone are huge: {} tokens", count_tokens(&prompt));
+        assert!(prompt.contains("small_symbol"), "the symbol itself should still be identifiable: {prompt}");
     }
 
     #[test]
