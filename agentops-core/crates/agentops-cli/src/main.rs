@@ -1810,6 +1810,10 @@ fn task_summarize(path: &Path, id: i64) -> Result<()> {
         anyhow::bail!("task {id} ({}) has session_id '{session_id}' but no activity recorded under it yet", task.title);
     }
 
+    // Default tier, not cheap: explicit user request, output goes to
+    // Linear/stdout for a human to read directly. Revised after a wrap-skill
+    // council audit flagged the original cheap-tier choice as mis-scoped
+    // (2026-09-28).
     let config = agentops_llm::AnthropicConfig::from_env()?;
     let summaries = agentops_llm::summarize_task_activity(&config, &task.title, &events)?;
 
@@ -1875,7 +1879,10 @@ fn note(path: &Path, kind: Option<NoteKindArg>, tags: &[String], with_embeddings
 fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classify: bool, llm_match: bool, min_name_len: usize, with_embeddings: bool) -> Result<()> {
     let resolved_notes_dir = agentops_notes::resolve_notes_path(path, notes_dir);
 
-    let llm_config = if llm_classify || llm_match { Some(agentops_llm::AnthropicConfig::from_env()?) } else { None };
+    // Cheap tier: both the classifier and matcher here are automated,
+    // best-effort adapters (ambiguous-case fallback and candidate re-ranking),
+    // not the opt-in/interactive `explain_symbol` path.
+    let llm_config = if llm_classify || llm_match { Some(agentops_llm::AnthropicConfig::from_env_cheap()?) } else { None };
 
     let heuristic_classifier = agentops_notes::HeuristicClassifier;
     let llm_classifier = llm_config.as_ref().map(|config| agentops_llm::LlmAssistedClassifier { config });

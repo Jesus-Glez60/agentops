@@ -18,6 +18,10 @@ use serde::{Deserialize, Serialize};
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
+/// Cheap tier for automated calls with no direct human reader of the raw
+/// output (note classification/symbol matching) — see
+/// `AnthropicConfig::from_env_cheap`.
+const DEFAULT_MODEL_CHEAP: &str = "claude-haiku-4-5-20251001";
 const DEFAULT_MAX_TOKENS: u32 = 1024;
 /// How many pattern-completed symbols (Initiative 4) `explain_symbol` pulls
 /// in as possibly-related context -- most get filtered out by
@@ -38,13 +42,37 @@ pub struct AnthropicConfig {
 }
 
 impl AnthropicConfig {
+    fn read_api_key() -> Result<String> {
+        std::env::var("AGENTOPS_ANTHROPIC_API_KEY")
+            .context("AGENTOPS_ANTHROPIC_API_KEY is not set — code interpretation is opt-in and requires your own Anthropic API key")
+    }
+
     /// Reads `AGENTOPS_ANTHROPIC_API_KEY` from the environment. Returns a
     /// clear, typed error when it's unset — callers should surface this as
-    /// "not configured", not a silent no-op.
+    /// "not configured", not a silent no-op. Model defaults to
+    /// `DEFAULT_MODEL`, overridable via `AGENTOPS_ANTHROPIC_MODEL` — use this
+    /// tier for opt-in/interactive calls (e.g. `explain_symbol`) where
+    /// quality matters more than cost.
     pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("AGENTOPS_ANTHROPIC_API_KEY")
-            .context("AGENTOPS_ANTHROPIC_API_KEY is not set — code interpretation is opt-in and requires your own Anthropic API key")?;
-        Ok(Self { api_key, model: DEFAULT_MODEL.to_string(), max_tokens: DEFAULT_MAX_TOKENS, api_url: API_URL.to_string() })
+        let api_key = Self::read_api_key()?;
+        let model = std::env::var("AGENTOPS_ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
+        Ok(Self { api_key, model, max_tokens: DEFAULT_MAX_TOKENS, api_url: API_URL.to_string() })
+    }
+
+    /// Same as `from_env`, but selects the cheap tier (`DEFAULT_MODEL_CHEAP`,
+    /// overridable via `AGENTOPS_ANTHROPIC_MODEL_CHEAP`) — use this only for
+    /// calls whose raw output isn't read directly by a person
+    /// (`LlmAssistedClassifier`/`LlmAssistedMatcher`: a re-ranking/
+    /// classification signal, not prose a user reads). `group_core_modules`
+    /// and `summarize_task_activity` were originally routed here too, but a
+    /// wrap-skill council audit (2026-09-28) correctly flagged that as
+    /// mis-scoped — their output is read directly (Documentation Viewer
+    /// labels; Linear/stdout summaries), the same category as
+    /// `explain_symbol`, so both now use `from_env` instead.
+    pub fn from_env_cheap() -> Result<Self> {
+        let api_key = Self::read_api_key()?;
+        let model = std::env::var("AGENTOPS_ANTHROPIC_MODEL_CHEAP").unwrap_or_else(|_| DEFAULT_MODEL_CHEAP.to_string());
+        Ok(Self { api_key, model, max_tokens: DEFAULT_MAX_TOKENS, api_url: API_URL.to_string() })
     }
 }
 
@@ -400,9 +428,67 @@ const CLIENT_FRIENDLY_TAG: &str = "CLIENT_FRIENDLY:";
 /// Renders `activity` using the exact same format `tool_get_task_activity`
 /// (`agentops-mcp/src/tools.rs`) already uses for a human/agent-facing
 /// activity feed — deliberately not a second, silently-divergent copy of
-/// that rendering.
+/// that rendering. Each line is passed through `compress_for_prompt` first,
+/// since `description` can carry verbatim tool output (test/build logs).
 fn render_activity(activity: &[agentops_graph::SessionEvent]) -> String {
-    activity.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, e.description)).collect::<Vec<_>>().join("\n")
+    activity.iter().map(|e| format!("- [{}] {}: {}", e.created_at, e.tool_name, compress_for_prompt(&e.description))).collect::<Vec<_>>().join("\n")
+}
+
+/// Longest a real CSI escape sequence's parameter bytes get in practice
+/// (e.g. 24-bit color codes) — bounds the terminator search below so a
+/// genuinely unterminated `ESC [` (no letter anywhere in the rest of the
+/// string) can't consume the rest of the text looking for one.
+const MAX_CSI_PARAM_LEN: usize = 32;
+
+/// Lossless prompt-content hygiene for text that may carry raw tool output:
+/// strips ANSI CSI escape codes and collapses 3+ consecutive identical lines
+/// into one with a repeat count. Deliberately narrow — no filler-word
+/// removal or semantic rewriting, which would risk changing meaning in a
+/// summary that's read for accuracy.
+fn compress_for_prompt(text: &str) -> String {
+    let mut no_ansi = String::with_capacity(text.len());
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\u{1b}' && chars.get(i + 1) == Some(&'[') {
+            let window_end = (i + 2 + MAX_CSI_PARAM_LEN).min(chars.len());
+            match chars[i + 2..window_end].iter().position(|c| c.is_ascii_alphabetic()) {
+                // A real CSI terminator is any letter (per the ANSI spec, not
+                // just 'm') — skip the whole sequence including it.
+                Some(offset) => i += 2 + offset + 1,
+                // No terminator within the bounded window: not a real escape
+                // sequence (or one this function doesn't need to handle) —
+                // keep the `ESC` byte itself literal and re-examine the rest
+                // character by character, rather than silently consuming it.
+                None => {
+                    no_ansi.push(chars[i]);
+                    i += 1;
+                }
+            }
+        } else {
+            no_ansi.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    // Collapse runs of 3+ identical consecutive lines into one + a count.
+    let mut out: Vec<String> = Vec::new();
+    let lines: Vec<&str> = no_ansi.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let mut j = i + 1;
+        while j < lines.len() && lines[j] == lines[i] {
+            j += 1;
+        }
+        let run_len = j - i;
+        if run_len >= 3 {
+            out.push(format!("{} (repeated {run_len} times)", lines[i]));
+        } else {
+            out.extend(lines[i..j].iter().map(|s| s.to_string()));
+        }
+        i = j;
+    }
+    out.join("\n")
 }
 
 /// Generates technical/non-technical/client-friendly summaries of a task's
@@ -514,6 +600,53 @@ mod tests {
 
     fn mock_config(base_url: &str) -> AnthropicConfig {
         AnthropicConfig { api_key: "test-key".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: format!("{base_url}/v1/messages") }
+    }
+
+    // Deliberately no test exercises `from_env`/`from_env_cheap`'s env-var
+    // reading directly (e.g. via `std::env::set_var`) — per
+    // `.agentops/notes/env-set-var-requires-unsafe-block-in-current-rust.md`,
+    // mutating process env is only safe single-threaded/pre-runtime, and
+    // `cargo test` runs this file's tests in parallel by default. Tier
+    // selection is covered instead via `compress_for_prompt` (pure) below
+    // and by constructing `AnthropicConfig` directly, matching `mock_config`.
+
+    #[test]
+    fn compress_for_prompt_strips_ansi_codes() {
+        let input = "\u{1b}[32mok\u{1b}[0m: build passed";
+        assert_eq!(compress_for_prompt(input), "ok: build passed");
+    }
+
+    #[test]
+    fn compress_for_prompt_collapses_long_repeated_lines() {
+        let input = "start\nnoisy line\nnoisy line\nnoisy line\nnoisy line\nend";
+        assert_eq!(compress_for_prompt(input), "start\nnoisy line (repeated 4 times)\nend");
+    }
+
+    #[test]
+    fn compress_for_prompt_leaves_short_runs_and_unique_lines_untouched() {
+        let input = "a\nb\nb\nc";
+        assert_eq!(compress_for_prompt(input), "a\nb\nb\nc");
+    }
+
+    #[test]
+    fn compress_for_prompt_preserves_content_after_a_truly_unterminated_escape() {
+        // No alphabetic byte anywhere in the rest of the string -- the old
+        // implementation's `.find()` consumed the whole remaining iterator
+        // looking for one, silently dropping everything after it. Confirmed
+        // via a wrap-skill council audit (2026-09-28): fixed by bounding the
+        // terminator search instead of scanning unboundedly.
+        let input = "before\u{1b}[315;999";
+        assert_eq!(compress_for_prompt(input), "before\u{1b}[315;999");
+    }
+
+    #[test]
+    fn compress_for_prompt_treats_any_letter_as_a_valid_csi_terminator() {
+        // Per the ANSI spec any letter ends a CSI sequence, not just 'm' --
+        // "\x1b[31T" is a real (if unusual) sequence (Scroll Left), so this
+        // is correct stripping, not data loss, despite looking similar to
+        // the case above at a glance.
+        let input = "\u{1b}[31Text";
+        assert_eq!(compress_for_prompt(input), "ext");
     }
 
     #[test]

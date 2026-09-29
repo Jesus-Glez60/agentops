@@ -64,6 +64,11 @@ pub fn generate_docs(repo_path: &Path) -> Result<PathBuf> {
 pub fn persist_doc_page(store: &dyn GraphStore, repo_path: &Path, repo: &str, files: &[ScannedFile], with_embeddings: bool) -> Result<()> {
     let ranked: Vec<PathBuf> = agentops_scanner::rank_files(repo_path, files).into_iter().map(|(p, _)| p).collect();
 
+    // Default tier, not cheap: these labels are read directly by users in the
+    // Documentation Viewer's Core Modules nav, closer to `explain_symbol`
+    // (interactive, quality matters) than to a background best-effort call.
+    // Revised after a wrap-skill council audit flagged the original cheap-
+    // tier choice as mis-scoped (2026-09-28).
     let module_labels = agentops_llm::AnthropicConfig::from_env()
         .and_then(|config| agentops_llm::group_core_modules(&config, repo, &ranked))
         .unwrap_or_default();
