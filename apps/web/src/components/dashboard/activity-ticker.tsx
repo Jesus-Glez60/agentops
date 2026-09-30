@@ -14,20 +14,20 @@ export function ActivityTicker() {
   const { data: activity } = useSWR("/activity", getActivity);
 
   return (
-    <section className="flex flex-col gap-3">
-      <h2 className="text-subheading font-semibold text-ink-100">Activity</h2>
-      <div className="flex flex-col divide-y divide-border rounded-lg border border-border-strong bg-panel">
+    <section className="flex flex-col gap-3.5">
+      <h2 className="text-[20px] font-extrabold tracking-[-0.02em] text-ink-100">Activity</h2>
+      <div className="flex flex-col divide-y divide-border rounded-2xl border border-border-strong bg-panel px-5">
         {!activity || activity.length === 0 ? (
-          <p className="p-4 text-body text-ink-500">No activity yet.</p>
+          <p className="py-4 text-[14px] text-ink-500">No activity yet.</p>
         ) : (
           activity.map((event, i) => {
             const nodesUpdated = event.files_added + event.files_changed + event.files_removed + event.symbols_added + event.symbols_changed + event.symbols_removed;
             return (
-              <div key={`${event.repo}-${event.started_at}-${i}`} className="flex flex-col gap-1 p-3 text-body">
-                <span className="text-ink-100">
-                  <span className="font-medium">{displayRepoName(event.repo)}</span> rescanned
+              <div key={`${event.repo}-${event.started_at}-${i}`} className="flex flex-col gap-1 py-3.5">
+                <span className="text-[14px] leading-snug text-ink-100">
+                  <span className="font-bold">{displayRepoName(event.repo)}</span> rescanned
                 </span>
-                <span className="text-mono-path text-ink-500">
+                <span className="font-mono text-[11.5px] text-ink-500">
                   {relativeTimeFromIsoString(event.started_at)} · <span className="text-health-healthy">{nodesUpdated} node{nodesUpdated === 1 ? "" : "s"} updated</span>
                 </span>
               </div>

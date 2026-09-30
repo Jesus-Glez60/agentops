@@ -22,14 +22,15 @@ function subtitle(needsCurationCount: number, anyRepoUnhealthy: boolean): string
 export function OverviewHero({ orgName, firstName, needsCurationCount, anyRepoUnhealthy }: { orgName: string; firstName: string; needsCurationCount: number; anyRepoUnhealthy: boolean }) {
   return (
     <div className="flex flex-wrap items-end justify-between gap-6">
-      <div className="flex flex-col gap-2">
-        <span className="text-mono-path uppercase tracking-wide text-mauve">
+      <div className="flex max-w-[760px] flex-col gap-3">
+        <span className="font-mono text-[12px] uppercase tracking-wide text-mauve">
           {orgName} · Overview
         </span>
-        <h1 className="text-3xl font-bold tracking-tight text-ink-100">
+        {/* clamp(34px,3.6vw,48px) in the prototype -- Tailwind arbitrary value carries the clamp() straight through. */}
+        <h1 className="text-[clamp(34px,3.6vw,48px)] leading-[1.02] font-extrabold tracking-[-0.04em] text-balance text-ink-100">
           {timeOfDayGreeting()}, {firstName}.
         </h1>
-        <p className="text-body text-ink-300">{subtitle(needsCurationCount, anyRepoUnhealthy)}</p>
+        <p className="text-[17px] leading-normal text-ink-300">{subtitle(needsCurationCount, anyRepoUnhealthy)}</p>
       </div>
       <div className="flex gap-2">
         <Button variant="outline" asChild>

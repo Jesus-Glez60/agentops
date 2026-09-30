@@ -9,6 +9,7 @@ export function StatCard({
   icon: Icon,
   valueClassName,
   href,
+  note,
 }: {
   label: string;
   value: string | number;
@@ -16,15 +17,18 @@ export function StatCard({
   valueClassName?: string;
   /** When set, the whole card is a real link -- e.g. to the gotchas page's actual review queue, not a "coming soon" placeholder. */
   href?: string;
+  /** Small descriptive line under the value, matching the prototype's stat-strip notes (e.g. "symbols, files, gotchas, decisions"). */
+  note?: string;
 }) {
   const card = (
     <Card className={cn("border-border-strong bg-panel py-4", href && "transition-colors hover:border-border-strong/80")}>
-      <CardContent className="flex flex-col gap-2 px-4">
-        <div className="flex items-center gap-2 text-section text-ink-500">
+      <CardContent className="flex flex-col gap-1.5 px-4">
+        <div className="flex items-center gap-2 text-[13.5px] text-ink-500">
           <Icon className="size-4" />
           {label}
         </div>
-        <div className={cn("text-2xl font-bold text-ink-100", valueClassName)}>{value}</div>
+        <div className={cn("text-[34px] leading-none font-extrabold tracking-tight text-ink-100", valueClassName)}>{value}</div>
+        {note && <div className="text-[12.5px] text-ink-500">{note}</div>}
       </CardContent>
     </Card>
   );

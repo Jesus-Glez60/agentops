@@ -49,7 +49,7 @@ export function RepoTable() {
   return (
     <Card className="border-border-strong bg-panel">
       <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-subheading">
+        <CardTitle className="flex items-center gap-2 text-[20px] font-extrabold tracking-[-0.02em]">
           <GitBranch className="size-4 text-ink-500" />
           Repository Intelligence
         </CardTitle>

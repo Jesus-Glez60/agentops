@@ -65,19 +65,20 @@ export function NextUp({ cards }: { cards: NextUpCard[] }) {
 
   return (
     <section className="flex flex-col gap-3">
-      <div className="flex items-baseline gap-2">
-        <h2 className="text-subheading font-semibold text-ink-100">Next up</h2>
-        <span className="text-mono-path text-ink-500">Sorted by what helps your agents most</span>
+      <div className="flex items-baseline gap-3">
+        <h2 className="text-[24px] font-extrabold tracking-[-0.02em] text-ink-100">Next up</h2>
+        <span className="text-[14px] text-ink-500">Sorted by what helps your agents most</span>
       </div>
-      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
         {cards.map((card) => (
-          <div key={card.tag} className="flex flex-col gap-2 rounded-lg border border-border-strong bg-panel p-4">
-            <span className="text-mono-path uppercase tracking-wide" style={{ color: card.color }}>
+          <div key={card.tag} className="flex flex-col gap-3 rounded-2xl border border-border-strong bg-panel p-[22px]">
+            <span className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide" style={{ color: card.color }}>
+              <span className="size-2 shrink-0 rotate-45" style={{ background: card.color }} />
               {card.tag}
             </span>
-            <h3 className="text-section font-semibold text-ink-100">{card.title}</h3>
-            <p className="flex-1 text-body text-ink-500">{card.desc}</p>
-            <Link href={card.href} className="text-section font-medium" style={{ color: card.color }}>
+            <h3 className="text-[20px] leading-tight font-bold tracking-[-0.02em] text-ink-100">{card.title}</h3>
+            <p className="flex-1 text-[14.5px] leading-normal text-ink-300">{card.desc}</p>
+            <Link href={card.href} className="self-start text-[14px] font-semibold" style={{ color: card.color }}>
               {card.cta}
             </Link>
           </div>
