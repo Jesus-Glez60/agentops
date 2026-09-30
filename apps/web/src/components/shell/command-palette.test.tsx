@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -8,27 +9,32 @@ vi.mock("next/navigation", () => ({
 }));
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { CommandPalette } from "@/components/shell/command-palette";
+import { CommandPaletteDialog, CommandPaletteTrigger } from "@/components/shell/command-palette";
 
-function renderPalette() {
-  return render(
+// CommandPaletteDialog/Trigger are controlled -- something above them owns
+// `open` state (AppShell, in the real app). This harness mirrors that shape
+// so the dialog+trigger pairing is tested the way it's actually wired.
+function Harness() {
+  const [open, setOpen] = useState(false);
+  return (
     <TooltipProvider>
-      <CommandPalette />
-    </TooltipProvider>,
+      <CommandPaletteTrigger onOpen={() => setOpen(true)} />
+      <CommandPaletteDialog open={open} onOpenChange={setOpen} />
+    </TooltipProvider>
   );
 }
 
-describe("CommandPalette", () => {
+describe("CommandPaletteDialog / CommandPaletteTrigger", () => {
   beforeEach(() => {
     push.mockClear();
   });
 
-  it("opens on Ctrl/Cmd+K and navigates + closes on item selection", async () => {
-    renderPalette();
+  it("opens via the trigger and navigates + closes on item selection", async () => {
+    render(<Harness />);
 
     expect(screen.queryByPlaceholderText("Jump to a page...")).not.toBeInTheDocument();
 
-    fireEvent.keyDown(document, { key: "k", ctrlKey: true });
+    fireEvent.click(screen.getByRole("button", { name: "Open command palette" }));
 
     expect(await screen.findByPlaceholderText("Jump to a page...")).toBeInTheDocument();
 
@@ -38,11 +44,13 @@ describe("CommandPalette", () => {
     await waitFor(() => expect(screen.queryByPlaceholderText("Jump to a page...")).not.toBeInTheDocument());
   });
 
-  it("also opens via the visible trigger button", async () => {
-    renderPalette();
+  it("stays closed until its open prop flips true", () => {
+    render(
+      <TooltipProvider>
+        <CommandPaletteDialog open={false} onOpenChange={() => {}} />
+      </TooltipProvider>,
+    );
 
-    fireEvent.click(screen.getByRole("button", { name: "Open command palette" }));
-
-    expect(await screen.findByPlaceholderText("Jump to a page...")).toBeInTheDocument();
+    expect(screen.queryByPlaceholderText("Jump to a page...")).not.toBeInTheDocument();
   });
 });

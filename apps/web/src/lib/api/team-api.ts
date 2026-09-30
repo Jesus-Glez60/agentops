@@ -270,6 +270,11 @@ export function switchTenant(tenant: string): Promise<{ tenant: string; role: Me
   return heavyFetch("/me/switch-tenant", { method: "POST", body: JSON.stringify({ tenant }) });
 }
 
+/** Shared by the sidebar's ScopeSwitcher and the Overview page's hero eyebrow -- `user.tenant` is a connection-id-shaped string on real deployments, never fit for display, so both fall back the same way: the current membership's name if set, else the email's local part. */
+export function resolveOrgDisplayName(memberships: Membership[], user: { tenant: string; email: string }): string {
+  return memberships.find((m) => m.tenant === user.tenant)?.name || user.email.split("@")[0] || user.tenant;
+}
+
 /** Unauthenticated -- goes through /api/invites/{token}, not /api/heavy/* (which always requires a session). See that route's doc comment. */
 export async function getInvitePreview(token: string): Promise<InvitePreview> {
   const res = await fetch(withBasePath(`/api/invites/${encodeURIComponent(token)}`), { cache: "no-store" });

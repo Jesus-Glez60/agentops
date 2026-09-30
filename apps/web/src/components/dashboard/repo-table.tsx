@@ -132,8 +132,25 @@ export function RepoTable() {
             })}
           </TableBody>
         </Table>
+        {!!repos?.length && (
+          <div className="flex flex-wrap gap-4 pt-3 text-mono-path text-ink-500">
+            <LegendItem colorClassName="bg-node-symbol" label="symbols" />
+            <LegendItem colorClassName="bg-node-file" label="files" />
+            <LegendItem colorClassName="bg-node-gotcha" label="gotchas" />
+            <LegendItem colorClassName="bg-node-decision" label="decisions" />
+          </div>
+        )}
       </CardContent>
     </Card>
+  );
+}
+
+function LegendItem({ colorClassName, label }: { colorClassName: string; label: string }) {
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className={`size-2 rounded-full ${colorClassName}`} />
+      {label}
+    </span>
   );
 }
 

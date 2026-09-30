@@ -5,12 +5,12 @@ import { Bell, Database } from "lucide-react";
 import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { repoHealth } from "@/lib/repo-health";
 import { BreadcrumbHeader } from "@/components/shell/breadcrumb-header";
-import { CommandPalette } from "@/components/shell/command-palette";
+import { CommandPaletteTrigger } from "@/components/shell/command-palette";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 
-export function AppHeader() {
+export function AppHeader({ onOpenPalette }: { onOpenPalette: () => void }) {
   // Same SWR key as the Overview page's repo table -- one shared cache
   // entry/one network request, not two independent fetches.
   const { data } = useSWR(REPOS_SWR_KEY, getRepos);
@@ -34,7 +34,7 @@ export function AppHeader() {
           {repos === undefined ? "—" : anyIssue ? "Needs attention" : allHealthy ? "All indexed" : "—"}
         </div>
 
-        <CommandPalette />
+        <CommandPaletteTrigger onOpen={onOpenPalette} />
 
         <Tooltip>
           <TooltipTrigger asChild>

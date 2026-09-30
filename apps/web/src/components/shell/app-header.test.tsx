@@ -13,7 +13,7 @@ describe("AppHeader", () => {
   it("renders the notification bell as disabled, matching the no-fake-unread-count precedent", () => {
     render(
       <TooltipProvider>
-        <AppHeader />
+        <AppHeader onOpenPalette={() => {}} />
       </TooltipProvider>,
     );
 

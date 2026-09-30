@@ -15,20 +15,20 @@ export interface NavItem {
 // about grouping, and a design-mock-order test pins that array), so the
 // sidebar clusters by this list instead of relying on NAV_ITEMS being
 // group-contiguous.
-export const NAV_GROUP_ORDER = ["Workspace", "Sources", "Knowledge"] as const;
+export const NAV_GROUP_ORDER = ["Explore", "Curate", "Sources", "Workspace"] as const;
 
 // Single source of truth for the sidebar, the command palette, and
 // breadcrumb label lookups -- one list, three consumers, so adding a page
 // never means updating three places by hand.
 export const NAV_ITEMS: NavItem[] = [
-  { href: "/", label: "Overview", icon: LayoutDashboard, group: "Workspace" },
-  { href: "/search", label: "Search", icon: Search, group: "Workspace" },
-  { href: "/graph", label: "Knowledge Graph", icon: Workflow, group: "Workspace" },
-  { href: "/docs", label: "Documentation", icon: BookOpen, group: "Knowledge" },
+  { href: "/", label: "Overview", icon: LayoutDashboard },
+  { href: "/search", label: "Search", icon: Search, group: "Explore" },
+  { href: "/graph", label: "Knowledge Graph", icon: Workflow, group: "Explore" },
+  { href: "/docs", label: "Documentation", icon: BookOpen, group: "Explore" },
   { href: "/libraries", label: "Libraries", icon: Library, group: "Sources" },
   { href: "/repositories", label: "Repositories", icon: GitBranch, group: "Sources" },
-  { href: "/gotchas", label: "Gotchas", icon: TriangleAlert, group: "Knowledge" },
-  { href: "/settings", label: "Settings", icon: Settings },
+  { href: "/gotchas", label: "Gotchas", icon: TriangleAlert, group: "Curate" },
+  { href: "/settings", label: "Settings", icon: Settings, group: "Workspace" },
 ];
 
 export function navLabelForPath(pathname: string): string {

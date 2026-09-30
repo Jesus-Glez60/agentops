@@ -1,39 +1,28 @@
 "use client";
 
-import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { LogOut, Plug, UserRound, Users } from "lucide-react";
-import { logout } from "@/lib/auth/client";
+import { UserRound, Users } from "lucide-react";
 import type { SessionUser } from "@/lib/auth/types";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 
 // Org switching lives in the sidebar's ScopeSwitcher now (see redesign plan
-// Phase 2) -- kept out of here so there's exactly one place to switch orgs,
-// not two competing controls.
+// Phase 2), and "Connect a coding tool"/"Log out" now live as persistent
+// sidebar-footer controls (Session 3 update) rather than buried here -- kept
+// out of this dropdown so there's exactly one place to do each, not two
+// competing controls.
 export function UserMenu({ user }: { user: SessionUser }) {
   const router = useRouter();
-  const [loggingOut, setLoggingOut] = useState(false);
-
-  async function handleLogout() {
-    setLoggingOut(true);
-    try {
-      await logout();
-    } finally {
-      router.push("/login");
-      router.refresh();
-    }
-  }
 
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <button className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-accent" disabled={loggingOut}>
+        <button className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-accent">
           <Avatar className="size-7 shrink-0">
             {user.avatar_url && <AvatarImage src={user.avatar_url} alt="" />}
             <AvatarFallback className="text-label">{user.first_name.charAt(0).toUpperCase()}</AvatarFallback>
           </Avatar>
-          <div className="min-w-0 flex-1">
+          <div className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden">
             <p className="truncate text-section text-ink-100">
               {user.first_name} {user.last_name}
             </p>
@@ -49,20 +38,6 @@ export function UserMenu({ user }: { user: SessionUser }) {
         <DropdownMenuItem onSelect={() => router.push("/settings")}>
           <Users className="size-4" />
           Team Settings
-        </DropdownMenuItem>
-        {/* /welcome never gates on onboarding_completed -- always safe to
-            revisit, it's the one place to regenerate an API key and get
-            the connect command again after the fact, not just on first
-            login. Caught live: there was no way back to this once past
-            onboarding. */}
-        <DropdownMenuItem onSelect={() => router.push("/welcome")}>
-          <Plug className="size-4" />
-          Connect a coding tool
-        </DropdownMenuItem>
-        <DropdownMenuSeparator />
-        <DropdownMenuItem onSelect={handleLogout} disabled={loggingOut}>
-          <LogOut className="size-4" />
-          {loggingOut ? "Logging out…" : "Log out"}
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
