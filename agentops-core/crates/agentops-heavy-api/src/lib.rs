@@ -2258,6 +2258,58 @@ mod tests {
         assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("Registered"), "{body:?}");
     }
 
+    /// A repo with no git remote at all (never pushed anywhere) can still
+    /// register via `register_repo`'s `local_id` argument -- the bug this
+    /// locks in the fix for: previously `register_repo` only ever accepted
+    /// `repo_url`, so a caller with nothing URL-shaped to pass had no way
+    /// to register such a repo and every other tool's `path` resolution
+    /// dead-ended with "not a repo connection id or URL."
+    #[tokio::test]
+    async fn mcp_register_repo_accepts_a_local_id_for_a_repo_with_no_remote() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (_user, token) = signup(&accounts, "dev@example.com");
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let mut req = mcp_request("tools/call", json!({ "name": "register_repo", "arguments": { "local_id": "deadbeef" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.clone().oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("Registered local-only repo"), "{body:?}");
+
+        // A follow-up call against the id it just registered must resolve,
+        // exactly like the repo_url-based path already does above.
+        let mut req = mcp_request("tools/call", json!({ "name": "status", "arguments": { "path": "deadbeef" } }), 2);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no scans recorded yet"), "{body:?}");
+    }
+
+    /// Registering the same `local_id` twice must return the existing
+    /// connection, not create a duplicate row or error -- same idempotent
+    /// posture as the `repo_url` path's own duplicate test above.
+    #[tokio::test]
+    async fn mcp_register_repo_with_local_id_is_idempotent() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (_user, token) = signup(&accounts, "dev@example.com");
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), std::env::temp_dir(), None);
+
+        for _ in 0..2 {
+            let mut req = mcp_request("tools/call", json!({ "name": "register_repo", "arguments": { "local_id": "cafef00d" } }), 1);
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let resp = app.clone().oneshot(req).await.unwrap();
+            let _ = body_json(resp).await;
+        }
+        let mut req = mcp_request("tools/call", json!({ "name": "register_repo", "arguments": { "local_id": "cafef00d" } }), 1);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let resp = app.oneshot(req).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("already registered"), "{body:?}");
+    }
+
     /// Locks in the per-tenant access-mode resolution `mcp_http::resolve_access_mode`
     /// does: with no `AGENTOPS_ACCESS_MODE` env var set (this process's own
     /// default, always Advisor in tests) and no team setting configured

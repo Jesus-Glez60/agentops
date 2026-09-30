@@ -5,19 +5,29 @@ export interface NavItem {
   href: string;
   label: string;
   icon: LucideIcon;
+  // Sidebar section this item renders under (see NAV_GROUP_ORDER). Omitted
+  // for items that render in their own unlabeled trailing group (Settings).
+  group?: string;
 }
+
+// Rendering order for grouped sidebar sections -- NAV_ITEMS itself stays in
+// its original flat order (command palette / breadcrumb lookups don't care
+// about grouping, and a design-mock-order test pins that array), so the
+// sidebar clusters by this list instead of relying on NAV_ITEMS being
+// group-contiguous.
+export const NAV_GROUP_ORDER = ["Workspace", "Sources", "Knowledge"] as const;
 
 // Single source of truth for the sidebar, the command palette, and
 // breadcrumb label lookups -- one list, three consumers, so adding a page
 // never means updating three places by hand.
 export const NAV_ITEMS: NavItem[] = [
-  { href: "/", label: "Overview", icon: LayoutDashboard },
-  { href: "/search", label: "Search", icon: Search },
-  { href: "/graph", label: "Knowledge Graph", icon: Workflow },
-  { href: "/docs", label: "Documentation", icon: BookOpen },
-  { href: "/libraries", label: "Libraries", icon: Library },
-  { href: "/repositories", label: "Repositories", icon: GitBranch },
-  { href: "/gotchas", label: "Gotchas", icon: TriangleAlert },
+  { href: "/", label: "Overview", icon: LayoutDashboard, group: "Workspace" },
+  { href: "/search", label: "Search", icon: Search, group: "Workspace" },
+  { href: "/graph", label: "Knowledge Graph", icon: Workflow, group: "Workspace" },
+  { href: "/docs", label: "Documentation", icon: BookOpen, group: "Knowledge" },
+  { href: "/libraries", label: "Libraries", icon: Library, group: "Sources" },
+  { href: "/repositories", label: "Repositories", icon: GitBranch, group: "Sources" },
+  { href: "/gotchas", label: "Gotchas", icon: TriangleAlert, group: "Knowledge" },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 

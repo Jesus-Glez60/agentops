@@ -86,7 +86,7 @@ pub(crate) fn resolve_connection_path(state: &AppState, tenant: &str, connection
         .or_else(|| store.list_connections(tenant).ok()?.into_iter().find(|c| c.repo_url == connection_ref));
     let Some(connection) = connection else {
         return Err(format!(
-            "'{connection_ref}' is not a repo connection id or URL for your organization -- use one of the ids/URLs from GET /repos, or call register_repo with this repo's git remote URL to auto-register it as pending"
+            "'{connection_ref}' is not a repo connection id or URL for your organization -- use one of the ids/URLs from GET /repos, or call register_repo (with this repo's git remote URL, or with a local_id if it has no remote) to auto-register it as pending"
         ));
     };
     Ok(checkout_path(&state.repo_checkouts_dir, tenant, &connection.id))
@@ -104,9 +104,49 @@ pub(crate) fn resolve_connection_path(state: &AppState, tenant: &str, connection
 /// shared `normalize_repo_path` (so an SSH-config-alias remote matches an
 /// already-connected repo instead of creating a duplicate row for the same
 /// repo).
-pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: &str) -> String {
+///
+/// Exactly one of `repo_url`/`local_id` is expected to be `Some` (enforced
+/// by the MCP tool's caller in `mcp_http.rs`, not re-validated here since
+/// this fn already returns a plain user-facing string either way). The
+/// `local_id` path exists for a repo with no git remote at all -- there's
+/// nothing `normalize_repo_path` could ever accept for that case, and it
+/// never will have one, so it's registered under a synthetic
+/// `LOCAL_ONLY_URL_PREFIX`-prefixed `repo_url` instead of a real one. See
+/// `ConnectionMethod::Discovered`'s doc comment for how this differs from
+/// the "real remote, not yet human-connected" case.
+pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&str>, local_id: Option<&str>) -> String {
     let store = state.store.lock().unwrap();
     let connections = store.list_connections(tenant).unwrap_or_default();
+
+    if let Some(local_id) = local_id {
+        // Unlike `repo_url`, which always gets its derived id passed through
+        // `owner_repo.replace('/', "--")` below before it's ever used as a
+        // connection id, `local_id` comes from the caller with no such
+        // normalization -- and it ends up both as this connection's `id`
+        // (a path component in `checkout_path`) and embedded in its
+        // `repo_url`. Any MCP-reachable caller could otherwise pass path
+        // separators or control characters through unchecked, so this path
+        // needs its own equivalent guard rather than inheriting the other
+        // path's safety for free.
+        if local_id.is_empty() || local_id.len() > 128 || !local_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+            return "'local_id' must be 1-128 characters, using only letters, digits, '-' and '_'".to_string();
+        }
+        let synthetic_url = format!("{}{local_id}", agentops_repo_access::store::LOCAL_ONLY_URL_PREFIX);
+        if let Some(existing) = connections.iter().find(|c| c.repo_url == synthetic_url) {
+            return format!("local repo '{local_id}' is already registered (id: {}, status: {:?}).", existing.id, existing.status);
+        }
+        return match store.create_discovered_connection(tenant, local_id, &synthetic_url) {
+            Ok(created) => format!(
+                "Registered local-only repo (id: {}). It has no git remote, so it can never be cloned or indexed server-side -- scans and notes from this machine's own CLI will attach to this connection directly.",
+                created.id
+            ),
+            Err(e) => format!("failed to register local repo '{local_id}': {e}"),
+        };
+    }
+
+    let Some(repo_url) = repo_url else {
+        return "register_repo requires either 'repo_url' (this repo's git remote) or 'local_id' (a stable id you generate, for a repo with no remote)".to_string();
+    };
 
     if let Some(existing) = connections.iter().find(|c| c.repo_url == repo_url) {
         return format!("'{repo_url}' is already connected (id: {}, status: {:?}).", existing.id, existing.status);
@@ -118,7 +158,7 @@ pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: &str) -> S
     }
 
     let Some(owner_repo) = agentops_repo_access::normalize_repo_path(repo_url) else {
-        return format!("'{repo_url}' doesn't look like a git remote URL -- nothing to register");
+        return format!("'{repo_url}' doesn't look like a git remote URL -- if this repo has no remote at all, call register_repo again with 'local_id' instead of 'repo_url'");
     };
     // Same `owner--repo` id convention `github_app_routes`'s installation
     // connect flow uses for `full_name.replace('/', "--")` -- keeps ids

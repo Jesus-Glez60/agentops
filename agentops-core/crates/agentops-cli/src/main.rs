@@ -1185,6 +1185,55 @@ fn git_remote_url(path: &Path) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
+/// Registers a brand-new, remote-less repo as a local-only connection via
+/// the `register_repo` MCP tool's `local_id` argument (see its doc comment
+/// in `agentops-heavy-api::tenant_repo` for what this does server-side).
+/// Goes through `/mcp` (JSON-RPC `tools/call`), the same endpoint every
+/// other MCP client uses, rather than a bespoke REST endpoint -- `/mcp`
+/// already accepts a personal API key via `require_tenant_auth`, so this
+/// reuses that auth path instead of adding a new one just for the CLI.
+/// The generated id becomes the connection's id (see `register_repo`'s
+/// server-side handling of `local_id`), so the caller can use it directly
+/// as `resolve_connection_id`'s return value without a second round trip.
+fn register_local_repo(server_url: &str, api_key: &str) -> Result<String> {
+    let local_id = agentops_repo_access::store::new_local_repo_id();
+    let mut response = ureq::post(format!("{server_url}/mcp"))
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_json(serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "register_repo", "arguments": { "local_id": local_id } },
+        }))
+        .context("calling POST /mcp to register this local repo")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        anyhow::bail!("POST /mcp returned {status}: {body}");
+    }
+    let body: serde_json::Value = response.body_mut().read_json().context("parsing /mcp response")?;
+    if let Some(error) = body.get("error") {
+        anyhow::bail!("register_repo failed: {error}");
+    }
+    let message = body.pointer("/result/content/0/text").and_then(|v| v.as_str()).unwrap_or("(no message returned)");
+    // `isError` is currently always `false` for this tool server-side --
+    // register_repo reports failure only through the message text (e.g.
+    // "failed to register local repo '...': ..." on a store error), never
+    // via the JSON-RPC error path checked above -- so this is the only
+    // signal available that the id this fn is about to return, and the
+    // caller is about to persist to .context/agentops-remote.json, was
+    // never actually created. Checking `isError` too costs nothing if the
+    // server's behavior changes later to set it correctly.
+    if body.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false) || message.starts_with("failed to register") {
+        anyhow::bail!("register_repo failed: {message}");
+    }
+    println!("{message}");
+    Ok(local_id)
+}
+
 fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool) -> Result<String> {
     let mut response = ureq::get(format!("{server_url}/repos"))
         .header("Authorization", &format!("Bearer {api_key}"))
@@ -1203,12 +1252,16 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
     }
     let body: serde_json::Value = response.body_mut().read_json().context("parsing GET /repos response")?;
     let connections: Vec<RepoConnectionSummary> = body.get("connections").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    let git_remote = git_remote_url(path);
 
-    if connections.is_empty() {
+    // A remote-less checkout can always self-register as local-only (see
+    // the `git_remote.is_none()` branch below) even with zero existing
+    // connections -- only bail early here for the "has a remote, nothing
+    // to match against yet" case, where sending the caller to the web app
+    // is the only real recovery.
+    if connections.is_empty() && git_remote.is_some() {
         anyhow::bail!("no repos are connected to your organization yet — connect one from the web app first (Repositories -> Connect a repository), then run this again");
     }
-
-    let git_remote = git_remote_url(path);
 
     if let Some(remote) = &git_remote {
         if let Some(matched) = connections.iter().find(|c| &c.repo_url == remote) {
@@ -1228,21 +1281,26 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
         }
     }
 
+    // "No remote at all" and "remote present but unmatched" are different
+    // situations needing different advice and different recovery -- a repo
+    // with no remote is never going to auto-match no matter which directory
+    // you're in, but unlike an unmatched remote (which usually just means
+    // the wrong directory, or a repo nobody's registered from the web app
+    // yet) it's always safe to self-register: `register_repo`'s `local_id`
+    // path (see its doc comment) exists exactly for this case, so there's
+    // no need to send the caller to the web app or bail under --yes either.
+    if git_remote.is_none() {
+        if yes || dialoguer::Confirm::new().with_prompt("This checkout has no git remote — register it as a local-only repo for your account? (it won't be cloned or indexed server-side; your own CLI's scans/notes will still attach to it)").default(true).interact()? {
+            return register_local_repo(server_url, api_key);
+        }
+        anyhow::bail!("this checkout has no git remote and wasn't registered — run again to register it, or point at a different local path");
+    }
+
     if yes {
         anyhow::bail!("couldn't auto-match this checkout's git remote to a connected repo, and --yes was set — run again without --yes to pick one interactively");
     }
 
-    // "No remote at all" and "remote present but unmatched" are different
-    // situations needing different advice -- a repo with no remote is
-    // never going to auto-match no matter which directory you're in
-    // (that's the local-only case the web app's own /repositories/connect/local
-    // page gives the same advice for), while an unmatched remote often
-    // just means the command was run from the wrong directory, which the
-    // "check a different path" prompt below can actually fix.
-    match &git_remote {
-        None => println!("This checkout has no git remote at all. If it's meant to stay local-only, run `agentops install`/`agentops connect` (without --remote) instead — otherwise pick the right connected repo below, or point at a different local path."),
-        Some(remote) => println!("This checkout's git remote ({remote}) doesn't match any of your connected repos."),
-    }
+    println!("This checkout's git remote ({}) doesn't match any of your connected repos.", git_remote.as_deref().unwrap_or(""));
 
     if dialoguer::Confirm::new().with_prompt("Check a different local path instead?").default(false).interact()? {
         let path_str: String = dialoguer::Input::new().with_prompt("Path to check").interact_text()?;
@@ -1334,7 +1392,17 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
         }
     };
 
-    let connection_id = resolve_connection_id(path, server_url, &api_key, yes)?;
+    // Reuse a connection this exact repo was already registered under,
+    // rather than re-resolving (and, for the no-remote case, re-registering
+    // with a brand-new random local_id) on every re-run -- resolve_connection_id
+    // has no way to rediscover a prior local-only registration on its own
+    // (there's no git remote URL to match against GET /repos), so without
+    // this check a second `connect --remote` on the same local-only repo
+    // would silently create a duplicate connection server-side each time.
+    let connection_id = match read_remote_marker(path) {
+        Some(marker) if marker.server_url == server_url => marker.connection_id,
+        _ => resolve_connection_id(path, server_url, &api_key, yes)?,
+    };
 
     let agents_md_path = path.join("AGENTS.md");
     let agents_md_content = if agents_md_path.exists() {

@@ -15,15 +15,47 @@ use serde::{Deserialize, Serialize};
 pub enum ConnectionMethod {
     Ssh,
     GitHubApp,
-    /// An agent (via the `register_repo` MCP tool) found this repo's git
-    /// remote mentioned during a session, but no human has granted real
-    /// access yet -- no keypair, no App installation, nothing in
-    /// `public_key_openssh`/`encrypted_private_key_openssh`/
-    /// `installation_id`. Always created `Pending` (see
-    /// `create_discovered_connection`); a human finishes connecting it via
-    /// the same `/repositories/connect` wizard as any other repo, which
-    /// replaces this row's method entirely once real auth material exists.
+    /// Either of two cases, distinguished by `repo_url`'s prefix
+    /// (`is_local_only_url`):
+    /// - An agent (via the `register_repo` MCP tool) found this repo's git
+    ///   remote mentioned during a session, but no human has granted real
+    ///   access yet -- no keypair, no App installation, nothing in
+    ///   `public_key_openssh`/`encrypted_private_key_openssh`/
+    ///   `installation_id`. A human finishes connecting it via the same
+    ///   `/repositories/connect` wizard as any other repo, which replaces
+    ///   this row's method entirely once real auth material exists.
+    /// - A repo with no git remote at all, registered via `register_repo`'s
+    ///   `local_id` path with a synthetic `LOCAL_ONLY_URL_PREFIX`-prefixed
+    ///   `repo_url`. This is a *permanent* state, not "pending" -- there is
+    ///   no remote to eventually connect via SSH/GitHub App, ever. Notes and
+    ///   scans for it come entirely from the registering machine's own CLI
+    ///   (`scan_repo`/`add_note` against this connection's id), never a
+    ///   server-side clone.
+    /// Always created `Pending` (see `create_discovered_connection`).
     Discovered,
+}
+
+/// Prefix used for the synthetic `repo_url` of a `Discovered` connection
+/// registered for a repo with no git remote at all (see `register_repo`'s
+/// `local_id` path in `agentops-heavy-api`). Never a real clonable URL --
+/// callers that need to clone/index a connection must check for this
+/// prefix first and treat it as permanently local-only, not "pending, needs
+/// a human to finish connecting" like every other `Discovered` row.
+pub const LOCAL_ONLY_URL_PREFIX: &str = "local:";
+
+pub fn is_local_only_url(repo_url: &str) -> bool {
+    repo_url.starts_with(LOCAL_ONLY_URL_PREFIX)
+}
+
+/// A stable id for a repo with no git remote, generated client-side (by
+/// `agentops-cli`) and passed as `register_repo`'s `local_id` argument --
+/// same random-hex-string shape `agentops-heavy-api::indexing`'s
+/// `new_random_job_id` already uses, exposed here so the CLI doesn't need
+/// its own copy of the same four lines.
+pub fn new_local_repo_id() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).expect("system randomness must be available");
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl ConnectionMethod {
@@ -445,6 +477,21 @@ mod tests {
 
         let fetched = store.get_connection("acme", "repo-1").unwrap().unwrap();
         assert_eq!(fetched.repo_url, "git@github.com:acme/widgets.git");
+    }
+
+    #[test]
+    fn is_local_only_url_distinguishes_the_synthetic_prefix_from_a_real_remote() {
+        assert!(is_local_only_url("local:deadbeef"));
+        assert!(!is_local_only_url("git@github.com:acme/widgets.git"));
+        assert!(!is_local_only_url("https://github.com/acme/widgets.git"));
+    }
+
+    #[test]
+    fn new_local_repo_id_is_non_empty_and_differs_across_calls() {
+        let a = new_local_repo_id();
+        let b = new_local_repo_id();
+        assert!(!a.is_empty());
+        assert_ne!(a, b);
     }
 
     #[test]

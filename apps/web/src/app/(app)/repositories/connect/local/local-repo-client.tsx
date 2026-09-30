@@ -7,8 +7,13 @@
 // connection flow:
 //
 //   1. No remote (or the picker isn't usable here at all) -- this repo can
-//      never be server-indexed or team-shared; show the plain local
-//      `agentops install` command.
+//      never be *cloned or indexed* server-side (nothing to clone), but it
+//      can still be registered as a local-only connection so your own
+//      machine's scans/notes reach the server and your coding tools can
+//      use it through a hosted deployment -- `agentops connect --remote`
+//      now handles this itself (see `register_repo`'s `local_id` path),
+//      same command as case 2 below. Plain `agentops install` remains the
+//      right call for a purely offline/solo setup with no server at all.
 //   2. Remote found, already connected -- show the `agentops connect
 //      --remote` device-login command, same one `ConnectToolSection`
 //      shows (no API key: an earlier device-authorization refactor moved
@@ -162,11 +167,17 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
         <div className="mt-6 rounded-md border border-border-strong bg-panel px-4 py-3.5">
           <p className="mb-3 text-section text-ink-300">
             {outcome?.kind === "no-remote" ? "That folder has no git remote — " : ""}
-            This repo can&apos;t be indexed by the server or shared with your team (there&apos;s no remote for it to reach). Run this on that machine instead:
+            it can never be cloned or indexed on the server (there&apos;s nothing for it to clone). You&apos;ve still got two options, both run on that machine:
           </p>
-          <div className="flex items-center gap-2">
+          <p className="mb-1.5 text-mono-code text-ink-500">Offline / solo only — scans and notes stay on this machine, nothing reaches a server:</p>
+          <div className="mb-3 flex items-center gap-2">
             <code className="flex-1 truncate rounded-md border border-border-strong bg-canvas px-3 py-2 text-mono-code text-ink-200">{INSTALL_COMMAND}</code>
             <CopyButton value={INSTALL_COMMAND} />
+          </div>
+          <p className="mb-1.5 text-mono-code text-ink-500">Register it with your account instead — your coding tools can use it through this server, even though it&apos;s never pushed anywhere:</p>
+          <div className="flex items-center gap-2">
+            <code className="flex-1 truncate rounded-md border border-border-strong bg-canvas px-3 py-2 text-mono-code text-ink-200">{`npx agentops-cli connect --remote ${apiUrl}`}</code>
+            <CopyButton value={`npx agentops-cli connect --remote ${apiUrl}`} />
           </div>
         </div>
       )}

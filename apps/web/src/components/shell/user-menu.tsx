@@ -2,12 +2,15 @@
 
 import { useState } from "react";
 import { useRouter } from "next/navigation";
-import { ChevronsUpDown, LogOut, Plug, UserRound, Users } from "lucide-react";
+import { LogOut, Plug, UserRound, Users } from "lucide-react";
 import { logout } from "@/lib/auth/client";
 import type { SessionUser } from "@/lib/auth/types";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 
+// Org switching lives in the sidebar's ScopeSwitcher now (see redesign plan
+// Phase 2) -- kept out of here so there's exactly one place to switch orgs,
+// not two competing controls.
 export function UserMenu({ user }: { user: SessionUser }) {
   const router = useRouter();
   const [loggingOut, setLoggingOut] = useState(false);
@@ -36,7 +39,6 @@ export function UserMenu({ user }: { user: SessionUser }) {
             </p>
             <p className="truncate text-mono-path text-ink-500">{user.email}</p>
           </div>
-          <ChevronsUpDown className="size-4 shrink-0 text-ink-500" />
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" side="top" className="w-56">

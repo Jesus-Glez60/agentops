@@ -59,8 +59,14 @@ use crate::{docbrain_db_path_for_org, AppState};
 fn register_repo_tool_definition() -> agentops_mcp::ToolDefinition {
     agentops_mcp::ToolDefinition {
         name: "register_repo",
-        description: "Registers this repo's git remote URL as a pending connection for your organization, if it isn't connected yet. Use this when another tool call reports a repo/path isn't a recognized connection. Returns the existing connection if one already matches. A registered repo still needs a human to finish connecting it (SSH deploy key or GitHub App) from Repositories -> Connect a repository before it can be scanned/indexed.",
-        input_schema: json!({ "type": "object", "properties": { "repo_url": { "type": "string" } }, "required": ["repo_url"] }),
+        description: "Registers this repo as a connection for your organization, if it isn't connected yet. Use this when another tool call reports a repo/path isn't a recognized connection. Returns the existing connection if one already matches. Pass 'repo_url' (this repo's git remote) for a normal repo -- it still needs a human to finish connecting it (SSH deploy key or GitHub App) from Repositories -> Connect a repository before it can be scanned/indexed server-side. If this repo has no git remote at all (never pushed anywhere), pass 'local_id' instead -- a short stable identifier you generate and reuse for this repo (e.g. a UUID) -- which registers it as permanently local-only: notes and scans from this machine's own CLI attach to it directly, with no server-side clone ever expected.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "repo_url": { "type": "string", "description": "This repo's git remote URL. Omit if using local_id instead." },
+                "local_id": { "type": "string", "description": "A stable identifier you generate for a repo with no git remote. Omit if using repo_url instead." },
+            },
+        }),
         annotations: agentops_mcp::ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: false },
     }
 }
@@ -174,10 +180,12 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     let mut arguments = params.get("arguments").cloned().unwrap_or(empty);
 
     if name == "register_repo" {
-        let Some(repo_url) = arguments.get("repo_url").and_then(|v| v.as_str()) else {
-            return err(id, INVALID_PARAMS, "missing 'repo_url' in register_repo arguments");
-        };
-        let message = register_repo(state, &caller.tenant, repo_url);
+        let repo_url = arguments.get("repo_url").and_then(|v| v.as_str());
+        let local_id = arguments.get("local_id").and_then(|v| v.as_str());
+        if repo_url.is_none() && local_id.is_none() {
+            return err(id, INVALID_PARAMS, "register_repo requires either 'repo_url' or 'local_id' in its arguments");
+        }
+        let message = register_repo(state, &caller.tenant, repo_url, local_id);
         return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": false }));
     }
 

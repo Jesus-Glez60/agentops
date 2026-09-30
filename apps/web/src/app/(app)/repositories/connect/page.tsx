@@ -5,8 +5,8 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
 import { toast } from "sonner";
-import { ArrowLeft, Cloud, FolderSearch, GitBranch, Key, ShieldCheck } from "lucide-react";
-import { getGithubAppInstallUrl, getGithubAppInstallations, GITHUB_APP_INSTALLATIONS_SWR_KEY } from "@/lib/api/repos-api";
+import { ArrowLeft, Cloud, FolderSearch, GitBranch, Key, Plus, ShieldCheck } from "lucide-react";
+import { getGithubAppInstallUrl, getGithubAppInstallations, GITHUB_APP_INSTALLATIONS_SWR_KEY, type GithubAppInstallation } from "@/lib/api/repos-api";
 import { StepIndicator } from "@/components/repositories/connect-wizard/step-indicator";
 import { InstallationRepoPicker } from "@/components/repositories/installation-repo-picker";
 import { Button } from "@/components/ui/button";
@@ -62,13 +62,37 @@ function ChooseConnectionMethodPageInner() {
   }
 
   if (installations.length > 0) {
-    return <AlreadyConnectedView installationId={installations[0].id} accountLogin={installations[0].account_login} manageUrl={installations[0].manage_url} />;
+    return <AlreadyConnectedView installations={installations} />;
   }
 
   return <ChooseMethodView />;
 }
 
-function AlreadyConnectedView({ installationId, accountLogin, manageUrl }: { installationId: string; accountLogin: string; manageUrl: string }) {
+/** Handles a freelancer/contractor with more than one GitHub account (e.g.
+ * their own personal account plus a client's org) connected to the same
+ * AgentOps tenant -- `installations` can hold any number of rows (backend
+ * has supported this from the start via `github_app_installations`'
+ * `(tenant, id)` primary key; this view previously only ever read
+ * `installations[0]`, silently hiding every account past the first). */
+function AlreadyConnectedView({ installations }: { installations: GithubAppInstallation[] }) {
+  const [selectedId, setSelectedId] = useState(installations[0].id);
+  const [addingAccount, setAddingAccount] = useState(false);
+  // The list can grow (a new install redirects back here) without this
+  // component remounting -- fall back to the first row if the previously
+  // selected installation ever disappears (e.g. revoked on GitHub).
+  const selected = installations.find((i) => i.id === selectedId) ?? installations[0];
+
+  async function handleAddAccount() {
+    setAddingAccount(true);
+    try {
+      const { install_url } = await getGithubAppInstallUrl();
+      window.location.href = install_url;
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't start the GitHub install flow. Please try again.");
+      setAddingAccount(false);
+    }
+  }
+
   return (
     <div className="mx-auto w-full max-w-[680px] px-6 py-12">
       <Link href="/repositories" className="mb-6 inline-flex items-center gap-1.5 text-section text-ink-400 hover:text-ink-100">
@@ -77,16 +101,38 @@ function AlreadyConnectedView({ installationId, accountLogin, manageUrl }: { ins
       </Link>
 
       <h1 className="text-page-title font-semibold text-ink-100">Add a repository</h1>
-      <p className="mt-1.5 text-section text-ink-400">
-        Connected via GitHub App as <span className="text-ink-200">{accountLogin}</span>. Select a repository below, or{" "}
-        <a href={manageUrl} target="_blank" rel="noreferrer" className="text-primary underline">
-          authorize more on GitHub
+      <p className="mt-1.5 text-section text-ink-400">Pick which connected GitHub account to browse, or connect another one.</p>
+
+      <div className="mt-5 flex flex-wrap items-center gap-2">
+        {installations.map((installation) => (
+          <button
+            key={installation.id}
+            type="button"
+            onClick={() => setSelectedId(installation.id)}
+            className={cn(
+              "rounded-md border px-3 py-1.5 text-section transition-colors",
+              installation.id === selected.id ? "border-primary bg-primary/5 text-ink-100" : "border-border-strong text-ink-400 hover:border-ink-500",
+            )}
+          >
+            {installation.account_login}
+          </button>
+        ))}
+        <Button variant="outline" size="sm" onClick={handleAddAccount} disabled={addingAccount}>
+          <Plus className="size-3.5" />
+          {addingAccount ? "Redirecting…" : "Add another GitHub account"}
+        </Button>
+      </div>
+
+      <p className="mt-3 text-section text-ink-400">
+        Connected via GitHub App as <span className="text-ink-200">{selected.account_login}</span>.{" "}
+        <a href={selected.manage_url} target="_blank" rel="noreferrer" className="text-primary underline">
+          Authorize more repos on GitHub
         </a>
         .
       </p>
 
       <div className="mt-6">
-        <InstallationRepoPicker installationId={installationId} />
+        <InstallationRepoPicker installationId={selected.id} />
       </div>
 
       <div className="mt-8 border-t border-border-strong pt-6">

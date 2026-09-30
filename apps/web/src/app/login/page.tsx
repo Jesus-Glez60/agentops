@@ -2,6 +2,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { LoginForm } from "@/components/auth/login-form";
 import { SignupForm } from "@/components/auth/signup-form";
+import { LogoMark } from "@/components/shared/logo-mark";
 import { heavyApiFetch } from "@/lib/server/heavy-api";
 
 // Next.js 16 Server Component searchParams is Promise-wrapped -- must
@@ -55,7 +56,10 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
     <main className="flex min-h-screen items-center justify-center bg-canvas p-4">
       <Card className="w-full max-w-sm">
         <CardHeader>
-          <CardTitle className="text-page-title">AgentOps</CardTitle>
+          <CardTitle className="flex items-center gap-2 text-page-title">
+            <LogoMark className="size-5 shrink-0" />
+            AgentOps
+          </CardTitle>
           <CardDescription>{!has_accounts ? "Set up your AgentOps instance." : "Sign in to your account, or create a new one."}</CardDescription>
         </CardHeader>
         <CardContent>

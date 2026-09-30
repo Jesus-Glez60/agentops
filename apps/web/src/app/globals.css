@@ -17,22 +17,31 @@
  * block below is what actually renders — the same values are also set
  * here in `:root` so there's no flash of shadcn's default light theme
  * before the class is evaluated.
+ *
+ * Palette is Catppuccin Mocha, pulled from the "Site v3" Claude Design
+ * prototype (see redesign plan) -- superseding the earlier GitHub-slate
+ * scheme below these values used to hold.
  */
 :root {
-  --canvas: #0f1117;
-  --panel: #161b22;
-  --raised: #1c2128;
-  --border-default: #21262d;
-  --border-strong: #30363d;
-  --ink-100: #f8f9fc;
-  --ink-300: #a0aec0;
-  --ink-500: #6e7681;
-  --slate-blue: #6e7fa8;
-  --blue-500: #3b82f6;
-  --amber-500: #f59e0b;
-  --teal-400: #2dd4bf;
-  --green-400: #4ade80;
-  --red-400: #f87171;
+  --canvas: #11111b;
+  --panel: #181825;
+  --raised: #1e1e2e;
+  --border-default: #313244;
+  --border-strong: #45475a;
+  --ink-100: #cdd6f4;
+  --ink-300: #a6adc8;
+  --ink-500: #7f849c;
+  --slate-blue: #b4befe;
+  --blue-500: #89b4fa;
+  --amber-500: #fab387;
+  --teal-400: #94e2d5;
+  --green-400: #a6e3a1;
+  --red-400: #f38ba8;
+  --mauve: #cba6f7;
+  --pink: #f5c2e7;
+  --peach: #fab387;
+  --yellow: #f9e2af;
+  --lavender: #b4befe;
 
   /* shadcn semantic contract — every generated component reads these */
   --background: var(--canvas);
@@ -41,8 +50,10 @@
   --card-foreground: var(--ink-100);
   --popover: var(--raised);
   --popover-foreground: var(--ink-100);
-  --primary: var(--blue-500);
-  --primary-foreground: var(--ink-100);
+  /* Prototype's primary CTA color is mauve, not blue -- every "+ Connect
+     repository"-style primary button uses it with a matching glow shadow. */
+  --primary: var(--mauve);
+  --primary-foreground: var(--canvas);
   --secondary: var(--raised);
   --secondary-foreground: var(--ink-100);
   --muted: var(--panel);
@@ -53,41 +64,42 @@
   --destructive-foreground: var(--ink-100);
   --border: var(--border-default);
   --input: var(--border-default);
-  --ring: var(--blue-500);
+  --ring: var(--mauve);
 
   /* shadcn sidebar-component tokens — mapped for when the AppShell sidebar
      is built with shadcn's own `sidebar` component rather than hand-rolled */
   --sidebar: var(--panel);
   --sidebar-foreground: var(--ink-100);
-  --sidebar-primary: var(--blue-500);
-  --sidebar-primary-foreground: var(--ink-100);
+  --sidebar-primary: var(--mauve);
+  --sidebar-primary-foreground: var(--canvas);
   --sidebar-accent: var(--raised);
   --sidebar-accent-foreground: var(--ink-100);
   --sidebar-border: var(--border-default);
-  --sidebar-ring: var(--blue-500);
+  --sidebar-ring: var(--mauve);
 
   /* domain tokens — outside shadcn's contract, specific to this product */
-  --node-symbol: var(--slate-blue);
-  --node-file: var(--ink-500);
-  --node-gotcha: var(--amber-500);
+  --node-symbol: var(--lavender);
+  --node-file: #9399b2;
+  --node-gotcha: var(--peach);
   --node-decision: var(--teal-400);
   --node-note: var(--blue-500);
   /* Graph hotspot overlay -- orthogonal to node kind (any kind can be
      flagged), so this is its own token rather than reusing --node-gotcha's
      amber for an unrelated meaning. */
-  --node-hotspot: var(--amber-500);
+  --node-hotspot: var(--peach);
 
   --health-healthy: var(--green-400);
   --health-scanning: var(--blue-500);
-  --health-warning: var(--amber-500);
-  --health-stale: var(--amber-500);
+  --health-warning: var(--yellow);
+  --health-stale: var(--peach);
   --health-failed: var(--red-400);
+  --health-local: var(--teal-400);
 
   --relevance-strong: var(--green-400);
   --relevance-related: var(--blue-500);
   --relevance-supporting: var(--ink-500);
 
-  --curation-needs-curation: var(--amber-500);
+  --curation-needs-curation: var(--peach);
   --curation-kept: var(--green-400);
   --curation-reduced: var(--ink-500);
   --curation-pinned: var(--blue-500);
@@ -103,8 +115,8 @@
   --card-foreground: var(--ink-100);
   --popover: var(--raised);
   --popover-foreground: var(--ink-100);
-  --primary: var(--blue-500);
-  --primary-foreground: var(--ink-100);
+  --primary: var(--mauve);
+  --primary-foreground: var(--canvas);
   --secondary: var(--raised);
   --secondary-foreground: var(--ink-100);
   --muted: var(--panel);
@@ -115,15 +127,15 @@
   --destructive-foreground: var(--ink-100);
   --border: var(--border-default);
   --input: var(--border-default);
-  --ring: var(--blue-500);
+  --ring: var(--mauve);
   --sidebar: var(--panel);
   --sidebar-foreground: var(--ink-100);
-  --sidebar-primary: var(--blue-500);
-  --sidebar-primary-foreground: var(--ink-100);
+  --sidebar-primary: var(--mauve);
+  --sidebar-primary-foreground: var(--canvas);
   --sidebar-accent: var(--raised);
   --sidebar-accent-foreground: var(--ink-100);
   --sidebar-border: var(--border-default);
-  --sidebar-ring: var(--blue-500);
+  --sidebar-ring: var(--mauve);
 }
 
 @theme inline {
@@ -135,6 +147,11 @@
   --color-ink-300: var(--ink-300);
   --color-ink-500: var(--ink-500);
   --color-slate-blue: var(--slate-blue);
+  --color-mauve: var(--mauve);
+  --color-pink: var(--pink);
+  --color-peach: var(--peach);
+  --color-yellow: var(--yellow);
+  --color-lavender: var(--lavender);
 
   --color-node-symbol: var(--node-symbol);
   --color-node-file: var(--node-file);
@@ -148,6 +165,7 @@
   --color-health-warning: var(--health-warning);
   --color-health-stale: var(--health-stale);
   --color-health-failed: var(--health-failed);
+  --color-health-local: var(--health-local);
 
   --color-relevance-strong: var(--relevance-strong);
   --color-relevance-related: var(--relevance-related);
@@ -188,7 +206,7 @@
   --color-sidebar-ring: var(--sidebar-ring);
 
   --font-sans: var(--font-body-sans);
-  --font-mono: var(--font-body-sans);
+  --font-mono: var(--font-body-mono);
   --font-heading: var(--font-body-sans);
 
   /* type scale — 20/16/13/13/11/12/10 per the mockup's design-system screen */

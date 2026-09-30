@@ -121,9 +121,7 @@ pub(crate) fn checkout_path(repo_checkouts_dir: &std::path::Path, tenant: &str, 
 /// `new_random_tenant_id`, a small deliberate duplication of the pattern
 /// rather than a shared dependency for one more call site.
 fn new_random_job_id() -> String {
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).expect("system randomness must be available");
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    agentops_repo_access::store::new_local_repo_id()
 }
 
 /// Creates the job row (+ all 9 stage rows) and spawns the orchestration
@@ -256,7 +254,12 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
             }
         }
         agentops_repo_access::store::ConnectionMethod::Discovered => {
-            fail_and_return!(STAGE_ORDER[1], "this repo was auto-discovered but not yet connected — finish connecting it from Repositories before it can be indexed".to_string());
+            let message = if agentops_repo_access::store::is_local_only_url(&connection.repo_url) {
+                "this repo has no git remote — it can never be cloned or indexed server-side; scans and notes come from the registering machine's own CLI instead".to_string()
+            } else {
+                "this repo was auto-discovered but not yet connected — finish connecting it from Repositories before it can be indexed".to_string()
+            };
+            fail_and_return!(STAGE_ORDER[1], message);
         }
     }
     log!("clone complete");
@@ -659,7 +662,12 @@ pub async fn list_branches(State(state): State<AppState>, user: Option<axum::Ext
             agentops_github_app::list_repo_branches(&token, owner_repo)
         }
         agentops_repo_access::store::ConnectionMethod::Discovered => {
-            return (StatusCode::CONFLICT, Json(json!({ "error": "this repo was auto-discovered but not yet connected — finish connecting it from Repositories first" })));
+            let error = if agentops_repo_access::store::is_local_only_url(&connection.repo_url) {
+                "this repo has no git remote — it has no branches to list server-side"
+            } else {
+                "this repo was auto-discovered but not yet connected — finish connecting it from Repositories first"
+            };
+            return (StatusCode::CONFLICT, Json(json!({ "error": error })));
         }
     };
 

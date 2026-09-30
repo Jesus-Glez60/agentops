@@ -48,7 +48,11 @@ export function GraphNode({ data }: NodeProps<GraphFlowNode>) {
             "flex items-center justify-center rounded-full border-2 bg-panel transition-transform",
             size,
             KIND_TAG_CLASSNAME[data.kind],
-            data.isSeed && "shadow-[0_0_0_4px_rgba(59,130,246,0.25)]",
+            // Literal RGB triple, not a CSS var -- Tailwind's arbitrary
+            // rgba() syntax can't interpolate a hex-valued custom property.
+            // Kept in sync with --lavender (#b4befe) by hand; see redesign
+            // plan's Phase 1 for why this one token stays a hardcoded exception.
+            data.isSeed && "shadow-[0_0_0_4px_rgba(180,190,254,0.25)]",
             // A hotspot ring layers on top of (never replaces) the
             // kind-based border color above -- a hotspot is orthogonal to
             // node kind, so this is an overlay, not a recoloring.

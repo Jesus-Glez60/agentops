@@ -15,6 +15,9 @@ hmac.workspace = true
 sha2.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
+# For `new_local_repo_id` -- same source `agentops-heavy-api::indexing`'s
+# `new_random_job_id` already uses, not a new choice for this workspace.
+getrandom.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

@@ -407,6 +407,21 @@ impl TeamStore {
         rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     }
 
+    /// Every tenant `user_id` belongs to, across the whole instance --
+    /// unlike `list_members` (one tenant, every member), this is one
+    /// member, every tenant. Backs the self-service org switcher
+    /// (`GET /me/memberships` in `agentops-heavy-api`): a freelancer/
+    /// contractor with more than one org (their own personal tenant plus
+    /// any client orgs they've accepted an invite into) needs to see and
+    /// pick among all of them, not just whichever one `users.tenant`
+    /// currently happens to point at. `idx_memberships_user` (this crate's
+    /// schema) makes this an indexed lookup, not a table scan.
+    pub fn memberships_for_user(&self, user_id: i64) -> Result<Vec<Membership>> {
+        let mut stmt = self.conn.prepare("SELECT user_id, tenant, role, status, joined_at FROM memberships WHERE user_id = ?1 ORDER BY joined_at ASC")?;
+        let rows = stmt.query_map([user_id], |r| Ok(Membership { user_id: r.get(0)?, tenant: r.get(1)?, role: r.get(2)?, status: r.get(3)?, joined_at: r.get(4)? }))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
+
     pub fn get_membership(&self, tenant: &str, user_id: i64) -> Result<Option<Membership>> {
         self.conn
             .query_row("SELECT user_id, tenant, role, status, joined_at FROM memberships WHERE tenant = ?1 AND user_id = ?2", rusqlite::params![tenant, user_id], |r| {
@@ -764,6 +779,22 @@ mod tests {
 
         assert_eq!(store.list_members("tenant-a").unwrap().len(), 1);
         assert_eq!(store.list_members("tenant-b").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn memberships_for_user_lists_every_tenant_that_user_belongs_to() {
+        let store = TeamStore::open_in_memory().unwrap();
+        store.add_member("personal-tenant", 1, "admin").unwrap();
+        store.add_member("client-tenant", 1, "member").unwrap();
+        store.add_member("client-tenant", 2, "admin").unwrap();
+
+        let memberships = store.memberships_for_user(1).unwrap();
+        assert_eq!(memberships.len(), 2);
+        assert!(memberships.iter().any(|m| m.tenant == "personal-tenant" && m.role == "admin"));
+        assert!(memberships.iter().any(|m| m.tenant == "client-tenant" && m.role == "member"));
+
+        assert_eq!(store.memberships_for_user(2).unwrap().len(), 1);
+        assert_eq!(store.memberships_for_user(999).unwrap().len(), 0);
     }
 
     #[test]

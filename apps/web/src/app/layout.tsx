@@ -1,13 +1,18 @@
 import type { Metadata } from "next";
-import { JetBrains_Mono } from "next/font/google";
+import { JetBrains_Mono, Schibsted_Grotesk } from "next/font/google";
 import "./globals.css";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { Toaster } from "@/components/ui/sonner";
 
-// JetBrains Mono for both body copy and code -- one deliberate typeface
-// choice for the whole app instead of a sans/mono split. Both --font-sans
-// and --font-mono (globals.css) point at this single variable.
+// Schibsted Grotesk for headings/prose, JetBrains Mono for code/labels --
+// the Site v3 two-font system (see redesign plan). --font-sans/--font-heading
+// (globals.css) point at the Grotesk variable; --font-mono points at this one.
 const jetbrainsMono = JetBrains_Mono({
+  variable: "--font-body-mono",
+  subsets: ["latin"],
+});
+
+const schibstedGrotesk = Schibsted_Grotesk({
   variable: "--font-body-sans",
   subsets: ["latin"],
 });
@@ -25,7 +30,7 @@ export default function RootLayout({
   return (
     <html
       lang="en"
-      className={`dark ${jetbrainsMono.variable} h-full antialiased`}
+      className={`dark ${jetbrainsMono.variable} ${schibstedGrotesk.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col">
         <TooltipProvider>{children}</TooltipProvider>

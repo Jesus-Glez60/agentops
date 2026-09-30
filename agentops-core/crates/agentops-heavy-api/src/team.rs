@@ -57,6 +57,8 @@ pub fn build_team_router(accounts: AccountStore, teams: TeamStore, repos: Connec
         .route("/team/mcp-access-mode", get(get_mcp_access_mode).put(set_mcp_access_mode))
         .route("/team/audit-log", get(get_audit_log))
         .route("/invites/accept", post(accept_invite))
+        .route("/me/memberships", get(list_my_memberships))
+        .route("/me/switch-tenant", post(switch_my_tenant))
         .layer(middleware::from_fn_with_state(state.clone(), require_session))
         // Public: no session required to preview an invite link (the
         // token itself is the secret) -- added after `.layer()` so it's
@@ -786,6 +788,86 @@ async fn accept_invite(State(state): State<TeamState>, headers: axum::http::Head
     let _ = teams.record_audit_event(&tenant, Some(user.id), "member_joined", Some(&user.email), client_ip(&headers).as_deref(), &metadata);
 
     (StatusCode::OK, Json(json!({ "tenant": tenant, "role": role })))
+}
+
+#[derive(Serialize)]
+struct MembershipView {
+    tenant: String,
+    /// Best-effort display name -- `organization_name` returns `""` for a
+    /// tenant nobody's ever named (e.g. a freelancer's own default personal
+    /// tenant), same fallback `get_team` already uses.
+    name: String,
+    role: String,
+    status: String,
+    joined_at: String,
+    is_current: bool,
+}
+
+/// Self-service "which orgs am I in" -- every `memberships` row for the
+/// caller, across every tenant, not just the one `users.tenant` currently
+/// points at. Backs the org switcher: a freelancer/contractor with a
+/// personal tenant plus one or more client orgs needs to see all of them to
+/// switch between, not just whichever one is currently active.
+///
+/// Calls `ensure_membership` for the caller's *current* tenant first (the
+/// same lazy-backfill every other membership-gated route in this file
+/// already calls) -- without it, a user who signed up but has never
+/// touched `/team/*` would have zero membership rows at all yet, and this
+/// would incorrectly report them as belonging to no org, including their
+/// own current one.
+async fn list_my_memberships(State(state): State<TeamState>, axum::Extension(user): axum::Extension<User>) -> (StatusCode, Json<serde_json::Value>) {
+    let teams = state.teams.lock().unwrap();
+    if let Err(e) = teams.ensure_membership(&user.tenant, user.id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    let memberships = match teams.memberships_for_user(user.id) {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    let views: Vec<MembershipView> = memberships
+        .into_iter()
+        .map(|m| {
+            let name = teams.organization_name(&m.tenant).unwrap_or_default().unwrap_or_default();
+            MembershipView { is_current: m.tenant == user.tenant, tenant: m.tenant, name, role: m.role, status: m.status, joined_at: m.joined_at }
+        })
+        .collect();
+    (StatusCode::OK, Json(json!({ "memberships": views })))
+}
+
+#[derive(Deserialize)]
+struct SwitchTenantRequest {
+    tenant: String,
+}
+
+/// Self-service equivalent of what `accept_invite`/org-deletion already do
+/// internally via `AccountStore::switch_tenant` -- guarded so a caller can
+/// only switch into a tenant they're actually an active member of, never an
+/// arbitrary string. No new session token is issued: sessions carry no
+/// tenant claim of their own (`verify_session` re-reads `users.tenant`
+/// fresh on every request), so the same bearer token the caller already
+/// has keeps working and simply resolves to the new tenant from the next
+/// request onward. Returns the caller's fresh tenant/role/name in the
+/// response body (rather than a bare 204) so the frontend can update its
+/// own state in place without a full page reload.
+async fn switch_my_tenant(State(state): State<TeamState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<SwitchTenantRequest>) -> (StatusCode, Json<serde_json::Value>) {
+    let teams = state.teams.lock().unwrap();
+    if let Err(e) = teams.ensure_membership(&user.tenant, user.id) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    let membership = match teams.get_membership(&req.tenant, user.id) {
+        Ok(m) => m,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    };
+    let Some(membership) = membership.filter(|m| m.status == "active") else {
+        return (StatusCode::FORBIDDEN, Json(json!({ "error": "you aren't an active member of that organization" })));
+    };
+
+    let accounts = state.accounts.lock().unwrap();
+    if let Err(e) = accounts.switch_tenant(user.id, &req.tenant) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+    }
+    let name = teams.organization_name(&req.tenant).unwrap_or_default().unwrap_or_default();
+    (StatusCode::OK, Json(json!({ "tenant": req.tenant, "role": membership.role, "name": name })))
 }
 
 #[derive(Serialize)]
@@ -1531,6 +1613,142 @@ mod tests {
         let members = body_json(members).await;
         let invitee_row = members.as_array().unwrap().iter().find(|m| m["email"] == "invitee@example.com").unwrap();
         assert_eq!(invitee_row["role"], "member");
+    }
+
+    /// Load-bearing for the whole "switch back and forth" org-switcher UX:
+    /// accepting a second org's invite must not delete or orphan the user's
+    /// membership row in their *original* tenant -- `memberships` is a
+    /// separate table from `users.tenant` (see `agentops-teams`'s own module
+    /// doc comment), so this was expected to already work, but nothing
+    /// exercised it before this test.
+    #[tokio::test]
+    async fn accepting_a_second_orgs_invite_leaves_the_original_tenants_membership_intact() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (admin, admin_token) = signup_user(&accounts, "admin@example.com");
+        let (invitee, invitee_token) = signup_user(&accounts, "invitee@example.com");
+        let original_tenant = invitee.tenant.clone();
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        // Touch /team/members first so the invitee's own original tenant
+        // gets its lazy-backfilled membership row -- same precondition
+        // `ensure_membership`'s other regression test already establishes.
+        let _ = app
+            .clone()
+            .oneshot(HttpRequest::get("/team/members").header("authorization", format!("Bearer {invitee_token}")).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let create = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/team/invites")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"email":"invitee@example.com","role":"member"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let token = body_json(create).await["token"].as_str().unwrap().to_string();
+
+        let accept = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/invites/accept")
+                    .header("authorization", format!("Bearer {invitee_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"token":"{token}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(accept.status(), StatusCode::OK);
+
+        // Still a valid session (the bearer token itself never changes) --
+        // now list this user's own memberships across every tenant.
+        let memberships = app.oneshot(HttpRequest::get("/me/memberships").header("authorization", format!("Bearer {invitee_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(memberships.status(), StatusCode::OK);
+        let memberships = body_json(memberships).await;
+        let rows = memberships["memberships"].as_array().unwrap();
+        assert!(rows.iter().any(|m| m["tenant"] == original_tenant), "original tenant's membership row must survive: {rows:?}");
+        assert!(rows.iter().any(|m| m["tenant"] == admin.tenant), "newly joined tenant must be present too: {rows:?}");
+        // Exactly one of them is flagged current, and it's the tenant the
+        // invite accept just switched into, not the original one.
+        let current: Vec<_> = rows.iter().filter(|m| m["is_current"] == true).collect();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0]["tenant"], admin.tenant);
+    }
+
+    #[tokio::test]
+    async fn switch_tenant_lets_a_member_move_their_active_session_between_their_own_orgs() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup_user(&accounts, "freelancer@example.com");
+        let personal_tenant = user.tenant.clone();
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&personal_tenant, user.id, "admin").unwrap();
+        teams.add_member("client-tenant", user.id, "member").unwrap();
+        teams.rename_organization("client-tenant", "Impact Ignite").unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        let switch = app
+            .clone()
+            .oneshot(
+                HttpRequest::post("/me/switch-tenant")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tenant":"client-tenant"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(switch.status(), StatusCode::OK);
+        let switched = body_json(switch).await;
+        assert_eq!(switched["tenant"], "client-tenant");
+        assert_eq!(switched["role"], "member");
+        assert_eq!(switched["name"], "Impact Ignite");
+
+        // The same session token now resolves to the new tenant.
+        let team = app.clone().oneshot(HttpRequest::get("/team").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        let team = body_json(team).await;
+        assert_eq!(team["tenant"], "client-tenant");
+
+        // And switching back to the personal tenant still works.
+        let switch_back = app
+            .oneshot(
+                HttpRequest::post("/me/switch-tenant")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"tenant":"{personal_tenant}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(switch_back.status(), StatusCode::OK);
+        assert_eq!(body_json(switch_back).await["tenant"], personal_tenant);
+    }
+
+    #[tokio::test]
+    async fn switch_tenant_rejects_a_tenant_the_caller_isnt_a_member_of() {
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup_user(&accounts, "dev@example.com");
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&user.tenant, user.id, "admin").unwrap();
+        teams.add_member("someone-elses-tenant", 999, "admin").unwrap();
+        let app = build_team_router(accounts, teams, ConnectionStore::open_in_memory().unwrap(), CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
+
+        let switch = app
+            .oneshot(
+                HttpRequest::post("/me/switch-tenant")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"tenant":"someone-elses-tenant"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(switch.status(), StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

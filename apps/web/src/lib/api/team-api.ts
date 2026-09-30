@@ -246,6 +246,30 @@ export interface InvitePreview {
   role: MemberRole;
 }
 
+// --- Org switcher (self-service multi-tenant membership) ----------------
+
+export const MY_MEMBERSHIPS_SWR_KEY = "/me/memberships";
+
+export interface Membership {
+  tenant: string;
+  /** `""` for a tenant nobody's ever named (e.g. a freelancer's own default personal tenant) -- same fallback the Team screen's own name field uses. */
+  name: string;
+  role: MemberRole;
+  status: MemberStatus;
+  joined_at: string;
+  is_current: boolean;
+}
+
+/** Every org the caller belongs to, across the whole instance -- not just the currently active one. Backs the org switcher; a solo user always gets back exactly one row (their own tenant). */
+export function getMyMemberships(): Promise<{ memberships: Membership[] }> {
+  return heavyFetch(MY_MEMBERSHIPS_SWR_KEY);
+}
+
+/** Switches the caller's active tenant to one they're already an active member of -- 403s otherwise. No new session token: the same bearer token keeps working and simply resolves to the new tenant from the next request onward, so callers must still refresh any tenant-scoped data themselves after this resolves (see `use-org-switch.ts`). */
+export function switchTenant(tenant: string): Promise<{ tenant: string; role: MemberRole; name: string }> {
+  return heavyFetch("/me/switch-tenant", { method: "POST", body: JSON.stringify({ tenant }) });
+}
+
 /** Unauthenticated -- goes through /api/invites/{token}, not /api/heavy/* (which always requires a session). See that route's doc comment. */
 export async function getInvitePreview(token: string): Promise<InvitePreview> {
   const res = await fetch(withBasePath(`/api/invites/${encodeURIComponent(token)}`), { cache: "no-store" });

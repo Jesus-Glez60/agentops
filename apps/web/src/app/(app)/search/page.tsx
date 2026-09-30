@@ -229,7 +229,7 @@ function SearchPageInner() {
 
               {!detail && <p className="text-body text-ink-500">Loading details…</p>}
 
-              {detail && <NodeDetailSections detail={detail} branch={branch} onSelectConnected={selectConnectedNode} />}
+              {detail && <NodeDetailSections detail={detail} branch={branch} onSelectConnected={selectConnectedNode} splitKnowledge />}
             </div>
           )}
         </div>
