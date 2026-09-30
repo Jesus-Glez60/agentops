@@ -30,7 +30,7 @@ export function AppShell({ user, children }: { user: SessionUser; children: Reac
     <SidebarProvider>
       <AppSidebar user={user} onOpenPalette={() => setPaletteOpen(true)} />
       <SidebarInset>
-        <AppHeader onOpenPalette={() => setPaletteOpen(true)} />
+        <AppHeader user={user} onOpenPalette={() => setPaletteOpen(true)} />
         {/* min-w-0/min-h-0 override flexbox's default min-width/min-height:auto
             -- without them, content wide or tall enough (a wrapping chip row,
             or a page with its own internal scroll regions like the

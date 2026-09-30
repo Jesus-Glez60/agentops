@@ -46,4 +46,14 @@ describe("relativeTimeFromIsoString", () => {
     const nowIso = new Date(NOW_MS - 60_000).toISOString();
     expect(relativeTimeFromIsoString(nowIso)).toBe("1m ago");
   });
+
+  it("handles Postgres's timestamptz::text shape (space-separated, trailing UTC offset) without producing NaN", () => {
+    // e.g. "2026-09-30 16:43:12.345678+00" -- a space separator like
+    // SQLite's, but with an offset already present. Blindly appending "Z"
+    // to this (the bug) produces "...+00Z", which Date can't parse.
+    const d = new Date(NOW_MS - 90_000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const pgShaped = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}.123456+00`;
+    expect(relativeTimeFromIsoString(pgShaped)).toBe("1m ago");
+  });
 });

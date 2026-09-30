@@ -19,12 +19,27 @@ export function relativeTimeFromUnixSeconds(unixSeconds: number): string {
 }
 
 export function relativeTimeFromIsoString(iso: string): string {
-  // SQLite's `CURRENT_TIMESTAMP` (the source of ScanHistory.started_at)
-  // produces real UTC time as "YYYY-MM-DD HH:MM:SS" -- no 'T', no 'Z'. JS's
-  // Date constructor parses that shape leniently as *local* time instead of
-  // UTC, which would silently skew every relative-time label by the
-  // browser's UTC offset. Normalize to real ISO-8601 UTC first; a string
-  // that's already proper ISO (has 'T') passes through unchanged.
-  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(iso) ? `${iso.replace(" ", "T")}Z` : iso;
+  // ScanHistory.started_at comes from two different stores with two
+  // different `::text` shapes: SQLite's `CURRENT_TIMESTAMP` produces real
+  // UTC time as "YYYY-MM-DD HH:MM:SS" -- no 'T', no offset -- while
+  // Postgres's `started_at::text` cast of a TIMESTAMPTZ column produces
+  // "YYYY-MM-DD HH:MM:SS.ffffff+00" -- a space separator like SQLite's, but
+  // *with* a trailing UTC offset, rendered bare (no colon, no minutes) for
+  // whole-hour offsets. Neither shape is directly Date-parseable: blindly
+  // appending "Z" to both (as this used to) breaks the Postgres case
+  // ("...+00Z", two conflicting offsets at once -> NaN, the "NaNd ago" bug),
+  // and a bare "+00" offset isn't valid per the Date Time String Format
+  // either (it requires "+00:00"). Normalize both cases explicitly instead
+  // of guessing with one blind append.
+  const trimmed = iso.trim();
+  if (!/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(trimmed)) return relativeTimeFromMs(new Date(trimmed).getTime());
+
+  let normalized = trimmed.replace(" ", "T");
+  const offsetMatch = normalized.match(/([+-]\d{2})(:(\d{2}))?$/);
+  if (offsetMatch) {
+    if (!offsetMatch[2]) normalized = `${normalized.slice(0, offsetMatch.index)}${offsetMatch[1]}:00`;
+  } else {
+    normalized += "Z";
+  }
   return relativeTimeFromMs(new Date(normalized).getTime());
 }

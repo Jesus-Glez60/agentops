@@ -65,7 +65,10 @@ export function NextUp({ cards }: { cards: NextUpCard[] }) {
 
   return (
     <section className="flex flex-col gap-3">
-      <h2 className="text-subheading font-semibold text-ink-100">Next up</h2>
+      <div className="flex items-baseline gap-2">
+        <h2 className="text-subheading font-semibold text-ink-100">Next up</h2>
+        <span className="text-mono-path text-ink-500">Sorted by what helps your agents most</span>
+      </div>
       <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
         {cards.map((card) => (
           <div key={card.tag} className="flex flex-col gap-2 rounded-lg border border-border-strong bg-panel p-4">

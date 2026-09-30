@@ -78,7 +78,7 @@ export function AppSidebar({ user, onOpenPalette }: { user: SessionUser; onOpenP
         </div>
         <SidebarMenu>
           <SidebarMenuItem>
-            <ScopeSwitcher user={user} repoCount={data?.connections.length} />
+            <ScopeSwitcher user={user} repos={data?.connections} />
           </SidebarMenuItem>
           <SidebarMenuItem>
             <SidebarMenuButton onClick={onOpenPalette} tooltip="Search or jump to…" className="text-ink-500">

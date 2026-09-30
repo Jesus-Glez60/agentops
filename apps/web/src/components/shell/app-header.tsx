@@ -1,38 +1,42 @@
 "use client";
 
+import Link from "next/link";
 import useSWR from "swr";
-import { Bell, Database } from "lucide-react";
+import { Bell } from "lucide-react";
 import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { repoHealth } from "@/lib/repo-health";
+import type { SessionUser } from "@/lib/auth/types";
 import { BreadcrumbHeader } from "@/components/shell/breadcrumb-header";
 import { CommandPaletteTrigger } from "@/components/shell/command-palette";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
 
-export function AppHeader({ onOpenPalette }: { onOpenPalette: () => void }) {
+export function AppHeader({ user, onOpenPalette }: { user: SessionUser; onOpenPalette: () => void }) {
   // Same SWR key as the Overview page's repo table -- one shared cache
   // entry/one network request, not two independent fetches.
   const { data } = useSWR(REPOS_SWR_KEY, getRepos);
   const repos = data?.connections;
-
-  const repoCount = repos?.length;
-  const allHealthy = repos?.every((r) => repoHealth(r) === "healthy") ?? false;
-  const anyIssue = repos?.some((r) => repoHealth(r) === "warning" || repoHealth(r) === "stale") ?? false;
+  // The "All repositories (N)" pill this used to show is now redundant with
+  // the sidebar's own ScopeSwitcher subtitle + repository list -- replaced
+  // with the prototype's simpler "N repo(s) need attention" summary, shown
+  // only when something actually does (never a fabricated "1 repo" the way
+  // the prototype's own mockup copy hardcodes it).
+  const unhealthyCount = repos?.filter((r) => repoHealth(r) !== "healthy").length ?? 0;
 
   return (
     <header className="flex h-14 shrink-0 items-center justify-between gap-4 border-b border-border bg-panel px-4">
-      <BreadcrumbHeader />
+      <BreadcrumbHeader user={user} />
 
-      <div className="flex items-center gap-2">
-        <div className="flex items-center gap-2 rounded-md border border-border px-3 py-1.5 text-section text-ink-300">
-          <Database className="size-3.5 text-ink-500" />
-          All repositories{repoCount !== undefined && ` (${repoCount})`}
-        </div>
-        <div className="flex items-center gap-1.5 text-section text-ink-500">
-          <span className={cn("size-1.5 rounded-full", repos === undefined ? "bg-ink-500" : anyIssue ? "bg-health-warning" : allHealthy ? "bg-health-healthy" : "bg-ink-500")} />
-          {repos === undefined ? "—" : anyIssue ? "Needs attention" : allHealthy ? "All indexed" : "—"}
-        </div>
+      <div className="flex items-center gap-3">
+        {unhealthyCount > 0 && (
+          <span className="flex items-center gap-1.5 text-section text-ink-300">
+            <span className="size-1.5 rounded-full bg-health-warning" />
+            {unhealthyCount} repo{unhealthyCount === 1 ? "" : "s"} need{unhealthyCount === 1 ? "s" : ""} attention
+          </span>
+        )}
+        <Link href="/docs" className="text-mono-path text-ink-500 hover:text-ink-300">
+          Docs ↗
+        </Link>
 
         <CommandPaletteTrigger onOpen={onOpenPalette} />
 
