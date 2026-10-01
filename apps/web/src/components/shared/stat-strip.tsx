@@ -20,9 +20,18 @@ export interface StatStripItem {
  * re-reading the prototype's actual markup for *this* screen directly
  * is what caught it.
  */
-export function StatStrip({ items, size = "lg", minColWidth = "170px" }: { items: StatStripItem[]; size?: "lg" | "md"; minColWidth?: string }) {
+export function StatStrip({ items, size = "lg" }: { items: StatStripItem[]; size?: "lg" | "md" }) {
   return (
-    <div className="grid overflow-hidden rounded-2xl border bg-panel" style={{ gridTemplateColumns: `repeat(auto-fit, minmax(${minColWidth}, 1fr))` }}>
+    // A fixed column count, not `repeat(auto-fit, minmax(...))` -- at this
+    // screen's real (narrower-than-the-prototype's-1280px-canvas) content
+    // width, auto-fit only fit 3 of the 4 columns at the chosen min-width,
+    // so the 4th item wrapped onto its own row with the other 3 columns'
+    // worth of space sitting empty next to it. A flex-basis wrap-based
+    // collapse under auto-fit is a layout bug, not a design-fidelity
+    // question -- this screen's strip must always keep every item in one
+    // row, shrinking cell width rather than ever dropping items to a new
+    // row.
+    <div className="grid overflow-hidden rounded-2xl border bg-panel" style={{ gridTemplateColumns: `repeat(${items.length}, minmax(0, 1fr))` }}>
       {items.map((item, i) => {
         // `border-r`/`last:border-r-0` live on *this* element -- the actual
         // grid child whose sibling position matters -- not on an inner div,

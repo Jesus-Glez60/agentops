@@ -16,7 +16,6 @@ export function LibraryStatsStrip({ libraries }: { libraries: Library[] }) {
   return (
     <StatStrip
       size="md"
-      minColWidth="180px"
       items={[
         { label: "Libraries indexed", value: libraries.length },
         { label: "Total versions", value: totalVersions },
