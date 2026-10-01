@@ -1,7 +1,7 @@
 "use client";
 
 import useSWR from "swr";
-import { Building2, Check, ChevronsUpDown, Plug } from "lucide-react";
+import { Check } from "lucide-react";
 import { useRouter } from "next/navigation";
 import type { SessionUser } from "@/lib/auth/types";
 import type { RepoConnection } from "@/lib/api/repos-api";
@@ -46,13 +46,21 @@ export function ScopeSwitcher({ user, repos }: { user: SessionUser; repos?: Repo
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <SidebarMenuButton size="lg" className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground">
-          <div className="flex size-6 shrink-0 items-center justify-center rounded-md bg-mauve text-canvas text-label font-bold">{currentOrgLabel.charAt(0).toUpperCase()}</div>
+        <SidebarMenuButton
+          size="lg"
+          className="border bg-raised data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
+        >
+          <div
+            className="flex size-[26px] shrink-0 items-center justify-center rounded-[7px] text-[12px] font-extrabold text-canvas"
+            style={{ background: "linear-gradient(135deg, var(--mauve), var(--peach))" }}
+          >
+            {currentOrgLabel.charAt(0).toUpperCase()}
+          </div>
           <div className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden">
             <p className="truncate text-section text-ink-100">{currentOrgLabel}</p>
             <p className="truncate text-mono-path text-ink-500">{scopeLabel}</p>
           </div>
-          <ChevronsUpDown className="ml-auto size-4 shrink-0 text-ink-500 group-data-[collapsible=icon]:hidden" />
+          <span className="ml-auto shrink-0 text-ink-500 group-data-[collapsible=icon]:hidden">▾</span>
         </SidebarMenuButton>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" side="bottom" className="w-56">
@@ -61,7 +69,7 @@ export function ScopeSwitcher({ user, repos }: { user: SessionUser; repos?: Repo
             <div className="px-2 pt-1.5 pb-1 text-mono-path text-ink-500">Organization</div>
             {memberships.map((m) => (
               <DropdownMenuItem key={m.tenant} onSelect={() => switchOrg(m.tenant)} disabled={switching !== null}>
-                <Building2 className="size-4" />
+                <span className="size-2 shrink-0 rounded-full bg-mauve" />
                 <span className="min-w-0 flex-1 truncate">{m.name || m.tenant}</span>
                 {m.tenant === user.tenant ? <Check className="size-4 shrink-0 text-ink-300" /> : switching === m.tenant ? <span className="text-mono-path text-ink-500">Switching…</span> : null}
               </DropdownMenuItem>
@@ -86,9 +94,8 @@ export function ScopeSwitcher({ user, repos }: { user: SessionUser; repos?: Repo
             <DropdownMenuSeparator />
           </>
         )}
-        <DropdownMenuItem onSelect={() => router.push("/repositories/connect")}>
-          <Plug className="size-4" />
-          Connect repository
+        <DropdownMenuItem onSelect={() => router.push("/repositories/connect")} className="text-mauve">
+          + Connect repository
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>

@@ -1,10 +1,13 @@
-import type { LucideIcon } from "lucide-react";
-import { BookOpen, GitBranch, LayoutDashboard, Library, Search, Settings, TriangleAlert, Workflow } from "lucide-react";
+export type NavShape = "circle" | "square" | "diamond";
 
 export interface NavItem {
   href: string;
   label: string;
-  icon: LucideIcon;
+  // Color + shape marker, not an icon -- matches the prototype's own `nav`
+  // array (`item(route, label, short, color, shape)`): every nav row is a
+  // small colored dot/square/diamond, never a lucide icon.
+  color: string;
+  shape: NavShape;
   // Sidebar section this item renders under (see NAV_GROUP_ORDER). Omitted
   // for items that render in their own unlabeled trailing group (Settings).
   group?: string;
@@ -19,16 +22,17 @@ export const NAV_GROUP_ORDER = ["Explore", "Curate", "Sources", "Workspace"] as 
 
 // Single source of truth for the sidebar, the command palette, and
 // breadcrumb label lookups -- one list, three consumers, so adding a page
-// never means updating three places by hand.
+// never means updating three places by hand. Colors/shapes are exact
+// values from the prototype's own `nav` array.
 export const NAV_ITEMS: NavItem[] = [
-  { href: "/", label: "Overview", icon: LayoutDashboard },
-  { href: "/search", label: "Search", icon: Search, group: "Explore" },
-  { href: "/graph", label: "Knowledge Graph", icon: Workflow, group: "Explore" },
-  { href: "/docs", label: "Documentation", icon: BookOpen, group: "Explore" },
-  { href: "/libraries", label: "Libraries", icon: Library, group: "Sources" },
-  { href: "/repositories", label: "Repositories", icon: GitBranch, group: "Sources" },
-  { href: "/gotchas", label: "Gotchas", icon: TriangleAlert, group: "Curate" },
-  { href: "/settings", label: "Settings", icon: Settings, group: "Workspace" },
+  { href: "/", label: "Overview", color: "var(--mauve)", shape: "circle" },
+  { href: "/search", label: "Search", color: "var(--blue-500)", shape: "circle", group: "Explore" },
+  { href: "/graph", label: "Knowledge Graph", color: "var(--lavender)", shape: "circle", group: "Explore" },
+  { href: "/docs", label: "Documentation", color: "var(--teal-400)", shape: "square", group: "Explore" },
+  { href: "/libraries", label: "Libraries", color: "var(--yellow)", shape: "square", group: "Sources" },
+  { href: "/repositories", label: "Repositories", color: "var(--node-file)", shape: "square", group: "Sources" },
+  { href: "/gotchas", label: "Gotchas", color: "var(--peach)", shape: "diamond", group: "Curate" },
+  { href: "/settings", label: "Settings", color: "var(--ink-500)", shape: "circle", group: "Workspace" },
 ];
 
 export function navLabelForPath(pathname: string): string {

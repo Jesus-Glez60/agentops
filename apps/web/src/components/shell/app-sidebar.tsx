@@ -4,14 +4,16 @@ import { useState } from "react";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import useSWR from "swr";
-import { LogOut, Plug, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import { NAV_GROUP_ORDER, NAV_ITEMS } from "@/lib/nav-config";
 import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { logout } from "@/lib/auth/client";
 import type { SessionUser } from "@/lib/auth/types";
 import { UserMenu } from "@/components/shell/user-menu";
 import { ScopeSwitcher } from "@/components/shell/scope-switcher";
+import { NavDot } from "@/components/shell/nav-dot";
 import { LogoMark } from "@/components/shared/logo-mark";
+import { Button } from "@/components/ui/button";
 import {
   Sidebar,
   SidebarContent,
@@ -57,7 +59,7 @@ export function AppSidebar({ user, onOpenPalette }: { user: SessionUser; onOpenP
       <SidebarMenuItem key={item.href}>
         <SidebarMenuButton asChild isActive={active} tooltip={item.label}>
           <Link href={item.href}>
-            <item.icon />
+            <NavDot color={item.color} shape={item.shape} />
             <span>{item.label}</span>
           </Link>
         </SidebarMenuButton>
@@ -81,6 +83,11 @@ export function AppSidebar({ user, onOpenPalette }: { user: SessionUser; onOpenP
             <ScopeSwitcher user={user} repos={data?.connections} />
           </SidebarMenuItem>
           <SidebarMenuItem>
+            {/* Kept as an icon, unlike every nav row below -- this is a
+                utility trigger, not a destination with a prototype-defined
+                color/shape, and the collapsed (icon-only) sidebar state
+                this app has (which the prototype's own two fixed layouts
+                don't) would otherwise render an entirely blank square. */}
             <SidebarMenuButton onClick={onOpenPalette} tooltip="Search or jump to…" className="text-ink-500">
               <Search />
               <span className="flex-1 text-left">Search or jump to…</span>
@@ -116,17 +123,16 @@ export function AppSidebar({ user, onOpenPalette }: { user: SessionUser; onOpenP
           -- its pieces degrade individually the same way nav items do
           (icon-only, label carried in the `tooltip` prop instead), so the
           profile avatar and a compact log-out control stay reachable even
-          when the sidebar is collapsed, matching the prototype's Rail mode. */}
-      <SidebarFooter>
+          when the sidebar is collapsed, matching the prototype's Rail mode.
+          `border-t` separates this block from the scrollable nav list
+          above it, matching the prototype's own footer border. */}
+      <SidebarFooter className="border-t pt-3">
         <SidebarMenu>
           <SidebarMenuItem>
             <SidebarMenuButton asChild tooltip="Connect a coding tool" className="h-auto flex-col items-start gap-0.5 border border-mauve/35 bg-mauve/8 py-2.5">
               <Link href="/welcome">
-                <div className="flex w-full items-center gap-2">
-                  <Plug className="size-4 shrink-0" />
-                  <span className="text-section font-medium">Connect a coding tool</span>
-                </div>
-                <span className="pl-6 text-mono-path text-ink-500 group-data-[collapsible=icon]:hidden">Claude Code, Cursor, Codex CLI, Gemini CLI</span>
+                <span className="text-section font-medium">Connect a coding tool</span>
+                <span className="pl-0 text-mono-path text-ink-500 group-data-[collapsible=icon]:hidden">Claude Code, Cursor, Codex CLI, Gemini CLI</span>
               </Link>
             </SidebarMenuButton>
           </SidebarMenuItem>
@@ -135,9 +141,16 @@ export function AppSidebar({ user, onOpenPalette }: { user: SessionUser; onOpenP
           <div className="min-w-0 flex-1">
             <UserMenu user={user} />
           </div>
-          <SidebarMenuButton onClick={handleLogout} disabled={loggingOut} tooltip={loggingOut ? "Logging out…" : "Log out"} aria-label={loggingOut ? "Logging out…" : "Log out"} className="w-auto shrink-0">
-            <LogOut className="size-4" />
-          </SidebarMenuButton>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleLogout}
+            disabled={loggingOut}
+            aria-label={loggingOut ? "Logging out…" : "Log out"}
+            className="h-9 shrink-0 rounded-[10px] text-ink-300 hover:border-destructive hover:text-destructive"
+          >
+            {loggingOut ? "Logging out…" : "Log out"}
+          </Button>
         </div>
       </SidebarFooter>
     </Sidebar>

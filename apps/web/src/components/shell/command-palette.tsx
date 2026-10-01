@@ -3,6 +3,7 @@
 import { useRouter } from "next/navigation";
 import { CommandIcon } from "lucide-react";
 import { NAV_ITEMS } from "@/lib/nav-config";
+import { NavDot } from "@/components/shell/nav-dot";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 // cmdk's CommandDialog does not auto-wrap children in <Command> -- the
@@ -32,7 +33,7 @@ export function CommandPaletteDialog({ open, onOpenChange }: { open: boolean; on
                   onOpenChange(false);
                 }}
               >
-                <item.icon className="size-4" />
+                <NavDot color={item.color} shape={item.shape} />
                 {item.label}
               </CommandItem>
             ))}
