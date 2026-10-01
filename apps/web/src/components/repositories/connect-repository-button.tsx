@@ -2,7 +2,6 @@
 
 import Link from "next/link";
 import useSWR from "swr";
-import { Plus } from "lucide-react";
 import { getRepos, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { Button } from "@/components/ui/button";
 
@@ -13,12 +12,12 @@ export function ConnectRepositoryButton() {
   const { data } = useSWR(REPOS_SWR_KEY, getRepos);
   if (data && !data.can_connect) return null;
 
+  // No "+" icon -- the prototype renders this as a literal "+" character
+  // in the label text, not a lucide icon (same "colors and shapes, not
+  // icons" pattern as everywhere else this pass touched).
   return (
-    <Button size="sm" asChild>
-      <Link href="/repositories/connect">
-        <Plus className="size-3.5" />
-        Connect repository
-      </Link>
+    <Button size="cta" asChild>
+      <Link href="/repositories/connect">+ Connect repository</Link>
     </Button>
   );
 }

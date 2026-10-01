@@ -1,7 +1,6 @@
 "use client";
 
 import useSWR from "swr";
-import { Database, Share2, Sparkles, TriangleAlert } from "lucide-react";
 import { getRepos, getRepoUsage, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { getMyMemberships, resolveOrgDisplayName, MY_MEMBERSHIPS_SWR_KEY } from "@/lib/api/team-api";
 import { repoHealth } from "@/lib/repo-health";
@@ -37,10 +36,10 @@ export function OverviewPageClient({ user }: { user: SessionUser }) {
       <NextUp cards={nextUpCards} />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard label="Repositories" value={repoCount} icon={Database} />
-        <StatCard label="Knowledge nodes" value={nodeCount.toLocaleString()} icon={Share2} />
-        <StatCard label="Gotchas needing curation" value={gotchaCount} icon={TriangleAlert} valueClassName="text-health-warning" href="/gotchas" />
-        <StatCard label="Knowledge hits" value={totalHits === undefined ? "—" : totalHits.toLocaleString()} icon={Sparkles} valueClassName="text-health-healthy" />
+        <StatCard label="Repositories" value={repoCount} />
+        <StatCard label="Knowledge nodes" value={nodeCount.toLocaleString()} />
+        <StatCard label="Gotchas needing curation" value={gotchaCount} valueClassName="text-health-warning" href="/gotchas" />
+        <StatCard label="Knowledge hits" value={totalHits === undefined ? "—" : totalHits.toLocaleString()} valueClassName="text-health-healthy" />
       </div>
 
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[2fr_1fr]">

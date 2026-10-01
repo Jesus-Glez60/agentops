@@ -16,7 +16,7 @@ export function ActivityTicker() {
   return (
     <section className="flex flex-col gap-3.5">
       <h2 className="text-page-title font-extrabold tracking-[-0.02em] text-ink-100">Activity</h2>
-      <div className="flex flex-col divide-y divide-border rounded-2xl border border-border-strong bg-panel px-5">
+      <div className="flex flex-col divide-y divide-border rounded-2xl border bg-panel px-5">
         {!activity || activity.length === 0 ? (
           <p className="py-4 text-[14px] text-ink-500">No activity yet.</p>
         ) : (

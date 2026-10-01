@@ -71,14 +71,24 @@ export function NextUp({ cards }: { cards: NextUpCard[] }) {
       </div>
       <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
         {cards.map((card) => (
-          <div key={card.tag} className="flex flex-col gap-3 rounded-2xl border border-border-strong bg-panel p-[22px]">
-            <span className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide" style={{ color: card.color }}>
+          <div key={card.tag} className="relative flex flex-col gap-3 overflow-hidden rounded-2xl border bg-panel p-[22px]">
+            {/* Top color-bleed glow, matching the prototype's per-card accent -- not a flat panel bg. */}
+            <div
+              aria-hidden
+              className="pointer-events-none absolute inset-x-0 top-0 h-[120px]"
+              style={{ background: `radial-gradient(ellipse 80% 100% at 20% -40%, color-mix(in srgb, ${card.color} 35%, transparent), transparent 70%)` }}
+            />
+            <span className="relative flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide" style={{ color: card.color }}>
               <span className="size-2 shrink-0 rotate-45" style={{ background: card.color }} />
               {card.tag}
             </span>
-            <h3 className="text-[20px] leading-tight font-bold tracking-[-0.02em] text-ink-100">{card.title}</h3>
-            <p className="flex-1 text-[14.5px] leading-normal text-ink-300">{card.desc}</p>
-            <Link href={card.href} className="self-start text-[14px] font-semibold" style={{ color: card.color }}>
+            <h3 className="relative text-[20px] leading-tight font-bold tracking-[-0.02em] text-ink-100">{card.title}</h3>
+            <p className="relative flex-1 text-[14.5px] leading-normal text-ink-300">{card.desc}</p>
+            <Link
+              href={card.href}
+              className="relative self-start rounded-full border px-4 py-2 text-[14px] font-semibold transition-colors hover:bg-white/5"
+              style={{ color: card.color, borderColor: card.color }}
+            >
               {card.cta}
             </Link>
           </div>

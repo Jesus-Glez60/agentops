@@ -33,10 +33,10 @@ export function OverviewHero({ orgName, firstName, needsCurationCount, anyRepoUn
         <p className="text-[17px] leading-normal text-ink-300">{subtitle(needsCurationCount, anyRepoUnhealthy)}</p>
       </div>
       <div className="flex gap-2">
-        <Button variant="outline" asChild>
+        <Button variant="outline" size="cta" asChild>
           <Link href="/search">Ask the graph</Link>
         </Button>
-        <Button asChild>
+        <Button size="cta" asChild>
           <Link href="/repositories/connect">+ Connect repository</Link>
         </Button>
       </div>

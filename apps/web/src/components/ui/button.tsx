@@ -32,8 +32,24 @@ const buttonVariants = cva(
         "icon-sm":
           "size-7 rounded-[min(var(--radius-md),12px)] in-data-[slot=button-group]:rounded-lg",
         "icon-lg": "size-9",
+        // Large pill CTA -- the prototype's prominent action buttons (hero
+        // actions, "Next up" card CTAs, wizard Next/Back) are consistently
+        // `border-radius:999px` with bigger padding/height and a heavier
+        // weight, a distinct second scale from every other button (nav
+        // rows, table actions, icon buttons), which the prototype keeps at
+        // the compact 8-10px radius already matching this component's
+        // other sizes. Don't make this the default -- only apply it where
+        // the design actually shows a pill.
+        cta: "h-11 gap-1.5 rounded-full px-5 text-[14.5px] font-semibold has-data-[icon=inline-end]:pr-4 has-data-[icon=inline-start]:pl-4",
       },
     },
+    compoundVariants: [
+      {
+        variant: "default",
+        size: "cta",
+        class: "font-bold shadow-[0_10px_30px_-10px_rgba(203,166,247,0.7)]",
+      },
+    ],
     defaultVariants: {
       variant: "default",
       size: "default",

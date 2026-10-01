@@ -3,7 +3,6 @@
 import { useState } from "react";
 import { useSWRConfig } from "swr";
 import { toast } from "sonner";
-import { Plus } from "lucide-react";
 import { discoverLibrary, registerLibraryManually, scrapeLibrary, ECOSYSTEM_LABELS, LIBRARIES_SWR_KEY, type Ecosystem } from "@/lib/api/libraries-api";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
@@ -86,10 +85,7 @@ export function AddLibraryDialog() {
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button size="sm">
-          <Plus className="size-3.5" />
-          Add library
-        </Button>
+        <Button size="cta">+ Add library</Button>
       </DialogTrigger>
       <DialogContent>
         <form onSubmit={handleSubmit}>
