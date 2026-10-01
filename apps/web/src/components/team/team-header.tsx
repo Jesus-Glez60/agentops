@@ -1,19 +1,18 @@
-import { Building2, Users } from "lucide-react";
 import type { TeamInfo } from "@/lib/api/team-api";
 
+// Hero band, not the old plain icon-box + text-lg name (redesign plan
+// Phase 7) -- same eyebrow + H1 + subtitle pattern as every other
+// top-level screen. The org's identity (name, member count) moves into
+// the subtitle since the H1 itself is the generic page title here, same
+// as the design.
 export function TeamHeader({ team }: { team: TeamInfo }) {
   return (
-    <div className="flex items-center gap-4 border-b border-border-strong px-8 py-6">
-      <div className="flex size-12 shrink-0 items-center justify-center rounded-xl border border-border-strong bg-panel">
-        <Building2 className="size-5 text-ink-400" />
-      </div>
-      <div className="min-w-0 flex-1">
-        <h1 className="text-lg font-semibold text-ink-100">{team.name || "Your organization"}</h1>
-        <div className="flex items-center gap-1.5 text-body text-ink-400">
-          <Users className="size-3.5" />
-          {team.member_count} member{team.member_count === 1 ? "" : "s"}
-        </div>
-      </div>
+    <div className="flex flex-col gap-2 border-b border-border-strong px-8 py-6">
+      <span className="font-mono text-[12px] uppercase tracking-wide text-mauve">Workspace</span>
+      <h1 className="text-display-hero font-extrabold tracking-[-0.04em] text-ink-100">Settings</h1>
+      <p className="text-body-lg text-ink-300">
+        {team.name || "Your organization"} · {team.member_count} member{team.member_count === 1 ? "" : "s"}
+      </p>
     </div>
   );
 }

@@ -66,7 +66,7 @@ export function NextUp({ cards }: { cards: NextUpCard[] }) {
   return (
     <section className="flex flex-col gap-3">
       <div className="flex items-baseline gap-3">
-        <h2 className="text-[24px] font-extrabold tracking-[-0.02em] text-ink-100">Next up</h2>
+        <h2 className="text-heading-lg font-extrabold tracking-[-0.02em] text-ink-100">Next up</h2>
         <span className="text-[14px] text-ink-500">Sorted by what helps your agents most</span>
       </div>
       <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3">

@@ -2,7 +2,6 @@
 
 import { useState } from "react";
 import useSWR from "swr";
-import { Bell, Users } from "lucide-react";
 import type { SessionUser } from "@/lib/auth/types";
 import { PROFILE_SWR_KEY, getProfile } from "@/lib/api/profile-api";
 import { ProfileHero } from "@/components/profile/profile-hero";
@@ -11,9 +10,15 @@ import { SecurityTab } from "@/components/profile/security-tab";
 import { ApiKeysTab } from "@/components/profile/api-keys-tab";
 import { ConnectToolSection } from "@/components/profile/connect-tool-section";
 import { PersonalIntegrationsTab } from "@/components/profile/personal-integrations-tab";
-import { EmptyState } from "@/components/shared/empty-state";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
+// Notifications and Team & Access tabs retired here (redesign plan Phase
+// 8) -- both were pure `EmptyState` "Coming soon" stubs with zero backing
+// logic, not real features, and the design doesn't show them either.
+// Integrations stays even though the design's own mockup doesn't show it:
+// it's a real, working feature, and "the design is the true UI" is never
+// grounds to remove a shipped feature the design merely didn't depict --
+// only stub placeholders get hidden to match it.
 export function ProfilePageClient({ initialUser, apiUrl, apiUrlIsGuessed }: { initialUser: SessionUser; apiUrl: string; apiUrlIsGuessed: boolean }) {
   const [tab, setTab] = useState("account");
   const { data: user } = useSWR(PROFILE_SWR_KEY, getProfile, { fallbackData: initialUser });
@@ -25,8 +30,6 @@ export function ProfilePageClient({ initialUser, apiUrl, apiUrlIsGuessed }: { in
         <TabsList variant="line" className="shrink-0 border-b border-border-strong px-8">
           <TabsTrigger value="account">Account</TabsTrigger>
           <TabsTrigger value="security">Security</TabsTrigger>
-          <TabsTrigger value="notifications">Notifications</TabsTrigger>
-          <TabsTrigger value="team">Team &amp; Access</TabsTrigger>
           <TabsTrigger value="api-keys">API Keys</TabsTrigger>
           <TabsTrigger value="coding-tools">Coding Tools</TabsTrigger>
           <TabsTrigger value="integrations">Integrations</TabsTrigger>
@@ -37,12 +40,6 @@ export function ProfilePageClient({ initialUser, apiUrl, apiUrlIsGuessed }: { in
           </TabsContent>
           <TabsContent value="security" className="mt-0">
             <SecurityTab user={user ?? initialUser} />
-          </TabsContent>
-          <TabsContent value="notifications" className="mt-0">
-            <EmptyState icon={Bell} title="Coming soon" description="Notification preferences will land here." />
-          </TabsContent>
-          <TabsContent value="team" className="mt-0">
-            <EmptyState icon={Users} title="Coming soon" description="Team membership and role management will land here." />
           </TabsContent>
           <TabsContent value="api-keys" className="mt-0">
             <ApiKeysTab />

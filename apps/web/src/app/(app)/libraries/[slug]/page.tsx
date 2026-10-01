@@ -72,7 +72,7 @@ function LibraryDetailPageInner() {
       <div className="flex shrink-0 items-start justify-between gap-4 border-b border-border-strong px-6 py-4">
         <div>
           <div className="mb-0.5 flex items-center gap-2">
-            <h1 className="text-lg font-semibold text-ink-100">{library.name}</h1>
+            <h1 className="text-[38px] font-bold tracking-[-0.02em] text-ink-100">{library.name}</h1>
             <DocStatusBadge hasMismatch={library.has_mismatch} />
           </div>
           {library.description && <p className="max-w-xl text-body text-ink-400">{library.description}</p>}

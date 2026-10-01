@@ -4,7 +4,20 @@ import useSWR from "swr";
 import { toast } from "sonner";
 import { TEAM_MCP_ACCESS_MODE_SWR_KEY, getMcpAccessMode, setMcpAccessMode, type McpAccessMode } from "@/lib/api/team-api";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
+
+const MODES: { value: McpAccessMode; title: string; description: string }[] = [
+  {
+    value: "advisor",
+    title: "Advisor (read-only)",
+    description: "Blocks write tools like scan_repo, explain_symbol, and task tools for every agent connected over MCP.",
+  },
+  {
+    value: "full",
+    title: "Full (read + write)",
+    description: "Every /mcp tool is enabled for every agent connected to this org, including scan_repo, explain_symbol, and task tools.",
+  },
+];
 
 /**
  * Owner/Admin only -- gated the same way `OrgIntegrationsTab` is (see
@@ -14,6 +27,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
  * just the caller -- defaults to Advisor (read-only) until an admin opts
  * in, same as the deployment-level `AGENTOPS_ACCESS_MODE` env var this
  * replaces the need to set manually.
+ *
+ * Radio-cards, not a `Select` dropdown (redesign plan Phase 7) -- reuses
+ * the same whole-card-is-the-button pattern already built for the
+ * Repositories Connect wizard's method-selection cards
+ * (`app/(app)/repositories/connect/page.tsx`'s `ChooseMethodView`), not a
+ * new `RadioGroup` primitive: neither that pattern nor the design's own
+ * markup uses a real `<input type="radio">`, just a styled button with a
+ * manually-drawn selected/unselected ring.
  */
 export function McpAccessTab() {
   const { data, isLoading, mutate } = useSWR(TEAM_MCP_ACCESS_MODE_SWR_KEY, getMcpAccessMode);
@@ -35,30 +56,37 @@ export function McpAccessTab() {
         <CardHeader className="border-b border-border-strong pb-4">
           <CardTitle>MCP Access Mode</CardTitle>
         </CardHeader>
-        <CardContent className="divide-y divide-border-strong p-0">
-          <div className="flex items-center justify-between gap-6 px-6 py-4">
-            <div>
-              <p className="text-body font-medium text-ink-100">Write access over MCP</p>
-              <p className="max-w-[520px] text-section text-ink-500">
-                Advisor (read-only) blocks write tools like <code className="text-mono-code">scan_repo</code>, <code className="text-mono-code">explain_symbol</code>, and task tools for every
-                agent connected over MCP. <code className="text-mono-code">add_note</code> and <code className="text-mono-code">ingest_notes</code> always work regardless of this setting —
-                growing the knowledge base isn&apos;t a destructive action.
-              </p>
+        <CardContent className="pt-5">
+          <p className="mb-4 max-w-[640px] text-section text-ink-500">
+            Controls write access over MCP for every agent connected to this org. <code className="text-mono-code">add_note</code> and <code className="text-mono-code">ingest_notes</code> always
+            work regardless of this setting — growing the knowledge base isn&apos;t a destructive action.
+          </p>
+          {isLoading || !data ? (
+            <p className="text-mono-code text-ink-500">Loading…</p>
+          ) : (
+            <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))" }}>
+              {MODES.map((mode) => {
+                const isSelected = data.mode === mode.value;
+                return (
+                  <button
+                    key={mode.value}
+                    type="button"
+                    onClick={() => save(mode.value)}
+                    aria-pressed={isSelected}
+                    className={cn("rounded-lg border p-4 text-left transition-colors", isSelected ? "border-primary bg-primary/5" : "border-border-strong hover:border-ink-500")}
+                  >
+                    <div className="mb-2 flex items-center gap-2.5">
+                      <span className={cn("flex size-4 shrink-0 items-center justify-center rounded-full border", isSelected ? "border-primary" : "border-border-strong")}>
+                        {isSelected && <span className="size-2 rounded-full bg-primary" />}
+                      </span>
+                      <span className="text-[17px] font-semibold text-ink-100">{mode.title}</span>
+                    </div>
+                    <p className="pl-[26px] text-section leading-relaxed text-ink-500">{mode.description}</p>
+                  </button>
+                );
+              })}
             </div>
-            {isLoading || !data ? (
-              <p className="shrink-0 text-mono-code text-ink-500">Loading…</p>
-            ) : (
-              <Select value={data.mode} onValueChange={(v) => save(v as McpAccessMode)}>
-                <SelectTrigger size="sm" className="w-44 shrink-0">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="advisor">Advisor (read-only)</SelectItem>
-                  <SelectItem value="full">Full (read + write)</SelectItem>
-                </SelectContent>
-              </Select>
-            )}
-          </div>
+          )}
         </CardContent>
       </Card>
     </div>

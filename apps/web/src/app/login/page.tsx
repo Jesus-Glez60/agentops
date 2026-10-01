@@ -1,8 +1,4 @@
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { LoginForm } from "@/components/auth/login-form";
-import { SignupForm } from "@/components/auth/signup-form";
-import { LogoMark } from "@/components/shared/logo-mark";
+import { LoginSignupPanel } from "@/components/auth/login-signup-panel";
 import { heavyApiFetch } from "@/lib/server/heavy-api";
 
 // Next.js 16 Server Component searchParams is Promise-wrapped -- must
@@ -52,39 +48,5 @@ export default async function LoginPage({ searchParams }: { searchParams: Promis
   const showSignupTab = signup_open || !!inviteToken;
   const defaultTab = !has_accounts ? "signup" : "login";
 
-  return (
-    <main className="flex min-h-screen items-center justify-center bg-canvas p-4">
-      <Card className="w-full max-w-sm">
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-page-title">
-            <LogoMark className="size-5 shrink-0" />
-            AgentOps
-          </CardTitle>
-          <CardDescription>{!has_accounts ? "Set up your AgentOps instance." : "Sign in to your account, or create a new one."}</CardDescription>
-        </CardHeader>
-        <CardContent>
-          {showSignupTab ? (
-            <Tabs defaultValue={defaultTab}>
-              <TabsList className="w-full">
-                <TabsTrigger value="login" className="flex-1">
-                  Log in
-                </TabsTrigger>
-                <TabsTrigger value="signup" className="flex-1">
-                  Sign up
-                </TabsTrigger>
-              </TabsList>
-              <TabsContent value="login" className="pt-4">
-                <LoginForm redirectTo={redirectTo} />
-              </TabsContent>
-              <TabsContent value="signup" className="pt-4">
-                <SignupForm redirectTo={redirectTo} inviteToken={inviteToken} />
-              </TabsContent>
-            </Tabs>
-          ) : (
-            <LoginForm redirectTo={redirectTo} />
-          )}
-        </CardContent>
-      </Card>
-    </main>
-  );
+  return <LoginSignupPanel hasAccounts={has_accounts} showSignupTab={showSignupTab} defaultTab={defaultTab} redirectTo={redirectTo} inviteToken={inviteToken} />;
 }

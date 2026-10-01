@@ -15,7 +15,7 @@ export function StepIndicator({ steps }: { steps: WizardStep[] }) {
           <div className="flex items-center gap-2">
             <span
               className={cn(
-                "flex size-5 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold",
+                "flex size-5 shrink-0 items-center justify-center rounded-full text-mono-path font-semibold",
                 step.status === "done" && "bg-health-healthy text-canvas",
                 step.status === "active" && "bg-primary text-primary-foreground",
                 step.status === "pending" && "border border-border-strong text-ink-500",

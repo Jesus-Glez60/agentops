@@ -34,7 +34,7 @@ export function ConnectToolSection({ apiUrl, apiUrlIsGuessed }: { apiUrl: string
   return (
     <Card className="max-w-[900px]">
       <CardHeader>
-        <CardTitle>Connect a coding tool</CardTitle>
+        <CardTitle className="text-page-title">Connect a coding tool</CardTitle>
       </CardHeader>
       <CardContent className="space-y-3">
         {apiUrlIsGuessed && (

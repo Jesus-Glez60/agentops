@@ -30,14 +30,14 @@ export function RolesTab() {
       {canManageRoles && (
         <div>
           <div className="mb-2 flex items-center justify-between">
-            <h2 className="text-body font-semibold text-ink-100">Custom Roles</h2>
+            <h2 className="text-heading-lg font-semibold text-ink-100">Custom Roles</h2>
             <CreateCustomRoleDialog matrix={data.matrix} />
           </div>
         </div>
       )}
       <div>
         <div className="mb-2 flex items-center justify-between">
-          <h2 className="text-body font-semibold text-ink-100">Permissions Matrix</h2>
+          <h2 className="text-heading-lg font-semibold text-ink-100">Permissions Matrix</h2>
           <span className="text-section text-ink-500">{canManageRoles ? "Clone a role above to customize capabilities" : "Read-only"}</span>
         </div>
         <PermissionsMatrixTable matrix={data.matrix} />

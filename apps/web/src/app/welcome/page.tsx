@@ -1,6 +1,6 @@
 import { requireUser } from "@/lib/auth/session";
 import { publicApiUrl } from "@/lib/server/public-api-url";
-import { OnboardingChecklist } from "@/components/onboarding/onboarding-checklist";
+import { WelcomeWizard } from "@/components/onboarding/welcome-wizard";
 
 // Top-level, deliberately outside (app)/ -- that layout redirects here
 // whenever `!user.onboarding_completed`, so living inside it would loop.
@@ -10,5 +10,5 @@ import { OnboardingChecklist } from "@/components/onboarding/onboarding-checklis
 export default async function WelcomePage() {
   const user = await requireUser();
   const { url: apiUrl, isGuess: apiUrlIsGuessed } = await publicApiUrl();
-  return <OnboardingChecklist user={user} apiUrl={apiUrl} apiUrlIsGuessed={apiUrlIsGuessed} />;
+  return <WelcomeWizard user={user} apiUrl={apiUrl} apiUrlIsGuessed={apiUrlIsGuessed} />;
 }

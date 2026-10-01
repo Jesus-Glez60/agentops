@@ -200,4 +200,72 @@ describe("GotchasPage", () => {
 
     await waitFor(() => expect(toastError).toHaveBeenCalledWith("network down"));
   });
+
+  it("pressing K keeps the selected gotcha", async () => {
+    getGotchas.mockResolvedValue([needsCurationGotcha]);
+    getNodeDetail.mockResolvedValue(nodeDetailFor(needsCurationGotcha));
+    setCuration.mockResolvedValue({ id: 1, prominence: "Full" });
+    renderPage();
+
+    fireEvent.click(await screen.findByText("Unbounded retry loop"));
+    await screen.findByRole("button", { name: /Keep as permanent knowledge/ });
+    fireEvent.keyDown(document, { key: "k" });
+
+    await waitFor(() => expect(setCuration).toHaveBeenCalledWith("agentops", 1, "Full", null));
+  });
+
+  it("pressing P pins the selected gotcha", async () => {
+    getGotchas.mockResolvedValue([needsCurationGotcha]);
+    getNodeDetail.mockResolvedValue(nodeDetailFor(needsCurationGotcha));
+    setCuration.mockResolvedValue({ id: 1, prominence: "Pinned" });
+    renderPage();
+
+    fireEvent.click(await screen.findByText("Unbounded retry loop"));
+    await screen.findByRole("button", { name: /Keep as permanent knowledge/ });
+    fireEvent.keyDown(document, { key: "p" });
+
+    await waitFor(() => expect(setCuration).toHaveBeenCalledWith("agentops", 1, "Pinned", null));
+  });
+
+  it("pressing R opens the reduce-reason dialog for the selected gotcha", async () => {
+    getGotchas.mockResolvedValue([needsCurationGotcha]);
+    getNodeDetail.mockResolvedValue(nodeDetailFor(needsCurationGotcha));
+    renderPage();
+
+    fireEvent.click(await screen.findByText("Unbounded retry loop"));
+    await screen.findByRole("button", { name: /Keep as permanent knowledge/ });
+    fireEvent.keyDown(document, { key: "r" });
+
+    expect(await screen.findByRole("button", { name: "Save" })).toBeInTheDocument();
+  });
+
+  it("pressing ArrowDown/ArrowUp moves the selection in the filtered list", async () => {
+    const secondNeedsCuration = { ...needsCurationGotcha, id: 3, name: "Second gotcha" };
+    getGotchas.mockResolvedValue([needsCurationGotcha, secondNeedsCuration]);
+    getNodeDetail.mockImplementation((repo: string, id: number) => Promise.resolve(nodeDetailFor(id === 1 ? needsCurationGotcha : secondNeedsCuration)));
+    renderPage();
+
+    fireEvent.click(await screen.findByText("Unbounded retry loop"));
+    await screen.findByRole("button", { name: /Keep as permanent knowledge/ });
+
+    fireEvent.keyDown(document, { key: "ArrowDown" });
+    await waitFor(() => expect(getNodeDetail).toHaveBeenCalledWith("agentops", 3));
+
+    fireEvent.keyDown(document, { key: "ArrowUp" });
+    await waitFor(() => expect(getNodeDetail).toHaveBeenCalledWith("agentops", 1));
+  });
+
+  it("ignores keyboard shortcuts while the reduce-reason textarea has focus", async () => {
+    getGotchas.mockResolvedValue([needsCurationGotcha]);
+    getNodeDetail.mockResolvedValue(nodeDetailFor(needsCurationGotcha));
+    renderPage();
+
+    fireEvent.click(await screen.findByText("Unbounded retry loop"));
+    fireEvent.click(await screen.findByRole("button", { name: /Reduce prominence/ }));
+    const textarea = await screen.findByPlaceholderText(/Only affects old Linux envs/);
+
+    fireEvent.keyDown(textarea, { key: "k" });
+
+    expect(setCuration).not.toHaveBeenCalled();
+  });
 });

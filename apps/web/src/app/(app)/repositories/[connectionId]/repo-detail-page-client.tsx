@@ -79,7 +79,7 @@ function RepoDetailPageInner({ apiUrl }: { apiUrl: string }) {
       <div className="flex-1 overflow-y-auto px-8 py-6">
         <div className="mb-1 flex items-center gap-2">
           <GitBranch className="size-4 text-ink-500" />
-          <h1 className="text-lg font-semibold text-ink-100">{repo.id}</h1>
+          <h1 className="text-display-card font-bold text-ink-100">{repo.id}</h1>
         </div>
         <p className="truncate text-mono-path text-ink-500">{repo.repo_url}</p>
 

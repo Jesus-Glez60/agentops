@@ -15,12 +15,13 @@ import {
   type NodeKind,
 } from "@/lib/api/repos-api";
 import { GraphHeader } from "@/components/graph/graph-header";
-import { GraphFilterPanel, GRAPH_FILTERABLE_KINDS } from "@/components/graph/graph-filter-panel";
+import { GraphFilterBar, GRAPH_FILTERABLE_KINDS } from "@/components/graph/graph-filter-bar";
 import { GraphCanvas } from "@/components/graph/graph-canvas";
 import { GraphDetailPanel } from "@/components/graph/graph-detail-panel";
 import { GraphStatusCaption } from "@/components/graph/graph-status-caption";
 import { RepoPicker } from "@/components/graph/repo-picker";
-import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { EmptyState } from "@/components/shared/empty-state";
+import { Waypoints } from "lucide-react";
 
 interface SeedRef {
   repo: string;
@@ -74,6 +75,14 @@ function GraphPageInner() {
   const { data: allRepos } = useSWR(REPOS_SWR_KEY, getRepos);
   const branch = repoName ? allRepos?.connections.find((r) => r.id === repoName)?.branch : undefined;
 
+  // Live per-kind counts for the filter bar's "Show" buttons -- derived
+  // from whatever's actually loaded (seed subgraph or whole-repo graph),
+  // not a separate request.
+  const kindCounts = graphData?.nodes.reduce<Partial<Record<NodeKind, number>>>((acc, node) => {
+    acc[node.kind] = (acc[node.kind] ?? 0) + 1;
+    return acc;
+  }, {});
+
   function toggleKind(kind: NodeKind) {
     setKinds((prev) => {
       // Empty means "all" -- unchecking one for the first time must expand
@@ -107,7 +116,9 @@ function GraphPageInner() {
   if (!repoName) {
     return (
       <div className="flex h-full flex-col">
-        <div className="flex h-[52px] shrink-0 items-center border-b border-border-strong px-5 text-section font-medium text-ink-100">Knowledge Graph</div>
+        <div className="flex flex-col gap-1 border-b border-border-strong px-6 py-5">
+          <h1 className="text-[28px] font-extrabold tracking-[-0.02em] text-ink-100">Knowledge Graph</h1>
+        </div>
         <div className="mx-auto flex w-full max-w-md flex-1 flex-col justify-center gap-3">
           <div className="flex flex-col items-center gap-1 text-center">
             <p className="text-subheading text-ink-100">Pick a repository</p>
@@ -127,20 +138,30 @@ function GraphPageInner() {
         onModeChange={setMode}
         repo={repoName}
         onChangeRepo={changeRepo}
+        branch={branch}
+        nodeCount={graphData?.nodes.length}
       />
 
-      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-4">
-        <GraphFilterPanel
-          kinds={kinds}
-          onToggleKind={toggleKind}
-          depth={depth}
-          onDepthChange={setDepth}
-          showDepth={seed !== null}
-          showHotspots={showHotspots}
-          onToggleHotspots={() => setShowHotspots((v) => !v)}
-        />
+      <GraphFilterBar
+        kinds={kinds}
+        onToggleKind={toggleKind}
+        kindCounts={kindCounts}
+        depth={depth}
+        onDepthChange={setDepth}
+        showDepth={seed !== null}
+        showHotspots={showHotspots}
+        onToggleHotspots={() => setShowHotspots((v) => !v)}
+      />
 
-        <div className="relative flex min-h-0 flex-1">
+      {/* Content row: canvas (flex-[3]) + a persistent detail panel
+          (flex-1, own overflow-y-auto) beside it rather than a Sheet
+          overlaying the graph -- matches the design's visible-together
+          layout while keeping the original Sheet's actual goal (a long
+          detail body scrolls independently and can never push the page
+          past the viewport), same `overflow-y-auto`-bounded-pane pattern
+          Documentation's panes already use (redesign plan Phase 3). */}
+      <div className="flex min-h-0 flex-1 gap-4 overflow-hidden p-4">
+        <div className="relative flex min-h-0 flex-[3]">
           <GraphCanvas subgraph={graphData} seedDetail={seedDetail} onNodeClick={selectNodeById} onNodeDoubleClick={(id) => setSeedId(id)} hotspotDegreeById={hotspotDegreeById} />
           <GraphStatusCaption repo={repoName} branch={branch} mode={seed ? mode : null} depth={seed ? depth : null} />
           {graphData?.truncated && (
@@ -149,24 +170,9 @@ function GraphPageInner() {
             </div>
           )}
         </div>
-      </div>
 
-      {/* A drawer, not a side-by-side panel -- fixed-positioned and
-          overlaying the graph rather than sharing the flex row with it, so
-          a long detail body scrolls entirely within its own area and can
-          never push the page itself into growing past the viewport (the
-          canvas + filter row above already has a fixed, non-scrolling
-          height on its own). Wider than the old inline panel so content
-          "breathes" the same way the search page's detail pane does. */}
-      <Sheet open={selected !== null} onOpenChange={(open) => !open && setSelected(null)}>
-        {/* `data-[side=right]:` prefix required to match (and win the
-            cascade against) SheetContent's own `data-[side=right]:sm:max-w-sm`
-            -- a bare `sm:max-w-3xl` has a different modifier stack, so
-            tailwind-merge doesn't dedupe it and the higher-specificity
-            base class still wins, silently keeping the old width. */}
-        <SheetContent side="right" showCloseButton={false} className="w-full overflow-y-auto data-[side=right]:sm:max-w-3xl">
-          <SheetTitle className="sr-only">{detail?.name ?? detail?.path ?? "Node details"}</SheetTitle>
-          {selected && (
+        <div className="flex min-h-0 flex-1 overflow-y-auto rounded-lg border border-border-strong bg-panel">
+          {selected ? (
             <GraphDetailPanel
               detail={detail}
               branch={branch}
@@ -175,9 +181,13 @@ function GraphPageInner() {
               onClose={() => setSelected(null)}
               onCenter={centerOnSelected}
             />
+          ) : (
+            <div className="flex w-full items-center justify-center p-6">
+              <EmptyState icon={Waypoints} title="No node selected" description="Click a node on the graph to see its details here." />
+            </div>
           )}
-        </SheetContent>
-      </Sheet>
+        </div>
+      </div>
     </div>
   );
 }

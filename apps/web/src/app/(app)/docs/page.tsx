@@ -7,6 +7,7 @@ import { getDocs, DOCS_SWR_KEY } from "@/lib/api/repos-api";
 import { DocsHeader } from "@/components/docs/docs-header";
 import { DocsNav } from "@/components/docs/docs-nav";
 import { DocsContent } from "@/components/docs/docs-content";
+import { DocsTocPane } from "@/components/docs/docs-toc-pane";
 import { RepoPicker } from "@/components/graph/repo-picker";
 
 export default function DocsPage() {
@@ -87,11 +88,12 @@ function DocsPageInner() {
         )}
         <div className="min-h-0 min-w-0 flex-1 overflow-y-auto">
           {page && activeSection ? (
-            <DocsContent page={page} section={activeSection} selectedItem={itemIndex} onSelectItem={setItemIndex} onViewInGraph={viewInGraph} />
+            <DocsContent page={page} section={activeSection} selectedItem={itemIndex} onSelectItem={setItemIndex} onSelectSection={selectSection} onViewInGraph={viewInGraph} />
           ) : (
             <p className="p-8 text-body text-ink-500">Loading documentation…</p>
           )}
         </div>
+        {page && <DocsTocPane sections={page.sections} activeSectionId={activeSection?.id ?? ""} onSelectSection={selectSection} onViewInGraph={() => viewInGraph()} />}
       </div>
     </div>
   );

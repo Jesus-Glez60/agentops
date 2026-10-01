@@ -27,7 +27,7 @@ export function StatCard({
           <Icon className="size-4" />
           {label}
         </div>
-        <div className={cn("text-[34px] leading-none font-extrabold tracking-tight text-ink-100", valueClassName)}>{value}</div>
+        <div className={cn("text-stat-value font-extrabold tracking-tight text-ink-100", valueClassName)}>{value}</div>
         {note && <div className="text-[12.5px] text-ink-500">{note}</div>}
       </CardContent>
     </Card>

@@ -225,6 +225,38 @@
   --text-label: 10px;
   --text-label--line-height: 1.2;
 
+  /* Display register -- the compact scale above (10-20px) covers tables/
+     badges/nav/metadata, but every screen's hero (page H1s, card titles,
+     stat values, auth headlines) uses a much larger register the compact
+     scale was never meant to cover. Values are exact prototype pixel/clamp()
+     values, reused only where the *same* exact value recurs across 2+
+     screens (redesign plan Phase 1) -- a screen with its own one-off size
+     close-but-not-identical to one of these uses an arbitrary Tailwind value
+     instead of forcing a mismatched token.
+     `--text-page-title` (20px, compact scale above) already covers the
+     Graph inspector panel's 20px title -- no separate token needed there. */
+  --text-display-auth: clamp(40px, 4.6vw, 64px);
+  --text-display-auth--line-height: 0.98;
+  /* Gotchas/Repositories/Libraries/Settings/Docs page H1 -- identical
+     clamp() across all five screens. */
+  --text-display-hero: clamp(32px, 3.4vw, 44px);
+  --text-display-hero--line-height: 1.02;
+  /* Gotcha detail title + auth-panel H2 ("Create your account" etc). */
+  --text-display-card: 30px;
+  --text-display-card--line-height: 1.1;
+  /* "Next up" heading, Settings tab section headings (Members, Roles &
+     permissions, ...). */
+  --text-heading-lg: 24px;
+  --text-heading-lg--line-height: 1.2;
+  /* Overview/Libraries stat-strip big numbers. */
+  --text-stat-value: 34px;
+  --text-stat-value--line-height: 1;
+  /* Hero subtitles (Welcome/Auth/Overview/Gotchas/etc.) -- 17px recurs
+     across most hero bands; Docs' 19px lead paragraph is a one-off, kept
+     as an arbitrary value there rather than forced into this token. */
+  --text-body-lg: 17px;
+  --text-body-lg--line-height: 1.5;
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
