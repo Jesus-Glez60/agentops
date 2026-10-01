@@ -28,9 +28,21 @@
   --raised: #1e1e2e;
   --border-default: #313244;
   --border-strong: #45475a;
+  /* Full Catppuccin Mocha text/overlay ramp -- 100/300/500 were the only
+     stops originally defined, but 200/400/600 were already in use across
+     ~37 files (presumably assuming a fuller ramp existed) with no CSS
+     custom property backing them. An undefined `var(--ink-N)` makes the
+     `color` property compute to its guaranteed-invalid value, which is
+     silently ignored (the element just inherits its parent's color
+     instead) -- not a crash, just a quietly wrong color everywhere one of
+     these was used. Filled in with the real adjacent Catppuccin Mocha
+     stops (subtext1/overlay2/overlay0) rather than inventing new values. */
   --ink-100: #cdd6f4;
+  --ink-200: #bac2de;
   --ink-300: #a6adc8;
+  --ink-400: #9399b2;
   --ink-500: #7f849c;
+  --ink-600: #6c7086;
   --slate-blue: #b4befe;
   --blue-500: #89b4fa;
   --amber-500: #fab387;
@@ -144,8 +156,11 @@
   --color-raised: var(--raised);
   --color-border-strong: var(--border-strong);
   --color-ink-100: var(--ink-100);
+  --color-ink-200: var(--ink-200);
   --color-ink-300: var(--ink-300);
+  --color-ink-400: var(--ink-400);
   --color-ink-500: var(--ink-500);
+  --color-ink-600: var(--ink-600);
   --color-slate-blue: var(--slate-blue);
   --color-mauve: var(--mauve);
   --color-pink: var(--pink);
