@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useParams } from "next/navigation";
 import useSWR from "swr";
 import { toast } from "sonner";
-import { CheckCircle2, CircleDashed, GitBranch, Loader2, TriangleAlert, RotateCcw, KeyRound } from "lucide-react";
+import { CheckCircle2, CircleDashed, Loader2, TriangleAlert, RotateCcw, KeyRound } from "lucide-react";
 import { getIndexingStatus, retryIndexing, regenerateDeployKey, INDEXING_STAGE_LABELS, type IndexingStage } from "@/lib/api/repos-api";
 import { Progress } from "@/components/ui/progress";
 import { Button } from "@/components/ui/button";
@@ -88,22 +88,24 @@ export default function IndexingStatusPage() {
   const doneCount = stages.filter((s) => s.status === "done").length;
 
   return (
-    <div className="mx-auto w-full max-w-[680px] px-6 py-10">
-      <div className="mb-6 flex items-center gap-3">
-        <div className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border-strong bg-panel">
-          <GitBranch className={cn("size-5", job.status === "failed" ? "text-health-failed" : "text-primary")} />
-        </div>
-        <div>
-          <h1 className="font-mono text-[16px] font-semibold text-ink-100">{connectionId}</h1>
-          <p className="font-mono text-mono-code text-ink-400">
-            {job.kind === "initial" ? "Initial index" : "Reindex"} &middot; {job.status}
-          </p>
-        </div>
+    <div className="relative overflow-hidden">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0"
+        style={{ background: "radial-gradient(ellipse 50% 40% at 50% -10%, rgba(203,166,247,0.2), transparent 70%)" }}
+      />
+      <div className="relative mx-auto w-full max-w-[680px] px-6 py-10">
+      <div className="mb-8 flex flex-col gap-2.5">
+        <h1 className="text-[clamp(30px,3.4vw,42px)] font-extrabold leading-[1.05] tracking-[-0.04em] text-ink-100">
+          {job.status === "succeeded" ? "Indexed. Your agents can query it now." : job.status === "failed" ? `Indexing failed: ${connectionId}` : `Indexing ${connectionId}…`}
+        </h1>
+        <p className="text-[16px] text-ink-300">
+          {connectionId} &middot; {job.kind === "initial" ? "Initial index" : "Reindex"}
+          {job.status === "running" && ". You can leave this page; indexing keeps going in the background."}
+        </p>
         {job.status === "running" && (
-          <div className="ml-auto text-right">
-            <div className="text-section font-medium text-primary">
-              {doneCount} / {stages.length} stages
-            </div>
+          <div className="text-section font-medium text-primary">
+            {doneCount} / {stages.length} stages
           </div>
         )}
       </div>
@@ -187,16 +189,16 @@ export default function IndexingStatusPage() {
 
           <div className="flex items-center gap-3">
             {failedStage.stage === "repository_cloned" && (
-              <Button onClick={handleRegenerateKey} disabled={regenerating} variant="outline">
+              <Button size="cta" onClick={handleRegenerateKey} disabled={regenerating} variant="outline">
                 <KeyRound className="size-3.5" />
                 {regenerating ? "Regenerating…" : "Regenerate deploy key"}
               </Button>
             )}
-            <Button onClick={handleRetry} disabled={retrying} variant="outline">
+            <Button size="cta" onClick={handleRetry} disabled={retrying} variant="outline">
               <RotateCcw className="size-3.5" />
               {retrying ? "Retrying…" : "Retry indexing"}
             </Button>
-            <Button variant="outline" asChild>
+            <Button size="cta" variant="outline" asChild>
               <Link href="/repositories">Manage connection</Link>
             </Button>
           </div>
@@ -204,12 +206,16 @@ export default function IndexingStatusPage() {
       )}
 
       {job.status === "succeeded" && (
-        <div className="flex items-center gap-3">
-          <Button asChild>
-            <Link href="/repositories">Back to repositories</Link>
+        <div className="flex flex-wrap items-center gap-3">
+          <Button size="cta" asChild>
+            <Link href={`/graph?repo=${encodeURIComponent(connectionId)}`}>Open in Knowledge Graph</Link>
+          </Button>
+          <Button size="cta" variant="outline" asChild>
+            <Link href="/welcome">Connect a coding tool</Link>
           </Button>
         </div>
       )}
+      </div>
     </div>
   );
 }

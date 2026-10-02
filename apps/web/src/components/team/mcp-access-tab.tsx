@@ -28,13 +28,15 @@ const MODES: { value: McpAccessMode; title: string; description: string }[] = [
  * in, same as the deployment-level `AGENTOPS_ACCESS_MODE` env var this
  * replaces the need to set manually.
  *
- * Radio-cards, not a `Select` dropdown (redesign plan Phase 7) -- reuses
- * the same whole-card-is-the-button pattern already built for the
- * Repositories Connect wizard's method-selection cards
+ * Radio-cards, not a `Select` dropdown (redesign plan Phase 7) -- the
+ * whole-card-is-the-button selected/background treatment matches the
+ * Connect wizard's method-selection cards
  * (`app/(app)/repositories/connect/page.tsx`'s `ChooseMethodView`), not a
  * new `RadioGroup` primitive: neither that pattern nor the design's own
- * markup uses a real `<input type="radio">`, just a styled button with a
- * manually-drawn selected/unselected ring.
+ * markup uses a real `<input type="radio">`, just a styled button. The
+ * radio-dot ring itself was built here first, not reused from Connect --
+ * Connect's cards didn't have one until the redesign's Session 6 added it
+ * there too, copying this component's markup in the other direction.
  */
 export function McpAccessTab() {
   const { data, isLoading, mutate } = useSWR(TEAM_MCP_ACCESS_MODE_SWR_KEY, getMcpAccessMode);

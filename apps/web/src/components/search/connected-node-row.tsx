@@ -1,7 +1,7 @@
 import { ArrowRight, ExternalLink } from "lucide-react";
 import type { NodeKind } from "@/lib/api/repos-api";
-import { KIND_TAG_CLASSNAME } from "@/lib/node-kind-colors";
-import { cn } from "@/lib/utils";
+import { NODE_KIND_SHAPE } from "@/lib/node-kind-shapes";
+import { NavDot } from "@/components/shell/nav-dot";
 
 export function ConnectedNodeRow({
   relation,
@@ -16,6 +16,7 @@ export function ConnectedNodeRow({
   label: string;
   onClick: () => void;
 }) {
+  const { color, shape } = NODE_KIND_SHAPE[kind];
   return (
     <button
       onClick={onClick}
@@ -23,7 +24,10 @@ export function ConnectedNodeRow({
     >
       <span className="w-16 shrink-0 text-mono-code text-ink-500">{relation}</span>
       <ArrowRight className="size-3 shrink-0 text-ink-500" />
-      <span className={cn("shrink-0 rounded border px-1.5 py-0.5 text-mono-code uppercase", KIND_TAG_CLASSNAME[kind])}>{kindLabel}</span>
+      <span className="flex shrink-0 items-center gap-1.5 font-mono text-[11px] uppercase tracking-wide" style={{ color }}>
+        <NavDot color={color} shape={shape} />
+        {kindLabel}
+      </span>
       <span className="min-w-0 flex-1 truncate text-body text-ink-100">{label}</span>
       <ExternalLink className="size-3.5 shrink-0 text-ink-500" />
     </button>

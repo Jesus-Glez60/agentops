@@ -141,7 +141,7 @@ export function InstallationRepoPicker({ installationId }: { installationId: str
       </div>
 
       <div className="mt-6 flex items-center gap-3">
-        <Button onClick={handleConnect} disabled={connecting || selected.size === 0}>
+        <Button size="cta" onClick={handleConnect} disabled={connecting || selected.size === 0}>
           {connecting ? "Connecting…" : `Connect ${selected.size} ${selected.size === 1 ? "repository" : "repositories"} →`}
         </Button>
       </div>

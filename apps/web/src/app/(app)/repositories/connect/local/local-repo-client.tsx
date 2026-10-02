@@ -134,16 +134,27 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
   }
 
   return (
-    <div className="mx-auto w-full max-w-[680px] px-6 py-10">
+    <div className="relative overflow-hidden">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0"
+        style={{ background: "radial-gradient(ellipse 50% 40% at 50% -10%, rgba(203,166,247,0.2), transparent 70%)" }}
+      />
+      <div className="relative mx-auto w-full max-w-[680px] px-6 py-10">
       <Link href="/repositories/connect" className="mb-6 inline-flex items-center gap-1.5 text-section text-ink-400 hover:text-ink-100">
         <ArrowLeft className="size-3.5" />
         Connect
       </Link>
 
-      <StepIndicator steps={[{ label: "Method", status: "done" }, { label: "Local folder", status: "active" }]} />
+      {/* Method/Configure only -- unlike SSH/GitHub App, local has no
+          distinct post-configure "Index" phase from this page: the user
+          still has to go run a command on their own machine, and there's
+          no indexing-progress route this flow hands off to the way the
+          other two methods do (see redesign plan Phase 10 item 6/7). */}
+      <StepIndicator steps={[{ label: "Method", status: "done" }, { label: "Configure", status: "active" }]} />
 
-      <h1 className="text-page-title font-semibold text-ink-100">Connect a local repo</h1>
-      <p className="mt-1 text-section text-ink-400">Point us at a folder on this machine and we&apos;ll tell you exactly what to run — including repos that aren&apos;t pushed anywhere.</p>
+      <h1 className="text-[clamp(30px,3.4vw,42px)] font-extrabold leading-[1.05] tracking-[-0.04em] text-ink-100">Connect a local repo</h1>
+      <p className="mt-2.5 text-[16px] text-ink-300">Point us at a folder on this machine and we&apos;ll tell you exactly what to run — including repos that aren&apos;t pushed anywhere.</p>
 
       {supported === false && (
         <div className="mt-6 rounded-md border border-border-strong bg-panel px-4 py-3.5 text-section text-ink-400">
@@ -155,7 +166,7 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
 
       {supported !== false && !outcome && (
         <div className="mt-6">
-          <Button onClick={handlePick} disabled={picking}>
+          <Button size="cta" onClick={handlePick} disabled={picking}>
             <FolderOpen className="size-4" />
             {picking ? "Reading folder…" : "Choose a folder"}
           </Button>
@@ -209,17 +220,18 @@ export function LocalRepoClient({ apiUrl, apiUrlIsGuessed }: { apiUrl: string; a
           <div className="flex items-center gap-3">
             {outcome.host === "github.com" ? (
               <>
-                <Button onClick={goToGithubApp}>Continue with GitHub App</Button>
-                <Button variant="outline" onClick={() => router.push(`/repositories/connect/ssh?repo_url=${encodeURIComponent(outcome.url)}`)}>
+                <Button size="cta" onClick={goToGithubApp}>Continue with GitHub App</Button>
+                <Button size="cta" variant="outline" onClick={() => router.push(`/repositories/connect/ssh?repo_url=${encodeURIComponent(outcome.url)}`)}>
                   Use SSH deploy key instead
                 </Button>
               </>
             ) : (
-              <Button onClick={() => router.push(`/repositories/connect/ssh?repo_url=${encodeURIComponent(outcome.url)}`)}>Continue with SSH deploy key</Button>
+              <Button size="cta" onClick={() => router.push(`/repositories/connect/ssh?repo_url=${encodeURIComponent(outcome.url)}`)}>Continue with SSH deploy key</Button>
             )}
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 }

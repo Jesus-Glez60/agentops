@@ -68,38 +68,43 @@ export default function SshDeployKeyPage() {
   }
 
   return (
-    <div className="mx-auto w-full max-w-[680px] px-6 py-10">
-      <Link href="/repositories/connect" className="mb-6 inline-flex items-center gap-1.5 text-section text-ink-400 hover:text-ink-100">
-        <ArrowLeft className="size-3.5" />
-        Connect
-      </Link>
-
-      <StepIndicator
-        steps={[
-          { label: "Method", status: "done" },
-          { label: "Deploy key", status: result ? "done" : "active" },
-          { label: "Repository URL", status: result ? "active" : "pending" },
-          { label: "Verify & index", status: "pending" },
-        ]}
+    <div className="relative overflow-hidden">
+      <div
+        aria-hidden
+        className="pointer-events-none absolute inset-0"
+        style={{ background: "radial-gradient(ellipse 50% 40% at 50% -10%, rgba(203,166,247,0.2), transparent 70%)" }}
       />
+      <div className="relative mx-auto w-full max-w-[680px] px-6 py-10">
+        <Link href="/repositories/connect" className="mb-6 inline-flex items-center gap-1.5 text-section text-ink-400 hover:text-ink-100">
+          <ArrowLeft className="size-3.5" />
+          Connect
+        </Link>
 
-      <h1 className="text-page-title font-semibold text-ink-100">SSH deploy key</h1>
-      <p className="mt-1 text-section text-ink-400">
-        {result ? "A unique read-only SSH deploy key has been generated for this repository. Add it to GitHub to grant AgentOps access." : "Enter the repository's SSH URL to generate a dedicated, read-only deploy key."}
-      </p>
+        <StepIndicator
+          steps={[
+            { label: "Method", status: "done" },
+            { label: "Configure", status: "active" },
+            { label: "Index", status: "pending" },
+          ]}
+        />
 
-      {!result ? (
-        <form onSubmit={handleConnect} className="mt-6">
-          <label className="mb-1.5 block text-mono-code uppercase text-ink-500">Repository SSH URL</label>
-          <Input value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} placeholder="git@github.com:acme/widgets.git" required autoFocus />
-          <p className="mt-1.5 text-mono-code text-ink-500">Use the SSH URL format: git@github.com:owner/repo.git</p>
-          <div className="mt-6">
-            <Button type="submit" disabled={connecting || !repoUrl.trim()}>
-              {connecting ? "Generating key…" : "Generate deploy key"}
-            </Button>
-          </div>
-        </form>
-      ) : (
+        <h1 className="text-[clamp(30px,3.4vw,42px)] font-extrabold leading-[1.05] tracking-[-0.04em] text-ink-100">SSH deploy key</h1>
+        <p className="mt-2.5 text-[16px] text-ink-300">
+          {result ? "A unique read-only SSH deploy key has been generated for this repository. Add it to GitHub to grant AgentOps access." : "Enter the repository's SSH URL to generate a dedicated, read-only deploy key."}
+        </p>
+
+        {!result ? (
+          <form onSubmit={handleConnect} className="mt-6">
+            <label className="mb-1.5 block text-mono-code uppercase text-ink-500">Repository SSH URL</label>
+            <Input value={repoUrl} onChange={(e) => setRepoUrl(e.target.value)} placeholder="git@github.com:acme/widgets.git" required autoFocus />
+            <p className="mt-1.5 text-mono-code text-ink-500">Use the SSH URL format: git@github.com:owner/repo.git</p>
+            <div className="mt-6">
+              <Button size="cta" type="submit" disabled={connecting || !repoUrl.trim()}>
+                {connecting ? "Generating key…" : "Generate deploy key"}
+              </Button>
+            </div>
+          </form>
+        ) : (
         <>
           <div className="mt-6">
             <label className="mb-2 block text-section font-medium text-ink-200">1. Copy the public SSH key</label>
@@ -147,16 +152,16 @@ export default function SshDeployKeyPage() {
           </div>
 
           <div className="mt-6 flex items-center gap-3">
-            <Button onClick={handleVerify} disabled={verifying}>
-              <ShieldCheck className="size-4" />
+            <Button size="cta" onClick={handleVerify} disabled={verifying}>
               {verifying ? "Verifying…" : "Verify access"}
             </Button>
-            <Button variant="outline" onClick={() => setResult(null)}>
+            <Button size="cta" variant="outline" onClick={() => setResult(null)}>
               Back
             </Button>
           </div>
         </>
-      )}
+        )}
+      </div>
     </div>
   );
 }

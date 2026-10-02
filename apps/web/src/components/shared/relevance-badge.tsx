@@ -2,10 +2,13 @@ import { cn } from "@/lib/utils";
 
 export type RelevanceLevel = "strong" | "related" | "supporting";
 
+// Plain colored text, not a bordered badge -- matches the prototype's own
+// search-result relevance label exactly (`font-size:12px;font-weight:600;
+// color:{{r.relC}}`, no border/background).
 const RELEVANCE_CONFIG: Record<RelevanceLevel, { label: string; className: string }> = {
-  strong: { label: "Strong match", className: "border-relevance-strong/40 text-relevance-strong" },
-  related: { label: "Related", className: "border-relevance-related/40 bg-relevance-related/10 text-relevance-related" },
-  supporting: { label: "Supporting context", className: "border-border-strong text-ink-500" },
+  strong: { label: "Strong match", className: "text-relevance-strong" },
+  related: { label: "Related", className: "text-relevance-related" },
+  supporting: { label: "Supporting context", className: "text-ink-500" },
 };
 
 export function relevanceForScore(score: number): RelevanceLevel {
@@ -16,9 +19,5 @@ export function relevanceForScore(score: number): RelevanceLevel {
 
 export function RelevanceBadge({ level, className }: { level: RelevanceLevel; className?: string }) {
   const config = RELEVANCE_CONFIG[level];
-  return (
-    <span className={cn("inline-flex items-center rounded-md border px-1.5 py-0.5 text-mono-code font-medium", config.className, className)}>
-      {config.label}
-    </span>
-  );
+  return <span className={cn("text-[12px] font-semibold", config.className, className)}>{config.label}</span>;
 }
