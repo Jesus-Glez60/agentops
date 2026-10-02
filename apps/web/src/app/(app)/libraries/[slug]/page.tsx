@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import useSWR from "swr";
 import { toast } from "sonner";
-import { ExternalLink, RefreshCw, Search } from "lucide-react";
+import { ExternalLink, RefreshCw } from "lucide-react";
 import { getLibrary, getLibraryChangelog, getLibraryDocs, rescrapeLibrary, LIBRARIES_SWR_KEY } from "@/lib/api/libraries-api";
 import { relativeTimeFromIsoString } from "@/lib/relative-time";
 import { MarkdownContent } from "@/components/shared/markdown-content";
@@ -69,24 +69,30 @@ function LibraryDetailPageInner() {
         )}
       </div>
 
-      <div className="flex shrink-0 items-start justify-between gap-4 border-b border-border-strong px-6 py-4">
-        <div>
-          <div className="mb-0.5 flex items-center gap-2">
-            <h1 className="text-[38px] font-bold tracking-[-0.02em] text-ink-100">{library.name}</h1>
-            <DocStatusBadge hasMismatch={library.has_mismatch} />
+      <div className="relative shrink-0 overflow-hidden border-b border-border-strong bg-canvas">
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0"
+          style={{ background: "radial-gradient(ellipse 50% 120% at 15% -40%, rgba(249,226,175,0.16), transparent 70%)" }}
+        />
+        <div className="relative flex flex-wrap items-end justify-between gap-5 px-6 py-5">
+          <div className="flex max-w-[720px] flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-3">
+              <h1 className="text-[38px] font-extrabold tracking-[-0.04em] text-ink-100">{library.name}</h1>
+              <DocStatusBadge hasMismatch={library.has_mismatch} />
+            </div>
+            {library.description && <p className="text-[16px] text-ink-300">{library.description}</p>}
           </div>
-          {library.description && <p className="max-w-xl text-body text-ink-400">{library.description}</p>}
-          <p className="mt-0.5 text-mono-code text-ink-500">{library.slug}</p>
+          {library.versions.length > 0 && (
+            <div className="flex flex-col items-end gap-2">
+              <p className="font-mono text-[10.5px] uppercase tracking-wide text-ink-500">Viewing version</p>
+              <VersionPillSelector versions={library.versions} selected={viewingVersion} onSelect={selectVersion} />
+            </div>
+          )}
         </div>
-        {library.versions.length > 0 && (
-          <div className="flex flex-col items-end gap-2">
-            <p className="text-mono-code uppercase text-ink-500">Viewing version</p>
-            <VersionPillSelector versions={library.versions} selected={viewingVersion} onSelect={selectVersion} />
-          </div>
-        )}
       </div>
 
-      <VersionMismatchBanner viewingVersion={viewingVersion} mismatched={mismatchedAgainstViewing} />
+      <VersionMismatchBanner slug={slug} viewingVersion={viewingVersion} mismatched={mismatchedAgainstViewing} />
 
       <Tabs value={tab} onValueChange={setTab} className="min-h-0 flex-1">
         <TabsList variant="line" className="shrink-0 border-b border-border-strong px-6">
@@ -119,13 +125,10 @@ function LibraryDetailPageInner() {
                 <Row label="Used in" value={`${library.used_in_count} repo${library.used_in_count === 1 ? "" : "s"}`} />
               </dl>
             </div>
-            <div className="space-y-1.5 border-t border-border-strong pt-3">
+            <div className="space-y-2 border-t border-border-strong pt-3">
               <p className="mb-2 text-mono-code uppercase text-ink-500">Actions</p>
-              <Button variant="outline" size="sm" className="w-full justify-start" asChild>
-                <Link href={`/search?library=${encodeURIComponent(library.slug)}`}>
-                  <Search className="size-3.5" />
-                  Search this library
-                </Link>
+              <Button size="cta" className="w-full justify-center" asChild>
+                <Link href={`/search?library=${encodeURIComponent(library.slug)}`}>Search this library</Link>
               </Button>
               <RescrapeButton slug={library.slug} version={viewingVersion} />
             </div>
@@ -179,7 +182,7 @@ function RescrapeButton({ slug, version }: { slug: string; version: string }) {
   }
 
   return (
-    <Button variant="outline" size="sm" className="w-full justify-start" disabled={pending} onClick={handleClick}>
+    <Button variant="outline" size="cta" className="w-full justify-center" disabled={pending} onClick={handleClick}>
       <RefreshCw className={pending ? "size-3.5 animate-spin" : "size-3.5"} />
       Re-index
     </Button>

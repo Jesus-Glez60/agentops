@@ -3,7 +3,12 @@
 // Distinct from the narrower `[connectionId]/index/page.tsx` (indexing-
 // progress-only, job stages/retry/regenerate-key) -- this is the general
 // "click a row, zoom into detail" page the dashboard's "View details"
-// button links to, modeled on `libraries/[slug]/page.tsx`'s layout.
+// button links to, modeled on `libraries/[slug]/page.tsx`'s two-column
+// layout (content left, meta/actions sidebar right) -- that pattern
+// already existed there before this pass touched it; this page adopts it
+// for consistency between the app's two sibling detail screens, not
+// because the prototype depicts a "Repository detail" screen (it doesn't
+// have one at all, confirmed via grep for every `data-screen-label=`).
 //
 // Explicitly out of scope for this pass: a multi-job history list and raw
 // job-log line viewer -- no backend endpoint exists for either yet
@@ -20,7 +25,7 @@ import { Suspense } from "react";
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import useSWR, { useSWRConfig } from "swr";
-import { ArrowLeft, ArrowRight, GitBranch } from "lucide-react";
+import { ArrowLeft, ArrowRight } from "lucide-react";
 import { getRepos, getRepoUsage, parseRepoStatus, REPOS_SWR_KEY } from "@/lib/api/repos-api";
 import { repoHealthWithReason } from "@/lib/repo-health";
 import { HealthBadge } from "@/components/dashboard/health-badge";
@@ -76,49 +81,53 @@ function RepoDetailPageInner({ apiUrl }: { apiUrl: string }) {
         <span className="font-medium text-ink-100">{repo.id}</span>
       </div>
 
-      <div className="flex-1 overflow-y-auto px-8 py-6">
-        <div className="mb-1 flex items-center gap-2">
-          <GitBranch className="size-4 text-ink-500" />
+      <div className="flex min-h-0 flex-1 overflow-hidden">
+        <div className="flex-1 overflow-y-auto px-8 py-6">
           <h1 className="text-display-card font-bold text-ink-100">{repo.id}</h1>
-        </div>
-        <p className="truncate text-mono-path text-ink-500">{repo.repo_url}</p>
+          <p className="mt-1 truncate text-mono-path text-ink-500">{repo.repo_url}</p>
 
-        <div className="mt-6 grid max-w-[640px] grid-cols-2 gap-x-8 gap-y-5">
-          <Field label="Connection method">
-            <span className="text-body text-ink-200">{METHOD_LABELS[repo.method] ?? repo.method}</span>
-          </Field>
-          <Field label="Branch">
-            <BranchSelect repo={repo} onChanged={() => mutate(REPOS_SWR_KEY)} className="w-full" />
-          </Field>
-          <Field label="Health">
-            <HealthBadge status={health} reason={reason} />
-          </Field>
-          <Field label="Status">
-            <span className="text-mono-code text-ink-300">{status.kind === "failed" ? status.reason : status.kind}</span>
-          </Field>
-          <Field label="Nodes">
-            {repo.counts ? (
-              <div className="flex flex-col gap-1">
-                <NodeCountBar counts={repo.counts} className="w-48" />
-                <span className="text-mono-code text-ink-500">{totalNodes} total</span>
-              </div>
-            ) : (
-              <span className="text-mono-code text-ink-500">not yet scanned</span>
-            )}
-          </Field>
+          <div className="mt-6 max-w-[640px]">
+            <UsageCard usage={usage ?? null} apiUrl={apiUrl} />
+          </div>
         </div>
 
-        <div className="mt-6 max-w-[640px]">
-          <UsageCard usage={usage ?? null} apiUrl={apiUrl} />
-        </div>
-
-        <div className="mt-8">
-          <Button variant="outline" size="sm" asChild>
-            <Link href={`/repositories/${encodeURIComponent(repo.id)}/index`}>
-              Indexing progress
-              <ArrowRight className="size-3.5" />
-            </Link>
-          </Button>
+        <div className="w-[260px] shrink-0 space-y-4 overflow-y-auto border-l border-border-strong bg-panel p-4">
+          <div>
+            <p className="mb-2 text-mono-code uppercase text-ink-500">Connection</p>
+            <dl className="space-y-3">
+              <Field label="Connection method">
+                <span className="text-body text-ink-200">{METHOD_LABELS[repo.method] ?? repo.method}</span>
+              </Field>
+              <Field label="Branch">
+                <BranchSelect repo={repo} onChanged={() => mutate(REPOS_SWR_KEY)} className="w-full" />
+              </Field>
+              <Field label="Health">
+                <HealthBadge status={health} reason={reason} />
+              </Field>
+              <Field label="Status">
+                <span className="text-mono-code text-ink-300">{status.kind === "failed" ? status.reason : status.kind}</span>
+              </Field>
+              <Field label="Nodes">
+                {repo.counts ? (
+                  <div className="flex flex-col gap-1">
+                    <NodeCountBar counts={repo.counts} />
+                    <span className="text-mono-code text-ink-500">{totalNodes} total</span>
+                  </div>
+                ) : (
+                  <span className="text-mono-code text-ink-500">not yet scanned</span>
+                )}
+              </Field>
+            </dl>
+          </div>
+          <div className="space-y-1.5 border-t border-border-strong pt-3">
+            <p className="mb-2 text-mono-code uppercase text-ink-500">Actions</p>
+            <Button size="cta" variant="outline" className="w-full justify-center" asChild>
+              <Link href={`/repositories/${encodeURIComponent(repo.id)}/index`}>
+                Indexing progress
+                <ArrowRight className="size-3.5" />
+              </Link>
+            </Button>
+          </div>
         </div>
       </div>
     </div>

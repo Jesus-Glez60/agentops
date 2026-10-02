@@ -74,7 +74,7 @@ export default function SetupPage() {
             <CardDescription>Wrote .env — restart the app for it to take effect (e.g. pm2 restart ecosystem.config.js), then continue to sign in.</CardDescription>
           </CardHeader>
           <CardFooter>
-            <Button className="w-full" onClick={() => router.push("/login")}>
+            <Button size="cta" className="w-full justify-center" onClick={() => router.push("/login")}>
               Continue to sign in
             </Button>
           </CardFooter>
@@ -145,7 +145,7 @@ export default function SetupPage() {
             )}
           </CardContent>
           <CardFooter>
-            <Button type="submit" className="w-full" disabled={pending}>
+            <Button type="submit" size="cta" className="w-full justify-center" disabled={pending}>
               {pending ? "Saving…" : "Save configuration"}
             </Button>
           </CardFooter>
