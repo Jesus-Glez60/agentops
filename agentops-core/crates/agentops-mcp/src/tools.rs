@@ -425,15 +425,12 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
         let hint = never_scanned_hint(store.as_ref(), &repo)?.unwrap_or_default();
         return Ok(format!("No gotchas recorded.{hint}"));
     }
-    if let Some(path_str) = get_str(args, "path") {
-        maybe_record_session_event(Path::new(path_str), args, "list_gotchas", &format!("listed {} gotcha(s)", gotchas.len()), None, "hit")?;
-    }
     // Full-prominence first -- every gotcha is still listed (this is
     // permanent knowledge, never hidden), just ranked so a curated-down
     // one doesn't dominate an agent's attention over ones nobody's
     // demoted.
     gotchas.sort_by_key(|n| n.prominence == agentops_graph::NodeProminence::Reduced);
-    Ok(gotchas
+    let rendered = gotchas
         .iter()
         .map(|n| {
             let reduced = if n.prominence == agentops_graph::NodeProminence::Reduced {
@@ -444,7 +441,16 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
             format!("- {} (node {}){reduced}", n.name.as_deref().unwrap_or("(untitled)"), n.id)
         })
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+    if let Some(path_str) = get_str(args, "path") {
+        // Already compact (title+id, no body) by construction -- this
+        // tool has no detail/compact toggle, so the only cost-accounting
+        // metadata worth recording is what actually went out, not a
+        // deferred/saved estimate the way related_context's compact mode
+        // has.
+        maybe_record_session_event(Path::new(path_str), args, "list_gotchas", &format!("listed {} gotcha(s), {} byte(s)", gotchas.len(), rendered.len()), None, "hit")?;
+    }
+    Ok(rendered)
 }
 
 fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
@@ -674,11 +680,15 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
         if hits.is_empty() {
             return Ok("No matches.".to_string());
         }
-        return Ok(hits
+        let rendered = hits
             .iter()
             .map(|h| format!("- {:?} {} (score {:.4}){}", h.node.kind, h.node.name.as_deref().unwrap_or("(untitled)"), h.fused_score, h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default()))
             .collect::<Vec<_>>()
-            .join("\n"));
+            .join("\n");
+        if let Some(path_str) = get_str(args, "path") {
+            maybe_record_session_event(Path::new(path_str), args, "local_semantic_search", &format!("gist_then_detail: {} hit(s), {} byte(s)", hits.len(), rendered.len()), None, "hit")?;
+        }
+        return Ok(rendered);
     }
 
     // "hybrid" (Phase 4): fuses dense + lexical + exact-match via
@@ -702,7 +712,7 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
         if hits.is_empty() {
             return Ok("No matches.".to_string());
         }
-        return Ok(hits
+        let rendered = hits
             .iter()
             .map(|h| {
                 let signals = [h.dense_rank.map(|_| "dense"), h.lexical_rank.map(|_| "lexical"), h.exact_rank.map(|_| "exact")].into_iter().flatten().collect::<Vec<_>>().join("+");
@@ -742,7 +752,11 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n"));
+            .join("\n");
+        if let Some(path_str) = get_str(args, "path") {
+            maybe_record_session_event(Path::new(path_str), args, "local_semantic_search", &format!("hybrid: {} hit(s), {} byte(s), graph_expand={graph_expand}", hits.len(), rendered.len()), None, "hit")?;
+        }
+        return Ok(rendered);
     }
 
     let embedding = agentops_embeddings::LocalEmbedder.embed(query)?;
@@ -766,7 +780,7 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
     });
     hits.truncate(top_k);
 
-    Ok(hits
+    let rendered = hits
         .iter()
         .map(|(n, distance)| {
             let reduced = if n.prominence == agentops_graph::NodeProminence::Reduced {
@@ -777,7 +791,11 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
             format!("- {:?} {} (distance {distance:.4}){}{reduced}", n.kind, n.name.as_deref().unwrap_or("(untitled)"), n.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
         })
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+    if let Some(path_str) = get_str(args, "path") {
+        maybe_record_session_event(Path::new(path_str), args, "local_semantic_search", &format!("dense: {} hit(s), {} byte(s)", hits.len(), rendered.len()), None, "hit")?;
+    }
+    Ok(rendered)
 }
 
 fn tool_get_session(args: &Value) -> anyhow::Result<String> {
@@ -906,9 +924,6 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
     if results.is_empty() {
         return Ok("No related symbols found.".to_string());
     }
-    if let Some(path_str) = get_str(args, "path") {
-        maybe_record_session_event(Path::new(path_str), args, "related_context", &format!("found {} related item(s)", results.len()), Some(symbol_id), "hit")?;
-    }
     // Progressive disclosure, opt-in: `compact: true` returns note
     // titles/ids with no body text at all (not even a `max_chars`-capped
     // one) -- a cheap "is there anything here, and which node ids do I
@@ -919,7 +934,12 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
     // call this today expecting full bodies, so flipping the default
     // would be a real breaking change, not a pure optimization.
     let compact = get_bool(args, "compact");
-    Ok(results
+    // Tracked alongside rendering (not a second pass over `results`) so
+    // the cost-accounting log below can report what compact mode actually
+    // saved -- the sum of each note's real body length that got skipped,
+    // not a guess.
+    let mut deferred_bytes: usize = 0;
+    let rendered = results
         .iter()
         .map(|m| {
             let via = match m.via {
@@ -934,6 +954,7 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
                     .iter()
                     .map(|(id, kind, title, text, _, _)| {
                         if compact {
+                            deferred_bytes += text.len();
                             format!("    - [{kind:?}] {title} (node {id})")
                         } else {
                             let capped = crate::budget::cap(text, max_chars(args), *id);
@@ -947,7 +968,12 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
             format!("- {} ({via}){}{notes}", m.node.name.as_deref().unwrap_or("(untitled)"), m.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
         })
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+    if let Some(path_str) = get_str(args, "path") {
+        let deferred = if deferred_bytes > 0 { format!(", deferred ~{deferred_bytes} body byte(s) (compact)") } else { String::new() };
+        maybe_record_session_event(Path::new(path_str), args, "related_context", &format!("found {} related item(s), {} byte(s) returned{deferred}", results.len(), rendered.len()), Some(symbol_id), "hit")?;
+    }
+    Ok(rendered)
 }
 
 fn tool_explain_symbol(args: &Value) -> anyhow::Result<String> {
@@ -1323,6 +1349,37 @@ mod tests {
         assert!(text.contains("scan_repo"), "{text}");
         assert!(text.contains("add_note"), "{text}");
         assert_eq!(text.matches("sess-unrelated").count(), 0, "the other session must not appear: {text}");
+    }
+
+    #[test]
+    fn related_context_and_local_semantic_search_log_real_byte_cost_to_the_session_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def helper():\n    pass\n\ndef seed():\n    return helper()\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let session_id = "sess-cost-accounting";
+
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path, "with_embeddings": true, "session_id": session_id })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Helper workaround", "body": "helper has a known workaround for a long-standing bug that took a while to track down.", "session_id": session_id })).unwrap();
+
+        let store = crate::store::open_store(std::path::Path::new(&path)).unwrap();
+        let repo = crate::scan::repo_name(std::path::Path::new(&path));
+        let seed_id = store.find_node(&repo, agentops_graph::NodeKind::Symbol, Some("auth.py"), Some("seed"), None).unwrap().unwrap().id;
+        drop(store);
+
+        // Full detail, then compact -- the feed must show a nonzero
+        // deferred-bytes estimate only for the compact call, since that's
+        // the one actually skipping body text.
+        call_tool(AccessMode::Advisor, "related_context", &json!({ "path": path, "symbol_id": seed_id, "session_id": session_id })).unwrap();
+        call_tool(AccessMode::Advisor, "related_context", &json!({ "path": path, "symbol_id": seed_id, "compact": true, "session_id": session_id })).unwrap();
+        call_tool(AccessMode::Advisor, "local_semantic_search", &json!({ "path": path, "query": "seed", "mode": "dense", "session_id": session_id })).unwrap();
+
+        let feed = call_tool(AccessMode::Full, "get_session", &json!({ "path": path, "session_id": session_id })).unwrap();
+        let text = &feed.content[0].text;
+        assert!(text.contains("related_context"), "{text}");
+        assert!(text.contains("byte(s) returned"), "related_context's log must report a real byte count, not just a hit count: {text}");
+        assert!(text.contains("deferred ~"), "the compact-mode call must report a nonzero deferred-bytes estimate: {text}");
+        assert!(text.contains("local_semantic_search"), "{text}");
+        assert!(text.contains("dense: "), "local_semantic_search's dense-mode call must be logged, which it never was before: {text}");
     }
 
     #[test]
