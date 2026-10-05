@@ -16,13 +16,17 @@ move, and don't skip a step just because a later one might also work.
    payoff this project's whole docs system is built around.
 
 3. Only if step 2 genuinely can't resolve the library — it's private,
-   unpublished, or not covered by any registry discovery reaches — and only
-   if a Context7-style documentation MCP tool (resolve a library id, then
-   query its docs) is available in this environment: use it for a one-off
-   lookup. Treat its availability as conditional, never assumed — check
-   what tools are actually present before reaching for it. Its result
-   doesn't get indexed into this project's own docs system the way step 2's
-   does, so step 2 is still the preferred path whenever it can succeed.
+   unpublished, or not covered by any registry discovery reaches: use
+   whichever one-off lookup source is actually available in this
+   environment — a Context7-style documentation MCP tool (resolve a
+   library id, then query its docs), or a Perplexity MCP tool's
+   search/ask/research capability (gated on a configured
+   `PERPLEXITY_API_KEY`, same as any other integration), whichever is
+   present. Treat availability as conditional, never assumed — check what
+   tools are actually configured before reaching for either. Neither
+   result gets indexed into this project's own docs system the way step
+   2's does, so step 2 is still the preferred path whenever it can
+   succeed.
 
 4. If neither step 2 nor step 3 resolves it, say so explicitly rather than
    silently guessing, and only then fall back to training knowledge — flag

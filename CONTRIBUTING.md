@@ -15,6 +15,10 @@ These will apply once forking/PRs are back on:
 - **You're responsible for every line.** However a change was produced, you need to be able to explain why each part of it is there and why it's correct. If you can't, it shouldn't be in the PR.
 - **Verify before you submit.** Especially for bug reports — reproduce it yourself first. An AI tool's claim that something is broken is not, by itself, a bug report.
 
+## Working on this repo with Claude Code
+
+Optional: [rtk](https://github.com/rtk-ai/rtk) compresses noisy `git`/`cargo`/`npm`/`docker` command output before it reaches the agent (`rtk init -g` installs a hook that rewrites commands transparently). This project's own review agents (`ponytail-auditor`, the plan-review council) lean heavily on `git diff`/`Bash`, so it's a decent token-saver for anyone doing Claude-Code-assisted work here — not required, no project-side config needed either way.
+
 ## Reporting security issues
 
 Don't file a public issue for a security vulnerability — see [SECURITY.md](./SECURITY.md).
