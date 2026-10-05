@@ -4,7 +4,7 @@ import { useRouter } from "next/navigation";
 import { BookOpen, SearchIcon, Target, X } from "lucide-react";
 import type { ConnectedNode, NodeDetail } from "@/lib/api/repos-api";
 import { kindLabel } from "@/lib/node-detail-formatting";
-import { KIND_TAG_CLASSNAME } from "@/lib/node-kind-colors";
+import { kindTagClassName } from "@/lib/node-kind-colors";
 import { Button } from "@/components/ui/button";
 import { CopyButton } from "@/components/shared/copy-button";
 import { NodeDetailSections } from "@/components/shared/node-detail-sections";
@@ -38,7 +38,7 @@ export function GraphDetailPanel({
       <div className="flex shrink-0 items-center justify-between border-b border-border-strong px-4 py-3">
         {detail ? (
           <div className="flex items-center gap-2">
-            <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-mono-code uppercase", KIND_TAG_CLASSNAME[detail.kind])}>{kindLabel(detail.kind)}</span>
+            <span className={cn("inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-mono-code uppercase", kindTagClassName(detail.kind))}>{kindLabel(detail.kind)}</span>
             <span className="text-section font-semibold text-ink-100">{detail.name ?? detail.path ?? `Node ${detail.id}`}</span>
           </div>
         ) : (

@@ -17,3 +17,16 @@ export const KIND_TAG_CLASSNAME: Record<NodeKind, string> = {
   // node kind that isn't user-filterable (see GRAPH_FILTERABLE_KINDS).
   DocSection: "border-node-file/40 text-node-file",
 };
+
+/**
+ * Safe accessor -- same reasoning as `nodeKindShape()` in `node-kind-shapes.ts`:
+ * bracket-indexing this map directly and feeding the result straight into
+ * `cn()` doesn't throw (string-or-undefined is fine there), but call sites
+ * that destructure or otherwise treat the result as always-present (e.g.
+ * `graph-node.tsx`'s `KIND_ICON[data.kind]`, a sibling lookup keyed the same
+ * way) do. Centralizing the fallback here keeps both tables degrading the
+ * same way for a kind value this map doesn't cover.
+ */
+export function kindTagClassName(kind: NodeKind): string {
+  return KIND_TAG_CLASSNAME[kind] ?? "border-ink-500/40 text-ink-500";
+}

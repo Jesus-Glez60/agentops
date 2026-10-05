@@ -1,8 +1,8 @@
-import { BookOpen, FileCode, FileText, Scale, SquareFunction, TriangleAlert } from "lucide-react";
+import { BookOpen, FileCode, FileText, HelpCircle, Scale, SquareFunction, TriangleAlert } from "lucide-react";
 import type { NodeProps, Node as FlowNode } from "@xyflow/react";
 import { Handle, Position } from "@xyflow/react";
 import type { NodeKind, NodeProminence } from "@/lib/api/repos-api";
-import { KIND_TAG_CLASSNAME } from "@/lib/node-kind-colors";
+import { kindTagClassName } from "@/lib/node-kind-colors";
 import { cn } from "@/lib/utils";
 
 const KIND_ICON: Record<NodeKind, typeof SquareFunction> = {
@@ -14,6 +14,7 @@ const KIND_ICON: Record<NodeKind, typeof SquareFunction> = {
   Note: BookOpen,
   DocSection: FileText,
 };
+
 
 export interface GraphNodeData {
   kind: NodeKind;
@@ -33,7 +34,10 @@ export interface GraphNodeData {
 export type GraphFlowNode = FlowNode<GraphNodeData, "graphNode">;
 
 export function GraphNode({ data }: NodeProps<GraphFlowNode>) {
-  const Icon = KIND_ICON[data.kind];
+  // Inline fallback, not a `kindIcon()` helper -- the react-hooks lint rule
+  // treats a function call that returns a component type as "creating a
+  // component during render" when assigned to a capitalized variable.
+  const Icon = KIND_ICON[data.kind] ?? HelpCircle;
   const size = data.isSeed ? "size-16" : "size-11";
   const isHotspot = data.hotspotDegree !== undefined;
 
@@ -47,7 +51,7 @@ export function GraphNode({ data }: NodeProps<GraphFlowNode>) {
           className={cn(
             "flex items-center justify-center rounded-full border-2 bg-panel transition-transform",
             size,
-            KIND_TAG_CLASSNAME[data.kind],
+            kindTagClassName(data.kind),
             // Literal RGB triple, not a CSS var -- Tailwind's arbitrary
             // rgba() syntax can't interpolate a hex-valued custom property.
             // Kept in sync with --lavender (#b4befe) by hand; see redesign

@@ -109,6 +109,7 @@ function AlreadyConnectedView({ installations }: { installations: GithubAppInsta
             key={installation.id}
             type="button"
             onClick={() => setSelectedId(installation.id)}
+            aria-pressed={installation.id === selected.id}
             className={cn(
               "rounded-md border px-3 py-1.5 text-section transition-colors",
               installation.id === selected.id ? "border-primary bg-primary/5 text-ink-100" : "border-border-strong text-ink-400 hover:border-ink-500",
@@ -215,7 +216,7 @@ function ChooseMethodView() {
         <h1 className="text-[clamp(30px,3.4vw,42px)] font-extrabold leading-[1.05] tracking-[-0.04em] text-ink-100">Where does the code live?</h1>
         <p className="mt-2.5 text-[16px] text-ink-300">Pick the one that matches your setup. You can connect more repos later, any way you like.</p>
 
-        <div className="mt-8 grid grid-cols-2 gap-4">
+        <div className="mt-8 grid grid-cols-1 gap-4 sm:grid-cols-2">
           {METHODS.map((method) => {
             const isSelected = selected === method.id;
             return (
