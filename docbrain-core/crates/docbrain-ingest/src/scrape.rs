@@ -170,10 +170,15 @@ fn extract_markdown_links(markdown: &str, base: &Url) -> Vec<Url> {
 }
 
 /// Content shorter than this (UTF-8 bytes) after the HTML fallback path is
-/// treated as likely a JS-app-shell placeholder rather than real content
-/// (confirmed live elsewhere in this file: a bare SPA shell runs a few
-/// hundred bytes of "Loading…"/error text, a real content page thousands)
-/// — the threshold `fetch_via_firecrawl` is tried below.
+/// treated as likely a JS-app-shell placeholder rather than real content —
+/// an unverified heuristic, not an empirically confirmed one (a council
+/// review caught an earlier version of this comment overclaiming it was
+/// "confirmed live elsewhere in this file"; it wasn't — the GitHub-SPA
+/// evidence in this file is about chunk *count* from repeated crawling,
+/// not a single page's byte size). A genuinely short real page (a
+/// minimal landing page, a stub doc) could fall under this threshold and
+/// get an unnecessary Firecrawl call; revisit with real measurements if
+/// that turns out to matter in practice.
 const LIKELY_JS_SHELL_BYTES: usize = 500;
 
 /// Tries a clean Markdown export of `url` first; falls back to extracting

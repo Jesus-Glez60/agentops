@@ -20,19 +20,23 @@ lines of new/changed code, and nothing on an auth/payment/data path, spawn
 one `plan-council-member` in **solo playbook mode** (see that agent's own
 instructions) against the plan text — its own report, including its Proof
 for each surviving finding, is the verdict; no chair is needed. Otherwise,
-spawn three `plan-council-member` subagents in parallel, one each in
-**council mode** for Skeptic, Outsider, and Opportunity-hunter (each told
-only its own persona, not to expect or wait on the other two — Skeptic
-stays in this reduced council because this project's own recorded
-knowledge includes a case where exactly its adversarial mode caught real
-bugs that a blind-spot or opportunity framing wouldn't have). Once all
-three return, spawn one `plan-council-chair` with the plan text and all
-three critiques attached, explicitly asking it to surface structured,
-evidence-grounded disagreement between them rather than just merging
-independent opinions, and report its consensus verdict. Fall back to
-performing the relevant pass(es) yourself in sequence if these subagents
-aren't available. If the verdict's required changes affect the plan file
-itself, apply them before treating the plan as ready.
+spawn all five `plan-council-member` subagents in parallel, one each in
+**council mode** for Skeptic, Simplifier, Completeness-checker, Outsider,
+and Opportunity-hunter (each told only its own persona, not to expect or
+wait on the other four). Keep the full five here, don't reduce it: a live
+test of a 3-persona-only version of this gate (Skeptic+Outsider+
+Opportunity-hunter, dropping Simplifier/Completeness-checker and the
+falsification pass for "efficiency") found this backwards — completeness/
+edge-case scrutiny should scale up with risk, not down, and the full
+council's cross-member disagreement synthesis is what substitutes for
+solo mode's self-falsification step on this path. Once all five return,
+spawn one `plan-council-chair` with the plan text and all five critiques
+attached, explicitly asking it to surface structured, evidence-grounded
+disagreement between them rather than just merging independent opinions,
+and report its consensus verdict. Fall back to performing the relevant
+pass(es) yourself in sequence if these subagents aren't available. If the
+verdict's required changes affect the plan file itself, apply them before
+treating the plan as ready.
 
 Report: the first-pass ladder/gotcha result, then the review verdict (the
 solo playbook's report, or the council's consensus verdict — clear, or the

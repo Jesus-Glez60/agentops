@@ -30,11 +30,18 @@ session's `git diff` instead of plan text: compute the size/risk gate
 auth/payment/data path) and spawn either one `plan-council-member` in
 **solo playbook mode** (the common case — its own report, including Proof
 for each surviving finding, is the verdict; no chair needed) or, at/above
-the threshold, three `plan-council-member` subagents in parallel in
-**council mode** (Skeptic, Outsider, Opportunity-hunter, each blind to the
-other two) plus one `plan-council-chair` synthesizing their critiques, with
-an explicit ask for structured, evidence-grounded disagreement between them
-rather than simple merging. Fall back to performing the relevant pass(es)
+the threshold, all five `plan-council-member` subagents in parallel in
+**council mode** (Skeptic, Simplifier, Completeness-checker, Outsider,
+Opportunity-hunter, each blind to the other four) plus one
+`plan-council-chair` synthesizing their critiques, with an explicit ask for
+structured, evidence-grounded disagreement between them rather than simple
+merging. (A live test of an earlier 3-persona-only version of this gate
+found that dropping Completeness-checker/Simplifier and the falsification
+pass from the large/risky path removed exactly the scrutiny that should
+scale up with risk, not down — the full 5-member council's cross-member
+disagreement synthesis is what substitutes for solo mode's self-
+falsification step here, so don't shrink this side again without
+preserving that property.) Fall back to performing the relevant pass(es)
 yourself in sequence if these subagents aren't available.
 
 Report: notes saved (with exact paths), the ladder-audit result (violations

@@ -168,9 +168,21 @@ pub(crate) async fn call_docbrain_tool(state: &AppState, tenant: &str, name: &st
     // only one that needs a per-tenant secret. `None` (no key stored) is
     // the common case and changes nothing about today's scrape behavior.
     if name == "scrape_library" {
+        // Distinguish "no key configured" (expected, common, silent) from
+        // a real vault error (corrupted store, unreachable DB) -- a
+        // council review of this code caught an earlier version
+        // collapsing both into the same `None` via `.unwrap_or(None)`,
+        // which would have silently masked a real vault failure as "this
+        // tenant just didn't set up Firecrawl".
         let firecrawl_key = {
             let credentials = state.credentials.lock().unwrap();
-            crate::resolve_firecrawl_key(&credentials, state.secrets.as_ref(), tenant).unwrap_or(None)
+            match crate::resolve_firecrawl_key(&credentials, state.secrets.as_ref(), tenant) {
+                Ok(key) => key,
+                Err(e) => {
+                    eprintln!("call_docbrain_tool: failed to resolve Firecrawl key for tenant {tenant:?}, proceeding without the fallback: {e}");
+                    None
+                }
+            }
         };
         if let (Some(key), Some(obj)) = (firecrawl_key, arguments.as_object_mut()) {
             obj.insert("_firecrawl_api_key".to_string(), json!(key));
