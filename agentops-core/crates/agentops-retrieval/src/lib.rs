@@ -143,6 +143,92 @@ pub struct HybridHit {
     /// fields, exposed so a caller/UI can show *why* graph expansion moved
     /// a result, not folded silently into `fused_score`.
     pub graph_score: Option<f64>,
+    /// One real, citable path of edges from a graph-expand seed to this
+    /// hit (via `shortest_path`, over the same `BoundedNeighborhood`
+    /// `graph_score` was computed from -- no extra DB query). `None` when
+    /// `graph_expand` wasn't requested, or when PPR gave this hit zero
+    /// mass (meaning no path within the explored neighborhood actually
+    /// reached it, so there's nothing honest to cite). PPR itself mixes
+    /// contributions from potentially many paths; this is *a* shortest
+    /// one, picked for display/citation, not a claim that it's the only
+    /// or dominant path -- the point is giving a caller a verifiable
+    /// `Symbol A --[Calls]--> Symbol B --[DefinedIn]--> file:line` trail
+    /// instead of an opaque similarity score it has to re-verify by hand.
+    pub path: Option<Vec<GraphPathHop>>,
+}
+
+/// One hop in a `HybridHit::path` citation trail.
+#[derive(Debug, Clone)]
+pub struct GraphPathHop {
+    pub relation: agentops_graph::EdgeRelation,
+    /// `true` if this hop walked the edge in its stored `src -> dst`
+    /// direction, `false` if walked against it -- traversal itself
+    /// (`shortest_path`, like `bounded_neighborhood`/PPR before it) is
+    /// direction-agnostic, but citation rendering needs this to draw the
+    /// arrow the right way (`A --[Calls]--> B` vs `A <--[Calls]-- B`).
+    pub forward: bool,
+    pub node: agentops_graph::Node,
+}
+
+/// BFS over an already-fetched `BoundedNeighborhood`'s edges (undirected
+/// for traversal purposes — a citation path just needs a real connection,
+/// not to respect the edge's semantic direction) from any of `seed_ids` to
+/// `target_id`. Returns the shortest such path as a sequence of hops away
+/// from the seed, or `None` if `target_id` isn't reachable within the
+/// neighborhood that was actually explored (e.g. depth/cap truncation cut
+/// it off before PPR could even reach it — exactly the case `graph_score`
+/// would already be `0.0`/absent for). An empty `Vec` means `target_id` is
+/// itself one of the seeds.
+pub fn shortest_path(neighborhood: &agentops_graph::BoundedNeighborhood, seed_ids: &[i64], target_id: i64) -> Option<Vec<GraphPathHop>> {
+    use std::collections::{HashSet, VecDeque};
+
+    let seed_set: HashSet<i64> = seed_ids.iter().copied().collect();
+    if seed_set.contains(&target_id) {
+        return Some(Vec::new());
+    }
+
+    let node_by_id: HashMap<i64, &agentops_graph::Node> = neighborhood.nodes.iter().map(|(n, _)| (n.id, n)).collect();
+    let mut adjacency: HashMap<i64, Vec<(i64, agentops_graph::EdgeRelation, bool)>> = HashMap::new();
+    for edge in &neighborhood.edges {
+        adjacency.entry(edge.src_id).or_default().push((edge.dst_id, edge.relation, true));
+        adjacency.entry(edge.dst_id).or_default().push((edge.src_id, edge.relation, false));
+    }
+
+    // `came_from[id] = (parent_id, relation, forward)` -- not populated for
+    // seeds themselves, so presence of a non-seed id here also doubles as
+    // "visited."
+    let mut came_from: HashMap<i64, (i64, agentops_graph::EdgeRelation, bool)> = HashMap::new();
+    let mut queue: VecDeque<i64> = seed_ids.iter().copied().collect();
+    let mut found = seed_set.contains(&target_id);
+
+    while let Some(current) = queue.pop_front() {
+        if current == target_id {
+            found = true;
+            break;
+        }
+        let Some(neighbors) = adjacency.get(&current) else { continue };
+        for &(next, relation, forward) in neighbors {
+            if seed_set.contains(&next) || came_from.contains_key(&next) {
+                continue;
+            }
+            came_from.insert(next, (current, relation, forward));
+            queue.push_back(next);
+        }
+    }
+    if !found && !came_from.contains_key(&target_id) {
+        return None;
+    }
+
+    let mut hops_from_seed = Vec::new();
+    let mut current = target_id;
+    while !seed_set.contains(&current) {
+        let &(parent, relation, forward) = came_from.get(&current)?;
+        let node = (*node_by_id.get(&current)?).clone();
+        hops_from_seed.push(GraphPathHop { relation, forward, node });
+        current = parent;
+    }
+    hops_from_seed.reverse();
+    Some(hops_from_seed)
 }
 
 /// Standard RRF constant — dampens the influence of any single source's
@@ -292,10 +378,12 @@ pub fn search_hybrid(store: &dyn GraphStore, embedder: &dyn Embedder, repo: &str
         let lexical_rank = rank_of(&lexical, id);
         let exact_rank = rank_of(&exact, id);
         let fused_score = rrf(dense_rank) + rrf(lexical_rank) + rrf(exact_rank);
-        hits.push(HybridHit { node, fused_score, dense_rank, lexical_rank, exact_rank, graph_score: None });
+        hits.push(HybridHit { node, fused_score, dense_rank, lexical_rank, exact_rank, graph_score: None, path: None });
     }
 
-    let graph_scores: HashMap<i64, f64> = if graph_expand && !hits.is_empty() {
+    let graph_scores: HashMap<i64, f64>;
+    let mut expand_context: Option<(agentops_graph::BoundedNeighborhood, Vec<i64>)> = None;
+    if graph_expand && !hits.is_empty() {
         // Seed PPR from the RRF-fused top hits themselves, not raw dense
         // hits alone -- so a lexical/exact-only match can still seed
         // activation, per the plan's revised design.
@@ -303,10 +391,11 @@ pub fn search_hybrid(store: &dyn GraphStore, embedder: &dyn Embedder, repo: &str
         seed_order.sort_by(|a, b| b.fused_score.partial_cmp(&a.fused_score).unwrap_or(std::cmp::Ordering::Equal));
         let seed_ids: Vec<i64> = seed_order.iter().take(fetch_k.min(10)).map(|h| h.node.id).collect();
         let neighborhood = bounded_neighborhood(store, repo, NeighborhoodQuery { seed_ids: &seed_ids, relations: &GRAPH_EXPAND_RELATIONS, direction: TraversalDirection::Both, max_depth: GRAPH_EXPAND_DEPTH, kind_filter: &[], cap: GRAPH_EXPAND_NODE_CAP })?;
-        personalized_pagerank(&neighborhood, &seed_ids, PPR_DAMPING, PPR_ITERATIONS)
+        graph_scores = personalized_pagerank(&neighborhood, &seed_ids, PPR_DAMPING, PPR_ITERATIONS);
+        expand_context = Some((neighborhood, seed_ids));
     } else {
-        HashMap::new()
-    };
+        graph_scores = HashMap::new();
+    }
     if graph_expand {
         for hit in &mut hits {
             hit.graph_score = Some(*graph_scores.get(&hit.node.id).unwrap_or(&0.0));
@@ -328,6 +417,13 @@ pub fn search_hybrid(store: &dyn GraphStore, embedder: &dyn Embedder, repo: &str
         rank_b.partial_cmp(&rank_a).unwrap_or(std::cmp::Ordering::Equal)
     });
     hits.truncate(top_k);
+    if let Some((neighborhood, seed_ids)) = &expand_context {
+        for hit in &mut hits {
+            if hit.graph_score.unwrap_or(0.0) > 0.0 {
+                hit.path = shortest_path(neighborhood, seed_ids, hit.node.id);
+            }
+        }
+    }
     Ok(hits)
 }
 
@@ -587,6 +683,56 @@ mod tests {
             connected_hit.graph_score.unwrap_or(0.0) > isolated_hit.graph_score.unwrap_or(0.0),
             "a References-connected node must accumulate more PPR mass than an equally text-matched but graph-isolated one: {hits:?}"
         );
+    }
+
+    #[test]
+    fn shortest_path_reconstructs_a_real_two_hop_chain_from_a_seed() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let seed = symbol(&store, "demo", "a.rs", "seed", "fn seed() {}");
+        let mid = symbol(&store, "demo", "b.rs", "mid", "fn mid() {}");
+        let target = symbol(&store, "demo", "c.rs", "target", "fn target() {}");
+        // `bounded_neighborhood` here only ever follows `GRAPH_EXPAND_RELATIONS`
+        // (Affects/References) -- a DependsOn edge wouldn't even be explored.
+        store.add_edge("demo", seed, mid, EdgeRelation::Affects).unwrap();
+        store.add_edge("demo", target, mid, EdgeRelation::References).unwrap();
+
+        let neighborhood = bounded_neighborhood(
+            &store,
+            "demo",
+            NeighborhoodQuery { seed_ids: &[seed], relations: &GRAPH_EXPAND_RELATIONS, direction: TraversalDirection::Both, max_depth: GRAPH_EXPAND_DEPTH, kind_filter: &[], cap: GRAPH_EXPAND_NODE_CAP },
+        )
+        .unwrap();
+
+        let path = shortest_path(&neighborhood, &[seed], target).expect("target is reachable through mid");
+        assert_eq!(path.len(), 2, "seed->mid->target must be exactly 2 hops: {path:?}");
+        assert_eq!(path[0].node.id, mid);
+        assert_eq!(path[0].relation, EdgeRelation::Affects);
+        assert!(path[0].forward, "seed->mid is walked in its stored direction");
+        assert_eq!(path[1].node.id, target);
+        assert_eq!(path[1].relation, EdgeRelation::References);
+        assert!(!path[1].forward, "mid->target is walked against the edge's stored target->mid direction");
+    }
+
+    #[test]
+    fn shortest_path_returns_none_for_an_unreachable_node() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let seed = symbol(&store, "demo", "a.rs", "seed", "fn seed() {}");
+        let isolated = symbol(&store, "demo", "b.rs", "isolated", "fn isolated() {}");
+
+        let neighborhood =
+            bounded_neighborhood(&store, "demo", NeighborhoodQuery { seed_ids: &[seed], relations: &GRAPH_EXPAND_RELATIONS, direction: TraversalDirection::Both, max_depth: GRAPH_EXPAND_DEPTH, kind_filter: &[], cap: GRAPH_EXPAND_NODE_CAP }).unwrap();
+
+        assert!(shortest_path(&neighborhood, &[seed], isolated).is_none());
+    }
+
+    #[test]
+    fn shortest_path_is_empty_when_the_target_is_itself_a_seed() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let seed = symbol(&store, "demo", "a.rs", "seed", "fn seed() {}");
+        let neighborhood =
+            bounded_neighborhood(&store, "demo", NeighborhoodQuery { seed_ids: &[seed], relations: &GRAPH_EXPAND_RELATIONS, direction: TraversalDirection::Both, max_depth: GRAPH_EXPAND_DEPTH, kind_filter: &[], cap: GRAPH_EXPAND_NODE_CAP }).unwrap();
+
+        assert_eq!(shortest_path(&neighborhood, &[seed], seed).map(|p| p.len()), Some(0));
     }
 
     /// The literal use case Module 3's design was written for: an exact

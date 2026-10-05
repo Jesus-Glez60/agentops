@@ -144,7 +144,7 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "Pattern completion around a symbol (Initiative 4, CLS-inspired retrieval plan): finds symbols elsewhere in the repo that are similar (dense embedding, requires with_embeddings from an earlier scan) or graph-connected (Personalized PageRank over Affects/References edges) to the given symbol, and returns each one's own recorded Gotcha/Decision notes. Read-only, no LLM call — the same recombined context explain_symbol now folds into its prompt automatically, exposed directly so an agent session can ask 'what's associated with this symbol' without triggering a full explanation. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "top_k": { "type": "integer" }, "session_id": { "type": "string" }, "max_chars": { "type": "integer", "description": "Truncation budget for each note's text (default 4000)." } }, "required": ["path", "symbol_id"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "symbol_id": { "type": "integer" }, "top_k": { "type": "integer" }, "session_id": { "type": "string" }, "max_chars": { "type": "integer", "description": "Truncation budget for each note's text (default 4000)." }, "compact": { "type": "boolean", "description": "Defaults to false. Set true to return note titles/ids only, no body text at all -- a cheaper first pass before fetching full detail." } }, "required": ["path", "symbol_id"] }),
             handler: tool_related_context,
         },
         ToolSpec {
@@ -712,8 +712,29 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
                 } else {
                     String::new()
                 };
+                // Graphify-style citation: the real edge chain `graph_score`
+                // came from, not just the opaque number -- so a caller can
+                // trust it without re-verifying via Grep. Only present when
+                // there's a non-empty path to show; a hit's own seed status
+                // or an unexpanded search leaves this blank, same as `graph`.
+                let citation = h
+                    .path
+                    .as_ref()
+                    .filter(|p| !p.is_empty())
+                    .map(|p| {
+                        let trail = p
+                            .iter()
+                            .map(|hop| {
+                                let arrow = if hop.forward { format!("--[{:?}]-->", hop.relation) } else { format!("<--[{:?}]--", hop.relation) };
+                                let loc = hop.node.path.as_deref().map(|path| format!(" ({path}{})", hop.node.start_line.map(|l| format!(":{l}")).unwrap_or_default())).unwrap_or_default();
+                                format!(" {arrow} {}{loc}", hop.node.name.as_deref().unwrap_or("(untitled)"))
+                            })
+                            .collect::<String>();
+                        format!("\n  via:{trail}")
+                    })
+                    .unwrap_or_default();
                 format!(
-                    "- {:?} {} (score {:.4}, signals: {signals}{graph}){}{reduced}",
+                    "- {:?} {} (score {:.4}, signals: {signals}{graph}){}{reduced}{citation}",
                     h.node.kind,
                     h.node.name.as_deref().unwrap_or("(untitled)"),
                     h.fused_score,
@@ -888,6 +909,16 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
     if let Some(path_str) = get_str(args, "path") {
         maybe_record_session_event(Path::new(path_str), args, "related_context", &format!("found {} related item(s)", results.len()), Some(symbol_id), "hit")?;
     }
+    // Progressive disclosure, opt-in: `compact: true` returns note
+    // titles/ids with no body text at all (not even a `max_chars`-capped
+    // one) -- a cheap "is there anything here, and which node ids do I
+    // actually need" first pass, before a second call (full-detail, or
+    // `fetch_content` on a specific id) pays for the bodies. Defaults to
+    // `false` so every existing caller's output is byte-for-byte
+    // unchanged -- this project's own skills (`plan`, `session`, `wrap`)
+    // call this today expecting full bodies, so flipping the default
+    // would be a real breaking change, not a pure optimization.
+    let compact = get_bool(args, "compact");
     Ok(results
         .iter()
         .map(|m| {
@@ -902,8 +933,12 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
                     .notes
                     .iter()
                     .map(|(id, kind, title, text, _, _)| {
-                        let capped = crate::budget::cap(text, max_chars(args), *id);
-                        format!("    - [{kind:?}] {title}: {}", capped.text)
+                        if compact {
+                            format!("    - [{kind:?}] {title} (node {id})")
+                        } else {
+                            let capped = crate::budget::cap(text, max_chars(args), *id);
+                            format!("    - [{kind:?}] {title}: {}", capped.text)
+                        }
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -1427,6 +1462,19 @@ mod tests {
         assert!(result.content[0].text.contains("helper"), "{:?}", result.content);
         assert!(result.content[0].text.contains("Helper workaround"), "{:?}", result.content);
         assert!(result.content[0].text.contains("graph-connected"), "{:?}", result.content);
+
+        // Progressive disclosure: `compact: true` must still name the note
+        // (title + node id, so a caller knows what to `fetch_content` if it
+        // wants the rest) but never include its body text.
+        let compact_result = call_tool(AccessMode::Advisor, "related_context", &json!({ "path": path, "symbol_id": seed_id, "compact": true })).unwrap();
+        assert!(!compact_result.is_error, "{:?}", compact_result.content);
+        assert!(compact_result.content[0].text.contains("Helper workaround"), "compact mode must still name the note: {:?}", compact_result.content);
+        assert!(compact_result.content[0].text.contains("(node "), "compact mode must still give the node id: {:?}", compact_result.content);
+        assert!(
+            !compact_result.content[0].text.contains("known workaround for a bug"),
+            "compact mode must never include the note's body text: {:?}",
+            compact_result.content
+        );
     }
 
     #[test]
