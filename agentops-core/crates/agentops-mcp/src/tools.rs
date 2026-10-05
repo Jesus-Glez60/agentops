@@ -658,6 +658,27 @@ fn parse_node_kind(s: &str) -> Option<NodeKind> {
     }
 }
 
+/// Renders a `HybridHit::path` citation as `"\n  via: A --[Rel]--> B ..."`,
+/// or `""` for `None`/an empty path (a hit that's itself a PPR seed, or one
+/// `graph_expand` never ran for). Extracted out of `tool_semantic_search`'s
+/// inline rendering closure specifically so it's directly unit-testable —
+/// a council review caught that this new, user-facing output format had
+/// zero test coverage, and exercising it through `search_hybrid`'s real
+/// seed-selection dynamics turned out impractical (a graph-connected hit
+/// in a small fixture is almost always a seed itself, with an empty path).
+fn format_citation_trail(path: Option<&[agentops_retrieval::GraphPathHop]>) -> String {
+    let Some(hops) = path.filter(|p| !p.is_empty()) else { return String::new() };
+    let trail = hops
+        .iter()
+        .map(|hop| {
+            let arrow = if hop.forward { format!("--[{:?}]-->", hop.relation) } else { format!("<--[{:?}]--", hop.relation) };
+            let loc = hop.node.path.as_deref().map(|path| format!(" ({path}{})", hop.node.start_line.map(|l| format!(":{l}")).unwrap_or_default())).unwrap_or_default();
+            format!(" {arrow} {}{loc}", hop.node.name.as_deref().unwrap_or("(untitled)"))
+        })
+        .collect::<String>();
+    format!("\n  via:{trail}")
+}
+
 fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
     use agentops_embeddings::Embedder;
 
@@ -727,22 +748,7 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
                 // trust it without re-verifying via Grep. Only present when
                 // there's a non-empty path to show; a hit's own seed status
                 // or an unexpanded search leaves this blank, same as `graph`.
-                let citation = h
-                    .path
-                    .as_ref()
-                    .filter(|p| !p.is_empty())
-                    .map(|p| {
-                        let trail = p
-                            .iter()
-                            .map(|hop| {
-                                let arrow = if hop.forward { format!("--[{:?}]-->", hop.relation) } else { format!("<--[{:?}]--", hop.relation) };
-                                let loc = hop.node.path.as_deref().map(|path| format!(" ({path}{})", hop.node.start_line.map(|l| format!(":{l}")).unwrap_or_default())).unwrap_or_default();
-                                format!(" {arrow} {}{loc}", hop.node.name.as_deref().unwrap_or("(untitled)"))
-                            })
-                            .collect::<String>();
-                        format!("\n  via:{trail}")
-                    })
-                    .unwrap_or_default();
+                let citation = format_citation_trail(h.path.as_deref());
                 format!(
                     "- {:?} {} (score {:.4}, signals: {signals}{graph}){}{reduced}{citation}",
                     h.node.kind,
@@ -1401,6 +1407,10 @@ mod tests {
         let text = &session_result.content[0].text;
         assert!(text.contains("list_gotchas"), "{text}");
         assert!(text.contains("get_symbol"), "{text}");
+        // A completeness-council review flagged that list_gotchas' new
+        // byte-count logging (added alongside the other 3 instrumented
+        // tools) had no coverage here, unlike those three.
+        assert!(text.contains("byte(s)"), "list_gotchas' log entry must report a real byte count, matching the other instrumented tools: {text}");
     }
 
     #[test]
@@ -1551,6 +1561,31 @@ mod tests {
         assert!(result.content[0].text.contains("No related symbols found"), "{:?}", result.content);
     }
 
+    #[test]
+    fn related_context_compact_mode_with_a_related_symbol_that_has_no_notes_never_panics_or_mentions_deferred_bytes() {
+        // A completeness-council review flagged this edge case: a related
+        // symbol with zero notes attached (`m.notes.is_empty()`) combined
+        // with `compact: true` -- `deferred_bytes` must stay 0 and no
+        // "deferred ~" text should appear, since nothing was actually
+        // skipped.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def helper():\n    pass\n\ndef seed():\n    return helper()\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        // Deliberately no add_note call -- `helper` has a real graph-connected
+        // relationship to `seed` but zero notes attached to it.
+
+        let store = crate::store::open_store(std::path::Path::new(&path)).unwrap();
+        let repo = crate::scan::repo_name(std::path::Path::new(&path));
+        let seed_id = store.find_node(&repo, agentops_graph::NodeKind::Symbol, Some("auth.py"), Some("seed"), None).unwrap().unwrap().id;
+        drop(store);
+
+        let result = call_tool(AccessMode::Advisor, "related_context", &json!({ "path": path, "symbol_id": seed_id, "compact": true })).unwrap();
+        assert!(!result.is_error, "{:?}", result.content);
+        assert!(result.content[0].text.contains("helper"), "{:?}", result.content);
+        assert!(!result.content[0].text.contains("deferred ~"), "a related symbol with no notes must never report deferred bytes: {:?}", result.content);
+    }
+
     /// `end_session` (Initiative 5) refuses to consolidate for a
     /// `session_id` that never did anything in this repo -- the gate
     /// `run_embedding_consolidation` is deliberately never even reached
@@ -1634,6 +1669,46 @@ mod tests {
         assert!(expanded_result.content[0].text.contains("score 0.0328"), "the fused score itself must be unaffected by graph_expand: {:?}", expanded_result.content);
         assert!(!default_result.content[0].text.contains("graph "), "graph_expand off must never render a graph-score annotation: {:?}", default_result.content);
         assert!(expanded_result.content[0].text.contains("graph "), "graph_expand on must render the annotation once a node has nonzero PPR mass: {:?}", expanded_result.content);
+    }
+
+    #[test]
+    fn format_citation_trail_renders_a_real_two_hop_trail_with_directional_arrows() {
+        // A completeness-council review flagged that the citation-rendering
+        // format (the "via: A --[Relation]--> B" trail) had zero test
+        // coverage despite being new, user-facing output. Exercising this
+        // through `search_hybrid`'s real seed-selection dynamics turned out
+        // impractical (a graph-connected hit in a small fixture becomes a
+        // seed itself, with an empty path) -- test the extracted rendering
+        // function directly against hand-built hops instead.
+        fn node(id: i64, name: &str, path: &str, start_line: i64) -> agentops_graph::Node {
+            agentops_graph::Node {
+                id,
+                kind: NodeKind::Symbol,
+                repo: "demo".into(),
+                path: Some(path.into()),
+                name: Some(name.into()),
+                container: None,
+                start_line: Some(start_line),
+                end_line: Some(start_line + 1),
+                content: None,
+                curated: false,
+                prominence: agentops_graph::NodeProminence::Full,
+                curation_reason: None,
+                last_touched_at: None,
+            }
+        }
+        let path = vec![
+            agentops_retrieval::GraphPathHop { relation: agentops_graph::EdgeRelation::Affects, forward: true, node: node(2, "mid", "b.rs", 10) },
+            agentops_retrieval::GraphPathHop { relation: agentops_graph::EdgeRelation::References, forward: false, node: node(3, "target", "c.rs", 20) },
+        ];
+
+        let rendered = format_citation_trail(Some(&path));
+        assert!(rendered.contains("via:"), "{rendered}");
+        assert!(rendered.contains("--[Affects]--> mid (b.rs:10)"), "{rendered}");
+        assert!(rendered.contains("<--[References]-- target (c.rs:20)"), "{rendered}");
+
+        assert_eq!(format_citation_trail(None), "", "no path must render nothing");
+        assert_eq!(format_citation_trail(Some(&[])), "", "an empty path (hit is itself a seed) must render nothing");
     }
 
     #[test]

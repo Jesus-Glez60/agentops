@@ -683,6 +683,16 @@ mod tests {
             connected_hit.graph_score.unwrap_or(0.0) > isolated_hit.graph_score.unwrap_or(0.0),
             "a References-connected node must accumulate more PPR mass than an equally text-matched but graph-isolated one: {hits:?}"
         );
+        // A completeness-council review caught that this test never
+        // verified the `path` field `search_hybrid` is also supposed to
+        // populate alongside `graph_score` -- regression risk: if
+        // path-population logic broke, nothing would catch it. Any hit
+        // with nonzero graph_score must carry `Some(_)` (possibly empty,
+        // if the hit is itself a PPR seed, as both are in this tiny
+        // fixture -- see `shortest_path_is_empty_when_the_target_is_itself_a_seed`
+        // for that exact case tested directly).
+        assert!(connected_hit.path.is_some(), "a hit with nonzero graph_score must carry a `path`, even if empty: {hits:?}");
+        assert!(isolated_hit.graph_score.unwrap_or(0.0) == 0.0 || isolated_hit.path.is_some());
     }
 
     #[test]
@@ -723,6 +733,32 @@ mod tests {
             bounded_neighborhood(&store, "demo", NeighborhoodQuery { seed_ids: &[seed], relations: &GRAPH_EXPAND_RELATIONS, direction: TraversalDirection::Both, max_depth: GRAPH_EXPAND_DEPTH, kind_filter: &[], cap: GRAPH_EXPAND_NODE_CAP }).unwrap();
 
         assert!(shortest_path(&neighborhood, &[seed], isolated).is_none());
+    }
+
+    #[test]
+    fn shortest_path_degrades_to_none_rather_than_panicking_when_a_reachable_node_is_missing_from_the_node_list() {
+        // A completeness-council review flagged this exact silent-degrade
+        // path: `bounded_neighborhood` is expected to keep `.nodes`/`.edges`
+        // consistent, but `shortest_path` itself doesn't assume that --
+        // hand-build an inconsistent neighborhood (an edge reaching a node
+        // that was never added to `.nodes`, simulating a cap/truncation
+        // edge case) and confirm the `?` short-circuit degrades to `None`
+        // instead of panicking on a node lookup that can't succeed.
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let seed = symbol(&store, "demo", "a.rs", "seed", "fn seed() {}");
+        let present = symbol(&store, "demo", "b.rs", "present", "fn present() {}");
+        let missing = symbol(&store, "demo", "c.rs", "missing", "fn missing() {}");
+        store.add_edge("demo", seed, present, EdgeRelation::Affects).unwrap();
+        store.add_edge("demo", present, missing, EdgeRelation::Affects).unwrap();
+
+        let real = bounded_neighborhood(&store, "demo", NeighborhoodQuery { seed_ids: &[seed], relations: &GRAPH_EXPAND_RELATIONS, direction: TraversalDirection::Both, max_depth: GRAPH_EXPAND_DEPTH, kind_filter: &[], cap: GRAPH_EXPAND_NODE_CAP }).unwrap();
+        let inconsistent = agentops_graph::BoundedNeighborhood {
+            nodes: real.nodes.into_iter().filter(|(n, _)| n.id != missing).collect(),
+            edges: real.edges,
+            truncated: real.truncated,
+        };
+
+        assert!(shortest_path(&inconsistent, &[seed], missing).is_none(), "a reachable-by-edges but absent-from-nodes target must degrade to None, not panic");
     }
 
     #[test]
