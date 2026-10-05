@@ -31,3 +31,20 @@ incomplete.
 Only propose genuinely new code for whatever's left after that check.
 Present the plan naming the specific existing code and dependencies it
 reuses, not just a list of new files to create.
+
+Record what this check actually found in a "Research performed" section
+of the plan, as a list of items in this shape:
+
+```
+{ id, question, finding, evidence, status: pass|flag|not-applicable, files }
+```
+
+`id` is a short slug for what was checked (e.g. `docs.react-hooks`,
+`ladder.auth-middleware`); `question` is what was being checked; `finding`
+and `evidence` record what you found and how (a `get_docs`/`search_docs`
+result, a `list_gotchas`/`related_context` title, a `Grep` hit); `files`
+lists the files/symbols that finding depends on. This is the same schema
+`audit-plan`/`wrap`'s review playbook uses for its own checklist — a later
+review pass trusts an item here **only if none of its `files` have changed
+since this plan was written**; anything stale, or anything this section
+doesn't cover, gets re-derived live instead of trusted from cache.

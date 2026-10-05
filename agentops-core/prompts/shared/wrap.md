@@ -24,14 +24,20 @@ uncommitted changes — delegate to the `ponytail-auditor` subagent if
 available, otherwise perform the same check directly (see
 `ponytail-audit`'s own instructions).
 
-Then run the same council pass `audit-plan` uses, against this session's
-`git diff` instead of plan text: spawn five `plan-council-member` subagents
-in parallel (Skeptic, Simplifier, Completeness-checker, Outsider,
-Opportunity-hunter), each blind to the other four, then spawn one
-`plan-council-chair` with the diff and all five critiques attached for a
-consensus verdict. Fall back to performing each pass yourself in sequence
-if these subagents aren't available.
+Then run the same review-depth gate `audit-plan` uses, against this
+session's `git diff` instead of plan text: compute the size/risk gate
+(fewer than 3 files touched, under ~80 changed lines, nothing on an
+auth/payment/data path) and spawn either one `plan-council-member` in
+**solo playbook mode** (the common case — its own report, including Proof
+for each surviving finding, is the verdict; no chair needed) or, at/above
+the threshold, three `plan-council-member` subagents in parallel in
+**council mode** (Skeptic, Outsider, Opportunity-hunter, each blind to the
+other two) plus one `plan-council-chair` synthesizing their critiques, with
+an explicit ask for structured, evidence-grounded disagreement between them
+rather than simple merging. Fall back to performing the relevant pass(es)
+yourself in sequence if these subagents aren't available.
 
 Report: notes saved (with exact paths), the ladder-audit result (violations
-found, or a one-line confirmation of none), and the council's consensus
-verdict (clear, or the consolidated required changes).
+found, or a one-line confirmation of none), and the review verdict (the
+solo playbook's report, or the council's consensus verdict — clear, or the
+consolidated required changes).

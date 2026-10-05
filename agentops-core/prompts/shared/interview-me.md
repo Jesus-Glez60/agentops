@@ -13,10 +13,15 @@ wants in one sentence plus an honest confidence number (0-100%). Ask one
 question at a time, each with your own guess attached and the reasoning
 behind it — never a batch; the user reacts faster to a wrong guess than
 they generate an answer from scratch, and batching lets them skim-read past
-what matters. Watch for answers that pattern-match best-practice talk
-("scalable", "the standard approach") rather than naming a specific
-outcome; when you hear one, ask what they'd actually want if they didn't
-have to justify it to anyone.
+what matters. Ask via the `AskUserQuestion` tool when it's available, with
+2-4 concrete options reflecting realistic answers (not generic yes/no
+placeholders) — the user can always type something else. After each
+answer, briefly acknowledge the decision (1-2 sentences) before moving to
+the next question; don't let acknowledgments stack into a running summary.
+Watch for answers that pattern-match best-practice talk ("scalable", "the
+standard approach") rather than naming a specific outcome; when you hear
+one, ask what they'd actually want if they didn't have to justify it to
+anyone.
 
 Stop when you can predict the user's reaction to the next three questions
 you'd ask — that's the test, not a fixed number of rounds. Then restate the
