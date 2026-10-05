@@ -1,5 +1,5 @@
 import type { NodeKind } from "@/lib/api/repos-api";
-import { NODE_KIND_SHAPE } from "@/lib/node-kind-shapes";
+import { nodeKindShape } from "@/lib/node-kind-shapes";
 import { NavDot } from "@/components/shell/nav-dot";
 import { cn } from "@/lib/utils";
 
@@ -25,7 +25,7 @@ export function SearchFilters({
     <div className="flex flex-wrap gap-2">
       {FILTERS.map((filter) => {
         const active = selected.includes(filter.kind);
-        const { color, shape } = NODE_KIND_SHAPE[filter.kind];
+        const { color, shape } = nodeKindShape(filter.kind);
         return (
           <button
             key={filter.kind}

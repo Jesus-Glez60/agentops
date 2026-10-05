@@ -1,6 +1,6 @@
 import { ArrowRight, ExternalLink } from "lucide-react";
 import type { NodeKind } from "@/lib/api/repos-api";
-import { NODE_KIND_SHAPE } from "@/lib/node-kind-shapes";
+import { nodeKindShape } from "@/lib/node-kind-shapes";
 import { NavDot } from "@/components/shell/nav-dot";
 
 export function ConnectedNodeRow({
@@ -16,7 +16,7 @@ export function ConnectedNodeRow({
   label: string;
   onClick: () => void;
 }) {
-  const { color, shape } = NODE_KIND_SHAPE[kind];
+  const { color, shape } = nodeKindShape(kind);
   return (
     <button
       onClick={onClick}

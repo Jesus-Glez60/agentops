@@ -8,7 +8,7 @@ import { getNodeDetail, getRepos, REPOS_SWR_KEY, search, type ConnectedNode, typ
 import { getRecentSearches, pushRecentSearch } from "@/lib/recent-searches";
 import { kindLabel } from "@/lib/node-detail-formatting";
 import { displayRepoName } from "@/lib/utils";
-import { NODE_KIND_SHAPE } from "@/lib/node-kind-shapes";
+import { nodeKindShape } from "@/lib/node-kind-shapes";
 import { Button } from "@/components/ui/button";
 import { NavDot } from "@/components/shell/nav-dot";
 import { SearchFilters } from "@/components/search/search-filters";
@@ -83,7 +83,7 @@ function SearchPageInner() {
     () => search(submittedQuery as string, { repos: repoScope, kinds }),
   );
 
-  const { data: detail } = useSWR(selected ? ["node", selected.repo, selected.id] : null, () => getNodeDetail(selected!.repo, selected!.id));
+  const { data: detail, error: detailError, mutate: mutateDetail } = useSWR(selected ? ["node", selected.repo, selected.id] : null, () => getNodeDetail(selected!.repo, selected!.id));
 
   // Same SWR key the Overview page/topbar/scope selector already share --
   // used here only to show a node's real branch, not a fabricated one.
@@ -110,6 +110,7 @@ function SearchPageInner() {
 
   const hasSubmitted = submittedQuery !== null;
   const scopeLabel = repoScope.length === 0 ? "all repositories" : repoScope.length === 1 ? repoScope[0] : `${repoScope.length} repositories`;
+  const selectedShape = selected ? nodeKindShape(selected.kind) : null;
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -222,8 +223,8 @@ function SearchPageInner() {
             <div className="flex min-w-0 flex-1 flex-col gap-6 overflow-y-auto border-l bg-panel p-7">
               <div className="flex flex-wrap items-start justify-between gap-3.5">
                 <div className="flex min-w-0 flex-col gap-1.5">
-                  <span className="flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wide" style={{ color: NODE_KIND_SHAPE[selected.kind].color }}>
-                    <NavDot color={NODE_KIND_SHAPE[selected.kind].color} shape={NODE_KIND_SHAPE[selected.kind].shape} />
+                  <span className="flex items-center gap-1.5 font-mono text-[11px] uppercase tracking-wide" style={{ color: selectedShape!.color }}>
+                    <NavDot color={selectedShape!.color} shape={selectedShape!.shape} />
                     {kindLabel(selected.kind)} · {displayRepoName(selected.repo)}
                   </span>
                   <p className="text-display-card font-bold text-ink-100">{selected.name ?? selected.path ?? `Node ${selected.id}`}</p>
@@ -240,7 +241,17 @@ function SearchPageInner() {
                 </div>
               </div>
 
-              {!detail && <p className="text-body text-ink-500">Loading details…</p>}
+              {!detail && !detailError && <p className="text-body text-ink-500">Loading details…</p>}
+
+              {detailError && (
+                <div className="flex flex-col gap-2">
+                  <p className="text-body text-destructive">Couldn&apos;t load this item&apos;s details.</p>
+                  <p className="text-section text-ink-500">{detailError instanceof Error ? detailError.message : "Please try again."}</p>
+                  <Button size="sm" variant="outline" className="self-start" onClick={() => mutateDetail()}>
+                    Retry
+                  </Button>
+                </div>
+              )}
 
               {detail && <NodeDetailSections detail={detail} branch={branch} onSelectConnected={selectConnectedNode} splitKnowledge />}
             </div>

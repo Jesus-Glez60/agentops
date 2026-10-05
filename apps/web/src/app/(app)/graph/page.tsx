@@ -70,7 +70,7 @@ function GraphPageInner() {
   const { data: hotspotsResponse } = useSWR(repoName && showHotspots ? ["hotspots", repoName] : null, () => getRepoHotspots(repoName!));
   const hotspotDegreeById = showHotspots && hotspotsResponse ? new Map(hotspotsResponse.hotspots.map((h) => [h.node_id, h.degree])) : undefined;
 
-  const { data: detail } = useSWR(selected ? ["node", selected.repo, selected.id] : null, () => getNodeDetail(selected!.repo, selected!.id));
+  const { data: detail, error: detailError, mutate: mutateDetail } = useSWR(selected ? ["node", selected.repo, selected.id] : null, () => getNodeDetail(selected!.repo, selected!.id));
   const { data: seedDetail } = useSWR(seed ? ["node", seed.repo, seed.id] : null, () => getNodeDetail(seed!.repo, seed!.id));
   const { data: allRepos } = useSWR(REPOS_SWR_KEY, getRepos);
   const branch = repoName ? allRepos?.connections.find((r) => r.id === repoName)?.branch : undefined;
@@ -175,6 +175,8 @@ function GraphPageInner() {
           {selected ? (
             <GraphDetailPanel
               detail={detail}
+              error={detailError}
+              onRetry={() => mutateDetail()}
               branch={branch}
               isSeed={seed !== null && selected.id === seed.id}
               onSelectConnected={selectConnectedNode}

@@ -25,37 +25,47 @@ const detail: NodeDetail = {
 
 describe("GraphDetailPanel", () => {
   it("shows a loading state when detail is undefined", () => {
-    render(<GraphDetailPanel detail={undefined} branch={null} isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
+    render(<GraphDetailPanel detail={undefined} onRetry={vi.fn()} branch={null} isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
     expect(screen.getAllByText("Loading…").length).toBeGreaterThan(0);
   });
 
+  it("shows an error state with a retry button when the detail fetch fails, instead of loading forever", () => {
+    const onRetry = vi.fn();
+    render(<GraphDetailPanel detail={undefined} error={new Error("request failed with 500")} onRetry={onRetry} branch={null} isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
+    expect(screen.queryByText("Loading details…")).not.toBeInTheDocument();
+    expect(screen.getByText("Couldn't load this item's details.")).toBeInTheDocument();
+    expect(screen.getByText("request failed with 500")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(onRetry).toHaveBeenCalledTimes(1);
+  });
+
   it("Search navigates to /search?q=<name>", () => {
-    render(<GraphDetailPanel detail={detail} branch="main" isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
+    render(<GraphDetailPanel detail={detail} onRetry={vi.fn()} branch="main" isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /Search/ }));
     expect(pushMock).toHaveBeenCalledWith("/search?q=refreshSession");
   });
 
   it("Docs navigates to /docs", () => {
-    render(<GraphDetailPanel detail={detail} branch="main" isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
+    render(<GraphDetailPanel detail={detail} onRetry={vi.fn()} branch="main" isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: /Docs/ }));
     expect(pushMock).toHaveBeenCalledWith("/docs");
   });
 
   it("close button calls onClose", () => {
     const onClose = vi.fn();
-    render(<GraphDetailPanel detail={detail} branch="main" isSeed onSelectConnected={vi.fn()} onClose={onClose} onCenter={vi.fn()} />);
+    render(<GraphDetailPanel detail={detail} onRetry={vi.fn()} branch="main" isSeed onSelectConnected={vi.fn()} onClose={onClose} onCenter={vi.fn()} />);
     fireEvent.click(screen.getByRole("button", { name: "Close" }));
     expect(onClose).toHaveBeenCalled();
   });
 
   it("hides Center here when the node is already the seed", () => {
-    render(<GraphDetailPanel detail={detail} branch="main" isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
+    render(<GraphDetailPanel detail={detail} onRetry={vi.fn()} branch="main" isSeed onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={vi.fn()} />);
     expect(screen.queryByTitle("Center graph on this node")).not.toBeInTheDocument();
   });
 
   it("shows Center here and calls onCenter when the node is not the seed", () => {
     const onCenter = vi.fn();
-    render(<GraphDetailPanel detail={detail} branch="main" isSeed={false} onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={onCenter} />);
+    render(<GraphDetailPanel detail={detail} onRetry={vi.fn()} branch="main" isSeed={false} onSelectConnected={vi.fn()} onClose={vi.fn()} onCenter={onCenter} />);
     fireEvent.click(screen.getByTitle("Center graph on this node"));
     expect(onCenter).toHaveBeenCalled();
   });

@@ -18,3 +18,19 @@ export const NODE_KIND_SHAPE: Record<NodeKind, { color: string; shape: NavShape 
   Definition: { color: "var(--node-symbol)", shape: "circle" },
   DocSection: { color: "var(--node-file)", shape: "square" },
 };
+
+/**
+ * Safe accessor -- bracket-indexing `NODE_KIND_SHAPE` directly and
+ * destructuring the result throws if `kind` is ever a value this map
+ * doesn't cover (the old badge-className lookup this replaced was a `cn()`
+ * call, which silently no-ops on `undefined`; a raw object/array
+ * destructure has no such tolerance). The backend's `NodeKind` enum should
+ * always match this map 1:1, but call sites render data the frontend
+ * doesn't control end-to-end (connected-node relations, stored vault
+ * content) -- falling back to a neutral ink-colored circle here means a
+ * genuinely unexpected value degrades to an unstyled marker instead of
+ * crashing the whole detail panel mid-render.
+ */
+export function nodeKindShape(kind: NodeKind): { color: string; shape: NavShape } {
+  return NODE_KIND_SHAPE[kind] ?? { color: "var(--ink-500)", shape: "circle" };
+}

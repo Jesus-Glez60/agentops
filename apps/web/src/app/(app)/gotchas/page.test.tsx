@@ -268,4 +268,21 @@ describe("GotchasPage", () => {
 
     expect(setCuration).not.toHaveBeenCalled();
   });
+
+  it("shows an error with a retry button when the detail fetch fails, instead of loading forever", async () => {
+    getGotchas.mockResolvedValue([needsCurationGotcha]);
+    getNodeDetail.mockRejectedValue(new Error("request failed with 500"));
+    renderPage();
+
+    fireEvent.click(await screen.findByText("Unbounded retry loop"));
+
+    expect(await screen.findByText("Couldn't load this item's details.")).toBeInTheDocument();
+    expect(screen.getByText("request failed with 500")).toBeInTheDocument();
+    expect(screen.queryByText("Loading details…")).not.toBeInTheDocument();
+
+    getNodeDetail.mockResolvedValue(nodeDetailFor(needsCurationGotcha));
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    expect(await screen.findByRole("button", { name: /Keep as permanent knowledge/ })).toBeInTheDocument();
+  });
 });

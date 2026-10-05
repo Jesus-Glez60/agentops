@@ -12,6 +12,8 @@ import { cn } from "@/lib/utils";
 
 export function GraphDetailPanel({
   detail,
+  error,
+  onRetry,
   branch,
   isSeed,
   onSelectConnected,
@@ -19,6 +21,9 @@ export function GraphDetailPanel({
   onCenter,
 }: {
   detail: NodeDetail | undefined;
+  /** Set once the detail fetch fails -- without this, a failed request left `detail` `undefined` forever and the panel showed "Loading details…" indefinitely, indistinguishable from a request that was still in flight. */
+  error?: unknown;
+  onRetry: () => void;
   branch: string | null | undefined;
   /** Hides "Center here" when the inspected node is already the seed -- re-centering on itself is a no-op. */
   isSeed: boolean;
@@ -52,7 +57,16 @@ export function GraphDetailPanel({
       </div>
 
       <div className="flex flex-1 flex-col gap-4 overflow-y-auto p-4 text-body">
-        {!detail && <p className="text-body text-ink-500">Loading details…</p>}
+        {!detail && !error && <p className="text-body text-ink-500">Loading details…</p>}
+        {error ? (
+          <div className="flex flex-col gap-2">
+            <p className="text-body text-destructive">Couldn&apos;t load this item&apos;s details.</p>
+            <p className="text-section text-ink-500">{error instanceof Error ? error.message : "Please try again."}</p>
+            <Button size="sm" variant="outline" className="self-start" onClick={onRetry}>
+              Retry
+            </Button>
+          </div>
+        ) : null}
         {detail && (
           <>
             <NodeDetailSections detail={detail} branch={branch} onSelectConnected={onSelectConnected} splitKnowledge />

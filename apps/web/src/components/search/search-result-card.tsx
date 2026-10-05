@@ -1,6 +1,6 @@
 import type { NodeKind } from "@/lib/api/repos-api";
 import { RelevanceBadge, relevanceForScore } from "@/components/shared/relevance-badge";
-import { NODE_KIND_SHAPE } from "@/lib/node-kind-shapes";
+import { nodeKindShape } from "@/lib/node-kind-shapes";
 import { NavDot } from "@/components/shell/nav-dot";
 import { cn } from "@/lib/utils";
 
@@ -24,7 +24,7 @@ export function SearchResultCard({
   selected: boolean;
   onClick: () => void;
 }) {
-  const { color, shape } = NODE_KIND_SHAPE[kind];
+  const { color, shape } = nodeKindShape(kind);
   return (
     <button
       onClick={onClick}

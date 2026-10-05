@@ -105,7 +105,7 @@ export default function GotchasPage() {
   // undefined and drop the whole detail panel. `NodeDetail` (any kind)
   // already carries curation fields, so it's the one source of truth here.
   const detailKey = selected ? (["node", selected.repo, selected.id] as const) : null;
-  const { data: detail } = useSWR(detailKey, () => getNodeDetail(selected!.repo, selected!.id));
+  const { data: detail, error: detailError } = useSWR(detailKey, () => getNodeDetail(selected!.repo, selected!.id));
   const branch = selected ? allRepos?.connections.find((r) => r.id === selected.repo)?.branch : undefined;
 
   async function applyCuration(prominence: NodeProminence, reason: string | null) {
@@ -330,7 +330,16 @@ export default function GotchasPage() {
 
         {selected && (
           <div className="flex min-w-0 flex-1 flex-col gap-6 overflow-y-auto rounded-lg border border-border-strong bg-panel p-5">
-            {!detail && <p className="text-body text-ink-500">Loading details…</p>}
+            {!detail && !detailError && <p className="text-body text-ink-500">Loading details…</p>}
+            {detailError && (
+              <div className="flex flex-col gap-2">
+                <p className="text-body text-destructive">Couldn&apos;t load this item&apos;s details.</p>
+                <p className="text-section text-ink-500">{detailError instanceof Error ? detailError.message : "Please try again."}</p>
+                <Button size="sm" variant="outline" className="self-start" onClick={() => mutate(detailKey)}>
+                  Retry
+                </Button>
+              </div>
+            )}
             {detail && (
               <>
                 <div className="flex items-start justify-between gap-2">
