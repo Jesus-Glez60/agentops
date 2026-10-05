@@ -156,9 +156,26 @@ fn resolve_access_mode(state: &AppState, tenant: &str) -> agentops_mcp::AccessMo
 /// `tools/call` dispatch and `libraries_http.rs`'s REST tool-call route —
 /// extracted so there's exactly one place that opens a per-tenant docbrain
 /// store for a tool call, not two copies of the same idiom.
-pub(crate) async fn call_docbrain_tool(state: &AppState, tenant: &str, name: &str, arguments: Value) -> Value {
+pub(crate) async fn call_docbrain_tool(state: &AppState, tenant: &str, name: &str, mut arguments: Value) -> Value {
     let db_path = docbrain_db_path_for_org(&state.docbrain_db_dir, Some(tenant));
     let name = name.to_string();
+    // `scrape_library` is the one docbrain tool with an optional paid-API
+    // fallback (Firecrawl, for JS-rendered doc pages the default
+    // ureq+scraper path can't see) -- resolved vault-only, same as
+    // `resolve_linear_config`, and threaded through `arguments` rather
+    // than `docbrain_mcp::call_tool`'s dispatcher signature, since every
+    // tool handler shares that one function-pointer shape and this is the
+    // only one that needs a per-tenant secret. `None` (no key stored) is
+    // the common case and changes nothing about today's scrape behavior.
+    if name == "scrape_library" {
+        let firecrawl_key = {
+            let credentials = state.credentials.lock().unwrap();
+            crate::resolve_firecrawl_key(&credentials, state.secrets.as_ref(), tenant).unwrap_or(None)
+        };
+        if let (Some(key), Some(obj)) = (firecrawl_key, arguments.as_object_mut()) {
+            obj.insert("_firecrawl_api_key".to_string(), json!(key));
+        }
+    }
     let call_result = tokio::task::spawn_blocking(move || {
         let store = docbrain_graph::SqliteDocbrainStore::open(&db_path)?;
         Ok::<_, anyhow::Error>(docbrain_mcp::call_tool(&store, &db_path, &name, &arguments))

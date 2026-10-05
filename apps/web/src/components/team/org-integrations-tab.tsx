@@ -10,13 +10,14 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { GithubAppIntegrationCard } from "@/components/team/github-app-integration-card";
 
-/** The two providers this deployment actually resolves credentials for
- * today (`resolve_linear_config`/`resolve_anthropic_config` in
- * agentops-heavy-api) -- the backend vault itself is provider-agnostic, so
- * this list is a frontend-only display choice, not a backend constraint. */
+/** The providers this deployment actually resolves credentials for today
+ * (`resolve_linear_config`/`resolve_anthropic_config`/`resolve_firecrawl_key`
+ * in agentops-heavy-api) -- the backend vault itself is provider-agnostic,
+ * so this list is a frontend-only display choice, not a backend constraint. */
 const KNOWN_PROVIDERS: { key: string; label: string; placeholder: string; description: string }[] = [
   { key: "linear", label: "Linear", placeholder: "lin_api_…", description: "Powers auto-kickoff and issue sync for the whole org." },
   { key: "anthropic", label: "Anthropic", placeholder: "sk-ant-…", description: "Used for LLM-assisted features (BYOK) across the org." },
+  { key: "firecrawl", label: "Firecrawl", placeholder: "fc-…", description: "Optional fallback for scraping JS-rendered documentation pages docbrain's default scraper can't see. Nothing changes if you skip this." },
 ];
 
 function ProviderRow({ provider, connected }: { provider: (typeof KNOWN_PROVIDERS)[number]; connected: IntegrationSummary | undefined }) {

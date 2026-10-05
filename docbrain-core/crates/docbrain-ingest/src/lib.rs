@@ -28,7 +28,9 @@ use docbrain_graph::DocbrainStore;
 /// `docs_url`, chunks/dedups/embeds/edges it, and stores it under
 /// `(slug, version)`, using the real local embedding model
 /// (`LocalEmbedder`, the `Embedder` port's production adapter).
-pub fn scrape_chunk_and_store(store: &dyn DocbrainStore, slug: &str, version: &str, docs_url: &str, max_pages: usize) -> Result<Vec<ChunkOutcome>> {
-    let pages = scrape_docs(docs_url, max_pages)?;
+/// `firecrawl_api_key` is passed straight through to `scrape_docs` — see
+/// its doc comment; `None` is the common case and changes nothing.
+pub fn scrape_chunk_and_store(store: &dyn DocbrainStore, slug: &str, version: &str, docs_url: &str, max_pages: usize, firecrawl_api_key: Option<&str>) -> Result<Vec<ChunkOutcome>> {
+    let pages = scrape_docs(docs_url, max_pages, firecrawl_api_key)?;
     chunk_and_store(store, slug, version, &pages, &LocalEmbedder)
 }

@@ -50,11 +50,13 @@ pub struct ScrapedPage {
 /// scraped off the landing page's HTML otherwise. Link discovery always
 /// uses HTML for the fallback path (Markdown exports don't reliably expose
 /// the same nav structure), even when the page content itself is fetched
-/// as Markdown.
-pub fn scrape_docs(url: &str, max_pages: usize) -> Result<Vec<ScrapedPage>> {
+/// as Markdown. `firecrawl_api_key` is an optional last-resort fallback
+/// for pages that render via JS (see `fetch_via_firecrawl`) — `None` by
+/// default, matching today's behavior exactly.
+pub fn scrape_docs(url: &str, max_pages: usize, firecrawl_api_key: Option<&str>) -> Result<Vec<ScrapedPage>> {
     let base = Url::parse(url).with_context(|| format!("parsing docs URL '{url}'"))?;
     let html = fetch(url)?;
-    let mut pages = vec![scrape_one_page(url, &html)];
+    let mut pages = vec![scrape_one_page(url, &html, firecrawl_api_key)];
 
     // Code-hosting sites aren't documentation sites: their sub-pages beyond
     // the landing page (commit history, file browser, issues) are mostly
@@ -69,7 +71,7 @@ pub fn scrape_docs(url: &str, max_pages: usize) -> Result<Vec<ScrapedPage>> {
         let links = fetch_llms_txt_links(&base).unwrap_or_else(|| same_scope_links(&html, &base));
         for link in links.into_iter().take(max_pages - 1) {
             match fetch(link.as_str()) {
-                Ok(page_html) => pages.push(scrape_one_page(link.as_str(), &page_html)),
+                Ok(page_html) => pages.push(scrape_one_page(link.as_str(), &page_html, firecrawl_api_key)),
                 Err(e) => {
                     // One follow-up page failing shouldn't sink the whole
                     // scrape — the landing page's content is still real.
@@ -167,17 +169,72 @@ fn extract_markdown_links(markdown: &str, base: &Url) -> Vec<Url> {
     links
 }
 
+/// Content shorter than this (UTF-8 bytes) after the HTML fallback path is
+/// treated as likely a JS-app-shell placeholder rather than real content
+/// (confirmed live elsewhere in this file: a bare SPA shell runs a few
+/// hundred bytes of "Loading…"/error text, a real content page thousands)
+/// — the threshold `fetch_via_firecrawl` is tried below.
+const LIKELY_JS_SHELL_BYTES: usize = 500;
+
 /// Tries a clean Markdown export of `url` first; falls back to extracting
 /// from `html_fallback` (already fetched for link discovery, so this is
-/// free) if the site doesn't offer one.
-fn scrape_one_page(url: &str, html_fallback: &str) -> ScrapedPage {
-    match fetch_markdown_export(url) {
-        Some(raw) => {
-            let (default_topic, body) = strip_frontmatter_title(&raw);
-            ScrapedPage { anchor_links: extract_markdown_anchor_links(&body), markdown: body, default_topic }
-        }
-        None => extract_page(html_fallback),
+/// free) if the site doesn't offer one; if that fallback's result is
+/// still too small to be real content and a Firecrawl key is available,
+/// tries Firecrawl's own JS-rendering scrape as a last resort.
+fn scrape_one_page(url: &str, html_fallback: &str, firecrawl_api_key: Option<&str>) -> ScrapedPage {
+    if let Some(raw) = fetch_markdown_export(url) {
+        let (default_topic, body) = strip_frontmatter_title(&raw);
+        return ScrapedPage { anchor_links: extract_markdown_anchor_links(&body), markdown: body, default_topic };
     }
+
+    let page = extract_page(html_fallback);
+    if page.markdown.len() >= LIKELY_JS_SHELL_BYTES {
+        return page;
+    }
+    let Some(key) = firecrawl_api_key else { return page };
+    match fetch_via_firecrawl(url, key) {
+        Ok(markdown) if markdown.len() > page.markdown.len() => {
+            ScrapedPage { anchor_links: extract_markdown_anchor_links(&markdown), markdown, default_topic: None }
+        }
+        Ok(_) => page,
+        Err(e) => {
+            eprintln!("docbrain: warning: Firecrawl fallback failed for {url}: {e}");
+            page
+        }
+    }
+}
+
+/// Calls Firecrawl's `/v1/scrape` endpoint (JS-rendering scrape-as-a-
+/// service) as a fallback for pages the plain ureq+scraper path can't see
+/// real content on. Entirely optional: only reached when a Firecrawl key
+/// is configured for the calling tenant (see `docbrain-mcp`'s
+/// `tool_scrape_library`) and the default path's own result looked like a
+/// JS-app-shell placeholder.
+fn fetch_via_firecrawl(url: &str, api_key: &str) -> Result<String> {
+    let mut response = ureq::post("https://api.firecrawl.dev/v1/scrape")
+        .header("Authorization", &format!("Bearer {api_key}"))
+        .send_json(serde_json::json!({ "url": url, "formats": ["markdown"] }))
+        .with_context(|| format!("calling Firecrawl /v1/scrape for '{url}'"))?;
+
+    let status = response.status();
+    if status.as_u16() == 401 {
+        anyhow::bail!("Firecrawl rejected the API key (401)");
+    }
+    if status.as_u16() == 429 {
+        anyhow::bail!("Firecrawl rate limit hit (429)");
+    }
+    if !status.is_success() {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        anyhow::bail!("Firecrawl returned {status}: {body}");
+    }
+
+    let parsed: serde_json::Value = response.body_mut().read_json().context("parsing Firecrawl response")?;
+    parsed
+        .get("data")
+        .and_then(|d| d.get("markdown"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Firecrawl response had no data.markdown field"))
 }
 
 /// Tries the two conventions real doc sites use to serve a clean Markdown
@@ -454,7 +511,7 @@ mod tests {
     // to follow same_scope_links into ~1625 chunks of repo-browser chrome.
     #[test]
     fn scrape_docs_never_follows_links_on_a_code_hosting_host() {
-        match scrape_docs("https://github.com/tokio-rs/axum", 200) {
+        match scrape_docs("https://github.com/tokio-rs/axum", 200, None) {
             Ok(pages) => assert_eq!(pages.len(), 1, "must stay at the landing page regardless of max_pages on a code-hosting host"),
             Err(e) => eprintln!("skipping network-dependent assertion: {e}"),
         }

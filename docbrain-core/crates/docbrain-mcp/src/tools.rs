@@ -266,6 +266,11 @@ fn tool_scrape_library(store: &dyn DocbrainStore, db_path: &Path, args: &Value) 
     let version = get_str(args, "version").ok_or_else(|| anyhow::anyhow!("missing required 'version'"))?.to_string();
     let max_pages = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
     let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Injected by `agentops-heavy-api::mcp_http::call_docbrain_tool` from
+    // the caller's tenant vault, not a user-supplied arg — absent (and
+    // therefore a no-op) for the CLI/single-tenant path, which has no
+    // vault to resolve it from. See `docbrain-ingest::scrape::scrape_docs`.
+    let firecrawl_api_key = get_str(args, "_firecrawl_api_key").map(str::to_string);
 
     let library = store
         .get_library(&slug)?
@@ -273,7 +278,7 @@ fn tool_scrape_library(store: &dyn DocbrainStore, db_path: &Path, args: &Value) 
     let docs_url = library.docs_url.clone().ok_or_else(|| anyhow::anyhow!("library '{slug}' has no docs_url registered — nothing to scrape"))?;
 
     if !background {
-        let outcomes = docbrain_ingest::scrape_chunk_and_store(store, &slug, &version, &docs_url, max_pages)?;
+        let outcomes = docbrain_ingest::scrape_chunk_and_store(store, &slug, &version, &docs_url, max_pages, firecrawl_api_key.as_deref())?;
         store.add_doc_snapshot(&slug, &version)?;
         let inserted = outcomes.iter().filter(|o| o.inserted).count();
         return Ok(format!("Scraped {docs_url} -> {} chunk(s), {inserted} new, persisted as {slug}@{version}.", outcomes.len()));
@@ -281,11 +286,11 @@ fn tool_scrape_library(store: &dyn DocbrainStore, db_path: &Path, args: &Value) 
 
     let job_id = store.create_job("scrape_library", &slug)?;
     let db_path = db_path.to_path_buf();
-    std::thread::spawn(move || run_scrape_job(db_path, slug, version, docs_url, max_pages, job_id));
+    std::thread::spawn(move || run_scrape_job(db_path, slug, version, docs_url, max_pages, job_id, firecrawl_api_key));
     Ok(format!("Started background scrape job {job_id}. Poll get_job_status with job_id: {job_id}."))
 }
 
-fn run_scrape_job(db_path: PathBuf, slug: String, version: String, docs_url: String, max_pages: usize, job_id: i64) {
+fn run_scrape_job(db_path: PathBuf, slug: String, version: String, docs_url: String, max_pages: usize, job_id: i64, firecrawl_api_key: Option<String>) {
     // `SqliteDocbrainStore::open` now sets a busy_timeout + WAL mode (see
     // its own doc comment), so concurrent-write contention here is rare --
     // but if opening still fails, there's no store to record a Failed
@@ -302,7 +307,7 @@ fn run_scrape_job(db_path: PathBuf, slug: String, version: String, docs_url: Str
         }
     };
     let outcome: Result<String> = (|| {
-        let outcomes = docbrain_ingest::scrape_chunk_and_store(&worker_store, &slug, &version, &docs_url, max_pages)?;
+        let outcomes = docbrain_ingest::scrape_chunk_and_store(&worker_store, &slug, &version, &docs_url, max_pages, firecrawl_api_key.as_deref())?;
         worker_store.add_doc_snapshot(&slug, &version)?;
         let inserted = outcomes.iter().filter(|o| o.inserted).count();
         Ok(format!("Scraped {docs_url} -> {} chunk(s), {inserted} new, persisted as {slug}@{version}.", outcomes.len()))

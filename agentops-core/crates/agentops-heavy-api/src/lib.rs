@@ -78,6 +78,16 @@ pub(crate) fn web_app_base_path() -> String {
 pub struct AppState {
     store: Arc<Mutex<ConnectionStore>>,
     secrets: Arc<dyn SecretsProvider + Send + Sync>,
+    /// Its own independent connection to the same `credentials.sqlite` the
+    /// accounts/team/linear route tables each already open separately
+    /// (see `build_full_router`'s comment on that pattern) — needed so the
+    /// `/mcp` dispatch path (`mcp_http::call_docbrain_tool`) can resolve a
+    /// per-tenant Firecrawl key for `scrape_library`, the one docbrain tool
+    /// with an optional paid-API fallback. Not threaded through
+    /// `build_router_with_tools_flag`'s already-at-the-limit argument list
+    /// — opened directly where `mode`/`install_state_secret`/`web_app_url`
+    /// already are, same convention.
+    credentials: Arc<Mutex<agentops_integrations::CredentialStore>>,
     /// GitHub App URL slug, if a GitHub App has actually been registered
     /// for this deployment — `GET /repos/github-app/install-url` 404s with
     /// a clear message when this is `None` rather than returning a bogus URL.
@@ -245,9 +255,12 @@ fn build_router_with_tools_flag(
     };
     let install_state_secret = std::env::var("AGENTOPS_GITHUB_INSTALL_STATE_SECRET").ok();
     let web_app_url = std::env::var("AGENTOPS_WEB_APP_URL").ok();
+    let credentials_db_path = std::env::var("AGENTOPS_INTEGRATIONS_DB").map(std::path::PathBuf::from).unwrap_or_else(|_| default_integrations_db_path());
+    let credentials = Arc::new(Mutex::new(agentops_integrations::CredentialStore::open(&credentials_db_path).expect("open integrations credential vault")));
     let state = AppState {
         store: Arc::new(Mutex::new(store)),
         secrets,
+        credentials,
         github_app_slug,
         api_key_hash,
         search_index,
@@ -484,6 +497,16 @@ fn resolve_linear_config(credentials: &agentops_integrations::CredentialStore, s
         .get_credential(secrets, tenant, "linear")?
         .ok_or_else(|| anyhow::anyhow!("no Linear credential stored for tenant {tenant:?} — add one via POST /integrations/linear"))?;
     Ok(agentops_linear::LinearConfig { api_key: cred.secret.to_string(), api_url: "https://api.linear.app/graphql".to_string() })
+}
+
+/// Resolves a stored Firecrawl key for `tenant`, if any — vault-only, same
+/// as `resolve_linear_config`, but `Ok(None)` rather than an error when
+/// nothing's stored: Firecrawl is an optional fallback for docbrain's
+/// scraper (JS-rendered pages the default ureq+scraper path can't see),
+/// not a required integration, so a tenant with nothing configured just
+/// gets the existing scrape behavior instead of an error.
+pub(crate) fn resolve_firecrawl_key(credentials: &agentops_integrations::CredentialStore, secrets: &dyn SecretsProvider, tenant: &str) -> anyhow::Result<Option<String>> {
+    Ok(credentials.get_credential(secrets, tenant, "firecrawl")?.map(|cred| cred.secret.to_string()))
 }
 
 /// Same vault-only resolution as `resolve_linear_config`, for
@@ -1339,6 +1362,27 @@ mod tests {
 
         let config = resolve_linear_config(&credentials, secrets.as_ref(), "default").unwrap();
         assert_eq!(config.api_key, "lin_api_from_vault");
+    }
+
+    #[test]
+    fn resolve_firecrawl_key_returns_none_rather_than_erroring_when_nothing_is_stored() {
+        let credentials = agentops_integrations::CredentialStore::open_in_memory().unwrap();
+        let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"22".repeat(32)).unwrap());
+
+        let key = resolve_firecrawl_key(&credentials, secrets.as_ref(), "default").unwrap();
+        assert_eq!(key, None, "no key stored means no fallback, not an error -- docbrain's scraper must still work");
+    }
+
+    #[test]
+    fn resolve_firecrawl_key_never_cross_resolves_between_tenants() {
+        let credentials = agentops_integrations::CredentialStore::open_in_memory().unwrap();
+        let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"22".repeat(32)).unwrap());
+        credentials
+            .store_credential(secrets.as_ref(), "tenant-a", agentops_integrations::NewCredential { provider: "firecrawl", auth_type: agentops_integrations::AuthType::ApiKey, secret: "fc-tenant-a-key", refresh_token: None, expires_at: None })
+            .unwrap();
+
+        assert_eq!(resolve_firecrawl_key(&credentials, secrets.as_ref(), "tenant-a").unwrap(), Some("fc-tenant-a-key".to_string()));
+        assert_eq!(resolve_firecrawl_key(&credentials, secrets.as_ref(), "tenant-b").unwrap(), None, "tenant-b stored nothing and must never see tenant-a's key");
     }
 
     #[test]
