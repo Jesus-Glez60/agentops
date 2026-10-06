@@ -73,10 +73,109 @@ pub fn persist_doc_page(store: &dyn GraphStore, repo_path: &Path, repo: &str, fi
         .and_then(|config| agentops_llm::group_core_modules(&config, repo, &ranked))
         .unwrap_or_default();
 
-    let doc_page = agentops_docgen::build_doc_page(store, repo, &ranked, &module_labels)?;
+    let mut doc_page = agentops_docgen::build_doc_page(store, repo, &ranked, &module_labels)?;
+
+    // Preserve agent-authored `Blueprint` sections (persisted by
+    // `persist_blueprint_doc`/`upsert_blueprint_section`) across every
+    // rescan -- `build_doc_page` never produces that group itself, so
+    // without this they'd be silently wiped the next time this function
+    // runs. A corrupted/unparseable previous page can't contribute anything
+    // here regardless, so that case just logs and falls through to the
+    // freshly-built page -- it must never panic or block this scan.
+    if let Ok(Some((_, previous_json))) = store.get_doc_page(repo) {
+        match serde_json::from_str::<agentops_docgen::DocPage>(&previous_json) {
+            Ok(previous) => {
+                let mut blueprint_sections: Vec<agentops_docgen::DocSection> =
+                    previous.sections.into_iter().filter(|s| s.group == agentops_docgen::DocGroup::Blueprint).collect();
+                // Dedupe by id, keeping the last occurrence -- only matters
+                // if a corrupted previous page somehow had duplicate
+                // Blueprint ids; a fresh build never emits this group at
+                // all, so there's no cross-group collision to resolve here.
+                let mut seen = std::collections::HashSet::new();
+                let mut deduped = Vec::with_capacity(blueprint_sections.len());
+                while let Some(section) = blueprint_sections.pop() {
+                    if seen.insert(section.id.clone()) {
+                        deduped.push(section);
+                    }
+                }
+                deduped.reverse();
+                doc_page.sections.extend(deduped);
+            }
+            Err(err) => {
+                eprintln!("warning: previous doc page for {repo:?} failed to deserialize ({err:#}) -- discarding it rather than blocking this scan's fresh page from saving");
+            }
+        }
+    }
+
     index_doc_sections(store, repo, &doc_page, with_embeddings)?;
     let content_json = serde_json::to_string(&doc_page).context("serializing the generated doc page")?;
     store.save_doc_page(repo, &doc_page.generated_at, &content_json)?;
+    Ok(())
+}
+
+/// Merges one agent-authored `Blueprint` section (one of the 8
+/// `project-blueprint` skill docs) into `repo`'s already-persisted
+/// `DocPage`, keyed on `note_type`-resolved `note_title`'s graph node for
+/// the section's `KnowledgeCallout` snapshot.
+///
+/// `note_type` only picks which `NodeKind` to search for when resolving
+/// `note_title` (`"knowledge"` → `NodeKind::Note`, `"decision"` →
+/// `NodeKind::Decision`) -- the 8 blueprint docs' ADR content is always
+/// written as a `Knowledge` note via `add_note`, so the `project-blueprint`
+/// skill always passes `"knowledge"` here; this parameter exists only so
+/// the lookup knows which kind to search, it doesn't change what gets
+/// persisted.
+///
+/// Concurrency: this is a non-atomic read-modify-write and `GraphStore` has
+/// no transaction wrapper -- a concurrent `scan_and_persist` or a second
+/// `persist_blueprint_doc` call for a different doc could race and drop
+/// one side's write. Documented as a known limitation rather than fixed:
+/// today's usage is one agent making explicitly sequenced tool calls, with
+/// no concurrent multi-agent sessions against the same repo.
+pub fn upsert_blueprint_section(
+    store: &dyn GraphStore,
+    repo: &str,
+    doc_id: &str,
+    title: &str,
+    markdown: String,
+    note_title: &str,
+    note_type: &str,
+) -> Result<()> {
+    let note_kind = match note_type {
+        "decision" => NodeKind::Decision,
+        _ => NodeKind::Note,
+    };
+    let note_node = store
+        .nodes_by_kind(repo, note_kind)?
+        .into_iter()
+        .find(|n| n.name.as_deref() == Some(note_title))
+        .with_context(|| format!("no {note_kind:?} note titled {note_title:?} -- call add_note first, then retry with the same title"))?;
+
+    let callout = agentops_docgen::DocBlock::KnowledgeCallout {
+        kind: note_node.kind,
+        node_id: note_node.id,
+        title: note_node.name.clone().unwrap_or_else(|| note_title.to_string()),
+        body: note_node.content.clone().unwrap_or_default(),
+        affects: String::new(),
+        source: None,
+    };
+    let section = agentops_docgen::DocSection {
+        id: format!("blueprint-{doc_id}"),
+        group: agentops_docgen::DocGroup::Blueprint,
+        title: title.to_string(),
+        blocks: vec![agentops_docgen::DocBlock::Prose { markdown }, callout],
+    };
+
+    let (generated_at, previous_json) =
+        store.get_doc_page(repo)?.with_context(|| format!("no doc page persisted for {repo} yet -- scan it first (agentops install / the scan_repo tool)"))?;
+    let mut doc_page: agentops_docgen::DocPage =
+        serde_json::from_str(&previous_json).context("the existing doc page failed to deserialize -- it may be corrupted")?;
+    doc_page.sections.retain(|s| s.id != section.id);
+    doc_page.sections.push(section.clone());
+
+    index_one_doc_section(store, repo, &section, false)?;
+    let content_json = serde_json::to_string(&doc_page).context("serializing the merged doc page")?;
+    store.save_doc_page(repo, &generated_at, &content_json)?;
     Ok(())
 }
 
@@ -90,30 +189,39 @@ pub fn persist_doc_page(store: &dyn GraphStore, repo_path: &Path, repo: &str, fi
 /// not something a human/agent action re-confirms.
 fn index_doc_sections(store: &dyn GraphStore, repo: &str, doc_page: &agentops_docgen::DocPage, with_embeddings: bool) -> Result<()> {
     for section in &doc_page.sections {
-        let (text, covered_ids) = section.search_text_and_covered_ids();
-        let node_id = upsert_node(
-            store,
-            NewNode {
-                kind: NodeKind::DocSection,
-                repo: repo.to_string(),
-                path: Some(format!("doc_section:{}", section.id)),
-                name: Some(section.title.clone()),
-                container: None,
-                start_line: None,
-                end_line: None,
-                content: Some(text.clone()),
-            },
-        )?;
+        index_one_doc_section(store, repo, section, with_embeddings)?;
+    }
+    Ok(())
+}
 
-        store.delete_edges_from(repo, node_id, EdgeRelation::Covers)?;
-        for covered_id in covered_ids {
-            store.add_edge(repo, node_id, covered_id, EdgeRelation::Covers)?;
-        }
+/// Upserts a single section's `NodeKind::DocSection` node and `Covers`
+/// edges -- factored out of `index_doc_sections`'s loop so
+/// `upsert_blueprint_section` can index just the one section it merged in,
+/// without re-indexing (and re-embedding) every other section on the page.
+fn index_one_doc_section(store: &dyn GraphStore, repo: &str, section: &agentops_docgen::DocSection, with_embeddings: bool) -> Result<()> {
+    let (text, covered_ids) = section.search_text_and_covered_ids();
+    let node_id = upsert_node(
+        store,
+        NewNode {
+            kind: NodeKind::DocSection,
+            repo: repo.to_string(),
+            path: Some(format!("doc_section:{}", section.id)),
+            name: Some(section.title.clone()),
+            container: None,
+            start_line: None,
+            end_line: None,
+            content: Some(text.clone()),
+        },
+    )?;
 
-        if with_embeddings && !text.trim().is_empty() {
-            let embedding = agentops_embeddings::LocalEmbedder.embed(&text)?;
-            store.set_embedding(repo, node_id, &embedding)?;
-        }
+    store.delete_edges_from(repo, node_id, EdgeRelation::Covers)?;
+    for covered_id in covered_ids {
+        store.add_edge(repo, node_id, covered_id, EdgeRelation::Covers)?;
+    }
+
+    if with_embeddings && !text.trim().is_empty() {
+        let embedding = agentops_embeddings::LocalEmbedder.embed(&text)?;
+        store.set_embedding(repo, node_id, &embedding)?;
     }
     Ok(())
 }
@@ -212,5 +320,105 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = generate_docs(dir.path()).unwrap_err();
         assert!(err.to_string().contains("scan it first"), "{err}");
+    }
+
+    #[test]
+    fn upsert_blueprint_section_errors_clearly_when_repo_has_never_been_scanned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        crate::notes::add_note(dir.path(), "Our PRD", "Status: Accepted\n", Some(agentops_notes::NoteType::Knowledge), &[], None, false).unwrap();
+
+        let err = upsert_blueprint_section(store.as_ref(), &repo, "prd", "Product Requirements", "some prose".into(), "Our PRD", "knowledge").unwrap_err();
+        assert!(err.to_string().contains("scan it first"), "{err}");
+    }
+
+    #[test]
+    fn upsert_blueprint_section_errors_clearly_when_the_note_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let err = upsert_blueprint_section(store.as_ref(), &repo, "prd", "Product Requirements", "some prose".into(), "Our PRD", "knowledge").unwrap_err();
+        assert!(err.to_string().contains("add_note first"), "{err}");
+    }
+
+    #[test]
+    fn upsert_blueprint_section_merges_into_the_doc_page_and_is_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        crate::notes::add_note(dir.path(), "Our PRD", "Status: Accepted\nContext: ...\n", Some(agentops_notes::NoteType::Knowledge), &[], None, false).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        upsert_blueprint_section(store.as_ref(), &repo, "prd", "Product Requirements", "a plain-language PRD".into(), "Our PRD", "knowledge").unwrap();
+
+        let (_generated_at, content_json) = store.get_doc_page(&repo).unwrap().unwrap();
+        let doc_page: agentops_docgen::DocPage = serde_json::from_str(&content_json).unwrap();
+        let section = doc_page.sections.iter().find(|s| s.id == "blueprint-prd").expect("the blueprint-prd section must be present");
+        assert_eq!(section.group, agentops_docgen::DocGroup::Blueprint);
+        // Other sections (e.g. the fresh scan's "overview") must still be present.
+        assert!(doc_page.sections.iter().any(|s| s.id == "overview"));
+
+        let indexed = store.nodes_by_kind(&repo, agentops_graph::NodeKind::DocSection).unwrap();
+        assert!(indexed.iter().any(|n| n.path.as_deref() == Some("doc_section:blueprint-prd")), "the blueprint-prd section must be indexed as its own node");
+    }
+
+    #[test]
+    fn a_blueprint_section_survives_a_second_scan_and_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        crate::notes::add_note(dir.path(), "Our PRD", "Status: Accepted\n", Some(agentops_notes::NoteType::Knowledge), &[], None, false).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        upsert_blueprint_section(store.as_ref(), &repo, "prd", "Product Requirements", "a plain-language PRD".into(), "Our PRD", "knowledge").unwrap();
+
+        // A second scan rebuilds the page from scratch -- the Blueprint
+        // section must be re-appended, not wiped.
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+
+        let (_generated_at, content_json) = store.get_doc_page(&repo).unwrap().unwrap();
+        let doc_page: agentops_docgen::DocPage = serde_json::from_str(&content_json).unwrap();
+        assert!(doc_page.sections.iter().any(|s| s.id == "blueprint-prd"), "the blueprint-prd section must survive a rescan: sections={:?}", doc_page.sections.iter().map(|s| &s.id).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_corrupted_previous_doc_page_does_not_block_a_fresh_scan_from_saving() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        // Corrupt the persisted page directly, bypassing the normal write path.
+        store.save_doc_page(&repo, "not-a-real-timestamp", "{ not valid json").unwrap();
+
+        // Must not panic, and the fresh page must still get saved.
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+
+        let (_generated_at, content_json) = store.get_doc_page(&repo).unwrap().unwrap();
+        let doc_page: agentops_docgen::DocPage = serde_json::from_str(&content_json).unwrap();
+        assert!(doc_page.sections.iter().any(|s| s.id == "overview"));
+    }
+
+    /// Confirms the externally-tagged `DocBlock` enum round-trips through
+    /// serialize/deserialize, and that an unrecognized `block_type`
+    /// discriminator fails predictably (an error), not silently (e.g.
+    /// defaulting to some variant or dropping the block).
+    #[test]
+    fn doc_block_round_trips_and_rejects_an_unknown_discriminator() {
+        let block = agentops_docgen::DocBlock::Prose { markdown: "hello".into() };
+        let json = serde_json::to_string(&block).unwrap();
+        let round_tripped: agentops_docgen::DocBlock = serde_json::from_str(&json).unwrap();
+        assert!(matches!(round_tripped, agentops_docgen::DocBlock::Prose { markdown } if markdown == "hello"));
+
+        let unknown = r#"{"block_type":"not_a_real_block_type"}"#;
+        let err = serde_json::from_str::<agentops_docgen::DocBlock>(unknown).unwrap_err();
+        assert!(err.to_string().contains("not_a_real_block_type"), "{err}");
     }
 }

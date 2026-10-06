@@ -251,6 +251,31 @@ fn tool_specs() -> Vec<ToolSpec> {
             handler: tool_generate_docs,
         },
         ToolSpec {
+            name: "persist_blueprint_doc",
+            description: "Merges one of the project-blueprint skill's 8 planning docs (PRD, Design Brief, Architecture, AI Agents Guide, Data Design, Technical Requirements, Security Guide, App Flow) into the repo's Documentation Viewer page, as plain-language prose plus a snapshot of an already-written add_note note (call add_note first with the ADR-style content, then this tool with the same note_title). Requires the repo to have been scanned already.",
+            // `Advisor`, same reasoning as `add_note` — this grows the
+            // documented knowledge base, it doesn't rescan or call a paid
+            // API.
+            access: AccessMode::Advisor,
+            annotations: WRITE_IDEMPOTENT,
+            input_schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "doc_id": { "type": "string", "enum": ["prd", "design_brief", "architecture", "ai_agents_guide", "data_design", "technical_requirements", "security_guide", "app_flow"] },
+                        "title": { "type": "string" },
+                        "markdown": { "type": "string" },
+                        "note_title": { "type": "string", "description": "Must match the title of a note already written via add_note." },
+                        "note_type": { "type": "string", "enum": ["knowledge", "decision"], "description": "Defaults to knowledge — picks which kind of note note_title resolves against." },
+                        "session_id": { "type": "string" },
+                    },
+                    "required": ["path", "doc_id", "title", "markdown", "note_title"],
+                })
+            },
+            handler: tool_persist_blueprint_doc,
+        },
+        ToolSpec {
             // Renamed from `semantic_search` — collides with
             // `agentops-heavy-mcp`'s own `semantic_search` tool (a
             // genuinely different backend: Qdrant-backed, requires
@@ -721,6 +746,22 @@ fn tool_generate_docs(args: &Value) -> anyhow::Result<String> {
     let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
     let out_path = crate::docgen::generate_docs(Path::new(path_str))?;
     Ok(format!("Wrote {}", out_path.display()))
+}
+
+fn tool_persist_blueprint_doc(args: &Value) -> anyhow::Result<String> {
+    let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
+    let doc_id = get_str(args, "doc_id").ok_or_else(|| anyhow::anyhow!("missing required 'doc_id'"))?;
+    let title = get_str(args, "title").ok_or_else(|| anyhow::anyhow!("missing required 'title'"))?;
+    let markdown = get_str(args, "markdown").ok_or_else(|| anyhow::anyhow!("missing required 'markdown'"))?;
+    let note_title = get_str(args, "note_title").ok_or_else(|| anyhow::anyhow!("missing required 'note_title'"))?;
+    let note_type = get_str(args, "note_type").unwrap_or("knowledge");
+
+    let store = crate::store::open_store(Path::new(path_str))?;
+    let repo = repo_name(Path::new(path_str));
+    crate::docgen::upsert_blueprint_section(store.as_ref(), &repo, doc_id, title, markdown.to_string(), note_title, note_type)?;
+
+    maybe_record_session_event(Path::new(path_str), args, "persist_blueprint_doc", &format!("persisted blueprint doc '{doc_id}': {title}"), None, "activity")?;
+    Ok(format!("Merged '{doc_id}' into {repo}'s Blueprint doc group."))
 }
 
 fn parse_node_kind(s: &str) -> Option<NodeKind> {

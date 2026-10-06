@@ -7,6 +7,7 @@ const GROUP_LABELS: Record<DocGroup, string> = {
   core_modules: "Core Modules",
   knowledge: "Knowledge",
   setup: "Setup",
+  blueprint: "Blueprint",
 };
 
 // Matches `knowledge-callout.tsx`'s `CALLOUT_STYLE` kind → color mapping
@@ -27,8 +28,9 @@ const BADGE_CLASSNAME: Record<NodeKind, string> = {
 };
 
 // No `execution_flows` entry -- ships as an omitted nav group for v1, see
-// `DocGroup`'s own doc comment.
-const GROUP_ORDER: DocGroup[] = ["repository", "core_modules", "knowledge", "setup"];
+// `DocGroup`'s own doc comment. `blueprint` is last -- it's agent-authored
+// planning content, not derived from the scan itself.
+const GROUP_ORDER: DocGroup[] = ["repository", "core_modules", "knowledge", "setup", "blueprint"];
 
 /** Left 220px pane: `DocSection[]` grouped by `DocGroup`, in a fixed group
  * order. A group with zero sections (e.g. `knowledge` on a repo with no

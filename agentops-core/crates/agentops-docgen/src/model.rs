@@ -4,15 +4,20 @@
 //! consumed by `agentops-api`'s `/repos/{name}/docs` endpoint and the
 //! frontend's three-pane Documentation Viewer.
 //!
-//! `Serialize`-only (no `Deserialize`) -- matching `agentops-api`'s
-//! `RepoSummary` convention, since this type is only ever produced here and
-//! read back as raw JSON text by callers, never reconstructed from JSON in
-//! Rust (see `sectioned.rs`'s persistence note).
+//! Also `Deserialize` (added alongside the original `Serialize`-only
+//! design): `agentops-mcp`'s blueprint-persistence tool needs to read back
+//! an already-persisted page, merge in an agent-authored `Blueprint`
+//! section, and re-save it. This doesn't reopen the crate-cycle the
+//! original design avoided -- `GraphStore::save_doc_page`/`get_doc_page`
+//! (in `agentops-graph`) still take/return an opaque JSON string, so
+//! `agentops-graph` still never depends on this crate. The parse-back-into-
+//! `DocPage` step happens entirely inside `agentops-mcp`, which already
+//! depends on both `agentops-graph` and this crate.
 
 use agentops_graph::NodeKind;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocPage {
     pub repo: String,
     pub generated_at: String,
@@ -20,7 +25,7 @@ pub struct DocPage {
     pub sections: Vec<DocSection>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocSection {
     /// Stable slug used for the frontend nav href and TOC anchor (e.g.
     /// `"core-modules-auth"`) -- stable across regenerations as long as the
@@ -32,20 +37,29 @@ pub struct DocSection {
     pub blocks: Vec<DocBlock>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DocGroup {
     Repository,
     CoreModules,
     Knowledge,
     Setup,
+    /// Agent-authored planning docs (PRD, Architecture, Security Guide,
+    /// etc., see the `project-blueprint` skill) -- never produced by
+    /// `build_doc_page` itself, only merged in by `agentops-mcp`'s
+    /// `persist_blueprint_doc` tool via `upsert_blueprint_section`. Because
+    /// `build_doc_page` never emits this group, `persist_doc_page`'s
+    /// preserve-on-rescan merge can always re-append a previous page's
+    /// `Blueprint` sections without any risk of colliding with a freshly
+    /// built section's id.
+    Blueprint,
     // Deliberately no `ExecutionFlows` variant for v1 -- no signal in the
     // graph derives a call-chain "flow" yet; see the plan this shipped
     // against. Add it here (and a corresponding nav group in the frontend)
     // once flow-detection is real, rather than shipping an always-empty one.
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "block_type", rename_all = "snake_case")]
 pub enum DocBlock {
     Prose {
@@ -72,7 +86,7 @@ pub enum DocBlock {
     },
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SymbolRow {
     pub name: String,
     pub one_liner: String,
@@ -169,5 +183,32 @@ mod tests {
         let sec = section(vec![DocBlock::Prose { markdown: "just prose, no symbols".into() }]);
         let (_, ids) = sec.search_text_and_covered_ids();
         assert!(ids.is_empty());
+    }
+
+    /// `DocPage` round-trips through `Deserialize` (added for
+    /// `agentops-mcp`'s blueprint-persistence tool, which needs to read
+    /// back an already-persisted page) -- including the `Blueprint`
+    /// variant, which `build_doc_page` itself never produces.
+    #[test]
+    fn doc_page_round_trips_through_serialize_deserialize() {
+        let page = DocPage {
+            repo: "my-repo".into(),
+            generated_at: "2026-01-01T00:00:00Z".into(),
+            node_count: 3,
+            sections: vec![DocSection {
+                id: "blueprint-prd".into(),
+                group: DocGroup::Blueprint,
+                title: "Product Requirements".into(),
+                blocks: vec![
+                    DocBlock::Prose { markdown: "plain-language PRD".into() },
+                    DocBlock::KnowledgeCallout { kind: NodeKind::Note, node_id: 7, title: "Our PRD".into(), body: "Status: Accepted".into(), affects: String::new(), source: None },
+                ],
+            }],
+        };
+        let json = serde_json::to_string(&page).unwrap();
+        let round_tripped: DocPage = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped.repo, page.repo);
+        assert_eq!(round_tripped.sections.len(), 1);
+        assert_eq!(round_tripped.sections[0].group, DocGroup::Blueprint);
     }
 }
