@@ -24,9 +24,11 @@ pub struct ScanPersistSummary {
     pub files: usize,
     pub symbols: usize,
     pub dependency_edges: usize,
-    /// Same-file symbol-to-symbol `References` edges (AST-precise where
-    /// tree-sitter parsed the file, word-boundary fallback otherwise) --
-    /// see `agentops_scanner::resolve_same_file_symbol_references`.
+    /// Symbol-to-symbol `References` edges: same-file (AST-precise where
+    /// tree-sitter parsed the file, word-boundary fallback otherwise -- see
+    /// `agentops_scanner::resolve_same_file_symbol_references`), plus, when
+    /// scanned via `scan_and_persist_with_lsp`, cross-file edges discovered
+    /// through a real `textDocument/references` LSP request.
     pub reference_edges: usize,
     pub pruned_files: usize,
     pub pruned_symbols: usize,
@@ -66,7 +68,133 @@ pub fn scan_and_persist(path: &Path, with_embeddings: bool) -> Result<ScanPersis
 pub fn scan_and_persist_with_lsp(path: &Path, with_embeddings: bool, handshake_timeout: Duration, expand_timeout: Duration) -> Result<ScanPersistSummary> {
     let mut report = agentops_scanner::scan_repo(path)?;
     enrich_with_macro_expansions(path, &mut report, handshake_timeout, expand_timeout);
-    persist(path, &report, with_embeddings)
+    let cross_file_references = find_cross_file_references(path, &report, handshake_timeout, expand_timeout);
+    persist_impl(path, &report, with_embeddings, &cross_file_references)
+}
+
+/// Finds cross-file `References` edges via a real `textDocument/references`
+/// LSP request per Rust symbol, returning `(from_file, from_symbol_idx,
+/// to_file, to_symbol_idx)` tuples resolved against `report.files[..]`'s own
+/// indices -- not yet node ids, since those aren't assigned until
+/// `persist_impl`'s own upsert runs; see `persist_impl`'s doc comment for how
+/// these get resolved. Same-file hits are deliberately skipped here --
+/// `agentops_scanner::resolve_same_file_symbol_references` and
+/// `agentops_notes::match_same_file_references` already cover those more
+/// cheaply (no LSP round trip) via `persist_impl`'s existing same-file paths;
+/// a same-file LSP hit would just be a slower, redundant duplicate of what's
+/// already found. Best-effort throughout, matching `enrich_with_macro_
+/// expansions`'s contract: a missing `rust-analyzer`, an unresolvable
+/// location, or a per-symbol timeout are all normal, expected outcomes, each
+/// skipped individually rather than failing the pass.
+/// Resolves `symbol`'s own name token to a 0-indexed `(line, character)` LSP
+/// position, for `textDocument/references` to query against. `start_line`
+/// is 1-indexed (`agentops_scanner::Symbol`'s own convention); LSP positions
+/// are 0-indexed. Position must land on the name's own token, not just
+/// anywhere on the declaration line (confirmed live this session: character
+/// 0, e.g. on `pub` in `pub fn greet() -> ...`, resolves nothing) -- found
+/// via a plain substring search on the declaration's own line.
+///
+/// **Known limitation, not fixed here** (verified by this function's own
+/// `symbol_name_position_can_match_the_wrong_earlier_token_on_the_line`
+/// test, not just asserted in a comment): a plain substring search matches
+/// the *first* occurrence of `symbol.name` on the line, which is wrong if
+/// an earlier token on the same line contains it too (e.g. two items
+/// declared on one physical line, the second one's name a prefix of the
+/// first). Rare in normal formatting (one item per line), and "query the
+/// wrong position" degrades the same way every other per-symbol failure in
+/// this pass does -- `references` either finds nothing there or something
+/// irrelevant, silently skipped by this function's caller, never a panic or
+/// a corrupted result -- so this stays a documented, tested limitation
+/// rather than a blocker.
+fn symbol_name_position(lines: &[&str], symbol: &agentops_scanner::Symbol) -> Option<(u32, u32)> {
+    let decl_line = lines.get(symbol.start_line.saturating_sub(1))?;
+    let byte_col = decl_line.find(symbol.name.as_str())?;
+    let character = decl_line[..byte_col].chars().count() as u32;
+    let line = (symbol.start_line.saturating_sub(1)) as u32;
+    Some((line, character))
+}
+
+fn find_cross_file_references(path: &Path, report: &ScanReport, handshake_timeout: Duration, request_timeout: Duration) -> Vec<(PathBuf, usize, PathBuf, usize)> {
+    if !report.files.iter().any(|f| f.path.extension().is_some_and(|ext| ext == "rs")) {
+        return Vec::new();
+    }
+
+    let mut client = match agentops_lsp_client::LspClient::spawn(path, handshake_timeout) {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("agentops: LSP cross-file-references pass skipped -- could not start rust-analyzer: {e:#}");
+            return Vec::new();
+        }
+    };
+
+    // Index-by-path once, so resolving a hit's target file (below) is a
+    // lookup, not a linear scan of every file per reference found.
+    let symbols_by_path: HashMap<&Path, (usize, &[agentops_scanner::Symbol])> = report.files.iter().enumerate().map(|(idx, f)| (f.path.as_path(), (idx, f.symbols.as_slice()))).collect();
+
+    // Canonicalized once, for comparison against `LspLocation::path` below
+    // (itself always canonical, since `LspClient::references` resolves it
+    // via `file.canonicalize()` before spawning the request) -- `path`
+    // itself may not be canonical as received (e.g. a macOS tempdir under a
+    // symlinked `/tmp`), and a raw `strip_prefix` against a non-canonical
+    // root would silently mismatch every single hit, confirmed live this
+    // session (every location was dropped until this fix). A fallback to
+    // the raw, non-canonical `path` on a `canonicalize` error would
+    // silently reintroduce that exact bug (every `strip_prefix` below would
+    // then fail too) -- bail out loudly instead, same shape as the
+    // `LspClient::spawn` failure right above.
+    let canonical_path = match path.canonicalize() {
+        Ok(canonical_path) => canonical_path,
+        Err(e) => {
+            eprintln!("agentops: LSP cross-file-references pass skipped -- could not canonicalize {}: {e:#}", path.display());
+            return Vec::new();
+        }
+    };
+
+    let mut cross_file_references = Vec::new();
+    for file in &report.files {
+        if file.path.extension().is_none_or(|ext| ext != "rs") {
+            continue;
+        }
+        let abs_path = path.join(&file.path);
+        let Ok(content) = std::fs::read_to_string(&abs_path) else { continue };
+        let lines: Vec<&str> = content.lines().collect();
+
+        for (from_symbol_idx, symbol) in file.symbols.iter().enumerate() {
+            let Some((line, character)) = symbol_name_position(&lines, symbol) else { continue };
+            let locations = match client.references(&abs_path, line, character, request_timeout) {
+                Ok(locations) => locations,
+                Err(_) => continue,
+            };
+
+            for loc in locations {
+                let Ok(rel_path) = loc.path.strip_prefix(&canonical_path) else { continue };
+                if rel_path == file.path {
+                    // Same-file hit -- already covered more cheaply by the
+                    // tree-sitter/word-boundary paths, see this function's
+                    // doc comment.
+                    continue;
+                }
+                let Some(&(referencer_file_idx, referencer_symbols)) = symbols_by_path.get(rel_path) else { continue };
+                // 0-indexed LSP location -> 1-indexed Symbol line range.
+                let target_line = loc.line as usize + 1;
+                let Some(referencer_symbol_idx) = referencer_symbols.iter().position(|s| s.start_line <= target_line && target_line <= s.end_line) else { continue };
+
+                // Direction matches the same-file paths' own convention
+                // (`resolve_same_file_symbol_references`): "from" is the
+                // symbol *containing* the reference, "to" is the symbol
+                // *being* referenced. `symbol` (this loop's own iteration
+                // variable) is the one this request queried `references`
+                // against -- i.e. the target being referenced -- while
+                // `loc` is where a referencing call-site actually sits, so
+                // the referencer/target roles are the reverse of this
+                // request's own query direction.
+                cross_file_references.push((report.files[referencer_file_idx].path.clone(), referencer_symbol_idx, file.path.clone(), from_symbol_idx));
+            }
+        }
+    }
+
+    client.shutdown();
+    cross_file_references
 }
 
 pub fn enrich_with_macro_expansions(path: &Path, report: &mut ScanReport, handshake_timeout: Duration, expand_timeout: Duration) {
@@ -133,12 +261,33 @@ pub fn enrich_with_macro_expansions(path: &Path, report: &mut ScanReport, handsh
 /// attached via `GraphStore::set_embedding` right after its `upsert_node`
 /// call, making it findable via `search_similar`/the `semantic_search` tool.
 pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Result<ScanPersistSummary> {
+    persist_impl(path, report, with_embeddings, &[])
+}
+
+/// `persist`'s real body, plus `cross_file_references` -- `(from_file,
+/// from_symbol_idx, to_file, to_symbol_idx)` tuples identifying symbols by
+/// their position in `report.files[..].symbols` (not yet-assigned node ids,
+/// which don't exist until this function's own Phase 2/3 upsert runs).
+/// Resolved into the same `reference_pairs: Vec<(i64, i64)>` the existing
+/// same-file (tree-sitter / word-boundary) paths already feed into Phase
+/// 5's reinforce/prune/add reconciliation -- cross-file LSP-discovered
+/// references are "just more reference pairs" to that machinery, not a
+/// separate edge type or a second pipeline. Kept private and parameterized
+/// rather than exposed directly: every existing caller keeps calling the
+/// unchanged public `persist`, so this split is zero-churn for them.
+fn persist_impl(path: &Path, report: &ScanReport, with_embeddings: bool, cross_file_references: &[(PathBuf, usize, PathBuf, usize)]) -> Result<ScanPersistSummary> {
     let repo = repo_name(path);
     let store = crate::store::open_store(path)?;
 
     let mut kept_file_ids = Vec::with_capacity(report.files.len());
     let mut kept_symbol_ids = Vec::new();
     let mut file_id_by_path: HashMap<PathBuf, i64> = HashMap::new();
+    // Every file's symbol-local-index -> node-id mapping, retained across
+    // the whole Phase 2/3 loop (unlike the loop-local `file_symbol_ids`
+    // below, which only lives for one file's iteration) -- needed to
+    // resolve `cross_file_references`, which can point at a target file
+    // processed earlier or later than the file containing the reference.
+    let mut file_symbol_ids_by_path: HashMap<PathBuf, Vec<i64>> = HashMap::new();
     let mut symbol_count = 0;
 
     let mut scan_entries: Vec<NewScanHistoryEntry> = Vec::new();
@@ -249,6 +398,24 @@ pub fn persist(path: &Path, report: &ScanReport, with_embeddings: bool) -> Resul
             for (from_id, to_id, _) in agentops_notes::match_same_file_references(&triples, 4)? {
                 reference_pairs.push((from_id, to_id));
             }
+        }
+
+        file_symbol_ids_by_path.insert(file.path.clone(), file_symbol_ids);
+    }
+
+    // Cross-file references (today: LSP-discovered, via `references_pairs`
+    // callers pass in as `cross_file_references`) resolve through the same
+    // per-file index->node-id map the same-file paths above already built,
+    // just looked up across files instead of within one. A target whose
+    // file or symbol index isn't found (e.g. the target file was filtered
+    // out of this scan, or the index is stale relative to `report`) is
+    // silently skipped -- best-effort, consistent with every other LSP
+    // enrichment in this codebase never failing a scan over a per-item miss.
+    for &(ref from_file, from_idx, ref to_file, to_idx) in cross_file_references {
+        let from_id = file_symbol_ids_by_path.get(from_file).and_then(|ids| ids.get(from_idx));
+        let to_id = file_symbol_ids_by_path.get(to_file).and_then(|ids| ids.get(to_idx));
+        if let (Some(&from_id), Some(&to_id)) = (from_id, to_id) {
+            reference_pairs.push((from_id, to_id));
         }
     }
     let symbol_versions_repo = repo.clone();
@@ -424,6 +591,51 @@ mod tests {
 
     fn open_store(repo_dir: &Path) -> SqliteGraphStore {
         SqliteGraphStore::open(&graph_db_path(repo_dir)).unwrap()
+    }
+
+    fn test_symbol(name: &str, start_line: usize) -> agentops_scanner::Symbol {
+        agentops_scanner::Symbol { name: name.to_string(), container: None, kind: "function".to_string(), start_line, end_line: start_line, source: String::new(), references: Vec::new() }
+    }
+
+    #[test]
+    fn symbol_name_position_finds_the_name_on_its_declaration_line() {
+        let lines = ["pub fn greet() -> &'static str {", "    \"hi\"", "}"];
+        let pos = symbol_name_position(&lines, &test_symbol("greet", 1));
+        // 0-indexed line; "greet" starts right after "pub fn ".
+        assert_eq!(pos, Some((0, 7)));
+    }
+
+    #[test]
+    fn symbol_name_position_returns_none_past_the_end_of_the_file() {
+        let lines = ["pub fn greet() {}"];
+        assert_eq!(symbol_name_position(&lines, &test_symbol("greet", 99)), None);
+    }
+
+    #[test]
+    fn symbol_name_position_returns_none_when_the_name_is_not_on_its_own_declaration_line() {
+        // A stale/mismatched line number (e.g. after an edit this pass never
+        // re-synced against) must degrade to "skip," never a panic or a
+        // wrong-but-silent match on unrelated text.
+        let lines = ["this line does not mention the symbol at all"];
+        assert_eq!(symbol_name_position(&lines, &test_symbol("greet", 1)), None);
+    }
+
+    #[test]
+    fn symbol_name_position_can_match_the_wrong_earlier_token_on_the_line() {
+        // Known, documented limitation (see `symbol_name_position`'s own
+        // doc comment): two items declared on one physical line, where the
+        // second one's name is a prefix of the first's -- `find` matches
+        // the *first* occurrence, landing inside `get_helper` instead of
+        // the real `get` declaration later on the same line. This test
+        // verifies that documented failure mode actually happens (rather
+        // than just asserting it in a comment), not that it's fixed.
+        let lines = ["fn get_helper() -> i32 { 1 } pub fn get() -> i32 { get_helper() }"];
+        let pos = symbol_name_position(&lines, &test_symbol("get", 1));
+        // The correct position (character 36, where `pub fn get` actually
+        // starts) is NOT what this returns -- it lands inside `get_helper`
+        // at character 3 instead, confirming the collision.
+        assert_eq!(pos, Some((0, 3)), "known limitation: must match the wrong, earlier token, not silently find the right one");
+        assert_ne!(pos, Some((0, 36)), "if this starts passing, the limitation was fixed -- update this test's expectation and doc comment together");
     }
 
     #[test]
@@ -1011,5 +1223,42 @@ mod tests {
 
         assert_eq!(generated.container.as_deref(), Some("Foo"), "the already-shipped container fix must apply automatically to expanded text, with zero new logic: {symbols:?}");
         assert!(generated.content.as_deref().unwrap_or("").contains('4') && generated.content.as_deref().unwrap_or("").contains('2'), "must carry real content from the expansion, not a placeholder: {symbols:?}");
+    }
+
+    fn cross_file_reference_fixture_dir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "[workspace]\n\n[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/lib.rs"), "pub mod callee;\npub mod caller;\n").unwrap();
+        std::fs::write(dir.path().join("src/callee.rs"), "pub fn greet() -> &'static str {\n    \"hi\"\n}\n").unwrap();
+        // References `callee::greet` from a different file -- the one case
+        // `resolve_same_file_symbol_references`/`match_same_file_references`
+        // structurally can't see, since both only ever look within one
+        // file's own symbol set.
+        std::fs::write(dir.path().join("src/caller.rs"), "use crate::callee::greet;\n\npub fn call_greet() -> &'static str {\n    greet()\n}\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn scan_and_persist_with_lsp_adds_a_cross_file_reference_edge() {
+        let dir = cross_file_reference_fixture_dir();
+        let summary = scan_and_persist_with_lsp(dir.path(), false, Duration::from_secs(30), Duration::from_secs(30)).expect("scan_and_persist_with_lsp itself must never fail, even if the LSP pass silently no-ops");
+
+        let store = open_store(dir.path());
+        let repo = repo_name(dir.path());
+        let symbols = store.nodes_by_kind(&repo, NodeKind::Symbol).unwrap();
+        let Some(greet) = symbols.iter().find(|s| s.name.as_deref() == Some("greet")) else {
+            eprintln!("skipping assertions: no real rust-analyzer available in this environment (`rustup component add rust-analyzer`) -- the LSP pass silently no-ops per its best-effort contract, confirmed by {} symbols found", summary.symbols);
+            return;
+        };
+        let Some(call_greet) = symbols.iter().find(|s| s.name.as_deref() == Some("call_greet")) else {
+            panic!("call_greet must exist regardless of the LSP pass -- it's found by the plain tree-sitter scan: {symbols:?}");
+        };
+
+        let edges = store.edges_from(&repo, call_greet.id).unwrap();
+        assert!(
+            edges.iter().any(|e| e.dst_id == greet.id && e.relation == EdgeRelation::References),
+            "call_greet -> greet must be a References edge, discovered via LSP since the two symbols are in different files: {edges:?}"
+        );
     }
 }

@@ -10,7 +10,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{GraphStore, NewTask, NodeKind, TaskStatus};
+use agentops_graph::{GraphStore, NewNode, NewTask, NodeKind, TaskStatus};
 use serde_json::{json, Value};
 
 use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
@@ -541,6 +541,83 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
     }
 
     Ok(out)
+}
+
+/// Composes `budget::compress_json` with persistence for whatever it drops,
+/// so a caller gets back JSON that stays fully reversible via the existing
+/// `fetch_content` tool, dropped items included — `compress_json` itself
+/// has no `GraphStore` dependency (see its own doc comment), so this is
+/// where that gap closes: each dropped item is stored as a `NodeKind::
+/// ToolOutput` node (the exact mechanism `agentops-cli::hook_capture`
+/// already uses for over-budget tool output -- reused here rather than
+/// inventing a second ad-hoc-content scheme, resolving the open design
+/// question the plan for this work originally flagged), and the compressed
+/// value gets one `fetch_content`-pointing note per dropped item instead of
+/// `compress_json`'s own generic drop-count marker.
+///
+/// **Does not itself guarantee the result fits `budget`**: `compress_json`
+/// always preserves every error-keyword/rare-value item regardless of
+/// budget (by design — a preserved item is never worth dropping just to
+/// hit a size target), so the output can exceed `budget` when those alone
+/// are large. Callers that need a hard size ceiling must still run the
+/// result through `cap`/`cap_sections` afterward; this function only adds
+/// *content-aware* compression ahead of that existing floor, it doesn't
+/// replace it.
+///
+/// Not yet called from any live tool handler -- staged infrastructure,
+/// exercised directly by its own tests rather than wired into a specific
+/// `tool_*` function yet. Choosing which existing JSON-array-shaped tool
+/// response(s) should actually route through this (vs. today's plain
+/// `cap`/`cap_sections`) is real follow-up work, not done in this pass --
+/// `#[allow(dead_code)]` below is deliberate, not an oversight.
+#[allow(dead_code)]
+fn compress_json_then_cap(store: &dyn GraphStore, repo: &str, value: &Value, budget: usize) -> anyhow::Result<Value> {
+    let compressed = crate::budget::compress_json(value, budget);
+    if compressed.dropped.is_empty() {
+        return Ok(compressed.value);
+    }
+
+    let mut fetch_notes = Vec::with_capacity(compressed.dropped.len());
+    for (idx, original_json) in &compressed.dropped {
+        let node_id = store.add_node(NewNode {
+            kind: NodeKind::ToolOutput,
+            repo: repo.to_string(),
+            path: Some(format!("tool_output:compressed:{}", now_nanos())),
+            name: None,
+            container: None,
+            start_line: None,
+            end_line: None,
+            content: Some(original_json.clone()),
+        })?;
+        fetch_notes.push(json!({ "dropped_item_index": idx, "fetch_content_id": node_id }));
+    }
+
+    // Replace `compress_json`'s own generic `_compressed_items_dropped`
+    // marker with the real per-item fetch pointers. The marker is always
+    // the array's last element when anything was dropped, per `compress_
+    // json`'s own current implementation — but that's an invariant of its
+    // implementation, not its public contract, so don't blindly `pop()`
+    // and trust it: only remove the last element if it's actually shaped
+    // like that marker. A future `compress_json` change that broke this
+    // invariant would otherwise silently replace a real data item with the
+    // marker instead of the marker itself — corrupting the response with
+    // no error raised anywhere.
+    let mut items = compressed.value.as_array().cloned().unwrap_or_default();
+    let last_is_marker = items.last().and_then(|v| v.as_object()).is_some_and(|o| o.contains_key("_compressed_items_dropped"));
+    if last_is_marker {
+        items.pop();
+    }
+    items.push(json!({ "_compressed_items_dropped": fetch_notes }));
+    Ok(Value::Array(items))
+}
+
+// Only called from `compress_json_then_cap`, itself currently unreachable
+// from any live tool handler -- see that function's own doc comment.
+// Dead-code reachability doesn't propagate through an already-`#[allow]`ed
+// caller, so this needs its own annotation too.
+#[allow(dead_code)]
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
 /// Companion to `budget::cap` — every truncated tool response points here by
@@ -1237,6 +1314,34 @@ mod tests {
 
         let result = call_tool(AccessMode::Full, "fetch_content", &json!({ "path": path, "id": 999999 })).unwrap();
         assert!(result.is_error, "{:?}", result.content);
+    }
+
+    #[test]
+    fn compress_json_then_cap_round_trips_a_dropped_item_through_fetch_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = repo_name(dir.path());
+
+        let mut items = Vec::new();
+        for i in 0..50 {
+            items.push(json!({"status": "ok", "id": i, "padding": "x".repeat(50)}));
+        }
+        let value = Value::Array(items);
+
+        let compressed = compress_json_then_cap(store.as_ref(), &repo, &value, 200).unwrap();
+        let kept = compressed.as_array().unwrap();
+        let marker = kept.last().expect("something must have been dropped at this budget");
+        let fetch_notes = marker.get("_compressed_items_dropped").and_then(|v| v.as_array()).expect("marker must carry fetch_content pointers, not just a count");
+        assert!(!fetch_notes.is_empty(), "{compressed:?}");
+
+        let first_id = fetch_notes[0].get("fetch_content_id").and_then(|v| v.as_i64()).expect("each dropped item must carry a real node id");
+        let full = call_tool(AccessMode::Full, "fetch_content", &json!({ "path": path, "id": first_id })).unwrap();
+        assert!(!full.is_error, "{:?}", full.content);
+        let recovered: Value = serde_json::from_str(&full.content[0].text).expect("fetch_content must return the dropped item's original JSON, byte-for-byte parseable");
+        assert_eq!(recovered.get("status").and_then(|s| s.as_str()), Some("ok"));
     }
 
     /// A repeatedly-reinforced gotcha must outrank a once-matched one when

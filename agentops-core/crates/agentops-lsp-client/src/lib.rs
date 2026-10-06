@@ -46,7 +46,8 @@ use anyhow::{Context, Result};
 use async_lsp::concurrency::ConcurrencyLayer;
 use async_lsp::lsp_types::notification::{LogMessage, Progress, PublishDiagnostics, ShowMessage};
 use async_lsp::lsp_types::{
-    ClientCapabilities, DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializedParams, TextDocumentIdentifier, TextDocumentItem, Url,
+    ClientCapabilities, DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializedParams, Position, ReferenceContext, ReferenceParams,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
 };
 use async_lsp::panic::CatchUnwindLayer;
 use async_lsp::router::Router;
@@ -72,6 +73,30 @@ pub struct LspSymbol {
     /// 1-indexed, matching `agentops_scanner::Symbol`'s own convention.
     pub start_line: u32,
     pub end_line: u32,
+}
+
+/// One `textDocument/references` hit -- a plain, minimal shape (not
+/// `lsp_types::Location` itself), matching `LspSymbol`'s own "callers never
+/// need this crate's `async-lsp`/`lsp-types` dependency in their own
+/// signatures" convention.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LspLocation {
+    /// Absolute path, matching what callers already pass in to the request
+    /// (not re-derived from the response's own `file://` URI, which could in
+    /// principle point outside the queried workspace for a cross-crate
+    /// reference -- round-tripping through `Url::to_file_path` keeps this
+    /// crate's "never assume, verify" convention rather than silently
+    /// dropping or mis-resolving a URI shape we haven't tested live).
+    pub path: std::path::PathBuf,
+    /// 0-indexed, matching raw LSP convention -- deliberately *not*
+    /// normalized to `LspSymbol`'s 1-indexed convention here, since a
+    /// reference location is a point (line, character), not a line range,
+    /// and the two aren't comparable the way `LspSymbol::start_line` is to
+    /// `agentops_scanner::Symbol::start_line`. Callers mapping this back to
+    /// a symbol's enclosing line range must account for the offset
+    /// themselves.
+    pub line: u32,
+    pub character: u32,
 }
 
 const DEFAULT_RUST_ANALYZER_BIN: &str = "rust-analyzer";
@@ -191,6 +216,57 @@ impl LspClient {
             .context("rust-analyzer did not respond to documentSymbol within the timeout")??;
 
             Ok(flatten_document_symbol_response(response))
+        })
+    }
+
+    /// Resolves every reference to the symbol at `line`/`character`
+    /// (0-indexed, raw LSP convention) in `file` via a real
+    /// `textDocument/references` request. `file`'s content is read fresh
+    /// from disk and sent as the `didOpen` body, same one-shot-enrichment
+    /// shape as `document_symbols`. `include_declaration: true` -- matches
+    /// Serena's own `find_referencing_symbols` default (the declaration
+    /// site itself is a legitimate "reference" for graph-edge purposes;
+    /// callers who need call-sites only can filter it out themselves by
+    /// comparing against the position they queried).
+    pub fn references(&mut self, file: &Path, line: u32, character: u32, request_timeout: Duration) -> Result<Vec<LspLocation>> {
+        let file = file.canonicalize().with_context(|| format!("resolving {}", file.display()))?;
+        let uri = Url::from_file_path(&file).map_err(|_| anyhow::anyhow!("not a valid file:// URI: {}", file.display()))?;
+        let text = std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
+        let server = &mut self.server;
+
+        self.rt.block_on(async move {
+            server
+                .did_open(DidOpenTextDocumentParams { text_document: TextDocumentItem { uri: uri.clone(), language_id: "rust".into(), version: 0, text } })
+                .context("sending didOpen")?;
+
+            let response = tokio::time::timeout(
+                request_timeout,
+                server.references(ReferenceParams {
+                    text_document_position: TextDocumentPositionParams { text_document: TextDocumentIdentifier { uri }, position: Position { line, character } },
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                    context: ReferenceContext { include_declaration: true },
+                }),
+            )
+            .await
+            .context("rust-analyzer did not respond to references within the timeout")??;
+
+            Ok(response
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|loc| {
+                    // Best-effort per this crate's documented contract: a
+                    // location whose URI can't resolve to a real local path
+                    // (e.g. a `jdt://`-style virtual document some servers
+                    // emit for library sources, not something rust-analyzer
+                    // itself is known to produce today) is dropped rather
+                    // than failing the whole call -- no evidence this
+                    // actually happens live for rust-analyzer, but the
+                    // fallible `to_file_path` conversion exists regardless
+                    // and must be handled one way or another.
+                    loc.uri.to_file_path().ok().map(|path| LspLocation { path, line: loc.range.start.line, character: loc.range.start.character })
+                })
+                .collect())
         })
     }
 
@@ -389,6 +465,29 @@ mod tests {
         assert_eq!(impl_forwards.len(), 2, "both impl blocks' `forward` methods must be reported: {symbols:?}");
         let containers: std::collections::HashSet<_> = impl_forwards.iter().map(|s| s.container_name.as_deref()).collect();
         assert_eq!(containers, std::collections::HashSet::from([Some("impl Foo"), Some("impl SomeTrait for Foo")]), "the inherent and trait impls must be independently named: {symbols:?}");
+
+        client.shutdown();
+    }
+
+    #[test]
+    fn references_finds_the_call_site_for_an_inherent_method() {
+        let mut client = match LspClient::spawn(&fixture_root(), Duration::from_secs(30)) {
+            Ok(client) => client,
+            Err(e) => {
+                eprintln!("skipping: could not spawn a real rust-analyzer ({e:#}) -- install via `rustup component add rust-analyzer` to run this test");
+                return;
+            }
+        };
+
+        // Line 7 (0-indexed): `    pub fn forward(&self) -> i32 {` -- the
+        // inherent impl's own declaration. Character 15 lands on "forward".
+        let locations = client.references(&fixture_root().join("src/lib.rs"), 7, 15, Duration::from_secs(30)).expect("references request");
+
+        // `include_declaration: true`, so the declaration itself must be
+        // among the hits, plus the real call-site this fixture provides
+        // (`call_inherent_forward`'s `f.forward()`).
+        assert!(locations.iter().any(|l| l.line == 7), "the declaration itself must be included: {locations:?}");
+        assert!(locations.iter().any(|l| l.line > 17), "the call-site in call_inherent_forward must be found: {locations:?}");
 
         client.shutdown();
     }

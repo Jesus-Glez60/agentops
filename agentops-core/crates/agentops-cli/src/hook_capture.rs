@@ -119,6 +119,30 @@ fn process_post_tool_use(input: &str) -> Result<()> {
 
     store.record_session_event(&repo, session_id, &payload.tool_name, &format!("captured {} chars of tool output ({} secret(s) redacted)", text.chars().count(), redaction.redacted_count), Some(node_id), "tool_output")?;
 
+    // CacheAligner-equivalent (Headroom-inspired, see the project's own
+    // notes on this): this captured `ToolOutput` node is exactly the kind
+    // of content a later session might reuse/re-embed verbatim -- flag it
+    // if it carries volatile content (a fresh timestamp, session UUID/JWT,
+    // or hash) that would look stale or misleading by the time it's reused.
+    // Detector-only, same as `detect_cache_unsafe` itself: never mutates
+    // the captured content, only warns. Best-effort, same as the warning
+    // above it -- a failure to record this must never fail the hook.
+    let hazards = agentops_mcp::budget::detect_cache_unsafe(&text);
+    if !hazards.is_empty() {
+        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for hazard in &hazards {
+            let kind = match hazard.kind {
+                agentops_mcp::budget::CacheHazardKind::Uuid => "UUID",
+                agentops_mcp::budget::CacheHazardKind::Jwt => "JWT",
+                agentops_mcp::budget::CacheHazardKind::HexHash => "hex hash",
+                agentops_mcp::budget::CacheHazardKind::Timestamp => "timestamp",
+            };
+            *counts.entry(kind).or_default() += 1;
+        }
+        let summary = counts.into_iter().map(|(kind, n)| format!("{n} {kind}")).collect::<Vec<_>>().join(", ");
+        let _ = store.record_session_event(&repo, session_id, &payload.tool_name, &format!("captured tool output contains volatile content ({summary}) — may look stale if reused verbatim in a later session"), Some(node_id), "cache_hazard_warning");
+    }
+
     Ok(())
 }
 
@@ -554,6 +578,37 @@ mod tests {
         let events = store.session_events(&repo, "sess-2").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].tool_name, "Bash");
+    }
+
+    #[test]
+    fn large_tool_output_containing_a_uuid_also_records_a_cache_hazard_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let big_output = format!("{}\nsession_id: 123e4567-e89b-12d3-a456-426614174000 done", "line of shell output\n".repeat(300));
+        let payload = serde_json::json!({ "tool_name": "Bash", "tool_response": big_output, "session_id": "sess-hazard", "cwd": path }).to_string();
+
+        process_post_tool_use(&payload).unwrap();
+
+        let store = agentops_mcp::open_store(dir.path()).unwrap();
+        let repo = agentops_mcp::repo_name(dir.path());
+        let events = store.session_events(&repo, "sess-hazard").unwrap();
+        assert_eq!(events.len(), 2, "both the tool_output capture and the cache_hazard_warning must be recorded: {events:?}");
+        assert!(events.iter().any(|e| e.event_kind == "cache_hazard_warning" && e.description.contains("UUID")), "{events:?}");
+    }
+
+    #[test]
+    fn large_tool_output_with_no_volatile_content_records_no_cache_hazard_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let big_output = "line of shell output\n".repeat(300);
+        let payload = serde_json::json!({ "tool_name": "Bash", "tool_response": big_output, "session_id": "sess-no-hazard", "cwd": path }).to_string();
+
+        process_post_tool_use(&payload).unwrap();
+
+        let store = agentops_mcp::open_store(dir.path()).unwrap();
+        let repo = agentops_mcp::repo_name(dir.path());
+        let events = store.session_events(&repo, "sess-no-hazard").unwrap();
+        assert!(!events.iter().any(|e| e.event_kind == "cache_hazard_warning"), "{events:?}");
     }
 
     #[test]

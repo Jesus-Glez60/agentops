@@ -79,6 +79,7 @@ repo-map.md
 /.claude/skills
 /.cursor/agents
 /.cursor/skills
+/.gemini/skills
 /AGENTS.md
 /AGENTS.md.bak
 /CLAUDE.md
