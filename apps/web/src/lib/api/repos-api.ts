@@ -74,6 +74,37 @@ export function verifyRepo(id: string): Promise<VerifyRepoResponse> {
   return heavyFetch<VerifyRepoResponse>(`/repos/${encodeURIComponent(id)}/verify`, { method: "POST" });
 }
 
+/** Removes a connection and wipes its recorded graph/notes/doc data server-side (`DELETE /repos/{id}`). Irreversible -- the caller must confirm before calling this. */
+export function deleteRepo(id: string): Promise<void> {
+  return heavyFetch<void>(`/repos/${encodeURIComponent(id)}`, { method: "DELETE" });
+}
+
+export interface AttachRemoteResponse {
+  connection: RepoConnection;
+  instructions?: string;
+  /** Only present on the GitHub App variant -- always `false` today. An
+   * upgraded connection keeps its original id, but the GitHub webhook push
+   * handler derives the id it looks up from the repo's owner/name, which
+   * won't match -- so a push never auto-triggers a reindex for an upgraded
+   * connection. Surface `webhook_autoreindex_reason` persistently (not a
+   * one-time toast) wherever this response lands. */
+  webhook_autoreindex?: boolean;
+  webhook_autoreindex_reason?: string;
+}
+
+/** Completes a `discovered`/local-only connection with a real SSH deploy-key remote, in place, same id (`POST /repos/{id}/attach-ssh`) -- only eligible when the connection's `method` is `"discovered"`; 409s otherwise. */
+export function attachSshRemote(id: string, repoUrl: string): Promise<AttachRemoteResponse> {
+  return heavyFetch<AttachRemoteResponse>(`/repos/${encodeURIComponent(id)}/attach-ssh`, { method: "POST", body: JSON.stringify({ repo_url: repoUrl }) });
+}
+
+/** Same as `attachSshRemote`, for the GitHub App method (`POST /repos/{id}/attach-github-app`). */
+export function attachGithubAppRemote(id: string, installationId: string, fullName: string): Promise<AttachRemoteResponse> {
+  return heavyFetch<AttachRemoteResponse>(`/repos/${encodeURIComponent(id)}/attach-github-app`, {
+    method: "POST",
+    body: JSON.stringify({ installation_id: installationId, full_name: fullName }),
+  });
+}
+
 export type ParsedRepoStatus = { kind: "pending" } | { kind: "active" } | { kind: "failed"; reason: string };
 
 /** The backend's `status` field is `"pending"`, `"active"`, or `"failed: <reason>"` (see `ConnectionView` in agentops-heavy-api) -- this is the one place that string gets parsed into something a component can switch on. */
@@ -411,12 +442,13 @@ export function getRepoGraph(connectionId: string, kinds: NodeKind[] = []): Prom
 }
 
 // Documentation Viewer types mirror `agentops-docgen::model` exactly (see
-// that crate's `model.rs` for the Rust source of truth). `DocPage` is
-// `Serialize`-only in Rust -- these types are never sent back to the
-// server, only read from `GET /repos/{id}/docs`'s response.
+// that crate's `model.rs` for the Rust source of truth). `DocPage` now also
+// derives `Deserialize` in Rust (for `agentops-mcp`'s blueprint-persistence
+// tool), but these frontend types are still never sent back to the server
+// from here, only read from `GET /repos/{id}/docs`'s response.
 
-/** `#[serde(rename_all = "snake_case")]` on `DocGroup` -- no `execution_flows` variant exists yet (see that enum's own doc comment: no signal in the graph derives a call-chain "flow"). */
-export type DocGroup = "repository" | "core_modules" | "knowledge" | "setup";
+/** `#[serde(rename_all = "snake_case")]` on `DocGroup` -- no `execution_flows` variant exists yet (see that enum's own doc comment: no signal in the graph derives a call-chain "flow"). `blueprint` holds the `project-blueprint` skill's 8 agent-authored planning docs, never produced by a scan itself. */
+export type DocGroup = "repository" | "core_modules" | "knowledge" | "setup" | "blueprint";
 
 export interface SymbolRow {
   name: string;

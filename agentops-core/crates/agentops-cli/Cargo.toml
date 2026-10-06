@@ -13,6 +13,10 @@ anyhow.workspace = true
 clap.workspace = true
 dirs.workspace = true
 tokio.workspace = true
+# Also a dev-dependency below for existing tests -- needed here too now:
+# `connect --global` renders skills into a throwaway tempdir before merging
+# just that output into ~/.claude/skills/.
+tempfile = "3"
 
 agentops-scanner = { path = "../agentops-scanner" }
 agentops-graph = { path = "../agentops-graph" }
@@ -54,6 +58,3 @@ open = "5"
 
 # (`docgen` command goes through agentops-mcp::generate_docs, no direct
 # agentops-docgen dep needed here.)
-
-[dev-dependencies]
-tempfile = "3"

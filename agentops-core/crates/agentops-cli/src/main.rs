@@ -254,8 +254,16 @@ enum Command {
         path: PathBuf,
         /// Comma-separated agent ids (e.g. claude,cursor,codex,gemini-cli) —
         /// skips the interactive multi-select prompt.
-        #[arg(long, value_delimiter = ',')]
+        #[arg(short = 'a', long, value_delimiter = ',')]
         agents: Vec<String>,
+        /// Install skills + register the MCP server globally (user-level,
+        /// e.g. ~/.claude/skills/) instead of into --path. No repo gets
+        /// scanned or registered by this alone -- do that afterward,
+        /// per-project, via register_repo/scan_repo (an agent can do this
+        /// itself once skills/MCP are available everywhere). --path is
+        /// ignored when this is set.
+        #[arg(short = 'g', long)]
+        global: bool,
         #[arg(long, value_enum, default_value_t = AccessModeArg::Advisor)]
         access_mode: AccessModeArg,
         /// Skip all prompts — requires --agents to be set (and --api-key,
@@ -599,7 +607,13 @@ fn main() -> Result<()> {
             UsageAction::Sync { path, claude_home, remote } => usage_sync_command(&path, claude_home.as_deref(), remote.as_deref()),
         },
         Command::Init { yes, path } => init(yes, &path),
-        Command::Connect { path, agents, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands } => connect(&path, agents, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands),
+        Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands } => {
+            if global {
+                connect_global(agents, access_mode, yes, remote, api_key, device_login)
+            } else {
+                connect(&path, agents, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands)
+            }
+        }
         Command::HookCapture { event, compress } => hook_capture::run(&event, compress),
         Command::CompressOutput { kind } => compress_output::run(kind),
         Command::MigrateGraph { from, to, repo, wipe_target } => migrate_graph(&from, &to, &repo, wipe_target),
@@ -1376,21 +1390,177 @@ fn device_flow_login(server_url: &str) -> Result<String> {
     }
 }
 
-fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents: &[String], yes: bool, device_login: bool) -> Result<()> {
-    let api_key = match api_key {
-        Some(k) => k,
-        None if device_login => device_flow_login(server_url)?,
+/// Sentinel dropped inside every AgentOps-managed global skill directory
+/// (content is irrelevant, only its presence matters) -- distinguishes a
+/// skill this tool created from one the user already had under the same
+/// name, so a re-install only ever overwrites its own prior output, never
+/// a user's unrelated skill that happens to share a name with one of
+/// AgentOps's own.
+const GLOBAL_SKILL_MARKER: &str = ".agentops-managed";
+
+/// `agentops connect --global` -- installs skills and registers the MCP
+/// server at the user level (e.g. `~/.claude/skills/`, `~/.claude.json`'s
+/// top-level `mcpServers`) instead of into a specific `--path`. No repo
+/// gets scanned or registered by this alone; that's a separate, per-project
+/// step (`register_repo`/`scan_repo`, which an agent can now do itself from
+/// any directory once this has run once).
+///
+/// Reuses `distribute_via_ruler` exactly as the per-project path does,
+/// just pointed at a throwaway tempdir instead of a real project -- the
+/// `@include`-expansion into a fully-resolved `SKILL.md` happens inside
+/// the real `ruler apply` binary, not in this crate, so there's no reason
+/// to reimplement that here. The tempdir's `AGENTS.md` content is
+/// irrelevant (a skill's own prose comes from the prompt pack, not from
+/// AGENTS.md) -- passed as `""`. When `--remote` is set, the remote marker
+/// is written into the *tempdir* first (mirroring `connect_remote`'s own
+/// sequencing), purely so `distribute_via_ruler`'s internal
+/// `write_user_level_mcp_entries` call picks the remote entry instead of
+/// the local/stdio one -- the tempdir itself is discarded right after.
+fn connect_global(agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool) -> Result<()> {
+    let agents = select_agents(agents, yes)?;
+    if agents.is_empty() {
+        println!("No agents selected — nothing to do.");
+        return Ok(());
+    }
+
+    agentops_ruler_bridge::preflight_check_npx()?;
+
+    let remote_url = match &remote {
+        Some(url) => Some(url.trim().trim_end_matches('/').to_string()),
+        None if yes => None,
+        None => {
+            let choice = dialoguer::Select::new()
+                .with_prompt("Is agentops running on this machine, or on a separate server you'll connect to?")
+                .items(&["This machine (local)", "A separate server (remote)"])
+                .default(0)
+                .interact()?;
+            if choice == 1 {
+                let url: String = dialoguer::Input::new().with_prompt("Server URL (e.g. http://192.168.1.10:3000 or https://agentops.example.com)").interact_text()?;
+                Some(url.trim().trim_end_matches('/').to_string())
+            } else {
+                None
+            }
+        }
+    };
+
+    let temp = tempfile::tempdir().context("creating a scratch directory to render skills into")?;
+
+    if let Some(server_url) = &remote_url {
+        let api_key = resolve_api_key_for_remote(server_url, api_key, yes, device_login)?;
+        // "global" as a placeholder connection id -- this marker is only
+        // ever read back by `distribute_via_ruler`'s own call into
+        // `read_remote_marker`, which only uses `server_url`/`api_key`,
+        // and the tempdir it lives in is discarded right after this
+        // function returns.
+        write_remote_marker(temp.path(), server_url, "global", &api_key)?;
+        distribute_via_ruler(temp.path(), "", &agents, "advisor");
+    } else {
+        let access_mode_str = if matches!(access_mode, AccessModeArg::Full) { "full" } else { "advisor" };
+        distribute_via_ruler(temp.path(), "", &agents, access_mode_str);
+    }
+
+    let mut merged_any = false;
+    if agents.iter().any(|a| a == "claude") {
+        if let Some(home) = dirs::home_dir() {
+            let rendered_skills_dir = temp.path().join(".claude").join("skills");
+            let global_skills_dir = home.join(".claude").join("skills");
+            match merge_global_skills(&rendered_skills_dir, &global_skills_dir) {
+                Ok(count) => {
+                    println!("Merged {count} skill(s) into {}", global_skills_dir.display());
+                    merged_any = true;
+                }
+                Err(e) => println!("WARNING: failed to merge skills into {}: {e}", global_skills_dir.display()),
+            }
+        }
+    }
+    if !merged_any {
+        println!("No global skills directory known for any of: {} (Claude Code's ~/.claude/skills/ is the only one confirmed so far).", agents.join(", "));
+    }
+
+    println!("\nGlobally connected: {}", agents.join(", "));
+    for agent_id in &agents {
+        match mcp_config_location(agent_id) {
+            Some(loc) => println!("  {agent_id}: {} — restart {agent_id} to pick up the new MCP server.", loc.display()),
+            None => println!("  {agent_id}: not a recognized agent id for user-level MCP registration — check its docs for how to register a stdio MCP server manually."),
+        }
+    }
+    println!("\nNo repo has been scanned or registered yet -- from any directory, ask an agent to register_repo/scan_repo (or create a new project and do the same) once it's connected.");
+
+    Ok(())
+}
+
+/// Copies each top-level skill subdirectory from `rendered_skills_dir`
+/// (this run's freshly-rendered output) into `global_skills_dir`, but only
+/// when the destination either doesn't exist yet or already carries
+/// `GLOBAL_SKILL_MARKER` from a prior AgentOps install -- a same-named
+/// directory without that marker is a user's own skill, left untouched
+/// (with a warning), never silently overwritten. Returns how many skills
+/// were actually written.
+fn merge_global_skills(rendered_skills_dir: &Path, global_skills_dir: &Path) -> Result<usize> {
+    if !rendered_skills_dir.is_dir() {
+        return Ok(0);
+    }
+    std::fs::create_dir_all(global_skills_dir).with_context(|| format!("creating {}", global_skills_dir.display()))?;
+
+    let mut count = 0;
+    for entry in std::fs::read_dir(rendered_skills_dir).context("reading rendered skills directory")? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let dest = global_skills_dir.join(&name);
+        if dest.exists() && !dest.join(GLOBAL_SKILL_MARKER).exists() {
+            println!("WARNING: skipping {} -- a skill with this name already exists globally and wasn't created by agentops. Remove it first if you want agentops's version instead.", dest.display());
+            continue;
+        }
+        if dest.exists() {
+            std::fs::remove_dir_all(&dest).with_context(|| format!("removing previous version of {}", dest.display()))?;
+        }
+        copy_dir_recursive(&entry.path(), &dest)?;
+        std::fs::write(dest.join(GLOBAL_SKILL_MARKER), "").with_context(|| format!("writing ownership marker for {}", dest.display()))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("creating {}", dst.display()))?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else {
+            std::fs::copy(entry.path(), &dest_path).with_context(|| format!("copying to {}", dest_path.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Shared by `connect_remote` and `connect_global`'s own `--remote` path --
+/// extracted after a council review of this session's diff flagged the
+/// identical 14-line block living in both functions, risking divergence on
+/// any future auth-method addition.
+fn resolve_api_key_for_remote(server_url: &str, api_key: Option<String>, yes: bool, device_login: bool) -> Result<String> {
+    match api_key {
+        Some(k) => Ok(k),
+        None if device_login => device_flow_login(server_url),
         None if yes => anyhow::bail!("--remote requires --api-key or --device-login when --yes is set (nothing to prompt for non-interactively)"),
         None => {
             let choice = dialoguer::Select::new().with_prompt("How do you want to authenticate?").items(&["Log in via browser (recommended)", "Paste an already-generated API key"]).default(0).interact()?;
             if choice == 0 {
-                device_flow_login(server_url)?
+                device_flow_login(server_url)
             } else {
                 println!("Generate a personal API key from Settings -> API Keys in the web app.");
-                dialoguer::Password::new().with_prompt("API key").interact()?
+                Ok(dialoguer::Password::new().with_prompt("API key").interact()?)
             }
         }
-    };
+    }
+}
+
+fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents: &[String], yes: bool, device_login: bool) -> Result<()> {
+    let api_key = resolve_api_key_for_remote(server_url, api_key, yes, device_login)?;
 
     // Reuse a connection this exact repo was already registered under,
     // rather than re-resolving (and, for the no-remote case, re-registering

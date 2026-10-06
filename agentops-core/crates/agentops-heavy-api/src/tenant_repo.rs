@@ -173,3 +173,22 @@ pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&st
         Err(e) => format!("failed to register '{repo_url}': {e}"),
     }
 }
+
+/// Backs the `unregister_repo` MCP tool -- symmetry with `register_repo`:
+/// an agent session should be able to clean up a connection it (or a human)
+/// created, not just create one. Does **not** wipe `agentops-graph-pg` data
+/// -- that requires `state.pg_store` and `spawn_blocking`, which this
+/// crate's generic MCP tool-call path doesn't have access to the way
+/// `delete_repo`'s REST handler does; an agent wanting a full cleanup
+/// should use the REST endpoint (or the web UI's "Remove repository"
+/// action) instead. This still removes the connection row itself, which is
+/// the part that actually matters for "stop this from showing up as a
+/// registered repo."
+pub(crate) fn unregister_repo(state: &AppState, tenant: &str, id: &str) -> String {
+    let store = state.store.lock().unwrap();
+    match store.delete_connection(tenant, id) {
+        Ok(true) => format!("Unregistered connection '{id}'. Its graph/notes data (if any) is not wiped by this call -- use the web UI's \"Remove repository\" action for a full cleanup."),
+        Ok(false) => format!("No connection '{id}' found for this organization -- nothing to unregister."),
+        Err(e) => format!("failed to unregister '{id}': {e}"),
+    }
+}

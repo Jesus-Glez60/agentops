@@ -21,23 +21,40 @@
 // `next/headers`, a server-only API -- needed for the Usage card's
 // `usage sync --remote` command (see `UsageCard`'s doc comment).
 
-import { Suspense } from "react";
+import { Suspense, useState } from "react";
 import Link from "next/link";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import useSWR, { useSWRConfig } from "swr";
+import { toast } from "sonner";
 import { ArrowLeft, ArrowRight } from "lucide-react";
-import { getRepos, getRepoUsage, parseRepoStatus, REPOS_SWR_KEY } from "@/lib/api/repos-api";
+import { deleteRepo, getRepos, getRepoUsage, parseRepoStatus, REPOS_SWR_KEY, type RepoConnection } from "@/lib/api/repos-api";
 import { repoHealthWithReason } from "@/lib/repo-health";
 import { HealthBadge } from "@/components/dashboard/health-badge";
 import { NodeCountBar } from "@/components/dashboard/node-count-bar";
 import { UsageCard } from "@/components/dashboard/usage-card";
 import { BranchSelect } from "@/components/repositories/branch-select";
 import { Button } from "@/components/ui/button";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 
 const METHOD_LABELS: Record<string, string> = {
   ssh: "SSH deploy key",
   github_app: "GitHub App",
 };
+
+/** No backend field tracks "was this connection upgraded from a discovered
+ * one" -- derived client-side instead: a GitHub App connection created the
+ * normal way (`connectFromInstallation`) always has `id ===
+ * full_name.replace('/', '--')`, matching exactly how the webhook handler
+ * derives the id it looks up (`github_app_routes.rs`). An *upgraded*
+ * connection kept its original id, which won't match that derivation --
+ * that mismatch is exactly when the webhook-autoreindex warning applies,
+ * not every github_app connection (an earlier version showed it
+ * unconditionally, confusing users on an otherwise-fine fresh connection). */
+function githubWebhookWillMatch(repo: RepoConnection): boolean {
+  const fullName = repo.repo_url.replace(/^https?:\/\/github\.com\//, "").replace(/\.git$/, "");
+  return repo.id === fullName.replace(/\//g, "--");
+}
 
 export function RepoDetailPageClient({ apiUrl }: { apiUrl: string }) {
   // useParams doesn't strictly need Suspense, but this page also reads no
@@ -127,6 +144,22 @@ function RepoDetailPageInner({ apiUrl }: { apiUrl: string }) {
                 <ArrowRight className="size-3.5" />
               </Link>
             </Button>
+            {repo.method === "discovered" && (
+              <>
+                <Button size="cta" variant="outline" className="w-full justify-center" asChild>
+                  <Link href={`/repositories/connect/ssh?upgradeConnectionId=${encodeURIComponent(repo.id)}&repoUrl=${encodeURIComponent(repo.repo_url)}`}>Connect via SSH</Link>
+                </Button>
+                <Button size="cta" variant="outline" className="w-full justify-center" asChild>
+                  <Link href={`/repositories/connect?upgradeConnectionId=${encodeURIComponent(repo.id)}`}>Connect to GitHub</Link>
+                </Button>
+              </>
+            )}
+            {repo.method === "github_app" && !githubWebhookWillMatch(repo) && (
+              <p className="text-mono-code text-ink-500">
+                This connection was upgraded from a local-only repo, so pushes won&apos;t auto-reindex (the webhook can&apos;t match this connection&apos;s id) -- use Verify or a manual rescan instead.
+              </p>
+            )}
+            <RemoveRepoButton repoId={repo.id} />
           </div>
         </div>
       </div>
@@ -140,5 +173,63 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
       <p className="mb-1.5 text-mono-code uppercase text-ink-500">{label}</p>
       {children}
     </div>
+  );
+}
+
+/** Destructive, type-to-confirm -- same pattern as `DangerZone`'s org
+ * deletion row. Also wipes this connection's recorded graph/notes/doc data
+ * server-side (`DELETE /repos/{id}`), not just the registration itself. */
+function RemoveRepoButton({ repoId }: { repoId: string }) {
+  const [open, setOpen] = useState(false);
+  const [confirmText, setConfirmText] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const router = useRouter();
+  const { mutate } = useSWRConfig();
+
+  async function handleDelete() {
+    if (confirmText !== repoId) return;
+    setDeleting(true);
+    try {
+      await deleteRepo(repoId);
+      toast.success("Repository removed");
+      mutate(REPOS_SWR_KEY);
+      router.push("/repositories");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't remove the repository. Please try again.");
+      setDeleting(false);
+    }
+  }
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setConfirmText("");
+      }}
+    >
+      <DialogTrigger asChild>
+        <Button size="cta" variant="destructive" className="w-full justify-center">
+          Remove repository
+        </Button>
+      </DialogTrigger>
+      <DialogContent>
+        <DialogHeader>
+          <DialogTitle>Remove repository</DialogTitle>
+          <DialogDescription>This permanently deletes this connection and every gotcha, decision, and doc recorded against it. This cannot be undone.</DialogDescription>
+        </DialogHeader>
+        <div className="py-4">
+          <label className="mb-1.5 block text-mono-code uppercase text-ink-500">
+            Type <span className="text-ink-200">{repoId}</span> to confirm
+          </label>
+          <Input value={confirmText} onChange={(e) => setConfirmText(e.target.value)} placeholder={repoId} autoFocus />
+        </div>
+        <DialogFooter>
+          <Button variant="destructive" size="sm" onClick={handleDelete} disabled={confirmText !== repoId || deleting}>
+            {deleting ? "Removing…" : "Permanently remove"}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

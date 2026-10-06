@@ -5,7 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { toast } from "sonner";
 import { ArrowLeft, Clock, Copy, Check, ShieldCheck } from "lucide-react";
-import { connectRepo, verifyRepo, type ConnectRepoResponse } from "@/lib/api/repos-api";
+import { attachSshRemote, connectRepo, verifyRepo, type AttachRemoteResponse, type ConnectRepoResponse } from "@/lib/api/repos-api";
 import { StepIndicator } from "@/components/repositories/connect-wizard/step-indicator";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -22,10 +22,16 @@ export default function SshDeployKeyPage() {
   // remote on a locally-picked folder that isn't connected yet, so the user
   // doesn't have to retype a URL the app already found for them.
   const searchParams = useSearchParams();
-  const [repoUrl, setRepoUrl] = useState(() => searchParams.get("repo_url") ?? "");
+  // Set by the repo detail page's "Connect via SSH" action for a
+  // `discovered`/local-only connection -- when present, this page attaches
+  // a real remote to that *existing* connection id instead of minting a
+  // new one, preserving every gotcha/decision/doc already recorded under
+  // it (see `attachSshRemote`'s doc comment).
+  const upgradeConnectionId = searchParams.get("upgradeConnectionId");
+  const [repoUrl, setRepoUrl] = useState(() => searchParams.get("repo_url") ?? searchParams.get("repoUrl") ?? "");
   const [connecting, setConnecting] = useState(false);
   const [verifying, setVerifying] = useState(false);
-  const [result, setResult] = useState<ConnectRepoResponse | null>(null);
+  const [result, setResult] = useState<ConnectRepoResponse | AttachRemoteResponse | null>(null);
   const [copied, setCopied] = useState(false);
 
   async function handleConnect(e: React.FormEvent) {
@@ -34,7 +40,7 @@ export default function SshDeployKeyPage() {
     if (!trimmed) return;
     setConnecting(true);
     try {
-      const connected = await connectRepo({ repo_id: repoIdFromUrl(trimmed), repo_url: trimmed });
+      const connected = upgradeConnectionId ? await attachSshRemote(upgradeConnectionId, trimmed) : await connectRepo({ repo_id: repoIdFromUrl(trimmed), repo_url: trimmed });
       setResult(connected);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Couldn't generate a deploy key for that repository. Please try again.");

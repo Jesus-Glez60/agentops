@@ -48,7 +48,7 @@ use axum::{Extension, Json};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::tenant_repo::{register_repo, resolve_connection_path, TenantCaller};
+use crate::tenant_repo::{register_repo, resolve_connection_path, unregister_repo, TenantCaller};
 use crate::{docbrain_db_path_for_org, AppState};
 
 /// Not one of `agentops_mcp::tool_specs()` -- see `handle_tools_call`'s
@@ -68,6 +68,24 @@ fn register_repo_tool_definition() -> agentops_mcp::ToolDefinition {
             },
         }),
         annotations: agentops_mcp::ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: false },
+    }
+}
+
+/// Symmetry with `register_repo_tool_definition` -- see that fn's doc
+/// comment for why this is special-cased the same way rather than going
+/// through `agentops_mcp::call_tool`'s generic table.
+fn unregister_repo_tool_definition() -> agentops_mcp::ToolDefinition {
+    agentops_mcp::ToolDefinition {
+        name: "unregister_repo",
+        description: "Removes a repo connection for your organization by id. Does not wipe its graph/notes data -- for a full cleanup (connection + all recorded knowledge), use the web UI's \"Remove repository\" action instead.",
+        input_schema: json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "The connection id to remove, as shown by GET /repos or register_repo's own response." },
+            },
+            "required": ["id"],
+        }),
+        annotations: agentops_mcp::ToolAnnotations { read_only_hint: false, destructive_hint: true, idempotent_hint: true, open_world_hint: false },
     }
 }
 
@@ -116,6 +134,7 @@ pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, Stat
         "tools/list" => {
             let mut tools = agentops_mcp::list_tools(resolve_access_mode(&state, &caller.tenant));
             tools.push(register_repo_tool_definition());
+            tools.push(unregister_repo_tool_definition());
             // `docbrain_mcp::ToolDefinition` is a structurally similar but
             // distinct type from `agentops_mcp::ToolDefinition` -- both
             // serialize to the same MCP JSON shape, so the merged list is
@@ -215,6 +234,14 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
             return err(id, INVALID_PARAMS, "register_repo requires either 'repo_url' or 'local_id' in its arguments");
         }
         let message = register_repo(state, &caller.tenant, repo_url, local_id);
+        return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": false }));
+    }
+
+    if name == "unregister_repo" {
+        let Some(repo_id) = arguments.get("id").and_then(|v| v.as_str()) else {
+            return err(id, INVALID_PARAMS, "unregister_repo requires 'id' in its arguments");
+        };
+        let message = unregister_repo(state, &caller.tenant, repo_id);
         return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": false }));
     }
 

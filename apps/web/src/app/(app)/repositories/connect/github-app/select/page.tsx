@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { ArrowLeft } from "lucide-react";
@@ -19,6 +19,19 @@ export default function SelectGithubAppReposPage() {
 function SelectGithubAppReposPageInner() {
   const searchParams = useSearchParams();
   const installationId = searchParams.get("installation_id");
+  // Carried across the external github.com install redirect via
+  // sessionStorage (a query param wouldn't survive it) -- see
+  // `connect/page.tsx`'s own doc comment on why. Read once, same
+  // "read and clear" convention `installation-repo-picker.tsx`'s
+  // "target-repo" value already uses for the identical problem.
+  const [upgradeConnectionId, setUpgradeConnectionId] = useState<string | null>(null);
+  useEffect(() => {
+    const stored = sessionStorage.getItem("agentops:connect:upgrade-connection-id");
+    if (stored) {
+      sessionStorage.removeItem("agentops:connect:upgrade-connection-id");
+      setUpgradeConnectionId(stored);
+    }
+  }, []);
 
   if (!installationId) {
     return (
@@ -57,7 +70,7 @@ function SelectGithubAppReposPageInner() {
         <p className="mt-2.5 text-[16px] text-ink-300">Choose which repositories from this installation to connect.</p>
 
         <div className="mt-6">
-          <InstallationRepoPicker installationId={installationId} />
+          <InstallationRepoPicker installationId={installationId} upgradeConnectionId={upgradeConnectionId} />
         </div>
       </div>
     </div>

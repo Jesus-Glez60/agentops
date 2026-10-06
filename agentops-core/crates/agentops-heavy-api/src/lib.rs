@@ -30,7 +30,7 @@ use axum::extract::{Path as AxumPath, Query, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -38,6 +38,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tower_http::cors::CorsLayer;
 
 use agentops_accounts::{AccountStore, User};
+use crate::tenant_repo::resolve_connection_path;
 use agentops_heavy_embeddings::SemanticIndex;
 use agentops_repo_access::secrets::SecretsProvider;
 use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnection};
@@ -285,6 +286,9 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/branches", get(indexing::list_branches))
         .route("/repos/{id}/branch", patch(indexing::set_branch))
         .route("/repos/{id}/regenerate-key", post(regenerate_key))
+        .route("/repos/{id}", delete(delete_repo))
+        .route("/repos/{id}/attach-ssh", post(attach_ssh))
+        .route("/repos/{id}/attach-github-app", post(attach_github_app))
         .route("/repos/github-app/install-url", get(github_app_install_url))
         .route("/repos/github-app/callback", get(github_app_routes::github_app_callback))
         .route("/repos/github-app/installations", get(github_app_routes::list_installations_handler))
@@ -1057,6 +1061,146 @@ async fn regenerate_key(State(state): State<AppState>, user: Option<axum::Extens
     }
 }
 
+/// `DELETE /repos/{id}` -- unregisters one connection: wipes its
+/// `agentops-graph-pg` data (nodes/edges/notes/doc_pages/etc, best-effort,
+/// via `wipe_repo`) first, then deletes the `repo_connections` row last, as
+/// the actual point of no return -- same ordering `delete_organization`
+/// already uses for its own leaf-stores-first cascade. `wipe_repo` is
+/// skipped (not an error) when this deployment has no Postgres configured
+/// -- nothing to wipe in that case.
+///
+/// `wipe_repo` calls `.block_on()` on `PostgresGraphStore`'s own internally-
+/// owned `Runtime` -- doing that directly from this `async fn` panics with
+/// "Cannot start a runtime from within a runtime" (a real past incident,
+/// see that gotcha), so it's wrapped in `spawn_blocking` here, same as
+/// every other call site in this codebase that touches `pg_store`.
+async fn delete_repo(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, q.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
+        return e;
+    }
+
+    let exists = { state.store.lock().unwrap().get_connection(&tenant, &id).ok().flatten().is_some() };
+    if !exists {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such connection for this tenant" })));
+    }
+
+    if let Some(pg) = state.pg_store.clone() {
+        let path = resolve_connection_path(&state, &tenant, &id);
+        let id_for_blocking = id.clone();
+        let wipe_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let repo = match path {
+                Ok(p) => agentops_mcp::repo_name(&p),
+                // No checkout path resolvable (shouldn't happen, we just
+                // confirmed the connection exists) -- fall back to the
+                // connection id itself, which is what `repo` always equals
+                // for a freshly-scanned connection anyway.
+                Err(_) => id_for_blocking,
+            };
+            pg.wipe_repo(&repo)
+        })
+        .await;
+        if let Ok(Err(e)) = wipe_result {
+            eprintln!("delete_repo: failed to wipe graph data for {tenant}/{id}: {e} -- continuing to delete the connection row anyway");
+        }
+    }
+
+    let store = state.store.lock().unwrap();
+    match store.delete_connection(&tenant, &id) {
+        Ok(_) => (StatusCode::NO_CONTENT, Json(json!({}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachSshRequest {
+    #[serde(default)]
+    tenant: Option<String>,
+    repo_url: String,
+}
+
+/// `POST /repos/{id}/attach-ssh` -- completes a `Discovered` connection (a
+/// true local-only placeholder, or a real-but-unauthenticated repo
+/// `register_repo` already found) with a real SSH deploy-key remote, in
+/// place, same id. See `ConnectionStore::attach_ssh_remote` for the
+/// eligibility guard and `register_repo`-style dedup check.
+async fn attach_ssh(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Json(req): Json<AttachSshRequest>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, req.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
+        return e;
+    }
+
+    let keypair = match agentops_repo_access::generate_deploy_keypair_for_repo(state.secrets.as_ref(), &tenant, &id) {
+        Ok(k) => k,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("generating deploy key: {e}") }))),
+    };
+
+    let store = state.store.lock().unwrap();
+    match store.attach_ssh_remote(&tenant, &id, &req.repo_url, &keypair) {
+        Ok(connection) => (
+            StatusCode::OK,
+            Json(json!({
+                "connection": ConnectionView::from(connection),
+                "instructions": "Add public_key_openssh as a read-only Deploy Key on the repo, then POST /repos/{id}/verify?tenant=... to confirm it works.",
+            })),
+        ),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AttachGithubAppRequest {
+    #[serde(default)]
+    tenant: Option<String>,
+    installation_id: String,
+    full_name: String,
+}
+
+/// `POST /repos/{id}/attach-github-app` -- same as `attach_ssh` but for the
+/// GitHub App method. `"webhook_autoreindex": false` is always included,
+/// not just on success -- an upgraded connection keeps its original `id`,
+/// but the webhook push handler derives the id it looks up from
+/// `full_name.replace('/', "--")`, which won't match. Automatic
+/// push-triggered reindexing never fires for an upgraded connection; manual
+/// "Verify"/rescan still works. The frontend must surface this
+/// persistently (repo detail page, not a one-time toast), not just log it.
+async fn attach_github_app(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Json(req): Json<AttachGithubAppRequest>) -> (StatusCode, Json<Value>) {
+    let tenant = match resolve_tenant(&user, req.tenant.as_deref()) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_REPOS_CONNECT) {
+        return e;
+    }
+
+    let owns_installation = { state.indexing.lock().unwrap().get_installation(&tenant, &req.installation_id) };
+    match owns_installation {
+        Ok(Some(_)) => {}
+        Ok(None) => return (StatusCode::NOT_FOUND, Json(json!({ "error": "no such installation for this tenant" }))),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+    }
+
+    let repo_url = format!("https://github.com/{}.git", req.full_name);
+    let store = state.store.lock().unwrap();
+    match store.attach_github_app_remote(&tenant, &id, &repo_url, &req.installation_id) {
+        Ok(connection) => (
+            StatusCode::OK,
+            Json(json!({
+                "connection": ConnectionView::from(connection),
+                "webhook_autoreindex": false,
+                "webhook_autoreindex_reason": "this connection kept its original id when it was upgraded, which doesn't match the id GitHub webhooks derive from the repo's owner/name -- pushes won't auto-reindex; use Verify or a manual rescan instead.",
+            })),
+        ),
+        Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e.to_string() }))),
+    }
+}
+
 /// Mints a `state` token (see `github_app_routes::install_state`) and
 /// embeds it in the returned install URL -- this is the one point in the
 /// whole install/callback handoff where a live session still exists, so
@@ -1679,6 +1823,155 @@ mod tests {
         let new_key = body["connection"]["public_key_openssh"].as_str().unwrap();
         assert_ne!(new_key, original_key, "regenerating must issue a genuinely fresh keypair, not echo the old one");
         assert_eq!(body["connection"]["status"], "pending", "a regenerated key resets the connection to pending, mirroring a brand-new connect");
+    }
+
+    /// Drives the real async `DELETE /repos/{id}` handler end-to-end (not
+    /// just `ConnectionStore::delete_connection` in isolation) -- this is
+    /// the test that would catch the "Cannot start a runtime from within a
+    /// runtime" class of panic if the `spawn_blocking` wrapping around
+    /// `wipe_repo` were ever removed or done wrong. No `AGENTOPS_DATABASE_URL`
+    /// in the test environment, so `pg_store` is `None` here and the wipe
+    /// step is skipped -- this test covers the connection-row deletion and
+    /// the handler not panicking; a live Postgres-backed deployment is what
+    /// actually exercises the `spawn_blocking(wipe_repo)` call itself.
+    #[tokio::test]
+    async fn delete_repo_removes_the_connection_and_returns_no_content() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let connect_req = Request::builder()
+            .method("POST")
+            .uri("/repos/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_id": "widgets", "repo_url": "git@github.com:acme/widgets.git"}).to_string()))
+            .unwrap();
+        app.clone().oneshot(connect_req).await.unwrap();
+
+        let delete_req = Request::builder().method("DELETE").uri("/repos/widgets?tenant=acme").body(Body::empty()).unwrap();
+        let resp = app.clone().oneshot(delete_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let list_req = Request::builder().method("GET").uri("/repos?tenant=acme").body(Body::empty()).unwrap();
+        let resp = app.oneshot(list_req).await.unwrap();
+        let body = body_json(resp).await;
+        assert!(body["connections"].as_array().unwrap().is_empty(), "the deleted connection must not still be listed: {body:?}");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_404s_for_a_connection_that_never_existed() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let delete_req = Request::builder().method("DELETE").uri("/repos/does-not-exist?tenant=acme").body(Body::empty()).unwrap();
+        let resp = app.oneshot(delete_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attach_ssh_turns_a_local_only_connection_into_a_real_one_preserving_its_id() {
+        let (store, secrets) = test_state();
+        // Same shape `register_repo`'s local_id path produces --
+        // `create_discovered_connection` directly, since the store is owned
+        // here before `build_router` takes it, no need to round-trip
+        // through the MCP tool's auth-token plumbing just to seed this.
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let attach_req = Request::builder()
+            .method("POST")
+            .uri("/repos/job-hunter/attach-ssh")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_url": "git@github.com:acme/job-hunter.git"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(attach_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["connection"]["id"], "job-hunter", "attaching a remote must preserve the original connection id");
+        assert_eq!(body["connection"]["method"], "ssh");
+        assert_eq!(body["connection"]["repo_url"], "git@github.com:acme/job-hunter.git");
+    }
+
+    #[tokio::test]
+    async fn attach_ssh_409s_against_an_already_real_connection() {
+        let (store, secrets) = test_state();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let connect_req = Request::builder()
+            .method("POST")
+            .uri("/repos/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_id": "widgets", "repo_url": "git@github.com:acme/widgets.git"}).to_string()))
+            .unwrap();
+        app.clone().oneshot(connect_req).await.unwrap();
+
+        let attach_req = Request::builder()
+            .method("POST")
+            .uri("/repos/widgets/attach-ssh")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_url": "git@github.com:acme/widgets.git"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(attach_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn attach_github_app_turns_a_local_only_connection_into_active_preserving_its_id() {
+        let (store, secrets) = test_state();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        let indexing = test_indexing_store();
+        indexing.create_installation("acme", "install-123", "acme-corp", Some("Organization")).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, indexing, std::env::temp_dir(), None);
+
+        let attach_req = Request::builder()
+            .method("POST")
+            .uri("/repos/job-hunter/attach-github-app")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "installation_id": "install-123", "full_name": "acme/job-hunter"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(attach_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["connection"]["id"], "job-hunter", "attaching a remote must preserve the original connection id");
+        assert_eq!(body["connection"]["method"], "github_app");
+        assert_eq!(body["connection"]["status"], "active");
+        assert_eq!(body["connection"]["repo_url"], "https://github.com/acme/job-hunter.git");
+        assert_eq!(body["webhook_autoreindex"], false, "an upgraded connection's id never matches what the webhook derives from full_name");
+        assert!(body["webhook_autoreindex_reason"].as_str().unwrap().contains("original id"), "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn attach_github_app_404s_for_an_installation_the_tenant_doesnt_own() {
+        let (store, secrets) = test_state();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
+
+        let attach_req = Request::builder()
+            .method("POST")
+            .uri("/repos/job-hunter/attach-github-app")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "installation_id": "does-not-exist", "full_name": "acme/job-hunter"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(attach_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn attach_github_app_409s_against_an_already_real_connection() {
+        let (store, secrets) = test_state();
+        let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), "acme", "job-hunter").unwrap();
+        store.create_ssh_connection("acme", "job-hunter", "git@github.com:acme/job-hunter.git", &keypair).unwrap();
+        let indexing = test_indexing_store();
+        indexing.create_installation("acme", "install-123", "acme-corp", Some("Organization")).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, indexing, std::env::temp_dir(), None);
+
+        let attach_req = Request::builder()
+            .method("POST")
+            .uri("/repos/job-hunter/attach-github-app")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "installation_id": "install-123", "full_name": "acme/job-hunter"}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(attach_req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

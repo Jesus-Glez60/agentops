@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { GitBranch, Lock } from "lucide-react";
-import { connectFromInstallation, getInstallationRepos, getRepos, GITHUB_APP_INSTALLATIONS_SWR_KEY, REPOS_SWR_KEY, type InstallationRepo } from "@/lib/api/repos-api";
+import { attachGithubAppRemote, connectFromInstallation, getInstallationRepos, getRepos, GITHUB_APP_INSTALLATIONS_SWR_KEY, REPOS_SWR_KEY, type InstallationRepo } from "@/lib/api/repos-api";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 
@@ -26,7 +26,7 @@ function repoFullNameFromUrl(url: string): string {
  * GitHub only redirects back for a brand-new install, never an update).
  * One implementation instead of two copies that could drift.
  */
-export function InstallationRepoPicker({ installationId }: { installationId: string }) {
+export function InstallationRepoPicker({ installationId, upgradeConnectionId }: { installationId: string; upgradeConnectionId?: string | null }) {
   const router = useRouter();
   const { mutate } = useSWRConfig();
 
@@ -69,6 +69,9 @@ export function InstallationRepoPicker({ installationId }: { installationId: str
 
   function toggle(fullName: string) {
     setSelected((prev) => {
+      // Upgrading an existing connection targets exactly one repo -- a
+      // single `attach-github-app` call against that one id, not a batch.
+      if (upgradeConnectionId) return prev.has(fullName) ? new Set() : new Set([fullName]);
       const next = new Set(prev);
       if (next.has(fullName)) next.delete(fullName);
       else next.add(fullName);
@@ -80,6 +83,18 @@ export function InstallationRepoPicker({ installationId }: { installationId: str
     if (selected.size === 0) return;
     setConnecting(true);
     try {
+      if (upgradeConnectionId) {
+        const fullName = Array.from(selected)[0];
+        const res = await attachGithubAppRemote(upgradeConnectionId, installationId, fullName);
+        toast.success("Repository connected.");
+        if (res.webhook_autoreindex === false && res.webhook_autoreindex_reason) {
+          toast.info(res.webhook_autoreindex_reason);
+        }
+        mutate(GITHUB_APP_INSTALLATIONS_SWR_KEY);
+        mutate(REPOS_SWR_KEY);
+        router.push(`/repositories/${encodeURIComponent(res.connection.id)}`);
+        return;
+      }
       const res = await connectFromInstallation(installationId, Array.from(selected));
       toast.success(res.connections.length === 1 ? "Repository connected — indexing started." : `${res.connections.length} repositories connected — indexing started.`);
       mutate(GITHUB_APP_INSTALLATIONS_SWR_KEY);

@@ -265,6 +265,114 @@ impl ConnectionStore {
         self.get_connection(tenant, id)?.context("just-updated connection not found — this is a store bug")
     }
 
+    /// Removes exactly one connection (tenant + id scoped). Returns whether
+    /// a row was actually removed, so a caller can tell "already gone" from
+    /// "just deleted" without a separate existence check. Scoped delete,
+    /// unlike `delete_all_for_tenant` (org deletion's full wipe) -- this is
+    /// the single-connection "unregister" path that had no code path at all
+    /// before this.
+    pub fn delete_connection(&self, tenant: &str, id: &str) -> Result<bool> {
+        let deleted = self
+            .conn
+            .execute("DELETE FROM repo_connections WHERE tenant = ?1 AND id = ?2", rusqlite::params![tenant, id])
+            .context("deleting repo connection")?;
+        Ok(deleted > 0)
+    }
+
+    /// Checks whether `repo_url` (after host-agnostic normalization) already
+    /// belongs to a *different* connection for this tenant -- the same
+    /// dedup check `register_repo` already does before creating a new
+    /// `Discovered` connection (`agentops-heavy-api::tenant_repo`), reused
+    /// here so attaching a remote can't silently create two connections
+    /// pointing at the same repo.
+    fn find_other_connection_with_repo_url(&self, tenant: &str, excluding_id: &str, repo_url: &str) -> Result<Option<RepoConnection>> {
+        let Some(normalized) = crate::normalize_repo_path(repo_url) else { return Ok(None) };
+        for connection in self.list_connections(tenant)? {
+            if connection.id == excluding_id {
+                continue;
+            }
+            if crate::normalize_repo_path(&connection.repo_url).as_deref() == Some(normalized.as_str()) {
+                return Ok(Some(connection));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Shared guard for both `attach_*` methods: loads the existing
+    /// connection, and refuses (with a clear, specific reason) to touch
+    /// anything that isn't actually eligible to be upgraded. Eligible means
+    /// `method == Discovered` -- covers both sub-cases that enum variant
+    /// represents (a true local-only placeholder, and a real-but-not-yet-
+    /// authenticated repo `register_repo` already found) in one condition,
+    /// and naturally excludes an already-`Ssh`/`GitHubApp` connection (not a
+    /// supported operation -- that connection already has a real remote and
+    /// working auth material, attaching a different one isn't "completing"
+    /// it, it's silently repointing it).
+    fn load_attachable_connection(&self, tenant: &str, id: &str, new_repo_url: &str) -> Result<RepoConnection> {
+        let existing = self.get_connection(tenant, id)?.with_context(|| format!("no connection {id:?} for tenant {tenant:?}"))?;
+        if existing.method != ConnectionMethod::Discovered {
+            anyhow::bail!("connection {id:?} is already {:?} — only a pending/unconnected connection can be upgraded", existing.method);
+        }
+        if !is_local_only_url(&existing.repo_url) {
+            // Already has a real repo_url (the "register_repo found a real
+            // remote, nobody's connected it yet" sub-case) -- attaching must
+            // be completing *that* connection, not repointing it to a
+            // different repo.
+            let existing_normalized = crate::normalize_repo_path(&existing.repo_url);
+            let new_normalized = crate::normalize_repo_path(new_repo_url);
+            if existing_normalized != new_normalized {
+                anyhow::bail!("connection {id:?} already points at {:?} — attaching a different remote isn't supported", existing.repo_url);
+            }
+        }
+        if let Some(other) = self.find_other_connection_with_repo_url(tenant, id, new_repo_url)? {
+            anyhow::bail!("repo_url {new_repo_url:?} is already connected as {:?} — refusing to create a duplicate", other.id);
+        }
+        Ok(existing)
+    }
+
+    /// Attaches a real SSH deploy-key remote to a connection that's
+    /// currently `Discovered` (local-only, or real-url-but-unauthenticated)
+    /// -- turns it into a working `Ssh` connection in place, same `id`, so
+    /// every gotcha/decision/doc already recorded under that id stays
+    /// attached. See `load_attachable_connection` for the eligibility guard.
+    pub fn attach_ssh_remote(&self, tenant: &str, id: &str, repo_url: &str, keypair: &crate::DeployKeypair) -> Result<RepoConnection> {
+        self.load_attachable_connection(tenant, id, repo_url)?;
+        self.conn
+            .execute(
+                "UPDATE repo_connections SET repo_url = ?1, method = ?2, public_key_openssh = ?3, encrypted_private_key_openssh = ?4, status = ?5
+                 WHERE tenant = ?6 AND id = ?7",
+                rusqlite::params![
+                    repo_url,
+                    ConnectionMethod::Ssh.as_str(),
+                    keypair.public_key_openssh,
+                    keypair.encrypted_private_key_openssh,
+                    ConnectionStatus::Pending.as_db_string(),
+                    tenant,
+                    id,
+                ],
+            )
+            .context("attaching ssh remote")?;
+        self.get_connection(tenant, id)?.context("just-updated connection not found — this is a store bug")
+    }
+
+    /// Attaches a real GitHub App remote to a connection that's currently
+    /// `Discovered` -- same shape as `attach_ssh_remote`, see
+    /// `load_attachable_connection` for the eligibility guard. Starts
+    /// `Active` immediately, same reasoning as `create_github_app_connection`
+    /// (the installation-token exchange the caller already performed is
+    /// itself proof of real access).
+    pub fn attach_github_app_remote(&self, tenant: &str, id: &str, repo_url: &str, installation_id: &str) -> Result<RepoConnection> {
+        self.load_attachable_connection(tenant, id, repo_url)?;
+        self.conn
+            .execute(
+                "UPDATE repo_connections SET repo_url = ?1, method = ?2, installation_id = ?3, status = ?4
+                 WHERE tenant = ?5 AND id = ?6",
+                rusqlite::params![repo_url, ConnectionMethod::GitHubApp.as_str(), installation_id, ConnectionStatus::Active.as_db_string(), tenant, id],
+            )
+            .context("attaching github app remote")?;
+        self.get_connection(tenant, id)?.context("just-updated connection not found — this is a store bug")
+    }
+
     pub fn get_connection(&self, tenant: &str, id: &str) -> Result<Option<RepoConnection>> {
         self.conn
             .query_row(
@@ -520,5 +628,116 @@ mod tests {
 
         let fetched = store.get_connection("acme", "repo-1").unwrap().unwrap();
         assert_eq!(fetched.status, ConnectionStatus::Failed("connection refused".into()));
+    }
+
+    #[test]
+    fn delete_connection_removes_exactly_the_targeted_row() {
+        let store = test_store();
+        let keypair_a1 = test_keypair("acme", "repo-1");
+        let keypair_a2 = test_keypair("acme", "repo-2");
+        store.create_ssh_connection("acme", "repo-1", "git@github.com:acme/widgets.git", &keypair_a1).unwrap();
+        store.create_ssh_connection("acme", "repo-2", "git@github.com:acme/gizmos.git", &keypair_a2).unwrap();
+
+        let deleted = store.delete_connection("acme", "repo-1").unwrap();
+        assert!(deleted);
+        assert!(store.get_connection("acme", "repo-1").unwrap().is_none());
+        assert!(store.get_connection("acme", "repo-2").unwrap().is_some(), "deleting repo-1 must not touch repo-2");
+    }
+
+    #[test]
+    fn delete_connection_returns_false_for_a_connection_that_never_existed() {
+        let store = test_store();
+        assert!(!store.delete_connection("acme", "does-not-exist").unwrap());
+    }
+
+    #[test]
+    fn attach_ssh_remote_succeeds_against_a_true_local_only_connection() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        let keypair = test_keypair("acme", "job-hunter");
+
+        let updated = store.attach_ssh_remote("acme", "job-hunter", "git@github.com:acme/job-hunter.git", &keypair).unwrap();
+        assert_eq!(updated.id, "job-hunter");
+        assert_eq!(updated.method, ConnectionMethod::Ssh);
+        assert_eq!(updated.repo_url, "git@github.com:acme/job-hunter.git");
+        assert_eq!(updated.status, ConnectionStatus::Pending);
+    }
+
+    #[test]
+    fn attach_ssh_remote_succeeds_against_a_real_but_unauthenticated_discovered_connection() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "acme--widgets", "git@github.com:acme/widgets.git").unwrap();
+        let keypair = test_keypair("acme", "acme--widgets");
+
+        // Same repo_url the Discovered row already had -- completing it, not repointing it.
+        let updated = store.attach_ssh_remote("acme", "acme--widgets", "git@github.com:acme/widgets.git", &keypair).unwrap();
+        assert_eq!(updated.method, ConnectionMethod::Ssh);
+    }
+
+    #[test]
+    fn attach_ssh_remote_rejects_an_already_connected_repo() {
+        let store = test_store();
+        let keypair = test_keypair("acme", "job-hunter");
+        store.create_ssh_connection("acme", "job-hunter", "git@github.com:acme/job-hunter.git", &keypair).unwrap();
+
+        let err = store.attach_ssh_remote("acme", "job-hunter", "git@github.com:acme/job-hunter.git", &keypair).unwrap_err();
+        assert!(err.to_string().contains("already Ssh"), "{err}");
+    }
+
+    #[test]
+    fn attach_ssh_remote_rejects_repointing_a_discovered_connection_to_a_different_repo() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "acme--widgets", "git@github.com:acme/widgets.git").unwrap();
+        let keypair = test_keypair("acme", "acme--widgets");
+
+        let err = store.attach_ssh_remote("acme", "acme--widgets", "git@github.com:acme/gizmos.git", &keypair).unwrap_err();
+        assert!(err.to_string().contains("attaching a different remote isn't supported"), "{err}");
+    }
+
+    #[test]
+    fn attach_ssh_remote_rejects_a_repo_url_already_used_by_a_different_connection() {
+        let store = test_store();
+        let keypair_a = test_keypair("acme", "repo-a");
+        store.create_ssh_connection("acme", "repo-a", "git@github.com:acme/widgets.git", &keypair_a).unwrap();
+        store.create_discovered_connection("acme", "repo-b", "local:repo-b").unwrap();
+        let keypair_b = test_keypair("acme", "repo-b");
+
+        let err = store.attach_ssh_remote("acme", "repo-b", "git@github.com:acme/widgets.git", &keypair_b).unwrap_err();
+        assert!(err.to_string().contains("already connected as \"repo-a\""), "{err}");
+    }
+
+    #[test]
+    fn attach_ssh_remote_normalizes_an_ssh_config_alias_against_the_canonical_host() {
+        let store = test_store();
+        let keypair_a = test_keypair("acme", "repo-a");
+        store.create_ssh_connection("acme", "repo-a", "git@github.com:acme/widgets.git", &keypair_a).unwrap();
+        store.create_discovered_connection("acme", "repo-b", "local:repo-b").unwrap();
+        let keypair_b = test_keypair("acme", "repo-b");
+
+        // Same repo via a custom SSH config host alias -- must still be
+        // recognized as a duplicate of repo-a, per the recorded gotcha
+        // about exact-string remote matching breaking on SSH aliases.
+        let err = store.attach_ssh_remote("acme", "repo-b", "git@github-personal:acme/widgets.git", &keypair_b).unwrap_err();
+        assert!(err.to_string().contains("already connected as \"repo-a\""), "{err}");
+    }
+
+    #[test]
+    fn attach_github_app_remote_preserves_id_and_turns_discovered_into_active() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+
+        let updated = store.attach_github_app_remote("acme", "job-hunter", "https://github.com/acme/job-hunter.git", "install-123").unwrap();
+        assert_eq!(updated.id, "job-hunter");
+        assert_eq!(updated.method, ConnectionMethod::GitHubApp);
+        assert_eq!(updated.status, ConnectionStatus::Active);
+        assert_eq!(updated.installation_id, Some("install-123".to_string()));
+    }
+
+    #[test]
+    fn attach_methods_reject_a_nonexistent_connection() {
+        let store = test_store();
+        let keypair = test_keypair("acme", "does-not-exist");
+        let err = store.attach_ssh_remote("acme", "does-not-exist", "git@github.com:acme/widgets.git", &keypair).unwrap_err();
+        assert!(err.to_string().contains("no connection"), "{err}");
     }
 }

@@ -132,6 +132,7 @@ dependencies = [
  "agentops-graph",
  "anyhow",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

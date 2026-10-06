@@ -34,6 +34,18 @@ export default function ChooseConnectionMethodPage() {
 function ChooseConnectionMethodPageInner() {
   const router = useRouter();
   const searchParams = useSearchParams();
+  // Set by the repo detail page's "Connect to GitHub" action for a
+  // `discovered`/local-only connection -- threaded through to
+  // `InstallationRepoPicker` so it attaches to this *existing* connection
+  // id instead of minting a new one. Also stashed in sessionStorage before
+  // a fresh-install round trip through github.com, same reason
+  // `installation-repo-picker.tsx`'s own "target-repo" value is: a query
+  // param doesn't survive that external redirect, sessionStorage does.
+  const upgradeConnectionId = searchParams.get("upgradeConnectionId");
+  useEffect(() => {
+    if (upgradeConnectionId) sessionStorage.setItem("agentops:connect:upgrade-connection-id", upgradeConnectionId);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [upgradeConnectionId]);
 
   // GitHub only redirects back to our callback for a brand-new install --
   // once a tenant is already connected, re-running the install flow just
@@ -62,7 +74,7 @@ function ChooseConnectionMethodPageInner() {
   }
 
   if (installations.length > 0) {
-    return <AlreadyConnectedView installations={installations} />;
+    return <AlreadyConnectedView installations={installations} upgradeConnectionId={upgradeConnectionId} />;
   }
 
   return <ChooseMethodView />;
@@ -74,7 +86,7 @@ function ChooseConnectionMethodPageInner() {
  * has supported this from the start via `github_app_installations`'
  * `(tenant, id)` primary key; this view previously only ever read
  * `installations[0]`, silently hiding every account past the first). */
-function AlreadyConnectedView({ installations }: { installations: GithubAppInstallation[] }) {
+function AlreadyConnectedView({ installations, upgradeConnectionId }: { installations: GithubAppInstallation[]; upgradeConnectionId?: string | null }) {
   const [selectedId, setSelectedId] = useState(installations[0].id);
   const [addingAccount, setAddingAccount] = useState(false);
   // The list can grow (a new install redirects back here) without this
@@ -133,7 +145,7 @@ function AlreadyConnectedView({ installations }: { installations: GithubAppInsta
       </p>
 
       <div className="mt-6">
-        <InstallationRepoPicker installationId={selected.id} />
+        <InstallationRepoPicker installationId={selected.id} upgradeConnectionId={upgradeConnectionId} />
       </div>
 
       <div className="mt-8 border-t border-border-strong pt-6">
