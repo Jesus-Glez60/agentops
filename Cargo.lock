@@ -533,6 +533,7 @@ dependencies = [
  "agentops-graph",
  "agentops-graph-pg",
  "anyhow",
+ "getrandom 0.4.3",
  "tempfile",
 ]
 

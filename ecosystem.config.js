@@ -43,6 +43,15 @@ module.exports = {
       name: "agentops-server",
       script: path.join(__dirname, "target/release/agentops-server"),
       env: { ...env, AGENTOPS_ADDR: env.AGENTOPS_ADDR || "0.0.0.0:8420" },
+      // Defense-in-depth for the Postgres-not-ready-on-cold-start crash
+      // loop (see agentops-store-open's own retry/backoff, the real fix):
+      // without this, PM2's default zero-delay restarts could in theory
+      // still burn through max_restarts faster than some future, slower
+      // Postgres recovery than the 3.4s one actually observed. Caps at
+      // 15000ms and resets to 0ms once the process survives 30s uninterrupted
+      // (verified against PM2's own docs).
+      exp_backoff_restart_delay: 100,
+      max_restarts: 20,
     },
     {
       name: "agentops-web",

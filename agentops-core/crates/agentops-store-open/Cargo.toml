@@ -9,6 +9,7 @@ name = "agentops_store_open"
 
 [dependencies]
 anyhow.workspace = true
+getrandom.workspace = true
 agentops-graph = { path = "../agentops-graph" }
 agentops-graph-pg = { path = "../agentops-graph-pg" }
 

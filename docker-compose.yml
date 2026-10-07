@@ -18,6 +18,20 @@ services:
       # into an env var -- e.g. AGENTOPS_GITHUB_APP_PRIVATE_KEY_PATH=/run/secrets/github-app-private-key.pem
       - ./secrets:/run/secrets:ro
     restart: unless-stopped
+    # `required: false` -- without it, Compose refuses the whole project with
+    # "depends on undefined service" whenever the `postgres` profile isn't
+    # active (confirmed empirically: `docker compose config` with no profile
+    # fails outright with a plain `depends_on`), which would break this
+    # file's SQLite-only default for self-hosters who never opt into the
+    # bundled Postgres at all. With it, Compose silently skips the
+    # dependency when `postgres` isn't part of the project, and otherwise
+    # (profile active) genuinely waits for its healthcheck -- verified live
+    # with a toy compose file: app started only after postgres's healthcheck
+    # flipped to "Healthy", not immediately alongside it.
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
 
   # The marketing site (apps/marketing) -- separate static app serving the
   # site root `/`, while `app` above serves `/suite`. Not started by
@@ -63,6 +77,16 @@ services:
     volumes:
       - agentops-postgres:/var/lib/postgresql/data
     restart: unless-stopped
+    # Note for an operator debugging a stuck `docker compose up` after
+    # changing Postgres credentials: `pg_isready` itself can hang this
+    # healthcheck (and so `app`'s `depends_on` gate) indefinitely if
+    # POSTGRES_USER/PASSWORD are wrong -- check `docker compose ps` for this
+    # service's health status first, not this fix.
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agentops"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
 
   # `docker compose --profile caddy up` -- TLS-terminating reverse proxy for
   # a public deployment. Copy Caddyfile.example to Caddyfile (gitignored,

@@ -113,11 +113,96 @@ pub fn open_store(repo_path: &Path) -> Result<Box<dyn GraphStore>> {
 /// request, and when Postgres-backed that meant a brand-new connection pool
 /// per request -- 54 concurrent requests once meant 54 simultaneous pool
 /// creations, and 32 of them failed under that thundering herd.
+///
+/// Retries with exponential backoff + jitter until Postgres is reachable or
+/// `retry_budget()` elapses -- fixes a second real production incident: on
+/// a host reboot (e.g. after a power outage), this function used to call
+/// `PostgresGraphStore::connect` exactly once, and if Postgres hadn't
+/// finished its own startup yet the `.expect(...)`/`?` at every caller
+/// panicked/errored immediately. PM2 (the process manager wrapping
+/// `agentops-server` in production) then burned through its entire
+/// restart budget in milliseconds -- zero delay between restarts -- far
+/// faster than Postgres's own recovery (confirmed live: 3.4 seconds,
+/// including WAL replay, from container start to "ready to accept
+/// connections") had any chance to finish, and gave up permanently with no
+/// auto-recovery. `PostgresGraphStore::connect` itself is unchanged -- this
+/// loop just calls it repeatedly until it succeeds or the budget runs out.
+///
+/// Deliberately **not** applied to `open_store` (the per-call CLI path
+/// just below) or any direct `PostgresGraphStore::connect` caller (e.g.
+/// `agentops-cli`'s one-shot `migrate-graph` command) -- a human running a
+/// quick command or an explicit one-time migration while watching the
+/// terminal should get an immediate, clear error if Postgres isn't up,
+/// not a silent minute-long hang. Only a caller starting a long-running
+/// server actually wants "wait, don't crash" semantics.
 pub fn open_shared_postgres_store() -> Result<Option<agentops_graph_pg::PostgresGraphStore>> {
-    match std::env::var("AGENTOPS_DATABASE_URL") {
-        Ok(url) => Ok(Some(agentops_graph_pg::PostgresGraphStore::connect(&url)?)),
-        Err(_) => Ok(None),
+    let Ok(url) = std::env::var("AGENTOPS_DATABASE_URL") else { return Ok(None) };
+    retry_with_backoff(retry_budget(), || agentops_graph_pg::PostgresGraphStore::connect(&url)).map(Some)
+}
+
+/// The actual retry-with-backoff loop, generic over the attempt so it's
+/// unit-testable without a real Postgres: `PostgresGraphStore::connect`
+/// does a full wire-protocol handshake, not just a TCP accept, so a bare
+/// `TcpListener` fixture can't stand in for "Postgres becomes reachable
+/// mid-retry" the way it could for a simpler TCP-only dependency. This is
+/// the only abstraction added for that reason -- `open_shared_postgres_store`
+/// itself keeps the exact same public signature and behavior either way.
+fn retry_with_backoff<T>(max_wait: std::time::Duration, mut attempt: impl FnMut() -> Result<T>) -> Result<T> {
+    let start = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(500);
+    loop {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(e) if start.elapsed() >= max_wait => {
+                return Err(e.context(format!("giving up connecting to Postgres after retrying for {:?}", start.elapsed())));
+            }
+            Err(e) => {
+                eprintln!("waiting for Postgres to become ready ({:?} elapsed, retrying in {:?}): {e:#}", start.elapsed(), delay);
+                std::thread::sleep(jittered(delay));
+                delay = (delay * 2).min(std::time::Duration::from_secs(5));
+            }
+        }
     }
+}
+
+/// How long `open_shared_postgres_store` retries before giving up, read
+/// from `AGENTOPS_PG_CONNECT_RETRY_SECS`. Default `60` -- chosen with a
+/// real, live-measured Postgres cold-start recovery of 3.4 seconds as its
+/// baseline (roughly a 17x margin), not an arbitrary round number; kept
+/// tunable via env var rather than hardcoded because that 3.4s figure is
+/// one data point from one incident (a clean shutdown/restart), not a
+/// guarantee about every future recovery -- a deployment that ever needs
+/// a real WAL-corruption replay could genuinely take longer. A
+/// non-positive or unparseable value means `Duration::ZERO`: try once, no
+/// retry at all -- explicit, documented behavior, not an infinite-loop-
+/// with-zero-sleep footgun.
+fn retry_budget() -> std::time::Duration {
+    match std::env::var("AGENTOPS_PG_CONNECT_RETRY_SECS") {
+        // Unset entirely -- the documented default.
+        Err(_) => std::time::Duration::from_secs(60),
+        // Set, but non-positive or unparseable -- explicit "try once", not
+        // the default (the previous `.filter(...).unwrap_or_else(default)`
+        // shape here collapsed this case into "unset", silently ignoring an
+        // explicit `=0`).
+        Ok(s) => s.parse::<i64>().ok().filter(|&secs| secs > 0).map(|secs| std::time::Duration::from_secs(secs as u64)).unwrap_or(std::time::Duration::ZERO),
+    }
+}
+
+/// Multiplies `delay` by a random factor in `0.5..=1.0` -- without this,
+/// every process restarting after the same outage would retry in
+/// lockstep on each backoff boundary, trading "all crash at once" for
+/// "all hammer Postgres at once" a few hundred milliseconds later. Reuses
+/// `getrandom` (already a workspace dependency, already this codebase's
+/// pattern for exactly this kind of lightweight randomness need -- see
+/// `agentops_repo_access::store::new_local_repo_id`) rather than adding a
+/// new dependency like `rand` just for one random byte.
+fn jittered(delay: std::time::Duration) -> std::time::Duration {
+    let mut byte = [0u8; 1];
+    if getrandom::fill(&mut byte).is_err() {
+        return delay;
+    }
+    let factor = 0.5 + (byte[0] as f64 / 255.0) * 0.5;
+    delay.mul_f64(factor)
 }
 
 /// Resolves the store a handler should use: the pre-shared Postgres store
@@ -222,6 +307,63 @@ mod tests {
         let store = resolve_store(None, dir.path()).unwrap();
         assert_eq!(store.all_nodes(&repo_name(dir.path())).unwrap().len(), 0);
         assert!(graph_db_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn retry_with_backoff_gives_up_with_a_clear_error_once_the_budget_elapses() {
+        let mut attempts = 0u32;
+        let result = retry_with_backoff(std::time::Duration::from_millis(50), || {
+            attempts += 1;
+            Err::<(), anyhow::Error>(anyhow::anyhow!("not ready yet"))
+        });
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("giving up connecting to Postgres after retrying for"));
+        // At least the first attempt plus one retry after the 500ms->jittered
+        // sleep -- actually just one attempt here, since the first attempt
+        // already exceeds the tiny 50ms budget before any sleep happens.
+        assert!(attempts >= 1);
+    }
+
+    #[test]
+    fn retry_with_backoff_succeeds_once_the_dependency_becomes_available() {
+        let mut attempts = 0u32;
+        let result = retry_with_backoff(std::time::Duration::from_secs(5), || {
+            attempts += 1;
+            if attempts < 3 { Err::<&str, anyhow::Error>(anyhow::anyhow!("still not ready")) } else { Ok("connected") }
+        });
+        assert_eq!(result.unwrap(), "connected");
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn retry_budget_env_var_zero_or_unset_means_try_once() {
+        let _guard = test_support::ENV_LOCK.lock().unwrap();
+        // SAFETY: guarded by ENV_LOCK above.
+        unsafe { std::env::set_var("AGENTOPS_PG_CONNECT_RETRY_SECS", "0") };
+        assert_eq!(retry_budget(), std::time::Duration::ZERO);
+
+        // A single attempt against a zero budget must not retry at all: the
+        // very first failure already has start.elapsed() >= Duration::ZERO.
+        let mut attempts = 0u32;
+        let result = retry_with_backoff(retry_budget(), || {
+            attempts += 1;
+            Err::<(), anyhow::Error>(anyhow::anyhow!("nope"))
+        });
+        assert!(result.is_err());
+        assert_eq!(attempts, 1);
+
+        unsafe { std::env::remove_var("AGENTOPS_PG_CONNECT_RETRY_SECS") };
+        assert_eq!(retry_budget(), std::time::Duration::from_secs(60));
+    }
+
+    #[test]
+    fn jittered_stays_within_half_to_full_of_the_input_delay() {
+        let delay = std::time::Duration::from_secs(4);
+        for _ in 0..50 {
+            let j = jittered(delay);
+            assert!(j >= delay.mul_f64(0.5), "{j:?} fell below the 0.5x floor of {delay:?}");
+            assert!(j <= delay, "{j:?} exceeded the unjittered {delay:?}");
+        }
     }
 
     /// Live against a real local Postgres, matching `agentops-graph-pg`'s
