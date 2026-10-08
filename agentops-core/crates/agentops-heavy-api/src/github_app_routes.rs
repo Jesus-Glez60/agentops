@@ -364,12 +364,25 @@ pub async fn connect_from_installation(State(state): State<AppState>, user: Opti
     for full_name in &req.repo_full_names {
         let connection_id = full_name.replace('/', "--");
         let repo_url = format!("https://github.com/{full_name}.git");
-        let connection = {
+        let short_name = full_name.rsplit('/').next().unwrap_or(full_name);
+        // Never silently attach to a stale local-only stub just because its
+        // stored name matches this repo's short name -- two different repos
+        // (different owners/orgs) can share a short name, and a wrong-repo
+        // attach would be worse than the duplicate-row bug this is meant to
+        // fix (see this change's plan/council review). Still create the new
+        // connection as before; just surface the possible match so a human
+        // can review and merge (POST .../attach-github-app against the
+        // stale id, then delete this one) via the web UI.
+        let (connection, suggested_merge) = {
             let store = state.store.lock().unwrap();
-            match store.create_github_app_connection(&tenant, &connection_id, &repo_url, &id) {
+            let suggestion = store.find_discovered_local_only_connections_by_name(&tenant, short_name).unwrap_or_default();
+            let connection = match store.create_github_app_connection(&tenant, &connection_id, &repo_url, &id) {
                 Ok(c) => c,
                 Err(e) => return (StatusCode::CONFLICT, Json(json!({ "error": format!("{full_name}: {e}") }))).into_response(),
-            }
+            };
+            let suggested_merge = (!suggestion.is_empty())
+                .then(|| suggestion.into_iter().map(|c| json!({ "stale_connection_id": c.id, "stale_connection_name": c.name })).collect::<Vec<_>>());
+            (connection, suggested_merge)
         };
         let job_id = match crate::indexing::create_and_spawn_job(&state.indexing_deps(), tenant.clone(), connection.clone(), JobKind::Initial) {
             Ok(id) => Some(id),
@@ -378,7 +391,11 @@ pub async fn connect_from_installation(State(state): State<AppState>, user: Opti
                 None
             }
         };
-        created.push(json!({ "connection": crate::ConnectionView::from(connection), "job_id": job_id }));
+        let mut entry = json!({ "connection": crate::ConnectionView::from(connection), "job_id": job_id });
+        if let Some(suggested_merge) = suggested_merge {
+            entry["suggested_merge"] = json!(suggested_merge);
+        }
+        created.push(entry);
     }
 
     (StatusCode::CREATED, Json(json!({ "connections": created }))).into_response()
@@ -468,7 +485,24 @@ async fn github_webhook_handler(State(state): State<Arc<GithubWebhookState>>, he
                 return (StatusCode::OK, Json(json!({ "dispatched": false, "reason": "push payload missing repository.full_name" }))).into_response();
             };
             let connection_id = full_name.replace('/', "--");
-            let connection = { state.deps.connections.lock().unwrap().get_connection(&tenant, &connection_id) };
+            let repo_url = format!("https://github.com/{full_name}.git");
+            // The derived `owner--repo` id matches a connection created
+            // fresh by `connect_from_installation`, but not one that was
+            // *upgraded in place* via `attach_github_app_remote` -- that
+            // path deliberately keeps the connection's original id (so
+            // existing graph/notes/doc data survives) rather than renaming
+            // it to match GitHub's naming. Fall back to a repo_url lookup
+            // for exactly that case, scoped to GitHubApp connections only --
+            // a same-repo_url Ssh or still-Discovered row must never be
+            // mistaken for a webhook-dispatchable GitHub App connection.
+            let connection = {
+                let connections = state.deps.connections.lock().unwrap();
+                match connections.get_connection(&tenant, &connection_id) {
+                    Ok(Some(c)) => Ok(Some(c)),
+                    Ok(None) => connections.find_connection_by_repo_url(&tenant, &repo_url),
+                    Err(e) => Err(e),
+                }
+            };
             match connection {
                 Ok(Some(c)) if c.method == ConnectionMethod::GitHubApp => match crate::indexing::create_and_spawn_job(&state.deps, tenant, c, JobKind::Reindex) {
                     Ok(job_id) => (StatusCode::OK, Json(json!({ "dispatched": true, "job_id": job_id }))).into_response(),
@@ -633,6 +667,99 @@ mod tests {
         let job = { deps.indexing.lock().unwrap().latest_job_for_connection("acme", "acme-corp--widgets").unwrap() };
         assert!(job.is_some());
         assert_eq!(job.unwrap().kind, agentops_repo_access::indexing_store::JobKind::Reindex);
+    }
+
+    #[tokio::test]
+    async fn a_push_event_still_reindexes_a_connection_upgraded_in_place_with_a_preserved_id() {
+        let secret = "wh-secret";
+        let deps = test_deps();
+
+        // Seed exactly what `attach_github_app_remote` produces: a
+        // connection whose id was NOT renamed to `owner--repo` on upgrade
+        // (preserved on purpose, so existing graph/notes/doc data under
+        // that id survives) -- the primary id-derived webhook lookup must
+        // miss here, forcing the repo_url fallback.
+        {
+            let indexing = deps.indexing.lock().unwrap();
+            indexing.create_installation("acme", "555", "acme-corp", None).unwrap();
+        }
+        {
+            let connections = deps.connections.lock().unwrap();
+            connections.create_discovered_connection("acme", "job-hunter-uuid1", "local:job-hunter-uuid1", Some("job-hunter")).unwrap();
+            connections.attach_github_app_remote("acme", "job-hunter-uuid1", "https://github.com/acme-corp/job-hunter.git", "555").unwrap();
+        }
+
+        let config = GitHubAppConfig { app_id: 1, private_key_pem: String::new(), webhook_secret: secret.to_string() };
+        let router = merge_github_webhook_route(Router::new(), deps.clone(), Some(config));
+
+        let body = serde_json::json!({
+            "installation": { "id": 555 },
+            "repository": { "full_name": "acme-corp/job-hunter" },
+        })
+        .to_string();
+        let signature = sign(secret, body.as_bytes());
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/github")
+                    .header(SIGNATURE_HEADER, signature)
+                    .header("x-github-event", "push")
+                    .header(DELIVERY_HEADER, "delivery-upgraded-1")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["dispatched"], true, "the repo_url fallback must find the upgraded connection despite its preserved, non-matching id: {json:?}");
+    }
+
+    #[tokio::test]
+    async fn a_push_events_repo_url_fallback_ignores_a_same_url_non_github_app_connection() {
+        let secret = "wh-secret";
+        let deps = test_deps();
+
+        {
+            let indexing = deps.indexing.lock().unwrap();
+            indexing.create_installation("acme", "555", "acme-corp", None).unwrap();
+        }
+        {
+            // A Discovered (not yet upgraded) row with the real repo_url --
+            // must never be mistaken for a dispatchable GitHub App
+            // connection just because its repo_url matches.
+            let connections = deps.connections.lock().unwrap();
+            connections.create_discovered_connection("acme", "acme-corp--job-hunter", "https://github.com/acme-corp/job-hunter.git", Some("job-hunter")).unwrap();
+        }
+
+        let config = GitHubAppConfig { app_id: 1, private_key_pem: String::new(), webhook_secret: secret.to_string() };
+        let router = merge_github_webhook_route(Router::new(), deps, Some(config));
+
+        let body = serde_json::json!({
+            "installation": { "id": 555 },
+            "repository": { "full_name": "acme-corp/job-hunter" },
+        })
+        .to_string();
+        let signature = sign(secret, body.as_bytes());
+
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/github")
+                    .header(SIGNATURE_HEADER, signature)
+                    .header("x-github-event", "push")
+                    .header(DELIVERY_HEADER, "delivery-undiscovered-1")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["dispatched"], false, "a matching repo_url on a non-GitHubApp connection must not trigger a reindex: {json:?}");
     }
 
     #[tokio::test]

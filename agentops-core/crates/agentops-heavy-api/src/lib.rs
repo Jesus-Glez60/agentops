@@ -1163,13 +1163,13 @@ struct AttachGithubAppRequest {
 }
 
 /// `POST /repos/{id}/attach-github-app` -- same as `attach_ssh` but for the
-/// GitHub App method. `"webhook_autoreindex": false` is always included,
-/// not just on success -- an upgraded connection keeps its original `id`,
-/// but the webhook push handler derives the id it looks up from
-/// `full_name.replace('/', "--")`, which won't match. Automatic
-/// push-triggered reindexing never fires for an upgraded connection; manual
-/// "Verify"/rescan still works. The frontend must surface this
-/// persistently (repo detail page, not a one-time toast), not just log it.
+/// GitHub App method. `"webhook_autoreindex": true` is always included on
+/// success -- an upgraded connection keeps its original `id`, which won't
+/// match what the webhook push handler's primary lookup derives from
+/// `full_name.replace('/', "--")`, but `github_webhook_handler` falls back
+/// to a `repo_url`-based lookup (scoped to `GitHubApp`-method connections)
+/// for exactly this case, so automatic push-triggered reindexing still
+/// works for an upgraded connection, same as a freshly-created one.
 async fn attach_github_app(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Json(req): Json<AttachGithubAppRequest>) -> (StatusCode, Json<Value>) {
     let tenant = match resolve_tenant(&user, req.tenant.as_deref()) {
         Ok(t) => t,
@@ -1193,8 +1193,8 @@ async fn attach_github_app(State(state): State<AppState>, user: Option<axum::Ext
             StatusCode::OK,
             Json(json!({
                 "connection": ConnectionView::from(connection),
-                "webhook_autoreindex": false,
-                "webhook_autoreindex_reason": "this connection kept its original id when it was upgraded, which doesn't match the id GitHub webhooks derive from the repo's owner/name -- pushes won't auto-reindex; use Verify or a manual rescan instead.",
+                "webhook_autoreindex": true,
+                "webhook_autoreindex_reason": "this connection kept its original id when it was upgraded, which doesn't match the id GitHub webhooks derive from the repo's owner/name -- the webhook handler falls back to a repo_url lookup for exactly this case, so pushes still auto-reindex.",
             })),
         ),
         Err(e) => (StatusCode::CONFLICT, Json(json!({ "error": e.to_string() }))),
@@ -1874,7 +1874,7 @@ mod tests {
         // `create_discovered_connection` directly, since the store is owned
         // here before `build_router` takes it, no need to round-trip
         // through the MCP tool's auth-token plumbing just to seed this.
-        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter", None).unwrap();
         let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
 
         let attach_req = Request::builder()
@@ -1917,7 +1917,7 @@ mod tests {
     #[tokio::test]
     async fn attach_github_app_turns_a_local_only_connection_into_active_preserving_its_id() {
         let (store, secrets) = test_state();
-        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter", None).unwrap();
         let indexing = test_indexing_store();
         indexing.create_installation("acme", "install-123", "acme-corp", Some("Organization")).unwrap();
         let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, indexing, std::env::temp_dir(), None);
@@ -1935,14 +1935,14 @@ mod tests {
         assert_eq!(body["connection"]["method"], "github_app");
         assert_eq!(body["connection"]["status"], "active");
         assert_eq!(body["connection"]["repo_url"], "https://github.com/acme/job-hunter.git");
-        assert_eq!(body["webhook_autoreindex"], false, "an upgraded connection's id never matches what the webhook derives from full_name");
+        assert_eq!(body["webhook_autoreindex"], true, "the webhook handler's repo_url fallback must cover an upgraded connection's preserved original id");
         assert!(body["webhook_autoreindex_reason"].as_str().unwrap().contains("original id"), "{body:?}");
     }
 
     #[tokio::test]
     async fn attach_github_app_404s_for_an_installation_the_tenant_doesnt_own() {
         let (store, secrets) = test_state();
-        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter", None).unwrap();
         let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, test_indexing_store(), std::env::temp_dir(), None);
 
         let attach_req = Request::builder()
@@ -1972,6 +1972,53 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(attach_req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn connect_from_installation_flags_a_matching_stale_local_only_stub_without_auto_attaching() {
+        let (store, secrets) = test_state();
+        store.create_discovered_connection("acme", "job-hunter-uuid1", "local:job-hunter-uuid1", Some("job-hunter")).unwrap();
+        let indexing = test_indexing_store();
+        indexing.create_installation("acme", "install-123", "acme-corp", Some("Organization")).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, indexing, std::env::temp_dir(), None);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/repos/github-app/installations/install-123/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_full_names": ["acme-corp/job-hunter"]}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        let entry = &body["connections"][0];
+        // A brand-new connection must still be created -- the matching
+        // stub is a suggestion to review, never an automatic merge.
+        assert_ne!(entry["connection"]["id"], "job-hunter-uuid1", "must not silently attach to the stale stub");
+        assert_eq!(entry["connection"]["id"], "acme-corp--job-hunter");
+        let suggested = entry["suggested_merge"].as_array().expect("a name match must be surfaced as suggested_merge");
+        assert_eq!(suggested.len(), 1);
+        assert_eq!(suggested[0]["stale_connection_id"], "job-hunter-uuid1");
+        assert_eq!(suggested[0]["stale_connection_name"], "job-hunter");
+    }
+
+    #[tokio::test]
+    async fn connect_from_installation_omits_suggested_merge_when_no_name_matches() {
+        let (store, secrets) = test_state();
+        let indexing = test_indexing_store();
+        indexing.create_installation("acme", "install-123", "acme-corp", Some("Organization")).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, indexing, std::env::temp_dir(), None);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/repos/github-app/installations/install-123/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_full_names": ["acme-corp/widgets"]}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        assert!(body["connections"][0].get("suggested_merge").is_none(), "{body:?}");
     }
 
     #[tokio::test]

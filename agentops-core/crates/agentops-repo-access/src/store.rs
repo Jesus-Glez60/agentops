@@ -134,6 +134,14 @@ pub struct RepoConnection {
     /// actually checked out right now): this is the *intent*, that's the
     /// *observed state*.
     pub tracked_branch: Option<String>,
+    /// Short human-readable name (e.g. a repo's basename or short GitHub
+    /// name), used only to match a `local:`-prefixed `Discovered` connection
+    /// against a real repo being connected later -- `local:<id>` carries no
+    /// information a real `repo_url`/`full_name` can be compared against, so
+    /// this is the one piece of identity that survives both sides. `None`
+    /// for connections created before this field existed, or created via a
+    /// path that never supplied one; such rows simply never match.
+    pub name: Option<String>,
 }
 
 pub struct ConnectionStore {
@@ -177,6 +185,9 @@ impl ConnectionStore {
         // already-migrated file" posture for genuinely new deployments.
         let _ = conn.execute("ALTER TABLE repo_connections ADD COLUMN installation_id TEXT", []);
         let _ = conn.execute("ALTER TABLE repo_connections ADD COLUMN tracked_branch TEXT", []);
+        let _ = conn.execute("ALTER TABLE repo_connections ADD COLUMN name TEXT", []);
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_repo_connections_tenant_name ON repo_connections(tenant, name)", [])
+            .context("creating tenant/name index")?;
         Ok(Self { conn })
     }
 
@@ -228,12 +239,12 @@ impl ConnectionStore {
     /// generated, no App was installed, an agent just reported seeing this
     /// URL. A human must still finish connecting it (SSH or GitHub App)
     /// before anything can actually clone/index it.
-    pub fn create_discovered_connection(&self, tenant: &str, id: &str, repo_url: &str) -> Result<RepoConnection> {
+    pub fn create_discovered_connection(&self, tenant: &str, id: &str, repo_url: &str, name: Option<&str>) -> Result<RepoConnection> {
         self.conn
             .execute(
-                "INSERT INTO repo_connections (id, tenant, repo_url, method, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![id, tenant, repo_url, ConnectionMethod::Discovered.as_str(), ConnectionStatus::Pending.as_db_string()],
+                "INSERT INTO repo_connections (id, tenant, repo_url, method, status, name)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![id, tenant, repo_url, ConnectionMethod::Discovered.as_str(), ConnectionStatus::Pending.as_db_string(), name],
             )
             .context("inserting discovered repo connection")?;
         self.get_connection(tenant, id)?.context("just-inserted connection not found — this is a store bug")
@@ -376,7 +387,7 @@ impl ConnectionStore {
     pub fn get_connection(&self, tenant: &str, id: &str) -> Result<Option<RepoConnection>> {
         self.conn
             .query_row(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch, name
                  FROM repo_connections WHERE tenant = ?1 AND id = ?2",
                 rusqlite::params![tenant, id],
                 row_to_connection,
@@ -390,12 +401,46 @@ impl ConnectionStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch, name
                  FROM repo_connections WHERE tenant = ?1 ORDER BY created_at DESC",
             )
             .context("preparing list query")?;
         let rows = stmt.query_map([tenant], row_to_connection).context("querying repo connections")?;
         rows.collect::<rusqlite::Result<Vec<_>>>().context("reading repo connection rows")
+    }
+
+    /// Every `Discovered`, `local:`-prefixed connection for `tenant` whose
+    /// stored `name` matches `name` case-insensitively -- used by
+    /// `connect_from_installation`/`register_repo`'s `repo_url` path to
+    /// *suggest* (never silently perform) a merge with a stale local-only
+    /// stub when a real repo is connected later. Deliberately never used to
+    /// auto-attach: two differently-owned GitHub repos can share a short
+    /// name, so a single match here is a suggestion, not proof of identity.
+    pub fn find_discovered_local_only_connections_by_name(&self, tenant: &str, name: &str) -> Result<Vec<RepoConnection>> {
+        Ok(self
+            .list_connections(tenant)?
+            .into_iter()
+            .filter(|c| c.method == ConnectionMethod::Discovered && is_local_only_url(&c.repo_url))
+            .filter(|c| c.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(name)))
+            .collect())
+    }
+
+    /// Finds the connection, scoped to `tenant`, whose `repo_url` normalizes
+    /// to the same repo as `repo_url` -- the read-side
+    /// counterpart to `find_other_connection_with_repo_url` (which exists
+    /// purely as a write-time dedup guard and takes an `excluding_id` built
+    /// for that purpose). Used by the GitHub webhook handler to find a
+    /// connection whose id no longer matches the payload-derived
+    /// `owner--repo` id, because it was upgraded in place via `attach_*` and
+    /// kept its original id.
+    pub fn find_connection_by_repo_url(&self, tenant: &str, repo_url: &str) -> Result<Option<RepoConnection>> {
+        let Some(normalized) = crate::normalize_repo_path(repo_url) else { return Ok(None) };
+        for connection in self.list_connections(tenant)? {
+            if crate::normalize_repo_path(&connection.repo_url).as_deref() == Some(normalized.as_str()) {
+                return Ok(Some(connection));
+            }
+        }
+        Ok(None)
     }
 
     /// Every connection created from a given GitHub App installation --
@@ -408,7 +453,7 @@ impl ConnectionStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch
+                "SELECT id, tenant, repo_url, method, public_key_openssh, encrypted_private_key_openssh, installation_id, status, created_at, tracked_branch, name
                  FROM repo_connections WHERE tenant = ?1 AND installation_id = ?2",
             )
             .context("preparing installation connections query")?;
@@ -468,6 +513,7 @@ fn row_to_connection(row: &rusqlite::Row) -> rusqlite::Result<RepoConnection> {
         status: ConnectionStatus::from_db_string(&status_str),
         created_at: row.get(8)?,
         tracked_branch: row.get(9)?,
+        name: row.get(10)?,
     })
 }
 
@@ -576,7 +622,7 @@ mod tests {
     #[test]
     fn create_discovered_connection_starts_pending_with_no_auth_material() {
         let store = test_store();
-        let created = store.create_discovered_connection("acme", "repo-1", "git@github.com:acme/widgets.git").unwrap();
+        let created = store.create_discovered_connection("acme", "repo-1", "git@github.com:acme/widgets.git", None).unwrap();
         assert_eq!(created.method, ConnectionMethod::Discovered);
         assert_eq!(created.status, ConnectionStatus::Pending);
         assert_eq!(created.public_key_openssh, None);
@@ -653,7 +699,7 @@ mod tests {
     #[test]
     fn attach_ssh_remote_succeeds_against_a_true_local_only_connection() {
         let store = test_store();
-        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter", None).unwrap();
         let keypair = test_keypair("acme", "job-hunter");
 
         let updated = store.attach_ssh_remote("acme", "job-hunter", "git@github.com:acme/job-hunter.git", &keypair).unwrap();
@@ -666,7 +712,7 @@ mod tests {
     #[test]
     fn attach_ssh_remote_succeeds_against_a_real_but_unauthenticated_discovered_connection() {
         let store = test_store();
-        store.create_discovered_connection("acme", "acme--widgets", "git@github.com:acme/widgets.git").unwrap();
+        store.create_discovered_connection("acme", "acme--widgets", "git@github.com:acme/widgets.git", None).unwrap();
         let keypair = test_keypair("acme", "acme--widgets");
 
         // Same repo_url the Discovered row already had -- completing it, not repointing it.
@@ -687,7 +733,7 @@ mod tests {
     #[test]
     fn attach_ssh_remote_rejects_repointing_a_discovered_connection_to_a_different_repo() {
         let store = test_store();
-        store.create_discovered_connection("acme", "acme--widgets", "git@github.com:acme/widgets.git").unwrap();
+        store.create_discovered_connection("acme", "acme--widgets", "git@github.com:acme/widgets.git", None).unwrap();
         let keypair = test_keypair("acme", "acme--widgets");
 
         let err = store.attach_ssh_remote("acme", "acme--widgets", "git@github.com:acme/gizmos.git", &keypair).unwrap_err();
@@ -699,7 +745,7 @@ mod tests {
         let store = test_store();
         let keypair_a = test_keypair("acme", "repo-a");
         store.create_ssh_connection("acme", "repo-a", "git@github.com:acme/widgets.git", &keypair_a).unwrap();
-        store.create_discovered_connection("acme", "repo-b", "local:repo-b").unwrap();
+        store.create_discovered_connection("acme", "repo-b", "local:repo-b", None).unwrap();
         let keypair_b = test_keypair("acme", "repo-b");
 
         let err = store.attach_ssh_remote("acme", "repo-b", "git@github.com:acme/widgets.git", &keypair_b).unwrap_err();
@@ -711,7 +757,7 @@ mod tests {
         let store = test_store();
         let keypair_a = test_keypair("acme", "repo-a");
         store.create_ssh_connection("acme", "repo-a", "git@github.com:acme/widgets.git", &keypair_a).unwrap();
-        store.create_discovered_connection("acme", "repo-b", "local:repo-b").unwrap();
+        store.create_discovered_connection("acme", "repo-b", "local:repo-b", None).unwrap();
         let keypair_b = test_keypair("acme", "repo-b");
 
         // Same repo via a custom SSH config host alias -- must still be
@@ -724,7 +770,7 @@ mod tests {
     #[test]
     fn attach_github_app_remote_preserves_id_and_turns_discovered_into_active() {
         let store = test_store();
-        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter").unwrap();
+        store.create_discovered_connection("acme", "job-hunter", "local:job-hunter", None).unwrap();
 
         let updated = store.attach_github_app_remote("acme", "job-hunter", "https://github.com/acme/job-hunter.git", "install-123").unwrap();
         assert_eq!(updated.id, "job-hunter");
@@ -739,5 +785,72 @@ mod tests {
         let keypair = test_keypair("acme", "does-not-exist");
         let err = store.attach_ssh_remote("acme", "does-not-exist", "git@github.com:acme/widgets.git", &keypair).unwrap_err();
         assert!(err.to_string().contains("no connection"), "{err}");
+    }
+
+    #[test]
+    fn find_discovered_local_only_connections_by_name_matches_case_insensitively() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "job-hunter-uuid1", "local:job-hunter-uuid1", Some("job-hunter")).unwrap();
+
+        let matches = store.find_discovered_local_only_connections_by_name("acme", "Job-Hunter").unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].id, "job-hunter-uuid1");
+    }
+
+    #[test]
+    fn find_discovered_local_only_connections_by_name_returns_every_match_not_just_one() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "job-hunter-uuid1", "local:job-hunter-uuid1", Some("job-hunter")).unwrap();
+        store.create_discovered_connection("acme", "job-hunter-uuid2", "local:job-hunter-uuid2", Some("job-hunter")).unwrap();
+
+        let matches = store.find_discovered_local_only_connections_by_name("acme", "job-hunter").unwrap();
+        assert_eq!(matches.len(), 2, "ambiguous name matches must all be surfaced, never silently picked between");
+    }
+
+    #[test]
+    fn find_discovered_local_only_connections_by_name_ignores_a_real_url_discovered_row() {
+        let store = test_store();
+        // A real-but-unauthenticated Discovered row (register_repo's
+        // repo_url path) must not be treated as a "local-only" match even
+        // if its name happens to coincide -- it already has its own real
+        // repo_url and is subject to the normal dedup guard instead.
+        store.create_discovered_connection("acme", "acme--job-hunter", "https://github.com/acme/job-hunter.git", Some("job-hunter")).unwrap();
+
+        let matches = store.find_discovered_local_only_connections_by_name("acme", "job-hunter").unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_discovered_local_only_connections_by_name_ignores_a_row_with_no_name() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "old-stub", "local:old-stub", None).unwrap();
+
+        let matches = store.find_discovered_local_only_connections_by_name("acme", "old-stub").unwrap();
+        assert!(matches.is_empty(), "a pre-migration row with no stored name must never match, not fall back to matching on its id");
+    }
+
+    #[test]
+    fn find_discovered_local_only_connections_by_name_is_tenant_scoped() {
+        let store = test_store();
+        store.create_discovered_connection("acme", "job-hunter-uuid1", "local:job-hunter-uuid1", Some("job-hunter")).unwrap();
+
+        let matches = store.find_discovered_local_only_connections_by_name("globex", "job-hunter").unwrap();
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_connection_by_repo_url_finds_a_connection_regardless_of_method() {
+        let store = test_store();
+        let keypair = test_keypair("acme", "repo-a");
+        store.create_ssh_connection("acme", "repo-a", "git@github.com:acme/widgets.git", &keypair).unwrap();
+
+        let found = store.find_connection_by_repo_url("acme", "https://github.com/acme/widgets.git").unwrap();
+        assert_eq!(found.unwrap().id, "repo-a", "must match via normalize_repo_path across different URL shapes for the same repo");
+    }
+
+    #[test]
+    fn find_connection_by_repo_url_returns_none_for_no_match() {
+        let store = test_store();
+        assert!(store.find_connection_by_repo_url("acme", "https://github.com/acme/nothing-here.git").unwrap().is_none());
     }
 }

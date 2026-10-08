@@ -65,6 +65,7 @@ fn register_repo_tool_definition() -> agentops_mcp::ToolDefinition {
             "properties": {
                 "repo_url": { "type": "string", "description": "This repo's git remote URL. Omit if using local_id instead." },
                 "local_id": { "type": "string", "description": "A stable identifier you generate for a repo with no git remote. Omit if using repo_url instead." },
+                "name": { "type": "string", "description": "A short human-readable name for this repo (e.g. its directory name). Helps AgentOps recognize this same repo later if it gets a real GitHub connection, so the two don't end up as separate, duplicate connections. If omitted when using local_id, it's derived from local_id itself." },
             },
         }),
         annotations: agentops_mcp::ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: false },
@@ -230,10 +231,11 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     if name == "register_repo" {
         let repo_url = arguments.get("repo_url").and_then(|v| v.as_str());
         let local_id = arguments.get("local_id").and_then(|v| v.as_str());
+        let name = arguments.get("name").and_then(|v| v.as_str());
         if repo_url.is_none() && local_id.is_none() {
             return err(id, INVALID_PARAMS, "register_repo requires either 'repo_url' or 'local_id' in its arguments");
         }
-        let message = register_repo(state, &caller.tenant, repo_url, local_id);
+        let message = register_repo(state, &caller.tenant, repo_url, local_id, name);
         return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": false }));
     }
 

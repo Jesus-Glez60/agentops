@@ -114,7 +114,7 @@ pub(crate) fn resolve_connection_path(state: &AppState, tenant: &str, connection
 /// `LOCAL_ONLY_URL_PREFIX`-prefixed `repo_url` instead of a real one. See
 /// `ConnectionMethod::Discovered`'s doc comment for how this differs from
 /// the "real remote, not yet human-connected" case.
-pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&str>, local_id: Option<&str>) -> String {
+pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&str>, local_id: Option<&str>, name: Option<&str>) -> String {
     let store = state.store.lock().unwrap();
     let connections = store.list_connections(tenant).unwrap_or_default();
 
@@ -135,7 +135,14 @@ pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&st
         if let Some(existing) = connections.iter().find(|c| c.repo_url == synthetic_url) {
             return format!("local repo '{local_id}' is already registered (id: {}, status: {:?}).", existing.id, existing.status);
         }
-        return match store.create_discovered_connection(tenant, local_id, &synthetic_url) {
+        // Agents already choose a human-readable `local_id` by convention
+        // (e.g. `job-hunter-<uuid>`) -- if the caller didn't pass an
+        // explicit `name`, strip a trailing `-<uuid-looking-suffix>` so the
+        // stored name is still something a later GitHub App connect can
+        // match against, instead of leaving it `None` for every caller that
+        // follows the existing convention but doesn't know about `name` yet.
+        let derived_name = name.map(str::to_string).or_else(|| derive_name_from_local_id(local_id));
+        return match store.create_discovered_connection(tenant, local_id, &synthetic_url, derived_name.as_deref()) {
             Ok(created) => format!(
                 "Registered local-only repo (id: {}). It has no git remote, so it can never be cloned or indexed server-side -- scans and notes from this machine's own CLI will attach to this connection directly.",
                 created.id
@@ -165,12 +172,78 @@ pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&st
     // human-readable and consistent across every way a connection gets
     // created, not just this one.
     let id = owner_repo.replace('/', "--");
+    let short_name = owner_repo.rsplit('/').next().unwrap_or(&owner_repo);
 
-    match store.create_discovered_connection(tenant, &id, repo_url) {
+    // Never silently attach to a stale local-only stub just because its
+    // stored name matches this repo's short name -- two different repos
+    // (different owners/orgs) can share a short name, and a wrong-repo
+    // attach would be worse than the duplicate-row bug this is meant to
+    // fix. Surface the possible match in the response text instead, so a
+    // human/agent can confirm it (via the web UI's merge action) rather
+    // than this silently guessing.
+    let suggestion = store.find_discovered_local_only_connections_by_name(tenant, short_name).unwrap_or_default();
+
+    match store.create_discovered_connection(tenant, &id, repo_url, Some(short_name)) {
         Ok(created) => {
-            format!("Registered '{repo_url}' as a pending connection (id: {}). Ask an admin to finish connecting it from Repositories -> Connect a repository.", created.id)
+            let mut msg = format!("Registered '{repo_url}' as a pending connection (id: {}). Ask an admin to finish connecting it from Repositories -> Connect a repository.", created.id);
+            if !suggestion.is_empty() {
+                let ids: Vec<&str> = suggestion.iter().map(|c| c.id.as_str()).collect();
+                msg.push_str(&format!(
+                    " Note: found existing local-only connection(s) with a matching name ({}) -- these may be the same repo registered locally before this remote existed; review and merge/remove via the web UI if so.",
+                    ids.join(", ")
+                ));
+            }
+            msg
         }
         Err(e) => format!("failed to register '{repo_url}': {e}"),
+    }
+}
+
+/// Best-effort fallback when a `local_id` caller doesn't pass an explicit
+/// `name`: agents already follow a `<name>-<uuid>` convention for `local_id`
+/// (see `register_repo`'s own doc comment, e.g. `job-hunter-D7CF44F0-0375-
+/// 4567-9A3D-AEE5B1881FB8`), so strip a trailing standard 8-4-4-4-12 hex
+/// UUID if present -- a plain `rsplit_once('-')` would only strip the last
+/// dash-separated segment and leave most of the UUID in the "name". Returns
+/// `None` (not the full `local_id`) when no such suffix is found, rather
+/// than guessing a name that's actually just an opaque id (e.g. the CLI's
+/// plain-hex `local_id`s) -- a wrong name would cause confusing/incorrect
+/// merge suggestions later, so "no name" is safer than "wrong name."
+fn derive_name_from_local_id(local_id: &str) -> Option<String> {
+    const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+    let segments: Vec<&str> = local_id.rsplitn(UUID_GROUP_LENGTHS.len() + 1, '-').collect();
+    if segments.len() <= UUID_GROUP_LENGTHS.len() {
+        return None;
+    }
+    let is_uuid_suffix = segments[..UUID_GROUP_LENGTHS.len()]
+        .iter()
+        .rev()
+        .zip(UUID_GROUP_LENGTHS.iter())
+        .all(|(segment, &expected_len)| segment.len() == expected_len && segment.chars().all(|c| c.is_ascii_hexdigit()));
+    if !is_uuid_suffix {
+        return None;
+    }
+    let name = segments[UUID_GROUP_LENGTHS.len()..].iter().rev().cloned().collect::<Vec<_>>().join("-");
+    (!name.is_empty()).then_some(name)
+}
+
+#[cfg(test)]
+mod name_derivation_tests {
+    use super::derive_name_from_local_id;
+
+    #[test]
+    fn strips_a_standard_uuid_suffix_leaving_a_hyphenated_name_intact() {
+        assert_eq!(derive_name_from_local_id("job-hunter-D7CF44F0-0375-4567-9A3D-AEE5B1881FB8"), Some("job-hunter".to_string()));
+    }
+
+    #[test]
+    fn returns_none_for_a_plain_hex_id_with_no_uuid_shape() {
+        assert_eq!(derive_name_from_local_id("d2ffb69148be99c3773c780c3516b58e"), None);
+    }
+
+    #[test]
+    fn returns_none_when_the_suffix_isnt_actually_uuid_shaped() {
+        assert_eq!(derive_name_from_local_id("my-repo-not-a-uuid"), None);
     }
 }
 

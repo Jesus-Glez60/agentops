@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { GitBranch, Lock } from "lucide-react";
-import { attachGithubAppRemote, connectFromInstallation, getInstallationRepos, getRepos, GITHUB_APP_INSTALLATIONS_SWR_KEY, REPOS_SWR_KEY, type InstallationRepo } from "@/lib/api/repos-api";
+import { attachGithubAppRemote, connectFromInstallation, deleteRepo, getInstallationRepos, getRepos, GITHUB_APP_INSTALLATIONS_SWR_KEY, REPOS_SWR_KEY, type InstallationRepo, type SuggestedMerge } from "@/lib/api/repos-api";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 
@@ -79,6 +79,40 @@ export function InstallationRepoPicker({ installationId, upgradeConnectionId }: 
     });
   }
 
+  /**
+   * One name-matched stale local-only stub -> a one-click-confirm merge
+   * toast (attach the new repo's remote onto the *stale* connection, then
+   * delete the just-created duplicate, so the stale id -- and everything
+   * already recorded under it -- is what survives). More than one match is
+   * genuinely ambiguous (see `find_discovered_local_only_connections_by_name`'s
+   * doc comment) -- surfaced as a plain info toast instead, no one-click
+   * action, so this never guesses which stub is the right one.
+   */
+  function promptMergeStaleStub(newConnectionId: string, repoUrl: string, matches: SuggestedMerge[]) {
+    if (matches.length > 1) {
+      toast.info(`Found ${matches.length} local-only connections that might be this same repo (${matches.map((m) => m.stale_connection_name ?? m.stale_connection_id).join(", ")}) -- review and remove the stale one(s) manually from the repositories list.`);
+      return;
+    }
+    const [match] = matches;
+    const fullName = repoFullNameFromUrl(repoUrl);
+    toast(`"${match.stale_connection_name ?? match.stale_connection_id}" looks like this repo, registered locally before it had a GitHub remote.`, {
+      duration: 15000,
+      action: {
+        label: "Merge",
+        onClick: async () => {
+          try {
+            await attachGithubAppRemote(match.stale_connection_id, installationId, fullName);
+            await deleteRepo(newConnectionId);
+            toast.success("Merged — the local-only registration now has this GitHub connection.");
+            mutate(REPOS_SWR_KEY);
+          } catch (err) {
+            toast.error(err instanceof Error ? err.message : "Couldn't merge automatically — remove the stale connection manually instead.");
+          }
+        },
+      },
+    });
+  }
+
   async function handleConnect() {
     if (selected.size === 0) return;
     setConnecting(true);
@@ -97,6 +131,15 @@ export function InstallationRepoPicker({ installationId, upgradeConnectionId }: 
       }
       const res = await connectFromInstallation(installationId, Array.from(selected));
       toast.success(res.connections.length === 1 ? "Repository connected — indexing started." : `${res.connections.length} repositories connected — indexing started.`);
+      // Never silently attach to a name-matched stale local-only stub (see
+      // `connect_from_installation`'s doc comment -- two differently-owned
+      // repos can share a short name) -- surface it as a one-click-confirm
+      // merge toast instead, so the duplicate doesn't just linger unseen.
+      for (const entry of res.connections) {
+        if (entry.suggested_merge?.length) {
+          promptMergeStaleStub(entry.connection.id, entry.connection.repo_url, entry.suggested_merge);
+        }
+      }
       mutate(GITHUB_APP_INSTALLATIONS_SWR_KEY);
       mutate(REPOS_SWR_KEY);
       const first = res.connections[0];

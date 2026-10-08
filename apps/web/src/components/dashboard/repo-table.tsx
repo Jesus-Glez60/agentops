@@ -5,7 +5,7 @@ import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { ExternalLink, RefreshCw } from "lucide-react";
 import Link from "next/link";
-import { getRepos, startIndexing, REPOS_SWR_KEY, parseRepoStatus, type RepoConnection } from "@/lib/api/repos-api";
+import { deleteRepo, getRepos, startIndexing, REPOS_SWR_KEY, parseRepoStatus, type RepoConnection } from "@/lib/api/repos-api";
 import { repoHealthWithReason } from "@/lib/repo-health";
 import { HealthBadge } from "@/components/dashboard/health-badge";
 import { NodeCountBar } from "@/components/dashboard/node-count-bar";
@@ -32,6 +32,28 @@ export function RepoTable() {
   // it's always the implicit default cache.
   const { mutate } = useSWRConfig();
   const [reindexingIds, setReindexingIds] = useState<Set<string>>(new Set());
+  const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
+
+  // Backstop for a `discovered`/local-only stub the connect flow's
+  // auto-suggested-merge toast didn't catch -- see
+  // `repositories-table.tsx`'s identical handler for why this only applies
+  // to `discovered` rows.
+  async function handleRemove(repo: RepoConnection) {
+    if (!window.confirm(`Remove "${repo.repo_url}"? This only removes the connection -- it doesn't wipe any already-recorded graph/notes/doc data.`)) return;
+    setRemovingIds((prev) => new Set(prev).add(repo.id));
+    try {
+      await deleteRepo(repo.id);
+      await mutate(REPOS_SWR_KEY);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't remove this connection. Please try again.");
+    } finally {
+      setRemovingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(repo.id);
+        return next;
+      });
+    }
+  }
 
   // Fires a background reindex job (async, polled elsewhere) -- unlike the
   // retired manifest-based `rescanRepo`, this is not a synchronous
@@ -98,9 +120,19 @@ export function RepoTable() {
 
               <div className="flex shrink-0 items-center gap-1.5">
                 {discovered ? (
-                  <Button asChild className="h-auto rounded-full border-border-strong px-3.5 py-[7px] text-[13px] font-semibold" variant="outline">
-                    <Link href={`/repositories/connect/ssh?repo_url=${encodeURIComponent(repo.repo_url)}`}>Finish connecting</Link>
-                  </Button>
+                  <>
+                    <Button asChild className="h-auto rounded-full border-border-strong px-3.5 py-[7px] text-[13px] font-semibold" variant="outline">
+                      <Link href={`/repositories/connect/ssh?repo_url=${encodeURIComponent(repo.repo_url)}`}>Finish connecting</Link>
+                    </Button>
+                    <Button
+                      variant="outline"
+                      disabled={removingIds.has(repo.id)}
+                      onClick={() => handleRemove(repo)}
+                      className="h-auto rounded-full border-border-strong px-3.5 py-[7px] text-[13px] font-semibold"
+                    >
+                      {removingIds.has(repo.id) ? "Removing…" : "Remove"}
+                    </Button>
+                  </>
                 ) : (
                   <Tooltip>
                     <TooltipTrigger asChild>

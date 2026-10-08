@@ -82,12 +82,11 @@ export function deleteRepo(id: string): Promise<void> {
 export interface AttachRemoteResponse {
   connection: RepoConnection;
   instructions?: string;
-  /** Only present on the GitHub App variant -- always `false` today. An
-   * upgraded connection keeps its original id, but the GitHub webhook push
-   * handler derives the id it looks up from the repo's owner/name, which
-   * won't match -- so a push never auto-triggers a reindex for an upgraded
-   * connection. Surface `webhook_autoreindex_reason` persistently (not a
-   * one-time toast) wherever this response lands. */
+  /** Only present on the GitHub App variant -- `true` today. An upgraded
+   * connection keeps its original id, which doesn't match what the GitHub
+   * webhook push handler's primary lookup derives from the repo's
+   * owner/name, but the handler falls back to a repo_url-based lookup for
+   * exactly that case, so pushes still auto-trigger a reindex. */
   webhook_autoreindex?: boolean;
   webhook_autoreindex_reason?: string;
 }
@@ -133,8 +132,20 @@ export function getInstallationRepos(installationId: string): Promise<{ reposito
   return heavyFetch(`/repos/github-app/installations/${encodeURIComponent(installationId)}/repos`);
 }
 
+/** A `discovered`/local-only connection whose stored short name matches the
+ * repo just connected -- very likely the same repo, registered locally
+ * before this remote existed, but never silently merged (see
+ * `connect_from_installation`'s doc comment): a human must confirm via
+ * `attachGithubAppRemote` against `stale_connection_id`, then `deleteRepo`
+ * the newly-created duplicate, since two differently-owned GitHub repos can
+ * share a short name. */
+export interface SuggestedMerge {
+  stale_connection_id: string;
+  stale_connection_name: string | null;
+}
+
 export interface ConnectFromInstallationResponse {
-  connections: { connection: RepoConnection; job_id: string | null }[];
+  connections: { connection: RepoConnection; job_id: string | null; suggested_merge?: SuggestedMerge[] }[];
 }
 
 export function connectFromInstallation(installationId: string, repoFullNames: string[]): Promise<ConnectFromInstallationResponse> {

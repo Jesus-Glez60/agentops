@@ -1209,8 +1209,17 @@ fn git_remote_url(path: &Path) -> Option<String> {
 /// The generated id becomes the connection's id (see `register_repo`'s
 /// server-side handling of `local_id`), so the caller can use it directly
 /// as `resolve_connection_id`'s return value without a second round trip.
-fn register_local_repo(server_url: &str, api_key: &str) -> Result<String> {
+///
+/// Also passes `path`'s directory basename as `name` -- purely a hint the
+/// server stores to later recognize this same repo if it gets a real
+/// GitHub remote and gets connected through the web UI, so the two don't
+/// end up as separate, duplicate connections (see the `name`-matching
+/// support in `register_repo`/`connect_from_installation`). Best-effort
+/// only: if the basename can't be read as valid UTF-8, `name` is simply
+/// omitted rather than failing registration over it.
+fn register_local_repo(path: &Path, server_url: &str, api_key: &str) -> Result<String> {
     let local_id = agentops_repo_access::store::new_local_repo_id();
+    let name = path.file_name().and_then(|n| n.to_str());
     let mut response = ureq::post(format!("{server_url}/mcp"))
         .header("Authorization", &format!("Bearer {api_key}"))
         .config()
@@ -1220,7 +1229,7 @@ fn register_local_repo(server_url: &str, api_key: &str) -> Result<String> {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "tools/call",
-            "params": { "name": "register_repo", "arguments": { "local_id": local_id } },
+            "params": { "name": "register_repo", "arguments": { "local_id": local_id, "name": name } },
         }))
         .context("calling POST /mcp to register this local repo")?;
     let status = response.status();
@@ -1305,7 +1314,7 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
     // no need to send the caller to the web app or bail under --yes either.
     if git_remote.is_none() {
         if yes || dialoguer::Confirm::new().with_prompt("This checkout has no git remote — register it as a local-only repo for your account? (it won't be cloned or indexed server-side; your own CLI's scans/notes will still attach to it)").default(true).interact()? {
-            return register_local_repo(server_url, api_key);
+            return register_local_repo(path, server_url, api_key);
         }
         anyhow::bail!("this checkout has no git remote and wasn't registered — run again to register it, or point at a different local path");
     }
