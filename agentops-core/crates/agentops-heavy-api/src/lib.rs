@@ -2003,6 +2003,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_from_installation_surfaces_every_match_when_multiple_stale_stubs_share_a_name() {
+        let (store, secrets) = test_state();
+        store.create_discovered_connection("acme", "job-hunter-uuid1", "local:job-hunter-uuid1", Some("job-hunter")).unwrap();
+        store.create_discovered_connection("acme", "job-hunter-uuid2", "local:job-hunter-uuid2", Some("job-hunter")).unwrap();
+        let indexing = test_indexing_store();
+        indexing.create_installation("acme", "install-123", "acme-corp", Some("Organization")).unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), None, None, indexing, std::env::temp_dir(), None);
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/repos/github-app/installations/install-123/connect")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"tenant": "acme", "repo_full_names": ["acme-corp/job-hunter"]}).to_string()))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        let entry = &body["connections"][0];
+        assert_eq!(entry["connection"]["id"], "acme-corp--job-hunter");
+        let suggested = entry["suggested_merge"].as_array().expect("ambiguous name matches must still be surfaced, not silently dropped");
+        assert_eq!(suggested.len(), 2, "both stale stubs must be listed -- the endpoint must never guess which one is right: {suggested:?}");
+        let stale_ids: std::collections::HashSet<&str> = suggested.iter().map(|m| m["stale_connection_id"].as_str().unwrap()).collect();
+        assert_eq!(stale_ids, std::collections::HashSet::from(["job-hunter-uuid1", "job-hunter-uuid2"]));
+    }
+
+    #[tokio::test]
     async fn connect_from_installation_omits_suggested_merge_when_no_name_matches() {
         let (store, secrets) = test_state();
         let indexing = test_indexing_store();

@@ -280,7 +280,11 @@ pub fn detect_cache_unsafe(text: &str) -> Vec<CacheHazard> {
     hazards
 }
 
-fn is_uuid_shaped(token: &str) -> bool {
+/// Standard 8-4-4-4-12 hex-digit UUID shape -- `pub` so other crates (e.g.
+/// `agentops-heavy-api::tenant_repo`'s `derive_name_from_local_id`, which
+/// needs the identical check to strip a UUID suffix off a `local_id`) can
+/// reuse this instead of reimplementing the same validation.
+pub fn is_uuid_shaped(token: &str) -> bool {
     let parts: Vec<&str> = token.split('-').collect();
     parts.len() == 5 && [8, 4, 4, 4, 12].iter().zip(&parts).all(|(&len, part)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
 }

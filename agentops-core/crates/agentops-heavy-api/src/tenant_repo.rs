@@ -203,27 +203,24 @@ pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&st
 /// `name`: agents already follow a `<name>-<uuid>` convention for `local_id`
 /// (see `register_repo`'s own doc comment, e.g. `job-hunter-D7CF44F0-0375-
 /// 4567-9A3D-AEE5B1881FB8`), so strip a trailing standard 8-4-4-4-12 hex
-/// UUID if present -- a plain `rsplit_once('-')` would only strip the last
-/// dash-separated segment and leave most of the UUID in the "name". Returns
-/// `None` (not the full `local_id`) when no such suffix is found, rather
-/// than guessing a name that's actually just an opaque id (e.g. the CLI's
-/// plain-hex `local_id`s) -- a wrong name would cause confusing/incorrect
-/// merge suggestions later, so "no name" is safer than "wrong name."
+/// UUID if present, reusing `agentops_mcp::budget::is_uuid_shaped` (the same
+/// check `detect_cache_unsafe` uses) rather than reimplementing UUID-shape
+/// validation here. Returns `None` (not the full `local_id`) when no such
+/// suffix is found, rather than guessing a name that's actually just an
+/// opaque id (e.g. the CLI's plain-hex `local_id`s) -- a wrong name would
+/// cause confusing/incorrect merge suggestions later, so "no name" is safer
+/// than "wrong name."
 fn derive_name_from_local_id(local_id: &str) -> Option<String> {
-    const UUID_GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
-    let segments: Vec<&str> = local_id.rsplitn(UUID_GROUP_LENGTHS.len() + 1, '-').collect();
-    if segments.len() <= UUID_GROUP_LENGTHS.len() {
+    const UUID_GROUP_COUNT: usize = 5;
+    let segments: Vec<&str> = local_id.split('-').collect();
+    if segments.len() <= UUID_GROUP_COUNT {
         return None;
     }
-    let is_uuid_suffix = segments[..UUID_GROUP_LENGTHS.len()]
-        .iter()
-        .rev()
-        .zip(UUID_GROUP_LENGTHS.iter())
-        .all(|(segment, &expected_len)| segment.len() == expected_len && segment.chars().all(|c| c.is_ascii_hexdigit()));
-    if !is_uuid_suffix {
+    let split_at = segments.len() - UUID_GROUP_COUNT;
+    if !agentops_mcp::budget::is_uuid_shaped(&segments[split_at..].join("-")) {
         return None;
     }
-    let name = segments[UUID_GROUP_LENGTHS.len()..].iter().rev().cloned().collect::<Vec<_>>().join("-");
+    let name = segments[..split_at].join("-");
     (!name.is_empty()).then_some(name)
 }
 

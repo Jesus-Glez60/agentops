@@ -100,14 +100,26 @@ export function InstallationRepoPicker({ installationId, upgradeConnectionId }: 
       action: {
         label: "Merge",
         onClick: async () => {
+          // Two independent calls, not one atomic backend operation --
+          // attach can succeed while the cleanup delete fails (network
+          // blip, etc). That leaves the stale connection correctly
+          // upgraded AND the just-created duplicate still around, which is
+          // exactly the bug this whole feature exists to avoid recreating.
+          // Distinguish the two failure points so the message tells the
+          // user their actual state, not a generic "nothing happened".
           try {
             await attachGithubAppRemote(match.stale_connection_id, installationId, fullName);
-            await deleteRepo(newConnectionId);
-            toast.success("Merged — the local-only registration now has this GitHub connection.");
-            mutate(REPOS_SWR_KEY);
           } catch (err) {
             toast.error(err instanceof Error ? err.message : "Couldn't merge automatically — remove the stale connection manually instead.");
+            return;
           }
+          try {
+            await deleteRepo(newConnectionId);
+            toast.success("Merged — the local-only registration now has this GitHub connection.");
+          } catch {
+            toast.error(`Merged, but couldn't remove the now-duplicate connection automatically — use "Remove" on it from the repositories list.`, { duration: 15000 });
+          }
+          mutate(REPOS_SWR_KEY);
         },
       },
     });
@@ -121,9 +133,6 @@ export function InstallationRepoPicker({ installationId, upgradeConnectionId }: 
         const fullName = Array.from(selected)[0];
         const res = await attachGithubAppRemote(upgradeConnectionId, installationId, fullName);
         toast.success("Repository connected.");
-        if (res.webhook_autoreindex === false && res.webhook_autoreindex_reason) {
-          toast.info(res.webhook_autoreindex_reason);
-        }
         mutate(GITHUB_APP_INSTALLATIONS_SWR_KEY);
         mutate(REPOS_SWR_KEY);
         router.push(`/repositories/${encodeURIComponent(res.connection.id)}`);

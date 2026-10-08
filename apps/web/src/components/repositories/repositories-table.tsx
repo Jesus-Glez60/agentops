@@ -5,7 +5,8 @@ import Link from "next/link";
 import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { GitBranch, RefreshCw } from "lucide-react";
-import { deleteRepo, getRepos, verifyRepo, parseRepoStatus, REPOS_SWR_KEY, type RepoConnection } from "@/lib/api/repos-api";
+import { getRepos, verifyRepo, parseRepoStatus, REPOS_SWR_KEY, type RepoConnection } from "@/lib/api/repos-api";
+import { useRemoveRepo } from "@/hooks/use-remove-repo";
 import { relativeTimeFromIsoString } from "@/lib/relative-time";
 import { RepoStatusBadge } from "@/components/repositories/repo-status-badge";
 import { ViewDeployKeyDialog } from "@/components/repositories/view-deploy-key-dialog";
@@ -18,31 +19,8 @@ export function RepositoriesTable() {
   const { data, isLoading } = useSWR(REPOS_SWR_KEY, getRepos);
   const { mutate } = useSWRConfig();
   const [verifyingIds, setVerifyingIds] = useState<Set<string>>(new Set());
-  const [removingIds, setRemovingIds] = useState<Set<string>>(new Set());
   const [keyDialogRepo, setKeyDialogRepo] = useState<RepoConnection | null>(null);
-
-  // Backstop for a `discovered`/local-only stub the auto-suggested-merge
-  // flow (see `installation-repo-picker.tsx`) didn't catch -- e.g. it was
-  // registered under a name that doesn't match any repo being connected, or
-  // the suggestion was dismissed. Only offered for `discovered` rows (never
-  // an active Ssh/GitHubApp connection) -- consistent with "Finish
-  // connecting" only showing there too.
-  async function handleRemove(repo: RepoConnection) {
-    if (!window.confirm(`Remove "${repo.repo_url}"? This only removes the connection -- it doesn't wipe any already-recorded graph/notes/doc data.`)) return;
-    setRemovingIds((prev) => new Set(prev).add(repo.id));
-    try {
-      await deleteRepo(repo.id);
-      await mutate(REPOS_SWR_KEY);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Couldn't remove this connection. Please try again.");
-    } finally {
-      setRemovingIds((prev) => {
-        const next = new Set(prev);
-        next.delete(repo.id);
-        return next;
-      });
-    }
-  }
+  const { removeRepo, removingIds } = useRemoveRepo();
 
   async function handleVerify(repo: RepoConnection) {
     setVerifyingIds((prev) => new Set(prev).add(repo.id));
@@ -118,7 +96,7 @@ export function RepositoriesTable() {
                         <Button variant="outline" size="sm" asChild>
                           <Link href={`/repositories/connect/ssh?repo_url=${encodeURIComponent(repo.repo_url)}`}>Finish connecting</Link>
                         </Button>
-                        <Button variant="outline" size="sm" onClick={() => handleRemove(repo)} disabled={removing}>
+                        <Button variant="outline" size="sm" onClick={() => removeRepo(repo)} disabled={removing}>
                           {removing ? "Removing…" : "Remove"}
                         </Button>
                       </>
