@@ -400,6 +400,9 @@ pub(crate) struct UsageSyncEntry {
     cache_read_tokens: i64,
     cache_write_tokens: i64,
     cost_estimate_usd: f64,
+    /// Absent from CLIs older than this field -- defaults to 0 ("unknown").
+    #[serde(default)]
+    peak_context_tokens: i64,
     session_started_at: String,
     session_ended_at: String,
 }
@@ -442,6 +445,7 @@ pub(crate) async fn usage_sync_json(State(state): State<AppState>, user: Option<
                 cache_read_tokens: entry.cache_read_tokens,
                 cache_write_tokens: entry.cache_write_tokens,
                 cost_estimate_usd: entry.cost_estimate_usd,
+                peak_context_tokens: entry.peak_context_tokens,
                 session_started_at: entry.session_started_at.clone(),
                 session_ended_at: entry.session_ended_at.clone(),
             })?;

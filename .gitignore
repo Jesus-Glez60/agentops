@@ -12,6 +12,9 @@ apps/web/.env*.local
 # Scan output — a structured map of a repo's internals should never be committed
 # by default (see SECURITY.md / plan §Security "Generated-output hygiene")
 .context/
+# `agentops librarian export-labels` output: full gotcha bodies + hand labels
+# pulled from the remote server -- private project knowledge, never commit.
+librarian-eval/
 *.context.db
 
 # Local dev SQLite stores (accounts, repo connections, etc.) — created

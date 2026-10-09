@@ -606,6 +606,14 @@ pub struct SessionEvent {
 /// `session_id` to an MCP tool call (`SessionEvent::session_id`) — see
 /// `agentops-api::usage`'s heuristic join for why those two can't be
 /// assumed equal.
+/// Suffix on `session_id` marking a row as one session's *subagent* usage
+/// (Claude Code's `<session>/subagents/agent-*.jsonl`), aggregated
+/// separately from the parent's own row so the main/subagent split stays
+/// visible. A suffix rather than a separate column because subagents often
+/// run on the same model as their parent, and `(repo, session_id, model)`
+/// is the table's unique key.
+pub const SUBAGENT_SESSION_SUFFIX: &str = "#subagents";
+
 #[derive(Debug, Clone)]
 pub struct NewSessionUsage {
     pub repo: String,
@@ -616,6 +624,10 @@ pub struct NewSessionUsage {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub cost_estimate_usd: f64,
+    /// Largest single-request context (input + cache read + cache write)
+    /// seen in this bucket — how big the conversation got, as opposed to
+    /// the cumulative totals above. Never add it to them.
+    pub peak_context_tokens: i64,
     pub session_started_at: String,
     pub session_ended_at: String,
 }
@@ -631,8 +643,46 @@ pub struct SessionUsage {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub cost_estimate_usd: f64,
+    pub peak_context_tokens: i64,
     pub session_started_at: String,
     pub session_ended_at: String,
+    pub recorded_at: String,
+}
+
+/// One AgentOps-initiated LLM API call — the server's *own* model spend
+/// (`explain_symbol`, note classification, docgen module grouping, ...),
+/// as opposed to `SessionUsage`'s coding-agent session totals. Append-only,
+/// one row per call, failures included (`success: false`, zero tokens), so
+/// a 429-heavy provider shows up as such rather than looking free.
+/// `cost_estimate_usd` is `None` whenever the model has no known rate
+/// (free tiers, unrecognized ids) — never a guessed default.
+#[derive(Debug, Clone)]
+pub struct NewLlmUsage {
+    pub repo: String,
+    pub operation: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_estimate_usd: Option<f64>,
+    pub latency_ms: i64,
+    pub success: bool,
+    pub error_kind: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct LlmUsage {
+    pub id: i64,
+    pub repo: String,
+    pub operation: String,
+    pub provider: String,
+    pub model: String,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cost_estimate_usd: Option<f64>,
+    pub latency_ms: i64,
+    pub success: bool,
+    pub error_kind: Option<String>,
     pub recorded_at: String,
 }
 
@@ -821,6 +871,12 @@ pub trait GraphStore {
     /// the raw material `agentops-api::usage`'s heuristic join aggregates
     /// against `session_events`' `"hit"`-kind rows.
     fn session_usage_for_repo(&self, repo: &str) -> Result<Vec<SessionUsage>>;
+
+    /// Appends one `NewLlmUsage` row — plain insert, never an upsert (each
+    /// call is its own row, unlike `upsert_session_usage`'s running total).
+    fn record_llm_usage(&self, usage: NewLlmUsage) -> Result<i64>;
+    /// Every `LlmUsage` row for `repo`, oldest first.
+    fn llm_usage_for_repo(&self, repo: &str) -> Result<Vec<LlmUsage>>;
 
     /// Creates a native task. For a Linear-sourced task, prefer
     /// `upsert_external_task` instead, which is idempotent on

@@ -305,3 +305,25 @@ CREATE TABLE IF NOT EXISTS session_usage (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_usage_unique ON session_usage(repo, session_id, model);
 CREATE INDEX IF NOT EXISTS idx_session_usage_repo_time ON session_usage(repo, session_started_at);
+-- Peak single-request context size for the bucket (see NewSessionUsage).
+ALTER TABLE session_usage ADD COLUMN IF NOT EXISTS peak_context_tokens BIGINT NOT NULL DEFAULT 0;
+
+-- AgentOps' own LLM spend ledger (agentops_graph::NewLlmUsage): one row per
+-- call, failures included -- deliberately no unique index (a unique key on
+-- operation/provider/model would reject every repeat call). Structural
+-- mirror of SqliteGraphStore's llm_usage migration step.
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                  BIGSERIAL PRIMARY KEY,
+    repo                TEXT NOT NULL,
+    operation           TEXT NOT NULL,
+    provider            TEXT NOT NULL,
+    model               TEXT NOT NULL,
+    input_tokens        BIGINT NOT NULL DEFAULT 0,
+    output_tokens       BIGINT NOT NULL DEFAULT 0,
+    cost_estimate_usd   DOUBLE PRECISION,
+    latency_ms          BIGINT NOT NULL DEFAULT 0,
+    success             BOOLEAN NOT NULL,
+    error_kind          TEXT,
+    recorded_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_llm_usage_repo_time ON llm_usage(repo, recorded_at);

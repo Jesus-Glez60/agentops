@@ -1103,8 +1103,12 @@ fn tool_related_context(args: &Value) -> anyhow::Result<String> {
 fn tool_explain_symbol(args: &Value) -> anyhow::Result<String> {
     let (store, repo) = repo_context(args)?;
     let symbol_id = args.get("symbol_id").and_then(|v| v.as_i64()).ok_or_else(|| anyhow::anyhow!("missing required 'symbol_id'"))?;
-    let config = agentops_llm::AnthropicConfig::from_env()?;
-    let definition_id = agentops_llm::explain_symbol(store.as_ref(), &config, &repo, symbol_id)?;
+    let recorder = agentops_llm::UsageRecorder::default();
+    let config = agentops_llm::AnthropicConfig::from_env()?.with_usage_sink(recorder.clone());
+    let explained = agentops_llm::explain_symbol(store.as_ref(), &config, &repo, symbol_id);
+    // Persisted before `?` so a failed call's spend is recorded too.
+    recorder.persist(store.as_ref(), &repo);
+    let definition_id = explained?;
     let definition = store.get_node(&repo, definition_id)?.ok_or_else(|| anyhow::anyhow!("definition node not found after creation"))?;
     if let Some(session_id) = get_str(args, "session_id") {
         store.record_session_event(&repo, session_id, "explain_symbol", &format!("explained symbol {symbol_id}"), None, "activity")?;

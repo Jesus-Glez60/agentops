@@ -10,6 +10,7 @@
 
 mod hook_capture;
 mod compress_output;
+mod librarian;
 mod usage;
 
 use std::path::{Path, PathBuf};
@@ -228,6 +229,13 @@ enum Command {
     Usage {
         #[command(subcommand)]
         action: UsageAction,
+    },
+    /// Evaluates whether a cheap model can reliably catalogue this repo's
+    /// gotchas as portable vs project-specific. Local-only: reads from the
+    /// remote server, never writes back to it.
+    Librarian {
+        #[command(subcommand)]
+        action: LibrarianAction,
     },
     /// Interactive first-run setup wizard for a classic (non-Docker,
     /// non-PM2) terminal deployment — collects the same config a Docker
@@ -468,6 +476,47 @@ enum UsageAction {
     },
 }
 
+#[derive(Subcommand)]
+enum LibrarianAction {
+    /// Fetches every gotcha from this repo's remote AgentOps server
+    /// (`.context/agentops-remote.json`) into `<out>/notes.json`, and writes
+    /// `<out>/labels.csv` with blank `scope`/`technology` columns for you to
+    /// fill in. Never overwrites an existing labels.csv.
+    ExportLabels {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long, default_value = "librarian-eval")]
+        out: PathBuf,
+    },
+    /// Classifies every labeled note with each model in `--models` and
+    /// writes `<out>/report.md` + `report.json`. Each model must classify
+    /// its first 5 notes cleanly (parseable verdict, real usage tokens) or
+    /// it's gated out of the rest of the run.
+    DryRun {
+        /// TOML file of `[[model]]` entries: name, provider, model,
+        /// api_key_env, and for non-anthropic providers base_url + json_mode
+        /// (json_schema_strict | json_schema | json_object | guided_json).
+        #[arg(long)]
+        models: PathBuf,
+        /// Directory holding notes.json + labels.csv from `export-labels`.
+        #[arg(long, default_value = "librarian-eval")]
+        labels: PathBuf,
+        #[arg(long, default_value = "librarian-eval")]
+        out: PathBuf,
+        /// Classify only the first N labeled notes (cheap trial runs).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Pass/fail thresholds for the report's decision section, e.g.
+        /// --min-accuracy 0.85 --max-cost 0.001 --max-429-rate 0.05.
+        #[arg(long)]
+        min_accuracy: Option<f64>,
+        #[arg(long)]
+        max_cost: Option<f64>,
+        #[arg(long = "max-429-rate")]
+        max_rate_limited_rate: Option<f64>,
+    },
+}
+
 #[derive(Clone, Copy, ValueEnum, Debug)]
 enum TaskStatusArg {
     Todo,
@@ -606,6 +655,20 @@ fn main() -> Result<()> {
         Command::Usage { action } => match action {
             UsageAction::Sync { path, claude_home, remote } => usage_sync_command(&path, claude_home.as_deref(), remote.as_deref()),
         },
+        Command::Librarian { action } => match action {
+            LibrarianAction::ExportLabels { path, out } => {
+                let marker = read_remote_marker(&path).context("no .context/agentops-remote.json here -- export-labels reads gotchas from this repo's remote AgentOps server; run `agentops connect --remote` first")?;
+                let count = librarian::export_labels(&marker.server_url, &marker.connection_id, &marker.api_key, &out)?;
+                println!("Exported {count} gotcha(s) to {}. Fill in the scope (portable / project_specific) and technology columns of labels.csv, then run `agentops librarian dry-run`.", out.display());
+                Ok(())
+            }
+            LibrarianAction::DryRun { models, labels, out, limit, min_accuracy, max_cost, max_rate_limited_rate } => {
+                let thresholds = librarian::Thresholds { min_accuracy, max_cost_usd: max_cost, max_rate_limited_rate };
+                let report = librarian::dry_run(&models, &labels, &out, limit, &thresholds)?;
+                println!("Report written to {}", report.display());
+                Ok(())
+            }
+        },
         Command::Init { yes, path } => init(yes, &path),
         Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands } => {
             if global {
@@ -707,6 +770,42 @@ fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result
     // rows locally), not part of the core knowledge this migration exists
     // to preserve.
     println!("session_events: skipped (no bulk-read accessor on GraphStore; see comment)");
+
+    // --- session_usage + llm_usage (no node references -- straight copies) ---
+    // Must be copied, not skipped: `wipe_repo` deletes both on the
+    // destination, so with --wipe-target a skip would lose them outright.
+    let session_usage = src.session_usage_for_repo(repo)?;
+    for u in &session_usage {
+        dst.upsert_session_usage(agentops_graph::NewSessionUsage {
+            repo: repo.to_string(),
+            session_id: u.session_id.clone(),
+            model: u.model.clone(),
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cache_read_tokens: u.cache_read_tokens,
+            cache_write_tokens: u.cache_write_tokens,
+            cost_estimate_usd: u.cost_estimate_usd,
+            peak_context_tokens: u.peak_context_tokens,
+            session_started_at: u.session_started_at.clone(),
+            session_ended_at: u.session_ended_at.clone(),
+        })?;
+    }
+    let llm_usage = src.llm_usage_for_repo(repo)?;
+    for u in &llm_usage {
+        dst.record_llm_usage(agentops_graph::NewLlmUsage {
+            repo: repo.to_string(),
+            operation: u.operation.clone(),
+            provider: u.provider.clone(),
+            model: u.model.clone(),
+            input_tokens: u.input_tokens,
+            output_tokens: u.output_tokens,
+            cost_estimate_usd: u.cost_estimate_usd,
+            latency_ms: u.latency_ms,
+            success: u.success,
+            error_kind: u.error_kind.clone(),
+        })?;
+    }
+    println!("session_usage: {} copied, llm_usage: {} copied", session_usage.len(), llm_usage.len());
 
     // --- tasks + task_links ---
     let tasks = src.list_tasks(repo)?;
@@ -2061,8 +2160,11 @@ fn task_summarize(path: &Path, id: i64) -> Result<()> {
     // Linear/stdout for a human to read directly. Revised after a wrap-skill
     // council audit flagged the original cheap-tier choice as mis-scoped
     // (2026-09-28).
-    let config = agentops_llm::AnthropicConfig::from_env()?;
-    let summaries = agentops_llm::summarize_task_activity(&config, &task.title, &events)?;
+    let recorder = agentops_llm::UsageRecorder::default();
+    let config = agentops_llm::AnthropicConfig::from_env()?.with_usage_sink(recorder.clone());
+    let summarized = agentops_llm::summarize_task_activity(&config, &task.title, &events);
+    recorder.persist(store.as_ref(), &repo);
+    let summaries = summarized?;
 
     println!("Technical:\n{}\n", summaries.technical);
     println!("Non-technical:\n{}\n", summaries.non_technical);
@@ -2129,7 +2231,8 @@ fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classi
     // Cheap tier: both the classifier and matcher here are automated,
     // best-effort adapters (ambiguous-case fallback and candidate re-ranking),
     // not the opt-in/interactive `explain_symbol` path.
-    let llm_config = if llm_classify || llm_match { Some(agentops_llm::AnthropicConfig::from_env_cheap()?) } else { None };
+    let recorder = agentops_llm::UsageRecorder::default();
+    let llm_config = if llm_classify || llm_match { Some(agentops_llm::AnthropicConfig::from_env_cheap()?.with_usage_sink(recorder.clone())) } else { None };
 
     let heuristic_classifier = agentops_notes::HeuristicClassifier;
     let llm_classifier = llm_config.as_ref().map(|config| agentops_llm::LlmAssistedClassifier { config });
@@ -2154,11 +2257,19 @@ fn ingest_notes(path: &Path, notes_dir: Option<&Path>, dry_run: bool, llm_classi
             let names: Vec<String> = matched_ids.iter().filter_map(|&id| store.get_node(&repo, id).ok().flatten().and_then(|n| n.name)).collect();
             println!("[{:?}] {} -> {}", note.note_type, note.title, if names.is_empty() { "(no match)".to_string() } else { names.join(", ") });
         }
+        // Real API calls were still made (and paid for) in a dry run --
+        // only the notes themselves aren't written.
+        recorder.persist(store.as_ref(), &repo);
         println!("\n(dry run — nothing written; drop --dry-run to ingest for real)");
         return Ok(());
     }
 
-    let summary = agentops_mcp::ingest_notes_dir(path, notes_dir, classifier, matcher, with_embeddings)?;
+    let ingested = agentops_mcp::ingest_notes_dir(path, notes_dir, classifier, matcher, with_embeddings);
+    if !recorder.records().is_empty() {
+        let (store, repo) = open_store(path)?;
+        recorder.persist(store.as_ref(), &repo);
+    }
+    let summary = ingested?;
     println!("Ingested {} of {} note(s) from {}, wrote {} edge(s), reinforced {}.", summary.notes_written, summary.notes_seen, resolved_notes_dir.display(), summary.edges_written, summary.edges_reinforced);
     Ok(())
 }
@@ -2199,8 +2310,11 @@ fn search(path: &Path, top_k: usize, kind: Option<SearchKindArg>, hybrid: bool, 
 fn explain(path: &Path, symbol: &str, file: Option<&Path>) -> Result<()> {
     let (store, repo) = open_store(path)?;
     let symbol_id = agentops_llm::find_symbol_by_name(store.as_ref(), &repo, symbol, file)?;
-    let config = agentops_llm::AnthropicConfig::from_env()?;
-    let definition_id = agentops_llm::explain_symbol(store.as_ref(), &config, &repo, symbol_id)?;
+    let recorder = agentops_llm::UsageRecorder::default();
+    let config = agentops_llm::AnthropicConfig::from_env()?.with_usage_sink(recorder.clone());
+    let explained = agentops_llm::explain_symbol(store.as_ref(), &config, &repo, symbol_id);
+    recorder.persist(store.as_ref(), &repo);
+    let definition_id = explained?;
     let definition = store.get_node(&repo, definition_id)?.context("definition node vanished immediately after being written")?;
 
     println!("Definition #{definition_id} for {symbol} (symbol #{symbol_id}):\n");

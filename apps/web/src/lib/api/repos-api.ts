@@ -525,12 +525,48 @@ export interface UsageTotals {
 
 export interface UsageSummary {
   repo: string;
+  /** Every synced session's usage, main agent + subagents. */
   tokens: UsageTotals;
+  /** The subagent share of `tokens` -- already included there. */
+  subagent_tokens: UsageTotals;
+  /** Most recent sessions first (at most 10). */
+  sessions: SessionBreakdown[];
   /** Real, exact count of recorded knowledge-reuse "hit" events. */
   hit_count: number;
   /** Estimated only -- see this file's section doc comment. */
   estimated_tokens_saved: number;
   estimated_cost_saved_usd: number;
+  /** AgentOps' own LLM spend, one entry per (operation, provider, model). */
+  llm_spend: LlmSpend[];
+}
+
+// Mirrors `agentops_api::usage::SessionBreakdown`. `peak_context_tokens` is
+// the largest single request's context (how big the conversation got) --
+// never add it to the totals.
+export interface SessionBreakdown {
+  session_id: string;
+  started_at: string;
+  ended_at: string;
+  main_tokens: number;
+  subagent_tokens: number;
+  peak_context_tokens: number;
+  cost_usd: number;
+}
+
+// Mirrors `agentops_api::usage::LlmSpend`. `cost_estimate_usd` is null when
+// no call in the group has a known rate; `cost_partial` is true when any
+// call lacks one -- render either case as partial/unknown, never as a
+// complete dollar figure.
+export interface LlmSpend {
+  operation: string;
+  provider: string;
+  model: string;
+  calls: number;
+  failures: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_estimate_usd: number | null;
+  cost_partial: boolean;
 }
 
 export function getRepoUsage(connectionId: string): Promise<UsageSummary> {

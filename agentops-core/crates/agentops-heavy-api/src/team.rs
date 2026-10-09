@@ -30,15 +30,40 @@ struct TeamState {
     /// every other handler in this file ignores these two fields entirely.
     credentials: Arc<Mutex<CredentialStore>>,
     docbrain_db_dir: std::path::PathBuf,
+    /// `None` when the server runs without Postgres (single-file SQLite
+    /// graphs live in each checkout and go with it) -- and in this file's
+    /// own tests, which never need a database.
+    graph_wipe: Option<GraphWipe>,
+}
+
+/// What `delete_organization` needs to delete each connection's Postgres
+/// graph data (gotcha 54151: org deletion previously left every graph row
+/// behind).
+#[derive(Clone)]
+pub struct GraphWipe {
+    pub pg: agentops_mcp::PostgresGraphStore,
+    pub repo_checkouts_dir: std::path::PathBuf,
 }
 
 pub fn build_team_router(accounts: AccountStore, teams: TeamStore, repos: ConnectionStore, credentials: CredentialStore, docbrain_db_dir: std::path::PathBuf) -> Router {
+    build_team_router_with_graph_wipe(accounts, teams, repos, credentials, docbrain_db_dir, None)
+}
+
+pub fn build_team_router_with_graph_wipe(
+    accounts: AccountStore,
+    teams: TeamStore,
+    repos: ConnectionStore,
+    credentials: CredentialStore,
+    docbrain_db_dir: std::path::PathBuf,
+    graph_wipe: Option<GraphWipe>,
+) -> Router {
     let state = TeamState {
         accounts: Arc::new(Mutex::new(accounts)),
         teams: Arc::new(Mutex::new(teams)),
         repos: Arc::new(Mutex::new(repos)),
         credentials: Arc::new(Mutex::new(credentials)),
         docbrain_db_dir,
+        graph_wipe,
     };
 
     Router::new()
@@ -574,15 +599,49 @@ async fn delete_organization(
     axum::Extension(user): axum::Extension<User>,
     Json(req): Json<DeleteOrganizationRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let mut teams = state.teams.lock().unwrap();
-    if let Err(e) = teams.ensure_membership(&user.tenant, user.id) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
-    }
-    if let Err(err) = require_owner(&teams, &user.tenant, user.id) {
-        return err;
+    {
+        let teams = state.teams.lock().unwrap();
+        if let Err(e) = teams.ensure_membership(&user.tenant, user.id) {
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })));
+        }
+        if let Err(err) = require_owner(&teams, &user.tenant, user.id) {
+            return err;
+        }
     }
     if req.confirm_tenant != user.tenant {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "confirm_tenant does not match your organization" })));
+    }
+
+    // Graph data first, while the connection rows that name each repo
+    // still exist. Every std Mutex guard is released above -- holding one
+    // across this `.await` would make the handler's future !Send.
+    if let Some(GraphWipe { pg, repo_checkouts_dir }) = state.graph_wipe.clone() {
+        let connection_ids: Vec<String> = match state.repos.lock().unwrap().list_connections(&user.tenant) {
+            Ok(connections) => connections.into_iter().map(|c| c.id).collect(),
+            Err(e) => {
+                eprintln!("org deletion: failed to list repo connections for tenant {}: {e}", user.tenant);
+                Vec::new()
+            }
+        };
+        let tenant = user.tenant.clone();
+        let wiped = tokio::task::spawn_blocking(move || {
+            for id in &connection_ids {
+                if let Err(e) = crate::indexing::wipe_connection_graph(&pg, &repo_checkouts_dir, &tenant, id) {
+                    eprintln!("org deletion: failed to wipe graph data for {tenant}/{id}: {e}");
+                }
+            }
+        })
+        .await;
+        if let Err(e) = wiped {
+            eprintln!("org deletion: graph wipe task failed for tenant {}: {e}", user.tenant);
+        }
+    }
+
+    let mut teams = state.teams.lock().unwrap();
+    // Re-checked under the re-acquired lock: ownership could have been
+    // transferred while the graph wipe above was running.
+    if let Err(err) = require_owner(&teams, &user.tenant, user.id) {
+        return err;
     }
 
     if let Err(e) = state.repos.lock().unwrap().delete_all_for_tenant(&user.tenant) {
@@ -1385,6 +1444,94 @@ mod tests {
         assert_eq!(after_body["tenant"], new_tenant);
         assert_eq!(after_body["member_count"], 1, "a fresh, empty org -- the old membership data is gone");
         assert_eq!(after_body["is_owner"], true);
+    }
+
+    /// Gotcha 54151: org deletion used to leave every Postgres graph row
+    /// for the tenant's repos behind. Live against a real local Postgres;
+    /// skips (not fails) when none is reachable.
+    #[tokio::test]
+    async fn deleting_the_organization_wipes_its_repos_postgres_graph_data_and_no_other_tenants() {
+        use agentops_graph::GraphStore;
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        // connect() and the final Drop both panic on a runtime thread
+        // (gotcha 54054) -- connect off-runtime, and keep `pg_keep` alive
+        // until the end so the last drop happens off-runtime too.
+        let pg_keep = match { let url = url.clone(); tokio::task::spawn_blocking(move || agentops_mcp::PostgresGraphStore::connect(&url)).await.unwrap() } {
+            Ok(pg) => pg,
+            Err(e) => {
+                eprintln!("skipping org-deletion graph wipe test: no Postgres reachable at {url} ({e})");
+                return;
+            }
+        };
+
+        let accounts = AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup_user(&accounts, "owner@example.com");
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        let repos = ConnectionStore::open_in_memory().unwrap();
+        seed_repo(&repos, &owner.tenant, "repo-1");
+
+        // Checkout dirs don't exist in this test, so rows live under the
+        // checkout directory name (`{connection_id}--{tenant}`) -- the
+        // same name a real scan stores them under.
+        let other_tenant = format!("other-{}", owner.tenant);
+        let (own_repo, other_repo) = (format!("repo-1--{}", owner.tenant), format!("repo-1--{other_tenant}"));
+        {
+            let (pg, own_repo, other_repo) = (pg_keep.clone(), own_repo.clone(), other_repo.clone());
+            tokio::task::spawn_blocking(move || {
+                for repo in [&own_repo, &other_repo] {
+                    pg.record_llm_usage(agentops_graph::NewLlmUsage {
+                        repo: repo.clone(),
+                        operation: "explain_symbol".into(),
+                        provider: "anthropic".into(),
+                        model: "claude-sonnet-5".into(),
+                        input_tokens: 10,
+                        output_tokens: 5,
+                        cost_estimate_usd: Some(0.001),
+                        latency_ms: 100,
+                        success: true,
+                        error_kind: None,
+                    })
+                    .unwrap();
+                    pg.record_session_event(repo, "sess", "list_gotchas", "listed", None, "hit").unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        }
+
+        let checkouts = tempfile::tempdir().unwrap();
+        let graph_wipe = GraphWipe { pg: pg_keep.clone(), repo_checkouts_dir: checkouts.path().to_path_buf() };
+        let app = build_team_router_with_graph_wipe(accounts, teams, repos, CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"), Some(graph_wipe));
+        let _ = app.clone().oneshot(HttpRequest::get("/team").header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap()).await.unwrap();
+
+        let response = app
+            .oneshot(
+                HttpRequest::post("/team/delete-organization")
+                    .header("authorization", format!("Bearer {owner_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"confirm_tenant":{:?}}}"#, owner.tenant)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let (own_left, other_left) = {
+            let (pg, own_repo, other_repo) = (pg_keep.clone(), own_repo.clone(), other_repo.clone());
+            tokio::task::spawn_blocking(move || {
+                let counts = |repo: &str| (pg.llm_usage_for_repo(repo).unwrap().len(), pg.session_events_for_repo(repo, None).unwrap().len());
+                let result = (counts(&own_repo), counts(&other_repo));
+                pg.wipe_repo(&other_repo).unwrap();
+                result
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(own_left, (0, 0), "the deleted org's llm_usage and session_events must be gone");
+        assert_eq!(other_left, (1, 1), "another tenant's same-named connection must be untouched");
+
+        tokio::task::spawn_blocking(move || drop(pg_keep)).await.unwrap();
     }
 
     #[tokio::test]

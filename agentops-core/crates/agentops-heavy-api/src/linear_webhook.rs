@@ -580,7 +580,12 @@ async fn summarize_task_handler(State(state): State<Arc<LinearModuleState>>, axu
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
         };
 
-        let summaries = match agentops_llm::summarize_task_activity(&anthropic_config, &task.title, &events) {
+        let recorder = agentops_llm::UsageRecorder::default();
+        let summarized = agentops_llm::summarize_task_activity(&anthropic_config.with_usage_sink(recorder.clone()), &task.title, &events);
+        // Already off the async executor (this whole closure is
+        // spawn_blocking), so PostgresGraphStore's internal block_on is safe.
+        recorder.persist(store.as_ref(), &repo);
+        let summaries = match summarized {
             Ok(s) => s,
             Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
         };

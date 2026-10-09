@@ -45,7 +45,7 @@
 //! the real deployment's actual Postgres server core count/storage.
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, Task, TaskLink, TaskStatus};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -146,6 +146,8 @@ impl PostgresGraphStore {
             client.execute("DELETE FROM doc_pages WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM repo_state WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_events WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM session_usage WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM llm_usage WHERE repo = $1", &[&repo]).await?;
             // Nodes last: edges cascade at the DB level, and the
             // soft-referenced tables above are already cleared, so nothing
             // left references these ids.
@@ -254,6 +256,7 @@ fn row_to_session_usage(row: &tokio_postgres::Row) -> SessionUsage {
         cache_read_tokens: row.get("cache_read_tokens"),
         cache_write_tokens: row.get("cache_write_tokens"),
         cost_estimate_usd: row.get("cost_estimate_usd"),
+        peak_context_tokens: row.get("peak_context_tokens"),
         session_started_at: row.get("session_started_at"),
         session_ended_at: row.get("session_ended_at"),
         recorded_at: row.get("recorded_at"),
@@ -264,8 +267,29 @@ fn row_to_session_usage(row: &tokio_postgres::Row) -> SessionUsage {
 // session_ended_at/recorded_at are TIMESTAMPTZ in Postgres but TEXT in
 // SQLite, so the shared Rust `SessionUsage` struct needs both backends to
 // hand back plain strings.
-const SESSION_USAGE_COLUMNS: &str = "id, repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, \
+const SESSION_USAGE_COLUMNS: &str = "id, repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, peak_context_tokens, \
      session_started_at::text AS session_started_at, session_ended_at::text AS session_ended_at, recorded_at::text AS recorded_at";
+
+fn row_to_llm_usage(row: &tokio_postgres::Row) -> LlmUsage {
+    LlmUsage {
+        id: row.get("id"),
+        repo: row.get("repo"),
+        operation: row.get("operation"),
+        provider: row.get("provider"),
+        model: row.get("model"),
+        input_tokens: row.get("input_tokens"),
+        output_tokens: row.get("output_tokens"),
+        cost_estimate_usd: row.get("cost_estimate_usd"),
+        latency_ms: row.get("latency_ms"),
+        success: row.get("success"),
+        error_kind: row.get("error_kind"),
+        recorded_at: row.get("recorded_at"),
+    }
+}
+
+// Same `::text` cast reasoning as SESSION_USAGE_COLUMNS.
+const LLM_USAGE_COLUMNS: &str = "id, repo, operation, provider, model, input_tokens, output_tokens, cost_estimate_usd, latency_ms, success, error_kind, \
+     recorded_at::text AS recorded_at";
 
 fn row_to_task(row: &tokio_postgres::Row) -> Task {
     let status: String = row.get("status");
@@ -823,10 +847,16 @@ impl GraphStore for PostgresGraphStore {
     }
 
     fn upsert_session_usage(&self, usage: NewSessionUsage) -> Result<i64> {
+        // `$n::text::timestamptz`, not `$n::timestamptz`: the bare cast makes
+        // Postgres describe the *placeholder* as timestamptz, which a Rust
+        // `String` can't be serialized into ("error serializing parameter
+        // 8") -- the same bug class `save_doc_page` fixes via
+        // `prepare_typed`. The hosted `POST /usage/sync` failed on every
+        // call until this was first exercised against a real database.
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            let sql = "INSERT INTO session_usage (repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, session_started_at, session_ended_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::timestamptz, $10::timestamptz) \
+            let sql = "INSERT INTO session_usage (repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, session_started_at, session_ended_at, peak_context_tokens) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::text::timestamptz, $10::text::timestamptz, $11) \
                  ON CONFLICT (repo, session_id, model) DO UPDATE SET \
                     input_tokens = excluded.input_tokens, \
                     output_tokens = excluded.output_tokens, \
@@ -835,6 +865,7 @@ impl GraphStore for PostgresGraphStore {
                     cost_estimate_usd = excluded.cost_estimate_usd, \
                     session_started_at = excluded.session_started_at, \
                     session_ended_at = excluded.session_ended_at, \
+                    peak_context_tokens = excluded.peak_context_tokens, \
                     recorded_at = now() \
                  RETURNING id";
             let row = client
@@ -851,6 +882,7 @@ impl GraphStore for PostgresGraphStore {
                         &usage.cost_estimate_usd,
                         &usage.session_started_at,
                         &usage.session_ended_at,
+                        &usage.peak_context_tokens,
                     ],
                 )
                 .await?;
@@ -864,6 +896,40 @@ impl GraphStore for PostgresGraphStore {
             let sql = format!("SELECT {SESSION_USAGE_COLUMNS} FROM session_usage WHERE repo = $1 ORDER BY session_started_at DESC");
             let rows = client.query(&sql, &[&repo]).await?;
             Ok(rows.iter().map(row_to_session_usage).collect())
+        })
+    }
+
+    fn record_llm_usage(&self, usage: NewLlmUsage) -> Result<i64> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client
+                .query_one(
+                    "INSERT INTO llm_usage (repo, operation, provider, model, input_tokens, output_tokens, cost_estimate_usd, latency_ms, success, error_kind) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING id",
+                    &[
+                        &usage.repo,
+                        &usage.operation,
+                        &usage.provider,
+                        &usage.model,
+                        &usage.input_tokens,
+                        &usage.output_tokens,
+                        &usage.cost_estimate_usd,
+                        &usage.latency_ms,
+                        &usage.success,
+                        &usage.error_kind,
+                    ],
+                )
+                .await?;
+            Ok(row.get(0))
+        })
+    }
+
+    fn llm_usage_for_repo(&self, repo: &str) -> Result<Vec<LlmUsage>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = format!("SELECT {LLM_USAGE_COLUMNS} FROM llm_usage WHERE repo = $1 ORDER BY id ASC");
+            let rows = client.query(&sql, &[&repo]).await?;
+            Ok(rows.iter().map(row_to_llm_usage).collect())
         })
     }
 
@@ -1287,6 +1353,73 @@ mod tests {
         assert_eq!(found.unwrap().path.as_deref(), Some("a.rs"));
 
         store.delete_nodes("pg-repo-b", &[a, b]).unwrap();
+    }
+
+    fn llm_row(repo: &str, cost: Option<f64>, success: bool) -> agentops_graph::NewLlmUsage {
+        agentops_graph::NewLlmUsage {
+            repo: repo.into(),
+            operation: "explain_symbol".into(),
+            provider: "anthropic".into(),
+            model: "claude-sonnet-5".into(),
+            input_tokens: 120,
+            output_tokens: 30,
+            cost_estimate_usd: cost,
+            latency_ms: 250,
+            success,
+            error_kind: (!success).then(|| "rate_limited".to_string()),
+        }
+    }
+
+    fn unique_repo(prefix: &str) -> String {
+        format!("{prefix}-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos())
+    }
+
+    #[test]
+    fn llm_usage_round_trips_one_row_per_call_including_null_cost_and_failures() {
+        let store = require_store!();
+        let repo = unique_repo("pg-llm-usage");
+        store.record_llm_usage(llm_row(&repo, Some(0.01), true)).unwrap();
+        store.record_llm_usage(llm_row(&repo, Some(0.01), true)).unwrap();
+        store.record_llm_usage(llm_row(&repo, None, false)).unwrap();
+
+        let rows = store.llm_usage_for_repo(&repo).unwrap();
+        assert_eq!(rows.len(), 3, "identical calls must each get their own row -- no unique key collapses them");
+        assert_eq!(rows[2].cost_estimate_usd, None);
+        assert!(!rows[2].success);
+        assert_eq!(rows[2].error_kind.as_deref(), Some("rate_limited"));
+        assert!(!rows[0].recorded_at.is_empty(), "TIMESTAMPTZ must come back as text via LLM_USAGE_COLUMNS' ::text cast");
+        store.wipe_repo(&repo).unwrap();
+    }
+
+    #[test]
+    fn wipe_repo_removes_only_its_own_llm_and_session_usage() {
+        let store = require_store!();
+        let (a, b) = (unique_repo("pg-wipe-a"), unique_repo("pg-wipe-b"));
+        for repo in [&a, &b] {
+            store.record_llm_usage(llm_row(repo, Some(0.01), true)).unwrap();
+            store
+                .upsert_session_usage(NewSessionUsage {
+                    repo: repo.to_string(),
+                    session_id: "sess".into(),
+                    model: "claude-sonnet-5".into(),
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_write_tokens: 0,
+                    cost_estimate_usd: 0.0,
+                    peak_context_tokens: 0,
+                    session_started_at: "2026-10-09T00:00:00Z".into(),
+                    session_ended_at: "2026-10-09T01:00:00Z".into(),
+                })
+                .unwrap();
+        }
+
+        store.wipe_repo(&a).unwrap();
+        assert!(store.llm_usage_for_repo(&a).unwrap().is_empty());
+        assert!(store.session_usage_for_repo(&a).unwrap().is_empty(), "wipe_repo previously left session_usage behind");
+        assert_eq!(store.llm_usage_for_repo(&b).unwrap().len(), 1);
+        assert_eq!(store.session_usage_for_repo(&b).unwrap().len(), 1);
+        store.wipe_repo(&b).unwrap();
     }
 
     #[test]

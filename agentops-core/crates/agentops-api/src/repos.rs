@@ -730,6 +730,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
                 cost_estimate_usd: 1.5,
+                peak_context_tokens: 0,
                 session_started_at: "2026-09-25T00:00:00Z".into(),
                 session_ended_at: "2026-09-25T01:00:00Z".into(),
             })

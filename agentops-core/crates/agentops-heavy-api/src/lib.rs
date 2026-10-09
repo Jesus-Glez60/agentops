@@ -38,7 +38,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use tower_http::cors::CorsLayer;
 
 use agentops_accounts::{AccountStore, User};
-use crate::tenant_repo::resolve_connection_path;
 use agentops_heavy_embeddings::SemanticIndex;
 use agentops_repo_access::secrets::SecretsProvider;
 use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnection};
@@ -519,7 +518,7 @@ fn resolve_anthropic_config(credentials: &agentops_integrations::CredentialStore
     let cred = credentials
         .get_credential(secrets, tenant, "anthropic")?
         .ok_or_else(|| anyhow::anyhow!("no Anthropic credential stored for tenant {tenant:?} — add one via POST /integrations/anthropic"))?;
-    Ok(agentops_llm::AnthropicConfig { api_key: cred.secret.to_string(), model: "claude-sonnet-5".to_string(), max_tokens: 1024, api_url: "https://api.anthropic.com/v1/messages".to_string() })
+    Ok(agentops_llm::AnthropicConfig { api_key: cred.secret.to_string(), model: "claude-sonnet-5".to_string(), max_tokens: 1024, api_url: "https://api.anthropic.com/v1/messages".to_string(), ..Default::default() })
 }
 
 /// Builds this service's complete, ready-to-serve `Router` — every route
@@ -623,11 +622,13 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
         Some(accounts_for_repos),
         Some(teams_for_repos),
         indexing_store,
-        repo_checkouts_dir,
+        repo_checkouts_dir.clone(),
         github_app_config.clone(),
         pg_store.clone(),
         include_tools,
     );
+    // Org deletion's cascade needs both to wipe each connection's graph.
+    let (graph_pg_store, repo_checkouts_dir_for_teams) = (pg_store.clone(), repo_checkouts_dir);
     app = github_app_routes::merge_github_webhook_route(app, webhook_deps, github_app_config);
 
     // Phase 7: accounts + the generic integrations vault. Phase 6c: the
@@ -695,7 +696,8 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
     let teams = agentops_teams::TeamStore::open(&teams_db_path)?;
     let repos_for_teams = ConnectionStore::open(db_path)?;
     let credentials_for_teams = agentops_integrations::CredentialStore::open(&credentials_db_path)?;
-    app = app.merge(build_team_router(accounts_for_teams, teams, repos_for_teams, credentials_for_teams, docbrain_db_dir));
+    let graph_wipe = graph_pg_store.map(|pg| team::GraphWipe { pg, repo_checkouts_dir: repo_checkouts_dir_for_teams });
+    app = app.merge(team::build_team_router_with_graph_wipe(accounts_for_teams, teams, repos_for_teams, credentials_for_teams, docbrain_db_dir, graph_wipe));
     println!("Team Management live: GET /team, GET /team/members, PATCH/DELETE /team/members/{{id}}, GET/PUT /team/repo-access, POST /team/delete-organization.");
 
     Ok(app.merge(health_router()).merge(contact_routes::contact_router()))
@@ -1089,20 +1091,11 @@ async fn delete_repo(State(state): State<AppState>, user: Option<axum::Extension
     }
 
     if let Some(pg) = state.pg_store.clone() {
-        let path = resolve_connection_path(&state, &tenant, &id);
-        let id_for_blocking = id.clone();
-        let wipe_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let repo = match path {
-                Ok(p) => agentops_mcp::repo_name(&p),
-                // No checkout path resolvable (shouldn't happen, we just
-                // confirmed the connection exists) -- fall back to the
-                // connection id itself, which is what `repo` always equals
-                // for a freshly-scanned connection anyway.
-                Err(_) => id_for_blocking,
-            };
-            pg.wipe_repo(&repo)
-        })
-        .await;
+        // `id` is a confirmed connection id (checked just above), so its
+        // checkout path -- and the repo name derived from it -- is exactly
+        // what `resolve_connection_path` would have produced.
+        let (dir, tenant_for_blocking, id_for_blocking) = (state.repo_checkouts_dir.clone(), tenant.clone(), id.clone());
+        let wipe_result = tokio::task::spawn_blocking(move || indexing::wipe_connection_graph(&pg, &dir, &tenant_for_blocking, &id_for_blocking)).await;
         if let Ok(Err(e)) = wipe_result {
             eprintln!("delete_repo: failed to wipe graph data for {tenant}/{id}: {e} -- continuing to delete the connection row anyway");
         }

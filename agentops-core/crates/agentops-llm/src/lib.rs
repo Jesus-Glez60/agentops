@@ -9,15 +9,21 @@
 //! (`NoteClassifier`) — both live here rather than in `agentops-notes`
 //! itself so that crate never gains a network dependency.
 
+pub mod librarian;
+pub mod pricing;
 mod tokens;
+pub mod usage;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
 use agentops_graph::{upsert_node, EdgeRelation, GraphStore, ModuleLabel, NewNode, Node, NodeKind, NodeProminence};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use tokens::{count_tokens, truncate_to_tokens};
+pub use usage::{LlmCallRecord, LlmErrorKind, LlmUsageSink, UsageRecorder};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -41,19 +47,82 @@ const PATTERN_COMPLETE_K: usize = 5;
 /// works regardless of which tier `AnthropicConfig` selected.
 const MAX_PROMPT_INPUT_TOKENS: usize = 60_000;
 
-/// Anthropic API configuration — `AGENTOPS_ANTHROPIC_API_KEY` follows the
-/// `AGENTOPS_<SUBSYSTEM>_<PURPOSE>` env var convention.
-#[derive(Debug, Clone)]
-pub struct AnthropicConfig {
+/// Which wire protocol a `LlmConfig` speaks. `OpenAiCompatible` covers
+/// any `/chat/completions` endpoint (Groq, Gemini's compat endpoint,
+/// NVIDIA NIM, OpenRouter, ...); `name` is only the label recorded in the
+/// spend ledger, and `api_url` must already be the full
+/// `{base_url}/chat/completions` URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Provider {
+    Anthropic,
+    OpenAiCompatible { name: String, json_mode: JsonMode },
+}
+
+impl Provider {
+    pub fn name(&self) -> &str {
+        match self {
+            Provider::Anthropic => "anthropic",
+            Provider::OpenAiCompatible { name, .. } => name,
+        }
+    }
+}
+
+/// How an OpenAI-compatible request asks for structured JSON — providers
+/// don't share one request shape (see the recorded gotcha on Groq/Gemini/
+/// NVIDIA NIM structured output).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JsonMode {
+    /// `response_format: {type: "json_schema", json_schema: {name, strict: true, schema}}` (Groq, select models).
+    JsonSchemaStrict,
+    /// `response_format: {type: "json_schema", json_schema: {name, schema}}` (Gemini compat, OpenAI-style).
+    JsonSchema,
+    /// `response_format: {type: "json_object"}` — valid JSON, no schema guarantee; prompt must mention JSON.
+    JsonObject,
+    /// `guided_json: <schema>` at the request body's top level (NVIDIA NIM).
+    GuidedJson,
+}
+
+/// LLM API configuration — `AGENTOPS_ANTHROPIC_API_KEY` follows the
+/// `AGENTOPS_<SUBSYSTEM>_<PURPOSE>` env var convention. `Debug` is
+/// hand-written so the key never reaches a log line.
+#[derive(Clone)]
+pub struct LlmConfig {
     pub api_key: String,
     pub model: String,
     pub max_tokens: u32,
     /// Overridable so tests can point at a `wiremock` server instead of the
-    /// real API.
+    /// real API. For `Provider::OpenAiCompatible`, the full
+    /// `{base_url}/chat/completions` URL.
     pub api_url: String,
+    pub provider: Provider,
+    /// Receives one `LlmCallRecord` per call, failures included — see
+    /// `usage`'s module doc comment.
+    pub usage_sink: Option<Arc<dyn LlmUsageSink>>,
 }
 
-impl AnthropicConfig {
+/// Kept so the many existing `AnthropicConfig` call sites and signatures
+/// don't all have to change at once.
+pub type AnthropicConfig = LlmConfig;
+
+impl std::fmt::Debug for LlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmConfig")
+            .field("model", &self.model)
+            .field("max_tokens", &self.max_tokens)
+            .field("api_url", &self.api_url)
+            .field("provider", &self.provider)
+            .field("usage_sink", &self.usage_sink.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self { api_key: String::new(), model: DEFAULT_MODEL.to_string(), max_tokens: DEFAULT_MAX_TOKENS, api_url: API_URL.to_string(), provider: Provider::Anthropic, usage_sink: None }
+    }
+}
+
+impl LlmConfig {
     fn read_api_key() -> Result<String> {
         std::env::var("AGENTOPS_ANTHROPIC_API_KEY")
             .context("AGENTOPS_ANTHROPIC_API_KEY is not set — code interpretation is opt-in and requires your own Anthropic API key")
@@ -68,7 +137,7 @@ impl AnthropicConfig {
     pub fn from_env() -> Result<Self> {
         let api_key = Self::read_api_key()?;
         let model = std::env::var("AGENTOPS_ANTHROPIC_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
-        Ok(Self { api_key, model, max_tokens: DEFAULT_MAX_TOKENS, api_url: API_URL.to_string() })
+        Ok(Self { api_key, model, ..Default::default() })
     }
 
     /// Same as `from_env`, but selects the cheap tier (`DEFAULT_MODEL_CHEAP`,
@@ -84,7 +153,12 @@ impl AnthropicConfig {
     pub fn from_env_cheap() -> Result<Self> {
         let api_key = Self::read_api_key()?;
         let model = std::env::var("AGENTOPS_ANTHROPIC_MODEL_CHEAP").unwrap_or_else(|_| DEFAULT_MODEL_CHEAP.to_string());
-        Ok(Self { api_key, model, max_tokens: DEFAULT_MAX_TOKENS, api_url: API_URL.to_string() })
+        Ok(Self { api_key, model, ..Default::default() })
+    }
+
+    pub fn with_usage_sink(mut self, sink: impl LlmUsageSink + 'static) -> Self {
+        self.usage_sink = Some(Arc::new(sink));
+        self
     }
 }
 
@@ -138,30 +212,95 @@ struct Usage {
     output_tokens: u64,
 }
 
-/// One Anthropic API call's result — token counts are exposed so callers
-/// can log real cost rather than this crate silently discarding them.
+/// One LLM API call's result — token counts are exposed so callers can log
+/// real cost rather than this crate silently discarding them.
 #[derive(Debug, Clone)]
 pub struct LlmCallResult {
     pub text: String,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub provider: String,
+    pub model: String,
+    pub latency_ms: u64,
 }
 
-/// Calls the Anthropic Messages API with a single user-role `prompt`. Maps
+/// Calls the configured provider with a single user-role `prompt`. Maps
 /// 401 (bad/missing key) and 429 (rate limit) to distinct, clearly-labeled
-/// errors rather than a generic transport failure.
-pub fn call_anthropic(config: &AnthropicConfig, prompt: &str) -> Result<LlmCallResult> {
-    send_messages(config, prompt, None)
+/// errors rather than a generic transport failure. `operation` is the
+/// spend-ledger label (`explain_symbol`, `classify_note`, ...).
+pub fn call_anthropic(config: &LlmConfig, operation: &str, prompt: &str) -> Result<LlmCallResult> {
+    send_messages(config, operation, prompt, None)
 }
 
-/// Same as `call_anthropic`, but constrains the response to `schema` via
-/// Anthropic's `output_config.format: json_schema` — the response text is
-/// guaranteed-valid JSON matching `schema`, not free text to parse.
-fn call_anthropic_json(config: &AnthropicConfig, prompt: &str, schema: serde_json::Value) -> Result<LlmCallResult> {
-    send_messages(config, prompt, Some(OutputConfig { format: OutputFormat::JsonSchema { schema } }))
+/// Same as `call_anthropic`, but constrains the response to `schema` —
+/// Anthropic's `output_config.format: json_schema`, or the provider's
+/// `JsonMode` for an OpenAI-compatible config. A response that still isn't
+/// valid JSON is recorded as `bad_json` and returned as an error.
+pub fn call_json(config: &LlmConfig, operation: &str, prompt: &str, schema: serde_json::Value) -> Result<LlmCallResult> {
+    send_messages(config, operation, prompt, Some(schema))
 }
 
-fn send_messages(config: &AnthropicConfig, prompt: &str, output_config: Option<OutputConfig>) -> Result<LlmCallResult> {
+fn call_anthropic_json(config: &LlmConfig, operation: &str, prompt: &str, schema: serde_json::Value) -> Result<LlmCallResult> {
+    call_json(config, operation, prompt, schema)
+}
+
+/// Every LLM call funnels through here, so every exit path — success,
+/// HTTP failures, transport errors, and unparseable JSON — is reported to
+/// `config.usage_sink` exactly once, before returning or propagating.
+fn send_messages(config: &LlmConfig, operation: &str, prompt: &str, json_schema: Option<serde_json::Value>) -> Result<LlmCallResult> {
+    let started = Instant::now();
+    let report = |input_tokens: u64, output_tokens: u64, error_kind: Option<LlmErrorKind>| {
+        if let Some(sink) = &config.usage_sink {
+            sink.record(&LlmCallRecord {
+                operation: operation.to_string(),
+                provider: config.provider.name().to_string(),
+                model: config.model.clone(),
+                input_tokens,
+                output_tokens,
+                latency_ms: started.elapsed().as_millis() as u64,
+                success: error_kind.is_none(),
+                error_kind,
+            });
+        }
+    };
+
+    let wants_json = json_schema.is_some();
+    let outcome = match &config.provider {
+        Provider::Anthropic => send_anthropic(config, prompt, json_schema),
+        Provider::OpenAiCompatible { json_mode, .. } => send_chat_completions(config, prompt, json_schema, *json_mode),
+    };
+
+    let (text, input_tokens, output_tokens) = match outcome {
+        Ok(ok) => ok,
+        Err((kind, err)) => {
+            report(0, 0, Some(kind));
+            return Err(err);
+        }
+    };
+
+    if wants_json && serde_json::from_str::<serde_json::Value>(&text).is_err() {
+        report(input_tokens, output_tokens, Some(LlmErrorKind::BadJson));
+        anyhow::bail!("{} returned non-JSON text for a structured-output request: {text}", config.provider.name());
+    }
+
+    report(input_tokens, output_tokens, None);
+    Ok(LlmCallResult { text, input_tokens, output_tokens, provider: config.provider.name().to_string(), model: config.model.clone(), latency_ms: started.elapsed().as_millis() as u64 })
+}
+
+type SendOutcome = std::result::Result<(String, u64, u64), (LlmErrorKind, anyhow::Error)>;
+
+/// Maps a non-2xx status to its error kind + message — shared by both
+/// providers so 401/429 read the same regardless of which one failed.
+fn http_failure(provider: &str, key_hint: &str, status: u16, body: String) -> (LlmErrorKind, anyhow::Error) {
+    match status {
+        401 => (LlmErrorKind::Auth, anyhow::anyhow!("{provider} API rejected the key (401) — check {key_hint}")),
+        429 => (LlmErrorKind::RateLimited, anyhow::anyhow!("{provider} API rate limit hit (429) — retry later")),
+        _ => (LlmErrorKind::Other, anyhow::anyhow!("{provider} API returned {status}: {body}")),
+    }
+}
+
+fn send_anthropic(config: &LlmConfig, prompt: &str, json_schema: Option<serde_json::Value>) -> SendOutcome {
+    let output_config = json_schema.map(|schema| OutputConfig { format: OutputFormat::JsonSchema { schema } });
     let request = MessagesRequest { model: &config.model, max_tokens: config.max_tokens, messages: vec![MessageIn { role: "user", content: prompt }], output_config };
 
     let mut response = ureq::post(&config.api_url)
@@ -171,25 +310,107 @@ fn send_messages(config: &AnthropicConfig, prompt: &str, output_config: Option<O
         .http_status_as_error(false)
         .build()
         .send_json(&request)
-        .context("calling the Anthropic Messages API")?;
+        .context("calling the Anthropic Messages API")
+        .map_err(|e| (LlmErrorKind::Other, e))?;
 
-    let status = response.status();
-    if status.as_u16() == 401 {
-        anyhow::bail!("Anthropic API rejected the key (401) — check AGENTOPS_ANTHROPIC_API_KEY");
-    }
-    if status.as_u16() == 429 {
-        anyhow::bail!("Anthropic API rate limit hit (429) — retry later");
-    }
-    if !status.is_success() {
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
         let body = response.body_mut().read_to_string().unwrap_or_default();
-        anyhow::bail!("Anthropic API returned {status}: {body}");
+        return Err(http_failure("Anthropic", "AGENTOPS_ANTHROPIC_API_KEY", status, body));
     }
 
-    let parsed: MessagesResponse = response.body_mut().read_json().context("parsing Anthropic API response")?;
-    let text =
-        parsed.content.into_iter().find(|c| c.kind == "text").and_then(|c| c.text).ok_or_else(|| anyhow::anyhow!("Anthropic response had no text content block"))?;
+    let parsed: MessagesResponse = response.body_mut().read_json().context("parsing Anthropic API response").map_err(|e| (LlmErrorKind::Other, e))?;
+    let text = parsed
+        .content
+        .into_iter()
+        .find(|c| c.kind == "text")
+        .and_then(|c| c.text)
+        .ok_or_else(|| (LlmErrorKind::Other, anyhow::anyhow!("Anthropic response had no text content block")))?;
 
-    Ok(LlmCallResult { text, input_tokens: parsed.usage.input_tokens, output_tokens: parsed.usage.output_tokens })
+    Ok((text, parsed.usage.input_tokens, parsed.usage.output_tokens))
+}
+
+/// Builds an OpenAI-compatible `/chat/completions` body, with structured
+/// output requested the way `json_mode` says this provider expects.
+fn chat_completions_body(model: &str, max_tokens: u32, prompt: &str, json_schema: Option<serde_json::Value>, json_mode: JsonMode) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": [{ "role": "user", "content": prompt }],
+    });
+    if let Some(schema) = json_schema {
+        match json_mode {
+            JsonMode::JsonSchemaStrict => {
+                body["response_format"] = serde_json::json!({ "type": "json_schema", "json_schema": { "name": "response", "strict": true, "schema": schema } });
+            }
+            JsonMode::JsonSchema => {
+                body["response_format"] = serde_json::json!({ "type": "json_schema", "json_schema": { "name": "response", "schema": schema } });
+            }
+            JsonMode::JsonObject => {
+                body["response_format"] = serde_json::json!({ "type": "json_object" });
+            }
+            JsonMode::GuidedJson => {
+                body["guided_json"] = schema;
+            }
+        }
+    }
+    body
+}
+
+#[derive(Deserialize)]
+struct ChatCompletionResponse {
+    choices: Vec<ChatChoice>,
+    usage: Option<ChatUsage>,
+}
+
+#[derive(Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Deserialize)]
+struct ChatMessage {
+    content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ChatUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+}
+
+fn send_chat_completions(config: &LlmConfig, prompt: &str, json_schema: Option<serde_json::Value>, json_mode: JsonMode) -> SendOutcome {
+    let provider = config.provider.name();
+    let body = chat_completions_body(&config.model, config.max_tokens, prompt, json_schema, json_mode);
+
+    let mut response = ureq::post(&config.api_url)
+        .header("Authorization", &format!("Bearer {}", config.api_key))
+        .config()
+        .http_status_as_error(false)
+        .build()
+        .send_json(&body)
+        .with_context(|| format!("calling {provider}'s chat completions API"))
+        .map_err(|e| (LlmErrorKind::Other, e))?;
+
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response.body_mut().read_to_string().unwrap_or_default();
+        return Err(http_failure(provider, "this model's api_key_env", status, body));
+    }
+
+    let parsed: ChatCompletionResponse =
+        response.body_mut().read_json().with_context(|| format!("parsing {provider}'s chat completions response")).map_err(|e| (LlmErrorKind::Other, e))?;
+    let (input_tokens, output_tokens) = parsed.usage.map(|u| (u.prompt_tokens, u.completion_tokens)).unwrap_or((0, 0));
+    let text = parsed
+        .choices
+        .into_iter()
+        .next()
+        .and_then(|c| c.message.content)
+        .ok_or_else(|| (LlmErrorKind::Other, anyhow::anyhow!("{provider} response had no message content")))?;
+
+    Ok((text, input_tokens, output_tokens))
 }
 
 /// Builds the prompt for explaining `symbol` — its full source, plus
@@ -387,7 +608,7 @@ pub fn explain_symbol(store: &dyn GraphStore, config: &AnthropicConfig, repo: &s
     let related = agentops_retrieval::pattern_complete(store, &agentops_embeddings::LocalEmbedder, repo, symbol_id, PATTERN_COMPLETE_K)?;
 
     let prompt = build_prompt(&symbol, &dep_paths, &existing_notes, &related);
-    let result = call_anthropic(config, &prompt)?;
+    let result = call_anthropic(config, "explain_symbol", &prompt)?;
 
     let definition_id = upsert_node(
         store,
@@ -465,7 +686,7 @@ impl agentops_notes::SymbolMatcher for LlmAssistedMatcher<'_> {
         let prompt = format!(
             "A project note says:\n\n{note_body}\n\nWhich of these candidate code symbol names, if any, does this note actually describe? Candidates: {list}\n\nReply with ONLY a comma-separated list of the matching names exactly as given, or NONE if none apply. No other text."
         );
-        let result = call_anthropic(self.config, &prompt)?;
+        let result = call_anthropic(self.config, "match_symbols", &prompt)?;
         let picked: std::collections::HashSet<String> = result.text.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && s.to_uppercase() != "NONE").collect();
         Ok(named.into_iter().filter(|(_, name)| picked.contains(name)).map(|(id, _)| id).collect())
     }
@@ -494,7 +715,7 @@ impl agentops_notes::NoteClassifier for LlmAssistedClassifier<'_> {
              Note:\n{note_body}\n\n\
              Reply with exactly one word: gotcha, decision, or knowledge."
         );
-        let result = call_anthropic(self.config, &prompt)?;
+        let result = call_anthropic(self.config, "classify_note", &prompt)?;
         let answer = result.text.trim().to_lowercase();
         Ok(if answer.contains("gotcha") {
             agentops_notes::NoteType::Gotcha
@@ -608,7 +829,7 @@ pub fn summarize_task_activity(config: &AnthropicConfig, task_title: &str, activ
         render_activity(activity)
     );
 
-    let result = call_anthropic(config, &prompt)?;
+    let result = call_anthropic(config, "summarize_task", &prompt)?;
     parse_task_summaries(&result.text)
 }
 
@@ -656,7 +877,7 @@ pub fn group_core_modules(config: &AnthropicConfig, repo: &str, ranked_paths: &[
         "additionalProperties": false
     });
 
-    let result = call_anthropic_json(config, &prompt, schema)?;
+    let result = call_anthropic_json(config, "group_modules", &prompt, schema)?;
     parse_module_groups(&result.text)
 }
 
@@ -697,7 +918,7 @@ mod tests {
     }
 
     fn mock_config(base_url: &str) -> AnthropicConfig {
-        AnthropicConfig { api_key: "test-key".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: format!("{base_url}/v1/messages") }
+        AnthropicConfig { api_key: "test-key".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: format!("{base_url}/v1/messages"), ..Default::default() }
     }
 
     // Deliberately no test exercises `from_env`/`from_env_cheap`'s env-var
@@ -999,7 +1220,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let result = call_anthropic(&mock_config(&server.uri()), "explain this").unwrap();
+        let result = call_anthropic(&mock_config(&server.uri()), "test", "explain this").unwrap();
         assert_eq!(result.text, "This function verifies a token.");
         assert_eq!(result.input_tokens, 42);
         assert_eq!(result.output_tokens, 7);
@@ -1010,7 +1231,7 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(wiremock::ResponseTemplate::new(401)).mount(&server).await;
 
-        let err = call_anthropic(&mock_config(&server.uri()), "x").unwrap_err();
+        let err = call_anthropic(&mock_config(&server.uri()), "test", "x").unwrap_err();
         assert!(err.to_string().contains("401"));
         assert!(err.to_string().contains("AGENTOPS_ANTHROPIC_API_KEY"));
     }
@@ -1020,9 +1241,160 @@ mod tests {
         let server = wiremock::MockServer::start().await;
         wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(wiremock::ResponseTemplate::new(429)).mount(&server).await;
 
-        let err = call_anthropic(&mock_config(&server.uri()), "x").unwrap_err();
+        let err = call_anthropic(&mock_config(&server.uri()), "test", "x").unwrap_err();
         assert!(err.to_string().contains("429"));
         assert!(err.to_string().to_lowercase().contains("rate limit"));
+    }
+
+    #[tokio::test]
+    async fn a_successful_call_reports_exactly_one_spend_record() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "usage": {"input_tokens": 42, "output_tokens": 7}
+            })))
+            .mount(&server)
+            .await;
+
+        let recorder = UsageRecorder::default();
+        let config = mock_config(&server.uri()).with_usage_sink(recorder.clone());
+        call_anthropic(&config, "explain_symbol", "x").unwrap();
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        let rec = &records[0];
+        assert_eq!((rec.operation.as_str(), rec.provider.as_str(), rec.model.as_str()), ("explain_symbol", "anthropic", "claude-sonnet-5"));
+        assert_eq!((rec.input_tokens, rec.output_tokens), (42, 7));
+        assert!(rec.success && rec.error_kind.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_call_is_recorded_before_its_error_reaches_the_caller() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(wiremock::ResponseTemplate::new(429)).mount(&server).await;
+
+        let recorder = UsageRecorder::default();
+        let config = mock_config(&server.uri()).with_usage_sink(recorder.clone());
+        let err = call_anthropic(&config, "classify_note", "x").unwrap_err();
+        assert!(err.to_string().contains("429"));
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 1, "{records:?}");
+        assert!(!records[0].success);
+        assert_eq!(records[0].error_kind, Some(LlmErrorKind::RateLimited));
+        assert_eq!((records[0].input_tokens, records[0].output_tokens), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn a_structured_request_answered_with_non_json_is_recorded_as_bad_json() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "Sure! Here are the modules:"}],
+                "usage": {"input_tokens": 30, "output_tokens": 6}
+            })))
+            .mount(&server)
+            .await;
+
+        let recorder = UsageRecorder::default();
+        let config = mock_config(&server.uri()).with_usage_sink(recorder.clone());
+        assert!(call_json(&config, "group_modules", "x", serde_json::json!({"type": "object"})).is_err());
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].error_kind, Some(LlmErrorKind::BadJson));
+        assert_eq!((records[0].input_tokens, records[0].output_tokens), (30, 6), "a bad-JSON response still spent its tokens");
+    }
+
+    #[test]
+    fn recorded_spend_persists_to_the_store_priced_by_model() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let recorder = UsageRecorder::default();
+        let base = LlmCallRecord { operation: "explain_symbol".into(), provider: "anthropic".into(), model: "claude-opus-5-5".into(), input_tokens: 1_000_000, output_tokens: 0, latency_ms: 5, success: true, error_kind: None };
+        recorder.record(&base);
+        recorder.record(&LlmCallRecord { provider: "groq".into(), model: "llama-3.3-70b-versatile".into(), success: false, error_kind: Some(LlmErrorKind::RateLimited), ..base.clone() });
+
+        assert_eq!(recorder.persist(&store, "demo"), 2);
+        assert!(recorder.records().is_empty(), "persist drains the buffer so a second persist can't double-count");
+
+        let rows = store.llm_usage_for_repo("demo").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].cost_estimate_usd, Some(4.0));
+        assert_eq!(rows[1].cost_estimate_usd, None, "an unpriced provider stays NULL, never $0");
+        assert_eq!(rows[1].error_kind.as_deref(), Some("rate_limited"));
+        assert!(store.llm_usage_for_repo("other").unwrap().is_empty());
+    }
+
+    fn openai_config(base_url: &str, json_mode: JsonMode) -> LlmConfig {
+        LlmConfig {
+            api_key: "test-key".into(),
+            model: "llama-3.3-70b-versatile".into(),
+            api_url: format!("{base_url}/openai/v1/chat/completions"),
+            provider: Provider::OpenAiCompatible { name: "groq".into(), json_mode },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn each_json_mode_builds_its_providers_own_request_shape() {
+        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"], "additionalProperties": false});
+        let body = |mode| chat_completions_body("m", 100, "p", Some(schema.clone()), mode);
+
+        let strict = body(JsonMode::JsonSchemaStrict);
+        assert_eq!(strict["response_format"]["type"], "json_schema");
+        assert_eq!(strict["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(strict["response_format"]["json_schema"]["schema"], schema);
+
+        let plain = body(JsonMode::JsonSchema);
+        assert_eq!(plain["response_format"]["type"], "json_schema");
+        assert!(plain["response_format"]["json_schema"].get("strict").is_none());
+
+        let object = body(JsonMode::JsonObject);
+        assert_eq!(object["response_format"], serde_json::json!({"type": "json_object"}));
+
+        let guided = body(JsonMode::GuidedJson);
+        assert_eq!(guided["guided_json"], schema, "NVIDIA NIM takes the schema as a top-level guided_json field");
+        assert!(guided.get("response_format").is_none());
+
+        let unstructured = chat_completions_body("m", 100, "p", None, JsonMode::JsonSchemaStrict);
+        assert!(unstructured.get("response_format").is_none() && unstructured.get("guided_json").is_none());
+    }
+
+    #[tokio::test]
+    async fn an_openai_compatible_call_reads_text_and_usage_and_reports_its_provider_name() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/openai/v1/chat/completions"))
+            .and(wiremock::matchers::header("authorization", "Bearer test-key"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{"message": {"role": "assistant", "content": "{\"a\": \"b\"}"}}],
+                "usage": {"prompt_tokens": 55, "completion_tokens": 9, "total_tokens": 64}
+            })))
+            .mount(&server)
+            .await;
+
+        let recorder = UsageRecorder::default();
+        let config = openai_config(&server.uri(), JsonMode::JsonSchemaStrict).with_usage_sink(recorder.clone());
+        let result = call_json(&config, "librarian_classify", "x", serde_json::json!({"type": "object"})).unwrap();
+        assert_eq!(result.text, "{\"a\": \"b\"}");
+        assert_eq!((result.input_tokens, result.output_tokens), (55, 9));
+
+        let records = recorder.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!((records[0].provider.as_str(), records[0].operation.as_str()), ("groq", "librarian_classify"));
+    }
+
+    #[tokio::test]
+    async fn an_openai_compatible_401_maps_to_an_auth_failure() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST")).respond_with(wiremock::ResponseTemplate::new(401)).mount(&server).await;
+
+        let recorder = UsageRecorder::default();
+        let config = openai_config(&server.uri(), JsonMode::JsonObject).with_usage_sink(recorder.clone());
+        let err = call_anthropic(&config, "librarian_classify", "x").unwrap_err();
+        assert!(err.to_string().contains("groq") && err.to_string().contains("401"), "{err}");
+        assert_eq!(recorder.records()[0].error_kind, Some(LlmErrorKind::Auth));
     }
 
     #[tokio::test]
@@ -1111,7 +1483,7 @@ mod tests {
     async fn llm_assisted_classifier_skips_the_api_call_when_the_heuristic_is_confident() {
         // No mock server mounted at all — if this made an API call, it
         // would fail to connect and the test would error out.
-        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into() };
+        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into(), ..Default::default() };
         let classifier = LlmAssistedClassifier { config: &config };
 
         let result = classifier.classify("There's a known workaround for this bug that fails when the cache is cold.").unwrap();
@@ -1159,7 +1531,7 @@ mod tests {
 
     #[test]
     fn summarize_task_activity_refuses_an_empty_activity_log() {
-        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into() };
+        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into(), ..Default::default() };
         let err = summarize_task_activity(&config, "Fix login bug", &[]).unwrap_err();
         assert!(err.to_string().contains("nothing to summarize"));
     }
@@ -1186,7 +1558,7 @@ mod tests {
 
     #[test]
     fn group_core_modules_short_circuits_with_no_network_call_when_given_no_paths() {
-        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into() };
+        let config = AnthropicConfig { api_key: "unused".into(), model: "claude-sonnet-5".into(), max_tokens: 1024, api_url: "http://127.0.0.1:1/v1/messages".into(), ..Default::default() };
         let groups = group_core_modules(&config, "demo", &[]).unwrap();
         assert!(groups.is_empty());
     }

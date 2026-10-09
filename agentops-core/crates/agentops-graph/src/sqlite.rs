@@ -18,7 +18,7 @@ use rusqlite_migration::{Migrations, M};
 
 use agentops_embeddings::EMBEDDING_DIM;
 
-use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, Task, TaskLink, TaskStatus};
+use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 
@@ -278,7 +278,8 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     // as edges.updated_at above -- constant '' placeholder, backfilled via
     // UPDATE. Every future add_node/update_node sets this explicitly to
     // CURRENT_TIMESTAMP, so the placeholder is only ever seen by this one
-    // backfill step. **Must stay the last entry in this slice** --
+    // backfill step. Was the last entry when added -- new steps always
+    // append at the end of this slice, since
     // `rusqlite_migration` tracks progress purely by position (`user_version`
     // as an index/count into MIGRATIONS_SLICE), not by content, so inserting
     // a step anywhere but the end would silently skip it on every
@@ -332,10 +333,35 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     // unindexed free-TEXT column -- see `NodeProminence`'s own doc comment
     // for why no CHECK-constraint widening migration was needed here,
     // unlike `NodeKind`/`EdgeRelation`). Purely additive/idempotent.
-    // **Must stay the last entry in this slice** -- rusqlite_migration
-    // tracks progress purely by position, not content (see the note on the
-    // migration above the session_usage one).
+    // Was the last entry when added -- rusqlite_migration tracks progress
+    // purely by position, not content (see the note on the migration above
+    // the session_usage one), so new steps always append below, never above.
     M::up("CREATE INDEX IF NOT EXISTS idx_nodes_repo_prominence ON nodes(repo, prominence);"),
+    // AgentOps' own LLM spend ledger (`NewLlmUsage`): one row per call,
+    // failures included, so deliberately no unique index -- only the
+    // `(repo, recorded_at)` one the usage dashboard reads by. Appended last,
+    // same position-tracking reason as every step above.
+    M::up(
+        "CREATE TABLE IF NOT EXISTS llm_usage (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo                TEXT NOT NULL,
+            operation           TEXT NOT NULL,
+            provider            TEXT NOT NULL,
+            model               TEXT NOT NULL,
+            input_tokens        INTEGER NOT NULL DEFAULT 0,
+            output_tokens       INTEGER NOT NULL DEFAULT 0,
+            cost_estimate_usd   REAL,
+            latency_ms          INTEGER NOT NULL DEFAULT 0,
+            success             INTEGER NOT NULL,
+            error_kind          TEXT,
+            recorded_at         TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_llm_usage_repo_time ON llm_usage(repo, recorded_at);",
+    ),
+    // Peak per-request context size per session bucket -- constant
+    // default, so a plain ADD COLUMN works on a populated table (gotchas
+    // 54087/54088 only bite non-constant defaults). Appended last.
+    M::up("ALTER TABLE session_usage ADD COLUMN peak_context_tokens INTEGER NOT NULL DEFAULT 0;"),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -447,8 +473,26 @@ impl SqliteGraphStore {
             cache_read_tokens: row.get("cache_read_tokens")?,
             cache_write_tokens: row.get("cache_write_tokens")?,
             cost_estimate_usd: row.get("cost_estimate_usd")?,
+            peak_context_tokens: row.get("peak_context_tokens")?,
             session_started_at: row.get("session_started_at")?,
             session_ended_at: row.get("session_ended_at")?,
+            recorded_at: row.get("recorded_at")?,
+        })
+    }
+
+    fn row_to_llm_usage(row: &rusqlite::Row) -> rusqlite::Result<LlmUsage> {
+        Ok(LlmUsage {
+            id: row.get("id")?,
+            repo: row.get("repo")?,
+            operation: row.get("operation")?,
+            provider: row.get("provider")?,
+            model: row.get("model")?,
+            input_tokens: row.get("input_tokens")?,
+            output_tokens: row.get("output_tokens")?,
+            cost_estimate_usd: row.get("cost_estimate_usd")?,
+            latency_ms: row.get("latency_ms")?,
+            success: row.get("success")?,
+            error_kind: row.get("error_kind")?,
             recorded_at: row.get("recorded_at")?,
         })
     }
@@ -916,8 +960,8 @@ impl GraphStore for SqliteGraphStore {
 
     fn upsert_session_usage(&self, usage: NewSessionUsage) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO session_usage (repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, session_started_at, session_ended_at, recorded_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP) \
+            "INSERT INTO session_usage (repo, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_estimate_usd, session_started_at, session_ended_at, peak_context_tokens, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, CURRENT_TIMESTAMP) \
              ON CONFLICT(repo, session_id, model) DO UPDATE SET \
                 input_tokens = excluded.input_tokens, \
                 output_tokens = excluded.output_tokens, \
@@ -926,6 +970,7 @@ impl GraphStore for SqliteGraphStore {
                 cost_estimate_usd = excluded.cost_estimate_usd, \
                 session_started_at = excluded.session_started_at, \
                 session_ended_at = excluded.session_ended_at, \
+                peak_context_tokens = excluded.peak_context_tokens, \
                 recorded_at = CURRENT_TIMESTAMP",
             rusqlite::params![
                 usage.repo,
@@ -938,6 +983,7 @@ impl GraphStore for SqliteGraphStore {
                 usage.cost_estimate_usd,
                 usage.session_started_at,
                 usage.session_ended_at,
+                usage.peak_context_tokens,
             ],
         )?;
         let id: i64 = self.conn.query_row(
@@ -951,6 +997,34 @@ impl GraphStore for SqliteGraphStore {
     fn session_usage_for_repo(&self, repo: &str) -> Result<Vec<SessionUsage>> {
         let mut stmt = self.conn.prepare("SELECT * FROM session_usage WHERE repo = ?1 ORDER BY session_started_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_session_usage)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn record_llm_usage(&self, usage: NewLlmUsage) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO llm_usage (repo, operation, provider, model, input_tokens, output_tokens, cost_estimate_usd, latency_ms, success, error_kind, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, CURRENT_TIMESTAMP)",
+            rusqlite::params![
+                usage.repo,
+                usage.operation,
+                usage.provider,
+                usage.model,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cost_estimate_usd,
+                usage.latency_ms,
+                usage.success,
+                usage.error_kind,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    fn llm_usage_for_repo(&self, repo: &str) -> Result<Vec<LlmUsage>> {
+        // `id`, not `recorded_at`: CURRENT_TIMESTAMP has one-second
+        // resolution, so calls within the same second would otherwise tie.
+        let mut stmt = self.conn.prepare("SELECT * FROM llm_usage WHERE repo = ?1 ORDER BY id ASC")?;
+        let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_llm_usage)?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
@@ -1708,6 +1782,7 @@ mod tests {
             cache_read_tokens: 0,
             cache_write_tokens: 0,
             cost_estimate_usd: 0.01,
+            peak_context_tokens: 0,
             session_started_at: "2026-09-03T00:00:00Z".into(),
             session_ended_at: "2026-09-03T01:00:00Z".into(),
         }

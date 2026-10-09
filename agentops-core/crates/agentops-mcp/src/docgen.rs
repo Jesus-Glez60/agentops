@@ -69,9 +69,11 @@ pub fn persist_doc_page(store: &dyn GraphStore, repo_path: &Path, repo: &str, fi
     // (interactive, quality matters) than to a background best-effort call.
     // Revised after a wrap-skill council audit flagged the original cheap-
     // tier choice as mis-scoped (2026-09-28).
+    let recorder = agentops_llm::UsageRecorder::default();
     let module_labels = agentops_llm::AnthropicConfig::from_env()
-        .and_then(|config| agentops_llm::group_core_modules(&config, repo, &ranked))
+        .and_then(|config| agentops_llm::group_core_modules(&config.with_usage_sink(recorder.clone()), repo, &ranked))
         .unwrap_or_default();
+    recorder.persist(store, repo);
 
     let mut doc_page = agentops_docgen::build_doc_page(store, repo, &ranked, &module_labels)?;
 

@@ -117,6 +117,23 @@ pub(crate) fn checkout_path(repo_checkouts_dir: &std::path::Path, tenant: &str, 
     repo_checkouts_dir.join(format!("{connection_id}--{tenant}"))
 }
 
+/// Deletes every Postgres graph row (nodes, session events/usage, LLM
+/// spend, ...) for one tenant's connection, via `PostgresGraphStore::
+/// wipe_repo` under the same repo name every other store lookup derives
+/// from its checkout path. Shared by `DELETE /repos/{id}` and org deletion
+/// so the two can't drift on which repo name they wipe. Blocking --
+/// `wipe_repo` runs `rt.block_on` internally, so call this only from
+/// `spawn_blocking`, never directly on an async task.
+pub(crate) fn wipe_connection_graph(pg: &agentops_mcp::PostgresGraphStore, repo_checkouts_dir: &std::path::Path, tenant: &str, connection_id: &str) -> anyhow::Result<()> {
+    let path = checkout_path(repo_checkouts_dir, tenant, connection_id);
+    // `repo_name` canonicalizes, and falls back to the *whole path string*
+    // when the checkout directory is gone -- a name no row was ever stored
+    // under, so the wipe would silently match nothing. The directory name
+    // itself is what every stored row uses either way.
+    let repo = if path.exists() { agentops_mcp::repo_name(&path) } else { format!("{connection_id}--{tenant}") };
+    pg.wipe_repo(&repo)
+}
+
 /// 16 random bytes, hex-encoded -- same shape as `team.rs`'s
 /// `new_random_tenant_id`, a small deliberate duplication of the pattern
 /// rather than a shared dependency for one more call site.

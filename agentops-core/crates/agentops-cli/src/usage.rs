@@ -43,6 +43,9 @@ pub struct UsageEntry {
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
     pub cost_estimate_usd: f64,
+    /// Largest single-request context in this bucket; 0 if unknown.
+    #[serde(default)]
+    pub peak_context_tokens: i64,
     pub session_started_at: String,
     pub session_ended_at: String,
 }
@@ -53,6 +56,7 @@ struct Aggregate {
     output_tokens: i64,
     cache_read_tokens: i64,
     cache_write_tokens: i64,
+    peak_context_tokens: i64,
     // ISO-8601 timestamps compare correctly as plain strings (same format,
     // same 'Z'/offset convention throughout one file) -- no need to parse
     // into a real datetime type just to find min/max.
@@ -60,28 +64,14 @@ struct Aggregate {
     ended_at: String,
 }
 
-/// Rough, hand-maintained $/million-token rates — Claude Code's JSONL
-/// transcripts don't carry a `costUSD` field, so this is the only way to
-/// produce a cost estimate at all. Deliberately approximate: matched by a
-/// substring of the model id, cache-read priced at 10% and cache-write at
-/// 125% of the input rate, matching Anthropic's real cache-pricing
-/// structure. Never presented as exact — see `agentops-api::usage`'s
-/// "estimated" labeling discipline.
-fn rate_per_million_tokens(model: &str) -> (f64, f64) {
-    if model.contains("opus") {
-        (15.0, 75.0)
-    } else if model.contains("haiku") {
-        (0.8, 4.0)
-    } else {
-        // sonnet, or anything unrecognized -- sonnet is the common default.
-        (3.0, 15.0)
-    }
-}
-
-fn cost_estimate_usd(model: &str, input_tokens: i64, output_tokens: i64, cache_read_tokens: i64, cache_write_tokens: i64) -> f64 {
-    let (input_rate, output_rate) = rate_per_million_tokens(model);
-    let million = 1_000_000.0;
-    (input_tokens as f64 * input_rate + output_tokens as f64 * output_rate + cache_read_tokens as f64 * (input_rate * 0.1) + cache_write_tokens as f64 * (input_rate * 1.25)) / million
+/// Claude Code's JSONL transcripts don't carry a `costUSD` field, so a
+/// hand-maintained rate table (`agentops_llm::pricing`, shared with the
+/// LLM spend ledger) is the only way to produce a cost estimate at all.
+/// `session_usage.cost_estimate_usd` is NOT NULL, so a model with no known
+/// rate records 0.0 here -- `collect_usage_entries` prints a warning naming
+/// it rather than letting the total pass as complete.
+fn cost_estimate_usd(model: &str, input_tokens: i64, output_tokens: i64, cache_read_tokens: i64, cache_write_tokens: i64) -> Option<f64> {
+    agentops_llm::pricing::cost_estimate_usd("anthropic", model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens)
 }
 
 /// `/` -> `-` — Claude Code's own convention for naming a project's session
@@ -96,53 +86,108 @@ fn default_claude_home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".claude")
 }
 
-/// One accumulated `(session_id, model)` bucket, parsed from every
-/// `*.jsonl` file under a repo's Claude Code project directory.
+/// One message's usage, as the *last* JSONL line carrying its
+/// `message.id` reported it.
+struct MessageUsage {
+    model: String,
+    timestamp: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+}
+
+/// Every API message in one JSONL file, deduped by `message.id`. Claude
+/// Code writes one `assistant` line per content block (thinking, text,
+/// tool_use) of the same message, each repeating that message's *full*
+/// usage -- summing per line overcounted a real session ~2.4x. A line with
+/// no `message.id` (older formats) is kept as its own message.
+fn read_session_messages(path: &Path) -> Result<Vec<MessageUsage>> {
+    let mut by_id: HashMap<String, MessageUsage> = HashMap::new();
+    let mut anonymous = Vec::new();
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    for line in std::io::BufReader::new(file).lines() {
+        // A session file can be actively appended to by a running
+        // Claude Code process — a trailing partial/corrupt line is
+        // expected, not an error; skip it and keep going.
+        let Ok(line) = line else { continue };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+        if value.get("type").and_then(|v| v.as_str()) != Some("assistant") {
+            continue;
+        }
+        let message = value.get("message");
+        let Some(usage) = message.and_then(|m| m.get("usage")) else { continue };
+        let get_u = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
+        let parsed = MessageUsage {
+            model: message.and_then(|m| m.get("model")).and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
+            timestamp: value.get("timestamp").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            input_tokens: get_u("input_tokens"),
+            output_tokens: get_u("output_tokens"),
+            cache_read_tokens: get_u("cache_read_input_tokens"),
+            cache_write_tokens: get_u("cache_creation_input_tokens"),
+        };
+        match message.and_then(|m| m.get("id")).and_then(|v| v.as_str()) {
+            Some(id) => {
+                by_id.insert(id.to_string(), parsed);
+            }
+            None => anonymous.push(parsed),
+        }
+    }
+    anonymous.extend(by_id.into_values());
+    Ok(anonymous)
+}
+
+fn add_messages(totals: &mut HashMap<(String, String), Aggregate>, session_id: &str, messages: Vec<MessageUsage>) {
+    for m in messages {
+        let agg = totals.entry((session_id.to_string(), m.model)).or_default();
+        agg.input_tokens += m.input_tokens;
+        agg.output_tokens += m.output_tokens;
+        agg.cache_read_tokens += m.cache_read_tokens;
+        agg.cache_write_tokens += m.cache_write_tokens;
+        agg.peak_context_tokens = agg.peak_context_tokens.max(m.input_tokens + m.cache_read_tokens + m.cache_write_tokens);
+        if !m.timestamp.is_empty() {
+            if agg.started_at.is_empty() || m.timestamp < agg.started_at {
+                agg.started_at = m.timestamp.clone();
+            }
+            if m.timestamp > agg.ended_at {
+                agg.ended_at = m.timestamp;
+            }
+        }
+    }
+}
+
+/// One accumulated `(session_id, model)` bucket per session file under a
+/// repo's Claude Code project directory, plus a `<session>#subagents`
+/// bucket for each session's `<session>/subagents/*.jsonl` transcripts
+/// (`agentops_graph::SUBAGENT_SESSION_SUFFIX`) -- a plain `read_dir` of the
+/// project dir never sees those, and they're real spend.
 fn accumulate_usage(projects_dir: &Path) -> Result<(HashMap<(String, String), Aggregate>, usize)> {
     let mut totals: HashMap<(String, String), Aggregate> = HashMap::new();
     let mut files_scanned = 0;
 
     let entries = std::fs::read_dir(projects_dir).with_context(|| format!("reading {}", projects_dir.display()))?;
     for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
+        let path = entry?.path();
         if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
         let session_id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown-session").to_string();
         files_scanned += 1;
+        add_messages(&mut totals, &session_id, read_session_messages(&path)?);
 
-        let file = std::fs::File::open(&path).with_context(|| format!("opening {}", path.display()))?;
-        for line in std::io::BufReader::new(file).lines() {
-            // A session file can be actively appended to by a running
-            // Claude Code process — a trailing partial/corrupt line is
-            // expected, not an error; skip it and keep going.
-            let Ok(line) = line else { continue };
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
-            if value.get("type").and_then(|v| v.as_str()) != Some("assistant") {
-                continue;
-            }
-            let message = value.get("message");
-            let Some(usage) = message.and_then(|m| m.get("usage")) else { continue };
-            let model = message.and_then(|m| m.get("model")).and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-            let timestamp = value.get("timestamp").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-
-            let get_u = |key: &str| usage.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
-            let agg = totals.entry((session_id.clone(), model)).or_default();
-            agg.input_tokens += get_u("input_tokens");
-            agg.output_tokens += get_u("output_tokens");
-            agg.cache_read_tokens += get_u("cache_read_input_tokens");
-            agg.cache_write_tokens += get_u("cache_creation_input_tokens");
-            if !timestamp.is_empty() {
-                if agg.started_at.is_empty() || timestamp < agg.started_at {
-                    agg.started_at = timestamp.clone();
+        let subagents_dir = projects_dir.join(&session_id).join("subagents");
+        if let Ok(sub_entries) = std::fs::read_dir(&subagents_dir) {
+            let subagent_bucket = format!("{session_id}{}", agentops_graph::SUBAGENT_SESSION_SUFFIX);
+            for sub in sub_entries {
+                let sub_path = sub?.path();
+                if sub_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
                 }
-                if timestamp > agg.ended_at {
-                    agg.ended_at = timestamp;
-                }
+                files_scanned += 1;
+                add_messages(&mut totals, &subagent_bucket, read_session_messages(&sub_path)?);
             }
         }
     }
@@ -174,7 +219,19 @@ pub fn collect_usage_entries(repo_path: &Path, claude_home: Option<&Path>) -> Re
             // there's nothing safe to write; skip rather than fabricate one.
             continue;
         }
-        let cost_estimate_usd = cost_estimate_usd(&model, agg.input_tokens, agg.output_tokens, agg.cache_read_tokens, agg.cache_write_tokens);
+        let has_tokens = agg.input_tokens + agg.output_tokens + agg.cache_read_tokens + agg.cache_write_tokens > 0;
+        let cost_estimate_usd = match cost_estimate_usd(&model, agg.input_tokens, agg.output_tokens, agg.cache_read_tokens, agg.cache_write_tokens) {
+            Some(cost) => cost,
+            None => {
+                // Zero-token buckets (e.g. Claude Code's `<synthetic>` model
+                // entries) cost nothing either way -- only warn when real
+                // usage went unpriced.
+                if has_tokens {
+                    eprintln!("warning: no known rate for model {model:?} -- its tokens are recorded but priced at $0.00; update agentops_llm::pricing");
+                }
+                0.0
+            }
+        };
         out.push(UsageEntry {
             session_id,
             model,
@@ -183,6 +240,7 @@ pub fn collect_usage_entries(repo_path: &Path, claude_home: Option<&Path>) -> Re
             cache_read_tokens: agg.cache_read_tokens,
             cache_write_tokens: agg.cache_write_tokens,
             cost_estimate_usd,
+            peak_context_tokens: agg.peak_context_tokens,
             session_started_at: agg.started_at,
             session_ended_at: agg.ended_at,
         });
@@ -205,6 +263,7 @@ pub fn write_usage_locally(store: &dyn GraphStore, repo: &str, entries: &[UsageE
             cache_read_tokens: entry.cache_read_tokens,
             cache_write_tokens: entry.cache_write_tokens,
             cost_estimate_usd: entry.cost_estimate_usd,
+            peak_context_tokens: entry.peak_context_tokens,
             session_started_at: entry.session_started_at.clone(),
             session_ended_at: entry.session_ended_at.clone(),
         })?;
@@ -269,6 +328,44 @@ mod tests {
         assert_eq!(agg.cache_write_tokens, 1);
         assert_eq!(agg.started_at, "2026-09-03T00:00:00Z");
         assert_eq!(agg.ended_at, "2026-09-03T00:05:00Z");
+    }
+
+    /// Claude Code writes one line per content block, each repeating the
+    /// whole message's usage -- real shape, from a 2026-10-09 transcript.
+    #[test]
+    fn accumulate_usage_counts_a_message_split_across_content_block_lines_once() {
+        let dir = tempfile::tempdir().unwrap();
+        write_jsonl(
+            dir.path(),
+            "sess-1",
+            &[
+                r#"{"type":"assistant","timestamp":"2026-10-09T00:00:00Z","message":{"id":"msg_a","model":"claude-opus-5-5","content":[{"type":"thinking"}],"usage":{"input_tokens":2,"output_tokens":300,"cache_read_input_tokens":20000,"cache_creation_input_tokens":500}}}"#,
+                r#"{"type":"assistant","timestamp":"2026-10-09T00:00:01Z","message":{"id":"msg_a","model":"claude-opus-5-5","content":[{"type":"tool_use"}],"usage":{"input_tokens":2,"output_tokens":300,"cache_read_input_tokens":20000,"cache_creation_input_tokens":500}}}"#,
+                r#"{"type":"assistant","timestamp":"2026-10-09T00:01:00Z","message":{"id":"msg_b","model":"claude-opus-5-5","content":[{"type":"text"}],"usage":{"input_tokens":1,"output_tokens":50,"cache_read_input_tokens":20500,"cache_creation_input_tokens":100}}}"#,
+            ],
+        );
+
+        let (totals, _) = accumulate_usage(dir.path()).unwrap();
+        let agg = &totals[&("sess-1".to_string(), "claude-opus-5-5".to_string())];
+        assert_eq!((agg.input_tokens, agg.output_tokens, agg.cache_read_tokens, agg.cache_write_tokens), (3, 350, 40500, 600));
+        assert_eq!(agg.peak_context_tokens, 20601, "largest single request: 1 + 20500 + 100");
+    }
+
+    #[test]
+    fn accumulate_usage_includes_subagent_transcripts_in_their_own_bucket() {
+        let dir = tempfile::tempdir().unwrap();
+        let line = |id: &str, out: i64| format!(r#"{{"type":"assistant","timestamp":"2026-10-09T00:00:00Z","message":{{"id":"{id}","model":"claude-opus-5-5","usage":{{"input_tokens":1,"output_tokens":{out},"cache_read_input_tokens":10,"cache_creation_input_tokens":0}}}}}}"#);
+        write_jsonl(dir.path(), "sess-1", &[&line("m1", 100)]);
+        let subagents = dir.path().join("sess-1").join("subagents");
+        std::fs::create_dir_all(&subagents).unwrap();
+        write_jsonl(&subagents, "agent-a", &[&line("s1", 7)]);
+        write_jsonl(&subagents, "agent-b", &[&line("s2", 5)]);
+
+        let (totals, files_scanned) = accumulate_usage(dir.path()).unwrap();
+        assert_eq!(files_scanned, 3);
+        assert_eq!(totals[&("sess-1".to_string(), "claude-opus-5-5".to_string())].output_tokens, 100);
+        let sub = &totals[&(format!("sess-1{}", agentops_graph::SUBAGENT_SESSION_SUFFIX), "claude-opus-5-5".to_string())];
+        assert_eq!(sub.output_tokens, 12, "both subagents, aggregated under the parent session");
     }
 
     #[test]
