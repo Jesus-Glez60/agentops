@@ -327,3 +327,27 @@ CREATE TABLE IF NOT EXISTS llm_usage (
     recorded_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_llm_usage_repo_time ON llm_usage(repo, recorded_at);
+
+-- Per-session token breakdown (agentops_graph::NewSessionReport): where a
+-- session's re-read tokens went, from `agentops-cli usage report` (source
+-- 'transcript', exact) or the report_usage MCP tool (source 'agent',
+-- estimated). categories/resets are JSON in TEXT, like repo_state's id
+-- lists. One row per (repo, session_id).
+CREATE TABLE IF NOT EXISTS session_report (
+    id                    BIGSERIAL PRIMARY KEY,
+    repo                  TEXT NOT NULL,
+    session_id            TEXT NOT NULL,
+    source                TEXT NOT NULL,
+    agent                 TEXT NOT NULL,
+    calls                 BIGINT NOT NULL DEFAULT 0,
+    tasks                 BIGINT NOT NULL DEFAULT 0,
+    baseline_tokens       BIGINT NOT NULL DEFAULT 0,
+    peak_context          BIGINT NOT NULL DEFAULT 0,
+    total_context_tokens  BIGINT NOT NULL DEFAULT 0,
+    output_tokens         BIGINT NOT NULL DEFAULT 0,
+    compactions           BIGINT NOT NULL DEFAULT 0,
+    categories_json       TEXT NOT NULL,
+    resets_json           TEXT NOT NULL,
+    recorded_at           TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_session_report_unique ON session_report(repo, session_id);

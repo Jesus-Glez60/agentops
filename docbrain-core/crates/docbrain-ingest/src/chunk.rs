@@ -231,6 +231,21 @@ fn extract_code_blocks(content: &str) -> (String, Vec<CodeExample>) {
     (prose, examples)
 }
 
+/// Longest topic (heading text) a node keeps.
+const MAX_TOPIC_CHARS: usize = 200;
+
+/// Caps a heading's text at [`MAX_TOPIC_CHARS`]. A scraped page with almost
+/// no newlines turns its first `#` line into the whole page; uncapped, that
+/// once produced a ~3.9M-char topic that `token_count` (content only)
+/// never saw, so `search_docs` returned it past any `max_tokens`. The full
+/// line is still in the section's content, which is token-bounded.
+pub(crate) fn cap_topic(text: &str) -> String {
+    match text.char_indices().nth(MAX_TOPIC_CHARS) {
+        None => text.to_string(),
+        Some((i, _)) => format!("{}…", &text[..i]),
+    }
+}
+
 /// Splits `markdown` at every heading line (`^#{1,6} text`) — a hard
 /// boundary, never merged with its neighbor regardless of size. Text before
 /// the first heading (or the whole page, if it has none) becomes a `level:
@@ -256,7 +271,7 @@ fn split_into_sections(markdown: &str, default_topic: &str) -> Vec<Section> {
                 }
                 section_start = offset;
                 current_level = level;
-                current_topic = text.to_string();
+                current_topic = cap_topic(text);
             }
         }
         offset += line.len();
@@ -446,6 +461,15 @@ mod tests {
             edges.iter().any(|e| e.from_node == overview_node.id && e.to_node == configuration_node.id && matches!(e.relation, EdgeRelation::CrossReference)),
             "expected a CrossReference edge from the Overview anchor to the Configuration heading it points at"
         );
+    }
+
+    #[test]
+    fn a_newline_free_page_does_not_become_a_multi_megabyte_topic() {
+        let markdown = format!("## Migrating to @openrouter/agent {}", "body text ".repeat(100_000));
+        let sections = split_into_sections(&markdown, "overview");
+        assert!(sections.iter().all(|s| s.topic.chars().count() <= MAX_TOPIC_CHARS + 1));
+        // The text itself is still kept, in the (token-bounded) content.
+        assert!(sections.iter().any(|s| s.content.len() >= 1_000_000));
     }
 
     #[test]

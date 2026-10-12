@@ -27,7 +27,7 @@ use std::collections::HashMap;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
 
-use agentops_graph::{GraphStore, NewSessionUsage};
+use agentops_graph::{GraphStore, NewSessionReport, NewSessionUsage};
 use anyhow::{Context, Result};
 use serde::Serialize;
 
@@ -78,11 +78,11 @@ fn cost_estimate_usd(model: &str, input_tokens: i64, output_tokens: i64, cache_r
 /// directory under `~/.claude/projects/`. Verified empirically against a
 /// real local `~/.claude/projects/` directory (e.g.
 /// `/Users/x/Repos/y` -> `-Users-x-Repos-y`), not assumed from docs.
-fn sanitize_project_path(canonical_path: &Path) -> String {
+pub(crate) fn sanitize_project_path(canonical_path: &Path) -> String {
     canonical_path.display().to_string().replace('/', "-")
 }
 
-fn default_claude_home() -> PathBuf {
+pub(crate) fn default_claude_home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".claude")
 }
 
@@ -211,6 +211,29 @@ pub fn collect_usage_entries(repo_path: &Path, claude_home: Option<&Path>) -> Re
     }
 
     let (totals, files_scanned) = accumulate_usage(&projects_dir)?;
+    Ok((entries_from_totals(totals), files_scanned))
+}
+
+/// One session's transcript (plus its `<session>/subagents/` siblings) --
+/// the SessionEnd hook's path, so ending one session doesn't re-parse
+/// every transcript the repo has ever had.
+pub fn collect_usage_entries_for_file(transcript: &Path) -> Result<(Vec<UsageEntry>, usize)> {
+    let session_id = transcript.file_stem().and_then(|s| s.to_str()).unwrap_or("unknown-session").to_string();
+    let mut totals: HashMap<(String, String), Aggregate> = HashMap::new();
+    add_messages(&mut totals, &session_id, read_session_messages(transcript)?);
+    let mut files_scanned = 1;
+    let subagents_dir = transcript.with_extension("").join("subagents");
+    if let Ok(subs) = std::fs::read_dir(&subagents_dir) {
+        let bucket = format!("{session_id}{}", agentops_graph::SUBAGENT_SESSION_SUFFIX);
+        for sub in subs.flatten().map(|e| e.path()).filter(|p| p.extension().and_then(|e| e.to_str()) == Some("jsonl")) {
+            files_scanned += 1;
+            add_messages(&mut totals, &bucket, read_session_messages(&sub)?);
+        }
+    }
+    Ok((entries_from_totals(totals), files_scanned))
+}
+
+fn entries_from_totals(totals: HashMap<(String, String), Aggregate>) -> Vec<UsageEntry> {
     let mut out = Vec::with_capacity(totals.len());
     for ((session_id, model), agg) in totals {
         if agg.started_at.is_empty() {
@@ -245,14 +268,16 @@ pub fn collect_usage_entries(repo_path: &Path, claude_home: Option<&Path>) -> Re
             session_ended_at: agg.ended_at,
         });
     }
-
-    Ok((out, files_scanned))
+    out
 }
 
 /// Upserts every entry into `store` directly — the local/self-hosted path,
 /// where this machine's own `.context/graph.db` (or `AGENTOPS_DATABASE_URL`)
 /// *is* the repo's real graph store.
-pub fn write_usage_locally(store: &dyn GraphStore, repo: &str, entries: &[UsageEntry]) -> Result<usize> {
+pub fn write_usage_locally(store: &dyn GraphStore, repo: &str, entries: &[UsageEntry], reports: &[NewSessionReport]) -> Result<usize> {
+    for report in reports {
+        store.upsert_session_report(NewSessionReport { repo: repo.to_string(), ..report.clone() })?;
+    }
     for entry in entries {
         store.upsert_session_usage(NewSessionUsage {
             repo: repo.to_string(),
@@ -276,14 +301,14 @@ pub fn write_usage_locally(store: &dyn GraphStore, repo: &str, entries: &[UsageE
 /// `agentops connect --remote`, using the same Bearer `api_key`
 /// `connect_remote` already obtained (device-login or `--api-key`) and
 /// persisted in `.context/agentops-remote.json`.
-pub fn push_usage_remote(server_url: &str, connection_id: &str, api_key: &str, entries: &[UsageEntry]) -> Result<usize> {
+pub fn push_usage_remote(server_url: &str, connection_id: &str, api_key: &str, entries: &[UsageEntry], reports: &[NewSessionReport]) -> Result<usize> {
     let url = format!("{server_url}/repos/{connection_id}/usage/sync");
     let mut response = ureq::post(&url)
         .header("Authorization", &format!("Bearer {api_key}"))
         .config()
         .http_status_as_error(false)
         .build()
-        .send_json(serde_json::json!({ "entries": entries }))
+        .send_json(serde_json::json!({ "entries": entries, "reports": reports }))
         .with_context(|| format!("calling POST {url}"))?;
     if !response.status().is_success() {
         let body = response.body_mut().read_to_string().unwrap_or_default();
@@ -407,7 +432,7 @@ mod tests {
         let store = agentops_graph::SqliteGraphStore::open_in_memory().unwrap();
         let repo = "test-repo";
         let (entries1, _) = collect_usage_entries(repo_dir.path(), Some(claude_home.path())).unwrap();
-        let synced1 = write_usage_locally(&store, repo, &entries1).unwrap();
+        let synced1 = write_usage_locally(&store, repo, &entries1, &[]).unwrap();
         assert_eq!(synced1, 1);
 
         // The session file grows -- re-syncing must update the same row,
@@ -421,7 +446,7 @@ mod tests {
             ],
         );
         let (entries2, _) = collect_usage_entries(repo_dir.path(), Some(claude_home.path())).unwrap();
-        let synced2 = write_usage_locally(&store, repo, &entries2).unwrap();
+        let synced2 = write_usage_locally(&store, repo, &entries2, &[]).unwrap();
         assert_eq!(synced2, 1);
 
         let rows = store.session_usage_for_repo(repo).unwrap();

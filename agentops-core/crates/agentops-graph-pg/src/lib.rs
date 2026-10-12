@@ -45,7 +45,7 @@
 //! the real deployment's actual Postgres server core count/storage.
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -148,6 +148,7 @@ impl PostgresGraphStore {
             client.execute("DELETE FROM session_events WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_usage WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM llm_usage WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM session_report WHERE repo = $1", &[&repo]).await?;
             // Nodes last: edges cascade at the DB level, and the
             // soft-referenced tables above are already cleared, so nothing
             // left references these ids.
@@ -899,6 +900,66 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn upsert_session_report(&self, r: NewSessionReport) -> Result<Option<i64>> {
+        // `query_opt`, not `query_one`: when the DO UPDATE's WHERE is false
+        // (an agent report against a transcript one), RETURNING yields no
+        // row (Postgres INSERT docs) -- that's "ignored", not an error.
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let sql = "INSERT INTO session_report (repo, session_id, source, agent, calls, tasks, baseline_tokens, peak_context, total_context_tokens, output_tokens, compactions, categories_json, resets_json) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+                 ON CONFLICT (repo, session_id) DO UPDATE SET \
+                    source = excluded.source, agent = excluded.agent, calls = excluded.calls, tasks = excluded.tasks, \
+                    baseline_tokens = excluded.baseline_tokens, peak_context = excluded.peak_context, \
+                    total_context_tokens = excluded.total_context_tokens, output_tokens = excluded.output_tokens, \
+                    compactions = excluded.compactions, categories_json = excluded.categories_json, \
+                    resets_json = excluded.resets_json, recorded_at = now() \
+                 WHERE session_report.source = 'agent' OR excluded.source = 'transcript' \
+                 RETURNING id";
+            let (categories, resets) = (serde_json::to_string(&r.categories)?, serde_json::to_string(&r.resets)?);
+            let row = client
+                .query_opt(
+                    sql,
+                    &[&r.repo, &r.session_id, &r.source, &r.agent, &r.calls, &r.tasks, &r.baseline_tokens, &r.peak_context, &r.total_context_tokens, &r.output_tokens, &r.compactions, &categories, &resets],
+                )
+                .await?;
+            Ok(row.map(|row| row.get(0)))
+        })
+    }
+
+    fn session_reports_for_repo(&self, repo: &str) -> Result<Vec<SessionReport>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client
+                .query(
+                    "SELECT repo, session_id, source, agent, calls, tasks, baseline_tokens, peak_context, total_context_tokens, output_tokens, compactions, categories_json, resets_json, recorded_at::text \
+                     FROM session_report WHERE repo = $1 ORDER BY recorded_at DESC, id DESC",
+                    &[&repo],
+                )
+                .await?;
+            rows.iter()
+                .map(|row| {
+                    let report = NewSessionReport {
+                        repo: row.get(0),
+                        session_id: row.get(1),
+                        source: row.get(2),
+                        agent: row.get(3),
+                        calls: row.get(4),
+                        tasks: row.get(5),
+                        baseline_tokens: row.get(6),
+                        peak_context: row.get(7),
+                        total_context_tokens: row.get(8),
+                        output_tokens: row.get(9),
+                        compactions: row.get(10),
+                        categories: serde_json::from_str(row.get(11))?,
+                        resets: serde_json::from_str(row.get(12))?,
+                    };
+                    Ok(SessionReport { report, recorded_at: row.get(13) })
+                })
+                .collect()
+        })
+    }
+
     fn record_llm_usage(&self, usage: NewLlmUsage) -> Result<i64> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
@@ -1414,12 +1475,43 @@ mod tests {
                 .unwrap();
         }
 
+        for repo in [&a, &b] {
+            store.upsert_session_report(NewSessionReport { repo: repo.to_string(), session_id: "sess".into(), source: "transcript".into(), agent: "claude-code".into(), ..Default::default() }).unwrap();
+        }
+
         store.wipe_repo(&a).unwrap();
+        assert!(store.session_reports_for_repo(&a).unwrap().is_empty());
+        assert_eq!(store.session_reports_for_repo(&b).unwrap().len(), 1);
         assert!(store.llm_usage_for_repo(&a).unwrap().is_empty());
         assert!(store.session_usage_for_repo(&a).unwrap().is_empty(), "wipe_repo previously left session_usage behind");
         assert_eq!(store.llm_usage_for_repo(&b).unwrap().len(), 1);
         assert_eq!(store.session_usage_for_repo(&b).unwrap().len(), 1);
         store.wipe_repo(&b).unwrap();
+    }
+
+    #[test]
+    fn session_report_ignored_agent_write_is_ok_none_and_json_round_trips() {
+        let store = require_store!();
+        let repo = unique_repo("pg-report");
+        let mk = |source: &str, total: i64| NewSessionReport {
+            repo: repo.clone(),
+            session_id: "s1".into(),
+            source: source.into(),
+            agent: "x".into(),
+            total_context_tokens: total,
+            categories: [("reminders".to_string(), total)].into(),
+            resets: vec![agentops_graph::ResetSim { threshold: 150_000, resets: 1, simulated_tokens: 7, savings: 0.5 }],
+            ..Default::default()
+        };
+        assert!(store.upsert_session_report(mk("agent", 1)).unwrap().is_some());
+        assert!(store.upsert_session_report(mk("transcript", 100)).unwrap().is_some());
+        // The case query_one would have turned into an error.
+        assert_eq!(store.upsert_session_report(mk("agent", 999)).unwrap(), None);
+        let rows = store.session_reports_for_repo(&repo).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].report, mk("transcript", 100));
+        assert!(!rows[0].recorded_at.is_empty());
+        store.wipe_repo(&repo).unwrap();
     }
 
     #[test]

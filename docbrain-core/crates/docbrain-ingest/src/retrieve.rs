@@ -20,6 +20,35 @@ pub struct DocResult {
     pub related_via: Option<EdgeRelation>,
 }
 
+static BPE: std::sync::LazyLock<tiktoken_rs::CoreBPE> = std::sync::LazyLock::new(|| tiktoken_rs::cl100k_base().expect("cl100k_base's bundled ranks must load"));
+
+/// Caps a stored node's topic: nodes ingested before `cap_topic` existed
+/// can carry a multi-MB topic until re-scraped.
+fn bounded(mut node: DocNode) -> DocNode {
+    node.topic = crate::chunk::cap_topic(&node.topic);
+    node
+}
+
+/// A node's budget cost. Floored at chars/4 rather than trusting the stored
+/// `token_count` alone: a live `search_docs(max_tokens: 1000)` once returned
+/// two ~3.9M-char nodes because a stored count understated them.
+fn cost_of(node: &DocNode) -> usize {
+    (node.token_count.max(0) as usize).max(node.content.len() / 4)
+}
+
+/// Truncates `node`'s content to `budget` tokens, appending a marker. Only a
+/// prefix (~8 chars/token, generous) is ever encoded, so a multi-MB node
+/// costs no more to cut than a small one.
+fn truncate_node(mut node: DocNode, budget: usize) -> DocNode {
+    let total_chars = node.content.len();
+    let prefix_end = node.content.char_indices().nth(budget.saturating_mul(8)).map_or(total_chars, |(i, _)| i);
+    let tokens = BPE.encode_with_special_tokens(&node.content[..prefix_end]);
+    let kept = BPE.decode(&tokens[..tokens.len().min(budget)]).unwrap_or_default();
+    node.content = format!("{kept}\n… [truncated: node {} is {total_chars} chars — narrow the query]", node.id);
+    node.token_count = budget as i64;
+    node
+}
+
 pub enum GetDocsOutcome {
     NotFound { available_versions: Vec<String> },
     Found { docs: Vec<DocResult>, hidden_examples: usize },
@@ -38,12 +67,17 @@ pub fn get_docs(store: &dyn DocbrainStore, slug: &str, version: &str, max_tokens
     let mut used = 0usize;
     let mut docs = Vec::new();
     for node in candidates {
-        let cost = node.token_count as usize;
-        if used > 0 && used + cost > max_tokens {
+        let cost = cost_of(&node);
+        if used + cost > max_tokens {
+            // An oversized first node is cut to fit rather than returned
+            // whole (or not at all).
+            if used == 0 {
+                docs.push(DocResult { node: truncate_node(bounded(node), max_tokens), distance: None, related_via: None });
+            }
             break;
         }
         used += cost;
-        docs.push(DocResult { node, distance: None, related_via: None });
+        docs.push(DocResult { node: bounded(node), distance: None, related_via: None });
     }
     Ok(GetDocsOutcome::Found { docs, hidden_examples })
 }
@@ -73,13 +107,16 @@ pub fn search_docs(
         if !included.insert(hit.node.id) {
             continue;
         }
-        let cost = hit.node.token_count as usize;
-        if used > 0 && used + cost > max_tokens {
+        let cost = cost_of(&hit.node);
+        if used + cost > max_tokens {
+            if used == 0 {
+                docs.push(DocResult { node: truncate_node(bounded(hit.node), max_tokens), distance: Some(hit.distance), related_via: None });
+            }
             break;
         }
         used += cost;
         let node_id = hit.node.id;
-        docs.push(DocResult { node: hit.node, distance: Some(hit.distance), related_via: None });
+        docs.push(DocResult { node: bounded(hit.node), distance: Some(hit.distance), related_via: None });
 
         // Associative expansion: pull directly-connected synapse-edge
         // context for this hit, budget permitting — this is what makes
@@ -93,13 +130,13 @@ pub fn search_docs(
             if !include_examples && neighbor.kind == NodeKind::CodeExample {
                 continue;
             }
-            let neighbor_cost = neighbor.token_count as usize;
+            let neighbor_cost = cost_of(&neighbor);
             if used + neighbor_cost > max_tokens {
                 continue;
             }
             used += neighbor_cost;
             included.insert(neighbor_id);
-            docs.push(DocResult { node: neighbor, distance: None, related_via: Some(edge.relation) });
+            docs.push(DocResult { node: bounded(neighbor), distance: None, related_via: Some(edge.relation) });
         }
     }
 
@@ -114,7 +151,7 @@ pub fn get_code_examples(store: &dyn DocbrainStore, node_id: i64) -> Result<Vec<
     for edge in store.node_edges(node_id)? {
         if matches!(edge.relation, EdgeRelation::HasExample) && edge.from_node == node_id {
             if let Some(node) = store.get_node(edge.to_node)? {
-                examples.push(node);
+                examples.push(bounded(node));
             }
         }
     }
@@ -209,6 +246,52 @@ mod tests {
 
         let with_examples = search_docs(&store, &FAKE_EMBED, "anything", None, 5, 2000, true).unwrap();
         assert_eq!(with_examples.len(), 2);
+    }
+
+    #[test]
+    fn search_docs_and_get_docs_cap_an_oversized_node_with_an_understated_token_count() {
+        let store = SqliteDocbrainStore::open_in_memory().unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
+        let vector = vec![1.0_f32; docbrain_graph::EMBEDDING_DIM];
+        let (big, small) = ("word ".repeat(200_000), "a small neighbour");
+        let (big_hash, small_hash) = (content_hash(&big), content_hash(small));
+        // token_count understates the 1M-char node, as on the live server.
+        let big_id = store
+            .upsert_doc_node("next", NewDocNode { version: "1.0", topic: "big", content: &big, content_hash: &big_hash, token_count: 10, embedding: Some(&vector), kind: NodeKind::Prose })
+            .unwrap()
+            .node_id();
+        let small_id = store
+            .upsert_doc_node("next", NewDocNode { version: "1.0", topic: "small", content: small, content_hash: &small_hash, token_count: 10, embedding: None, kind: NodeKind::Prose })
+            .unwrap()
+            .node_id();
+        store.add_doc_edge(big_id, small_id, EdgeRelation::Sequence).unwrap();
+
+        let docs = search_docs(&store, &FAKE_EMBED, "anything", None, 3, 1000, false).unwrap();
+        let chars: usize = docs.iter().map(|d| d.node.content.len()).sum();
+        assert!(chars < 8_000, "search_docs returned {chars} chars for max_tokens 1000");
+        assert!(docs[0].node.content.contains("[truncated: node"));
+
+        let GetDocsOutcome::Found { docs, .. } = get_docs(&store, "next", "1.0", 1000, false).unwrap() else { panic!("expected Found") };
+        let chars: usize = docs.iter().map(|d| d.node.content.len()).sum();
+        assert!(chars < 8_000, "get_docs returned {chars} chars for max_tokens 1000");
+    }
+
+    #[test]
+    fn search_docs_caps_a_legacy_multi_megabyte_topic() {
+        // The real live shape: small, correctly-counted content under a
+        // ~3.9M-char topic stored before ingest capped topics.
+        let store = SqliteDocbrainStore::open_in_memory().unwrap();
+        store.add_library("next", "Next.js", None, None, None).unwrap();
+        let vector = vec![1.0_f32; docbrain_graph::EMBEDDING_DIM];
+        let topic = "Migrating ".repeat(400_000);
+        let hash = content_hash("small body");
+        store
+            .upsert_doc_node("next", NewDocNode { version: "1.0", topic: &topic, content: "small body", content_hash: &hash, token_count: 3, embedding: Some(&vector), kind: NodeKind::Prose })
+            .unwrap();
+
+        let docs = search_docs(&store, &FAKE_EMBED, "anything", None, 3, 1000, false).unwrap();
+        assert_eq!(docs.len(), 1);
+        assert!(docs[0].node.topic.chars().count() <= 201, "topic is {} chars", docs[0].node.topic.len());
     }
 
     #[test]

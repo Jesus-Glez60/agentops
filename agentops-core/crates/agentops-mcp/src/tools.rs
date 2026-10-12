@@ -180,6 +180,29 @@ fn tool_specs() -> Vec<ToolSpec> {
             handler: tool_end_session,
         },
         ToolSpec {
+            name: "report_usage",
+            description: "Fallback for agents with no local session transcript (e.g. Cursor, Codex): records this session's token usage as an agent-estimated report, shown on the usage dashboard labelled as estimated. Claude Code sessions are reported automatically from their transcript -- do not call this from Claude Code. Never overwrites a transcript-based report for the same session_id.",
+            access: AccessMode::Full,
+            annotations: WRITE_IDEMPOTENT,
+            input_schema: || {
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "session_id": { "type": "string" },
+                        "agent": { "type": "string", "description": "Which coding agent, e.g. 'cursor'." },
+                        "calls": { "type": "integer" },
+                        "output_tokens": { "type": "integer" },
+                        "total_context_tokens": { "type": "integer", "description": "Sum of the context sent across all model calls." },
+                        "peak_context": { "type": "integer", "description": "Largest single call's context." },
+                        "categories": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Optional: category name -> tokens." },
+                    },
+                    "required": ["path", "session_id", "agent"],
+                })
+            },
+            handler: tool_report_usage,
+        },
+        ToolSpec {
             name: "create_task",
             description: "Creates a native task owned by AgentOps (not synced to Linear). Pass session_id to correlate future scan_repo/add_note/etc. calls into this task's activity feed via get_task_activity.",
             access: AccessMode::Full,
@@ -388,8 +411,15 @@ fn never_scanned_hint(store: &dyn GraphStore, repo: &str) -> anyhow::Result<Opti
 /// call signatures, which caused duplicate logging calls and type
 /// conflicts; collapsing into one signature here avoids that class of bug
 /// entirely rather than fixing it after the fact.
+/// Session id a `"hit"` is filed under when the call carried none. Agents
+/// (Claude Code included) rarely pass `session_id`, and gating hits on it
+/// left the dashboard's "Knowledge hits" at 0 despite real use. Other event
+/// kinds feed per-session activity feeds, so they still require a real id.
+pub const UNATTRIBUTED_SESSION: &str = "unattributed";
+
 fn maybe_record_session_event(path: &Path, args: &Value, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> anyhow::Result<()> {
-    if let Some(session_id) = get_str(args, "session_id") {
+    let session_id = get_str(args, "session_id").or((event_kind == "hit").then_some(UNATTRIBUTED_SESSION));
+    if let Some(session_id) = session_id {
         let store = crate::store::open_store(path)?;
         store.record_session_event(&repo_name(path), session_id, tool_name, description, node_id, event_kind)?;
     }
@@ -953,6 +983,34 @@ fn tool_get_session_guide(args: &Value) -> anyhow::Result<String> {
         return Ok(briefing);
     }
     Ok(format!("No activity recorded for session '{session_id}' in {repo}, and no scan history either — call scan_repo first."))
+}
+
+fn tool_report_usage(args: &Value) -> anyhow::Result<String> {
+    let (store, repo) = repo_context(args)?;
+    let required = |key: &str| get_str(args, key).map(str::to_string).ok_or_else(|| anyhow::anyhow!("missing required '{key}'"));
+    let int = |key: &str| args.get(key).and_then(Value::as_i64).unwrap_or(0);
+    let categories = args
+        .get("categories")
+        .and_then(Value::as_object)
+        .map(|m| m.iter().filter_map(|(k, v)| v.as_i64().map(|n| (k.clone(), n))).collect())
+        .unwrap_or_default();
+    let session_id = required("session_id")?;
+    let stored = store.upsert_session_report(agentops_graph::NewSessionReport {
+        repo: repo.clone(),
+        session_id: session_id.clone(),
+        source: "agent".into(),
+        agent: required("agent")?,
+        calls: int("calls"),
+        output_tokens: int("output_tokens"),
+        total_context_tokens: int("total_context_tokens"),
+        peak_context: int("peak_context"),
+        categories,
+        ..Default::default()
+    })?;
+    Ok(match stored {
+        Some(_) => format!("Recorded agent-estimated usage for session '{session_id}' in {repo}."),
+        None => format!("Ignored: session '{session_id}' in {repo} already has a transcript-based report, which agent estimates never replace."),
+    })
 }
 
 fn tool_end_session(args: &Value) -> anyhow::Result<String> {
@@ -1564,7 +1622,7 @@ mod tests {
     }
 
     #[test]
-    fn list_gotchas_does_not_record_a_hit_when_session_id_is_absent() {
+    fn list_gotchas_without_session_id_counts_an_unattributed_hit_but_never_joins_another_session() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
         let path = dir.path().to_string_lossy().to_string();
@@ -1575,6 +1633,11 @@ mod tests {
 
         let session_result = call_tool(AccessMode::Advisor, "get_session", &json!({ "path": path, "session_id": "never-used" })).unwrap();
         assert!(session_result.content[0].text.contains("No activity recorded"), "{:?}", session_result.content);
+
+        // ...but it does count toward the repo's knowledge hits.
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let hits = store.session_events_for_repo(&repo_name(dir.path()), Some("hit")).unwrap();
+        assert_eq!(hits.iter().filter(|e| e.session_id == UNATTRIBUTED_SESSION).count(), 1);
     }
 
     /// Module 7's actual differentiator, not the CRUD: a task's own
@@ -1740,6 +1803,28 @@ mod tests {
     /// `session_id` that never did anything in this repo -- the gate
     /// `run_embedding_consolidation` is deliberately never even reached
     /// for.
+    #[test]
+    fn report_usage_records_an_estimate_but_never_replaces_a_transcript_report() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+
+        let fresh = call_tool(AccessMode::Full, "report_usage", &json!({ "path": path, "session_id": "cursor-1", "agent": "cursor", "total_context_tokens": 5000, "categories": { "tool:Read": 3000 } })).unwrap();
+        assert!(!fresh.is_error && fresh.content[0].text.starts_with("Recorded"), "{:?}", fresh.content);
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = repo_name(dir.path());
+        store.upsert_session_report(agentops_graph::NewSessionReport { repo: repo.clone(), session_id: "cc-1".into(), source: "transcript".into(), agent: "claude-code".into(), total_context_tokens: 77, ..Default::default() }).unwrap();
+        let ignored = call_tool(AccessMode::Full, "report_usage", &json!({ "path": path, "session_id": "cc-1", "agent": "cursor", "total_context_tokens": 1 })).unwrap();
+        assert!(!ignored.is_error && ignored.content[0].text.starts_with("Ignored"), "{:?}", ignored.content);
+
+        let rows = store.session_reports_for_repo(&repo).unwrap();
+        let get = |id: &str| rows.iter().find(|r| r.report.session_id == id).unwrap().report.clone();
+        assert_eq!((get("cursor-1").source.as_str(), get("cursor-1").categories["tool:Read"]), ("agent", 3000));
+        assert_eq!((get("cc-1").source.as_str(), get("cc-1").total_context_tokens), ("transcript", 77), "the transcript row must be unchanged");
+    }
+
     #[test]
     fn end_session_reports_nothing_to_consolidate_for_an_unused_session_id() {
         let dir = tempfile::tempdir().unwrap();

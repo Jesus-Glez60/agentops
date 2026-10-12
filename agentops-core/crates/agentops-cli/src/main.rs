@@ -12,6 +12,7 @@ mod hook_capture;
 mod compress_output;
 mod librarian;
 mod usage;
+mod usage_report;
 
 use std::path::{Path, PathBuf};
 
@@ -473,6 +474,35 @@ enum UsageAction {
         /// marker is picked up automatically either way.
         #[arg(long)]
         remote: Option<String>,
+        /// Sync only this one transcript (and its subagents) instead of
+        /// every session for the repo -- what the SessionEnd hook runs.
+        #[arg(long)]
+        transcript: Option<PathBuf>,
+    },
+    /// Replays local Claude Code transcripts offline: where each session's
+    /// context tokens went (re-read cost by category, calibrated against
+    /// provider-reported usage) and what resetting the session at a
+    /// context threshold would have saved. Reads only local JSONL.
+    Report {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        claude_home: Option<PathBuf>,
+        /// Session id (JSONL file stem); defaults to the most recent.
+        #[arg(long, conflicts_with = "all")]
+        session: Option<String>,
+        /// Every session and subagent transcript, plus a corpus total.
+        #[arg(long)]
+        all: bool,
+        /// Comma-separated context thresholds to simulate a reset at.
+        #[arg(long, default_value = "100k,150k,200k")]
+        reset_at: String,
+        /// Context a reset resumes with on top of the baseline -- 30k
+        /// matches real auto-compaction summaries (22-36k measured).
+        #[arg(long, default_value = "30k")]
+        handoff_tokens: String,
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -653,7 +683,16 @@ fn main() -> Result<()> {
             TaskAction::SyncLinear { path, limit, push, status_name } => task_sync_linear(&path, limit, push, status_name.as_deref()),
         },
         Command::Usage { action } => match action {
-            UsageAction::Sync { path, claude_home, remote } => usage_sync_command(&path, claude_home.as_deref(), remote.as_deref()),
+            UsageAction::Sync { path, claude_home, remote, transcript } => usage_sync_command(&path, claude_home.as_deref(), remote.as_deref(), transcript.as_deref()),
+            UsageAction::Report { path, claude_home, session, all, reset_at, handoff_tokens, json } => usage_report::report_command(usage_report::ReportArgs {
+                path: &path,
+                claude_home: claude_home.as_deref(),
+                session: session.as_deref(),
+                all,
+                thresholds: reset_at.split(',').map(usage_report::parse_tokens).collect::<Result<_>>()?,
+                handoff: usage_report::parse_tokens(&handoff_tokens)?,
+                json,
+            }),
         },
         Command::Librarian { action } => match action {
             LibrarianAction::ExportLabels { path, out } => {
@@ -771,7 +810,7 @@ fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result
     // to preserve.
     println!("session_events: skipped (no bulk-read accessor on GraphStore; see comment)");
 
-    // --- session_usage + llm_usage (no node references -- straight copies) ---
+    // --- session_usage + llm_usage + session_report (no node references -- straight copies) ---
     // Must be copied, not skipped: `wipe_repo` deletes both on the
     // destination, so with --wipe-target a skip would lose them outright.
     let session_usage = src.session_usage_for_repo(repo)?;
@@ -805,7 +844,11 @@ fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result
             error_kind: u.error_kind.clone(),
         })?;
     }
-    println!("session_usage: {} copied, llm_usage: {} copied", session_usage.len(), llm_usage.len());
+    let session_reports = src.session_reports_for_repo(repo)?;
+    for r in &session_reports {
+        dst.upsert_session_report(agentops_graph::NewSessionReport { repo: repo.to_string(), ..r.report.clone() })?;
+    }
+    println!("session_usage: {} copied, llm_usage: {} copied, session_report: {} copied", session_usage.len(), llm_usage.len(), session_reports.len());
 
     // --- tasks + task_links ---
     let tasks = src.list_tasks(repo)?;
@@ -1172,6 +1215,7 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
         ("UserPromptSubmit", "userpromptsubmit"),
         ("SessionStart", "sessionstart"),
         ("PreToolUse", "pretooluse"),
+        ("SessionEnd", "sessionend"),
     ];
     for (event_name, event_flag) in HOOKS {
         // `--compress` is only meaningful for `--event pretooluse` (see
@@ -1183,7 +1227,7 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
     }
     let compress_note = if compress_commands { ", command-output compression enabled" } else { "" };
     println!(
-        "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse{compress_note} — see the get_session_guide/fetch_content/semantic_search MCP tools).",
+        "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse/SessionEnd{compress_note} — see the get_session_guide/fetch_content/semantic_search MCP tools).",
         settings_path.display()
     );
     Ok(())
@@ -1213,7 +1257,26 @@ fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str) -> R
     if !hooks.is_object() {
         *hooks = serde_json::json!({});
     }
-    hooks.as_object_mut().expect("just normalized to an object above").insert(event_name.to_string(), serde_json::json!({ "command": command }));
+    // Claude Code's schema is event -> [matcher group] -> [handler]; this
+    // once wrote a bare `{"command": ..}` object instead, which Claude Code
+    // never ran. Drop any earlier agentops handler (either shape) and keep
+    // every other group, then append ours (no matcher = every occurrence).
+    let ours = |h: &serde_json::Value| h.get("command").and_then(|c| c.as_str()).is_some_and(|c| c.starts_with("agentops hook-capture"));
+    let event = hooks.as_object_mut().expect("just normalized to an object above").entry(event_name).or_insert_with(|| serde_json::json!([]));
+    let mut groups = match event.take() {
+        serde_json::Value::Array(groups) => groups,
+        legacy if ours(&legacy) => Vec::new(),
+        other if other.is_null() => Vec::new(),
+        other => vec![other],
+    };
+    for group in &mut groups {
+        if let Some(handlers) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+            handlers.retain(|h| !ours(h));
+        }
+    }
+    groups.retain(|g| g.get("hooks").and_then(|h| h.as_array()).is_none_or(|h| !h.is_empty()));
+    groups.push(serde_json::json!({ "hooks": [{ "type": "command", "command": command }] }));
+    *event = serde_json::Value::Array(groups);
 
     if let Some(parent) = settings_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
@@ -2099,8 +2162,12 @@ fn task_activity(path: &Path, id: i64) -> Result<()> {
     Ok(())
 }
 
-fn usage_sync_command(path: &Path, claude_home: Option<&Path>, remote: Option<&str>) -> Result<()> {
-    let (entries, files_scanned) = usage::collect_usage_entries(path, claude_home)?;
+fn usage_sync_command(path: &Path, claude_home: Option<&Path>, remote: Option<&str>, transcript: Option<&Path>) -> Result<()> {
+    let (entries, files_scanned) = match transcript {
+        Some(file) => usage::collect_usage_entries_for_file(file)?,
+        None => usage::collect_usage_entries(path, claude_home)?,
+    };
+    let reports = usage_report::reports_for_sync(path, claude_home, transcript)?;
     if files_scanned == 0 {
         println!("No Claude Code session files found for {} — nothing to sync.", path.display());
         return Ok(());
@@ -2117,7 +2184,7 @@ fn usage_sync_command(path: &Path, claude_home: Option<&Path>, remote: Option<&s
         let api_key = device_flow_login(server_url)?;
         let connection_id = resolve_connection_id(path, server_url, &api_key, false)?;
         write_remote_marker(path, server_url, &connection_id, &api_key)?;
-        let synced = usage::push_usage_remote(server_url, &connection_id, &api_key, &entries)?;
+        let synced = usage::push_usage_remote(server_url, &connection_id, &api_key, &entries, &reports)?;
         println!("Scanned {files_scanned} session file(s), synced {synced} session/model usage row(s) to {server_url} (repo: {connection_id}).");
         return Ok(());
     }
@@ -2128,7 +2195,7 @@ fn usage_sync_command(path: &Path, claude_home: Option<&Path>, remote: Option<&s
     // reads (the same "check the remote marker first" discipline as
     // gotchas/notes). Push there instead when the marker exists.
     if let Some(marker) = read_remote_marker(path) {
-        let synced = usage::push_usage_remote(&marker.server_url, &marker.connection_id, &marker.api_key, &entries)?;
+        let synced = usage::push_usage_remote(&marker.server_url, &marker.connection_id, &marker.api_key, &entries, &reports)?;
         println!("Scanned {files_scanned} session file(s), synced {synced} session/model usage row(s) to {} (repo: {}).", marker.server_url, marker.connection_id);
         return Ok(());
     }
@@ -2140,7 +2207,7 @@ fn usage_sync_command(path: &Path, claude_home: Option<&Path>, remote: Option<&s
     // has ever run against this repo.
     let store = agentops_mcp::open_store(path)?;
     let repo = agentops_mcp::repo_name(path);
-    let sessions_synced = usage::write_usage_locally(store.as_ref(), &repo, &entries)?;
+    let sessions_synced = usage::write_usage_locally(store.as_ref(), &repo, &entries, &reports)?;
     println!("Scanned {files_scanned} session file(s), synced {sessions_synced} session/model usage row(s) for {repo}.");
     Ok(())
 }
@@ -2417,6 +2484,51 @@ mod tests {
         assert_eq!(parsed["mcpServers"]["agentops"]["env"]["AGENTOPS_ACCESS_MODE"], "advisor");
     }
 
+    /// Live Postgres only (`AGENTOPS_TEST_DATABASE_URL`, same default as
+    /// agentops-graph-pg's tests); says so loudly when it can't run.
+    #[test]
+    fn migrate_graph_copies_session_reports_and_is_fine_with_none() {
+        use agentops_graph::GraphStore;
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let Ok(dst) = agentops_graph_pg::PostgresGraphStore::connect(&url) else {
+            eprintln!("SKIPPING migrate_graph_copies_session_reports_and_is_fine_with_none: no Postgres at {url}");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        let src = agentops_graph::SqliteGraphStore::open(&db).unwrap();
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let (with, without) = (format!("mig-reports-{stamp}"), format!("mig-none-{stamp}"));
+        src.upsert_session_report(agentops_graph::NewSessionReport { repo: with.clone(), session_id: "s1".into(), source: "transcript".into(), agent: "claude-code".into(), total_context_tokens: 42, ..Default::default() }).unwrap();
+        drop(src);
+
+        migrate_graph(&db, &url, &with, true).unwrap();
+        migrate_graph(&db, &url, &without, true).unwrap();
+        let copied = dst.session_reports_for_repo(&with).unwrap();
+        assert_eq!((copied.len(), copied[0].report.total_context_tokens), (1, 42));
+        assert!(dst.session_reports_for_repo(&without).unwrap().is_empty());
+        dst.wipe_repo(&with).unwrap();
+    }
+
+    fn last_hook_command(parsed: &serde_json::Value, event: &str) -> serde_json::Value {
+        let groups = parsed["hooks"][event].as_array().unwrap_or_else(|| panic!("{event} is not a matcher-group array: {parsed}"));
+        groups.last().unwrap()["hooks"][0]["command"].clone()
+    }
+
+    #[test]
+    fn write_claude_hook_replaces_a_legacy_bare_object_entry_and_never_duplicates_ours() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+        std::fs::write(&settings_path, r#"{"hooks":{"SessionEnd":{"command":"agentops hook-capture --event sessionend"}}}"#).unwrap();
+
+        write_claude_hook(&settings_path, "SessionEnd", "agentops hook-capture --event sessionend").unwrap();
+        write_claude_hook(&settings_path, "SessionEnd", "agentops hook-capture --event sessionend").unwrap();
+
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
+        assert_eq!(parsed["hooks"]["SessionEnd"], serde_json::json!([{ "hooks": [{ "type": "command", "command": "agentops hook-capture --event sessionend" }] }]));
+    }
+
     #[test]
     fn write_claude_hook_creates_the_file_and_parent_dir_when_neither_exists_yet() {
         let dir = tempfile::tempdir().unwrap();
@@ -2425,7 +2537,7 @@ mod tests {
         write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse").unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture --event posttooluse");
+        assert_eq!(last_hook_command(&parsed, "PostToolUse"), "agentops hook-capture --event posttooluse");
     }
 
     #[test]
@@ -2433,14 +2545,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
-        std::fs::write(&settings_path, r#"{"hooks":{"SessionStart":{"command":"some-other-tool"}},"otherTopLevelSetting":true}"#).unwrap();
+        std::fs::write(
+            &settings_path,
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"some-other-tool"}]}],"PostToolUse":[{"matcher":"Write","hooks":[{"type":"command","command":"user-linter"}]}]},"otherTopLevelSetting":true}"#,
+        )
+        .unwrap();
 
         write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse").unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(parsed["hooks"]["SessionStart"]["command"], "some-other-tool", "a pre-existing, unrelated hook must survive: {parsed}");
+        assert_eq!(last_hook_command(&parsed, "SessionStart"), "some-other-tool", "a pre-existing, unrelated hook must survive: {parsed}");
+        assert_eq!(parsed["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "user-linter", "a user's own group on the same event must survive: {parsed}");
         assert_eq!(parsed["otherTopLevelSetting"], true, "unrelated top-level settings must survive: {parsed}");
-        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture --event posttooluse");
+        assert_eq!(last_hook_command(&parsed, "PostToolUse"), "agentops hook-capture --event posttooluse");
     }
 
     #[test]
@@ -2451,8 +2568,8 @@ mod tests {
         maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse")] {
-            assert_eq!(parsed["hooks"][event]["command"], format!("agentops hook-capture --event {flag}"), "{event}: {parsed}");
+        for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse"), ("SessionEnd", "sessionend")] {
+            assert_eq!(last_hook_command(&parsed, event), format!("agentops hook-capture --event {flag}"), "{event}: {parsed}");
         }
     }
 
@@ -2471,9 +2588,9 @@ mod tests {
         maybe_install_claude_hooks(dir.path(), &["claude".to_string()], true).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        assert_eq!(parsed["hooks"]["PreToolUse"]["command"], "agentops hook-capture --event pretooluse --compress");
-        assert_eq!(parsed["hooks"]["PostToolUse"]["command"], "agentops hook-capture --event posttooluse", "compress must not leak onto unrelated hook events");
-        assert_eq!(parsed["hooks"]["SessionStart"]["command"], "agentops hook-capture --event sessionstart");
+        assert_eq!(last_hook_command(&parsed, "PreToolUse"), "agentops hook-capture --event pretooluse --compress");
+        assert_eq!(last_hook_command(&parsed, "PostToolUse"), "agentops hook-capture --event posttooluse", "compress must not leak onto unrelated hook events");
+        assert_eq!(last_hook_command(&parsed, "SessionStart"), "agentops hook-capture --event sessionstart");
     }
 
     #[test]

@@ -2073,7 +2073,7 @@ mod tests {
     fn init_bare_repo_with_one_commit() -> PathBuf {
         let bare = std::env::temp_dir().join(format!("agentops-test-bare-{}", uuid_like()));
         let scratch = std::env::temp_dir().join(format!("agentops-test-scratch-{}", uuid_like()));
-        std::process::Command::new("git").args(["init", "--bare", "-q"]).arg(&bare).status().unwrap();
+        std::process::Command::new("git").args(["init", "--bare", "-q", "-b", "main"]).arg(&bare).status().unwrap();
         std::process::Command::new("git").args(["clone", "-q"]).arg(&bare).arg(&scratch).status().unwrap();
         std::fs::write(scratch.join("README.md"), "# widgets\n").unwrap();
         std::process::Command::new("git").args(["-C"]).arg(&scratch).args(["add", "."]).status().unwrap();

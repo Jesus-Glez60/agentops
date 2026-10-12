@@ -16,12 +16,14 @@
 //! - `pretooluse`: a proactive secret-exposure warning — never blocks (see
 //!   `process_pre_tool_use`'s doc comment for why it's especially careful
 //!   about this).
+//! - `sessionend`: spawns a detached `usage sync --transcript` for the
+//!   ending session (see `process_session_end`).
 //! - `sessionstart`: renders the session-resume guide on compact/resume,
 //!   via `agentops_mcp::session_guide::build` (shared with the
 //!   `get_session_guide` MCP tool — one implementation, two callers).
 
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use agentops_graph::{NewNode, NodeKind};
 use agentops_mcp::budget::{cap, DEFAULT_CHAR_BUDGET};
@@ -40,6 +42,14 @@ pub fn run(event: &str, compress: bool) -> Result<()> {
         "posttoolusefailure" => process_post_tool_use_failure(&input),
         "userpromptsubmit" => process_user_prompt_submit(&input),
         "sessionstart" => process_session_start(&input),
+        // Like `pretooluse`, never fails the hook: a usage sync is
+        // bookkeeping, and must not surface as an error on exit.
+        "sessionend" => {
+            if let Err(e) = process_session_end(&input) {
+                eprintln!("agentops hook-capture --event sessionend: {e:#} (non-fatal)");
+            }
+            Ok(())
+        }
         // `PreToolUse` is the one event whose nonzero exit can actually
         // block the tool call it's reacting to (confirmed against Claude
         // Code's real hook docs — unlike every other event here). This
@@ -451,6 +461,44 @@ fn detect_command_rewrite(tool_name: &str, tool_input: &serde_json::Value) -> Op
     let command = tool_input.get("command").and_then(|v| v.as_str())?;
     let action = classify_for_compression(command)?;
     Some(rewrite_command(command, &action))
+}
+
+// ---------------------------------------------------------------------
+// SessionEnd
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SessionEndPayload {
+    transcript_path: Option<String>,
+    cwd: Option<String>,
+    reason: Option<String>,
+}
+
+/// Syncs the ending session's usage. Claude Code cancels SessionEnd hooks
+/// after 1.5s by default (confirmed against its hooks docs), too short for
+/// a remote push -- so this spawns a detached `agentops usage sync
+/// --transcript` and returns at once. Its output is appended to
+/// `.context/usage-sync.log` so a failed push leaves a trace (gotcha
+/// 54237: usage pushes have failed silently before).
+fn process_session_end(input: &str) -> Result<()> {
+    let payload: SessionEndPayload = serde_json::from_str(input).context("parsing SessionEnd payload")?;
+    let transcript = payload.transcript_path.context("SessionEnd payload has no transcript_path")?;
+    let cwd = PathBuf::from(payload.cwd.unwrap_or_else(|| ".".into()));
+    let context_dir = cwd.join(".context");
+    std::fs::create_dir_all(&context_dir)?;
+    let mut log = std::fs::OpenOptions::new().create(true).append(true).open(context_dir.join("usage-sync.log"))?;
+    // `reason` = clear/resume/logout/prompt_input_exit/other; a `clear` is
+    // a manual reset, which the reset lever's measurement needs to tell apart.
+    writeln!(log, "session end (reason: {}): {transcript}", payload.reason.as_deref().unwrap_or("unknown"))?;
+    std::process::Command::new(std::env::current_exe()?)
+        .args(["usage", "sync", "--transcript", &transcript, "--path"])
+        .arg(&cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .spawn()
+        .context("spawning detached usage sync")?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------

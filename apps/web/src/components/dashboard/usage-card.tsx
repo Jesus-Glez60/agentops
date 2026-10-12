@@ -1,5 +1,5 @@
 import { Info } from "lucide-react";
-import type { LlmSpend, SessionBreakdown, UsageSummary } from "@/lib/api/repos-api";
+import type { LlmSpend, SessionBreakdown, SessionReportSummary, UsageSummary } from "@/lib/api/repos-api";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CopyButton } from "@/components/shared/copy-button";
 
@@ -60,6 +60,60 @@ function RecentSessionsSection({ sessions }: { sessions: SessionBreakdown[] }) {
                 <td className="py-1 text-right">{formatUsd(s.cost_usd)}</td>
               </tr>
             ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+/** The reset threshold the dashboard headlines; `usage report` simulates 100k/150k/200k. */
+const HEADLINE_RESET = 150_000;
+
+/**
+ * Where each recent session's tokens went (`session_report`), from
+ * `agentops usage report`'s calibrated re-read attribution. Percentages are
+ * shares of the session's summed context. "Reset @150K" is the simulated
+ * saving had the session reset at that context size -- an upper bound, since
+ * re-exploration after a reset isn't modelled. Agent-reported rows are
+ * self-reported estimates and are labelled so.
+ */
+function WhereTokensWentSection({ reports }: { reports: SessionReportSummary[] }) {
+  if (reports.length === 0) return null;
+  return (
+    <div className="mt-4">
+      <p className="mb-2 text-mono-code uppercase text-ink-500">Where tokens went</p>
+      <div className="overflow-x-auto">
+        <table className="w-full text-body">
+          <thead>
+            <tr className="text-left text-mono-code uppercase text-ink-500">
+              <th className="py-1 pr-4 font-normal">Session</th>
+              <th className="py-1 pr-4 text-right font-normal">Context total</th>
+              <th className="py-1 pr-4 font-normal">Top categories</th>
+              <th className="py-1 text-right font-normal">Reset @150K (max)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {reports.map((r) => {
+              const reset = r.resets.find((x) => x.threshold === HEADLINE_RESET);
+              const total = Math.max(r.total_context_tokens, 1);
+              return (
+                <tr key={r.session_id} className="border-t border-border-strong text-ink-200">
+                  <td className="py-1 pr-4 text-ink-400" title={r.session_id}>
+                    <span className="font-mono text-mono-code">{r.session_id.slice(0, 8)}</span> {r.agent}
+                    {r.source === "agent" && <span className="ml-1 text-ink-500">(estimated)</span>}
+                  </td>
+                  <td className="py-1 pr-4 text-right">{formatTokens(r.total_context_tokens)}</td>
+                  <td className="py-1 pr-4 text-ink-400">
+                    {r.top_categories
+                      .slice(0, 3)
+                      .map(([name, tokens]) => `${name} ${Math.round((tokens / total) * 100)}%`)
+                      .join(" · ")}
+                  </td>
+                  <td className="py-1 text-right">{reset ? `−${Math.round(reset.savings * 100)}%` : "—"}</td>
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -183,6 +237,7 @@ export function UsageCard({ usage, apiUrl }: { usage: UsageSummary | null; apiUr
       </div>
 
       <RecentSessionsSection sessions={usage.sessions ?? []} />
+      <WhereTokensWentSection reports={usage.reports ?? []} />
       <ModelSpendSection spend={usage.llm_spend ?? []} />
     </div>
   );

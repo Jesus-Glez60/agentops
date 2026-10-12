@@ -18,7 +18,7 @@ use rusqlite_migration::{Migrations, M};
 
 use agentops_embeddings::EMBEDDING_DIM;
 
-use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
+use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 
@@ -362,6 +362,28 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     // default, so a plain ADD COLUMN works on a populated table (gotchas
     // 54087/54088 only bite non-constant defaults). Appended last.
     M::up("ALTER TABLE session_usage ADD COLUMN peak_context_tokens INTEGER NOT NULL DEFAULT 0;"),
+    // Per-session token breakdown (`NewSessionReport`): categories/resets
+    // as JSON in TEXT, like `repo_state.top_gotcha_ids`. Appended last.
+    M::up(
+        "CREATE TABLE IF NOT EXISTS session_report (
+            id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+            repo                  TEXT NOT NULL,
+            session_id            TEXT NOT NULL,
+            source                TEXT NOT NULL,
+            agent                 TEXT NOT NULL,
+            calls                 INTEGER NOT NULL DEFAULT 0,
+            tasks                 INTEGER NOT NULL DEFAULT 0,
+            baseline_tokens       INTEGER NOT NULL DEFAULT 0,
+            peak_context          INTEGER NOT NULL DEFAULT 0,
+            total_context_tokens  INTEGER NOT NULL DEFAULT 0,
+            output_tokens         INTEGER NOT NULL DEFAULT 0,
+            compactions           INTEGER NOT NULL DEFAULT 0,
+            categories_json       TEXT NOT NULL,
+            resets_json           TEXT NOT NULL,
+            recorded_at           TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_session_report_unique ON session_report(repo, session_id);",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -998,6 +1020,79 @@ impl GraphStore for SqliteGraphStore {
         let mut stmt = self.conn.prepare("SELECT * FROM session_usage WHERE repo = ?1 ORDER BY session_started_at DESC")?;
         let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_session_usage)?;
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn upsert_session_report(&self, r: NewSessionReport) -> Result<Option<i64>> {
+        // A false DO UPDATE ... WHERE is a silent no-op (no error, no row
+        // touched), so `changes()` -- not `last_insert_rowid()`, which
+        // would be stale -- tells an ignored agent report apart.
+        let changed = self.conn.execute(
+            "INSERT INTO session_report (repo, session_id, source, agent, calls, tasks, baseline_tokens, peak_context, total_context_tokens, output_tokens, compactions, categories_json, resets_json, recorded_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, CURRENT_TIMESTAMP) \
+             ON CONFLICT(repo, session_id) DO UPDATE SET \
+                source = excluded.source, agent = excluded.agent, calls = excluded.calls, tasks = excluded.tasks, \
+                baseline_tokens = excluded.baseline_tokens, peak_context = excluded.peak_context, \
+                total_context_tokens = excluded.total_context_tokens, output_tokens = excluded.output_tokens, \
+                compactions = excluded.compactions, categories_json = excluded.categories_json, \
+                resets_json = excluded.resets_json, recorded_at = CURRENT_TIMESTAMP \
+             WHERE session_report.source = 'agent' OR excluded.source = 'transcript'",
+            rusqlite::params![
+                r.repo,
+                r.session_id,
+                r.source,
+                r.agent,
+                r.calls,
+                r.tasks,
+                r.baseline_tokens,
+                r.peak_context,
+                r.total_context_tokens,
+                r.output_tokens,
+                r.compactions,
+                serde_json::to_string(&r.categories)?,
+                serde_json::to_string(&r.resets)?,
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        let id = self.conn.query_row("SELECT id FROM session_report WHERE repo = ?1 AND session_id = ?2", rusqlite::params![r.repo, r.session_id], |row| row.get(0))?;
+        Ok(Some(id))
+    }
+
+    fn session_reports_for_repo(&self, repo: &str) -> Result<Vec<SessionReport>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo, session_id, source, agent, calls, tasks, baseline_tokens, peak_context, total_context_tokens, output_tokens, compactions, categories_json, resets_json, recorded_at \
+             FROM session_report WHERE repo = ?1 ORDER BY recorded_at DESC, id DESC",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![repo], |row| {
+            Ok((
+                NewSessionReport {
+                    repo: row.get(0)?,
+                    session_id: row.get(1)?,
+                    source: row.get(2)?,
+                    agent: row.get(3)?,
+                    calls: row.get(4)?,
+                    tasks: row.get(5)?,
+                    baseline_tokens: row.get(6)?,
+                    peak_context: row.get(7)?,
+                    total_context_tokens: row.get(8)?,
+                    output_tokens: row.get(9)?,
+                    compactions: row.get(10)?,
+                    categories: Default::default(),
+                    resets: Vec::new(),
+                },
+                row.get::<_, String>(11)?,
+                row.get::<_, String>(12)?,
+                row.get::<_, String>(13)?,
+            ))
+        })?;
+        rows.map(|r| {
+            let (mut report, categories, resets, recorded_at) = r?;
+            report.categories = serde_json::from_str(&categories)?;
+            report.resets = serde_json::from_str(&resets)?;
+            Ok(SessionReport { report, recorded_at })
+        })
+        .collect()
     }
 
     fn record_llm_usage(&self, usage: NewLlmUsage) -> Result<i64> {
@@ -1809,6 +1904,56 @@ mod tests {
         let rows = store.session_usage_for_repo("repo-a").unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].repo, "repo-a");
+    }
+
+    fn report(repo: &str, session_id: &str, source: &str, total: i64) -> NewSessionReport {
+        NewSessionReport {
+            repo: repo.into(),
+            session_id: session_id.into(),
+            source: source.into(),
+            agent: if source == "agent" { "cursor".into() } else { "claude-code".into() },
+            total_context_tokens: total,
+            categories: [("tool:Bash".to_string(), total / 2)].into(),
+            resets: vec![crate::ResetSim { threshold: 150_000, resets: 2, simulated_tokens: total / 3, savings: 0.66 }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn session_report_resync_replaces_and_round_trips_json_fields() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let first = store.upsert_session_report(report("repo-a", "s1", "transcript", 100)).unwrap();
+        let second = store.upsert_session_report(report("repo-a", "s1", "transcript", 400)).unwrap();
+        assert_eq!(first, second);
+        let rows = store.session_reports_for_repo("repo-a").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].report, report("repo-a", "s1", "transcript", 400));
+    }
+
+    #[test]
+    fn an_agent_report_never_overwrites_a_transcript_one_in_either_order() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        // transcript first: the agent write is ignored.
+        store.upsert_session_report(report("repo-a", "s1", "transcript", 100)).unwrap();
+        assert_eq!(store.upsert_session_report(report("repo-a", "s1", "agent", 999)).unwrap(), None);
+        // agent first: a transcript replaces it, and an agent may revise its own.
+        assert!(store.upsert_session_report(report("repo-a", "s2", "agent", 5)).unwrap().is_some());
+        assert!(store.upsert_session_report(report("repo-a", "s2", "agent", 6)).unwrap().is_some());
+        assert!(store.upsert_session_report(report("repo-a", "s2", "transcript", 200)).unwrap().is_some());
+
+        let rows = store.session_reports_for_repo("repo-a").unwrap();
+        let by_id = |id: &str| rows.iter().find(|r| r.report.session_id == id).unwrap().report.clone();
+        assert_eq!((by_id("s1").source.as_str(), by_id("s1").total_context_tokens), ("transcript", 100));
+        assert_eq!((by_id("s2").source.as_str(), by_id("s2").total_context_tokens), ("transcript", 200));
+    }
+
+    #[test]
+    fn session_reports_for_repo_excludes_other_repos() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.upsert_session_report(report("repo-a", "s1", "transcript", 1)).unwrap();
+        store.upsert_session_report(report("repo-b", "s1", "transcript", 2)).unwrap();
+        let rows = store.session_reports_for_repo("repo-a").unwrap();
+        assert_eq!((rows.len(), rows[0].report.repo.as_str()), (1, "repo-a"));
     }
 
     fn new_task(repo: &str, title: &str) -> NewTask {

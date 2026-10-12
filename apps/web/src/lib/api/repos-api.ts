@@ -531,6 +531,8 @@ export interface UsageSummary {
   subagent_tokens: UsageTotals;
   /** Most recent sessions first (at most 10). */
   sessions: SessionBreakdown[];
+  /** Every synced main-agent session, uncapped; absent from older servers. */
+  session_count?: number;
   /** Real, exact count of recorded knowledge-reuse "hit" events. */
   hit_count: number;
   /** Estimated only -- see this file's section doc comment. */
@@ -538,6 +540,33 @@ export interface UsageSummary {
   estimated_cost_saved_usd: number;
   /** AgentOps' own LLM spend, one entry per (operation, provider, model). */
   llm_spend: LlmSpend[];
+  /** Where recent sessions' tokens went; absent from servers older than this field. */
+  reports?: SessionReportSummary[];
+}
+
+// Mirrors `agentops_graph::ResetSim`: summed context had the session reset
+// to baseline + handoff past `threshold`. `savings` is an upper bound.
+export interface ResetSim {
+  threshold: number;
+  resets: number;
+  simulated_tokens: number;
+  savings: number;
+}
+
+// Mirrors `agentops_api::usage::SessionReportSummary`. `source: "agent"` is
+// a self-reported estimate (report_usage MCP tool) -- always label it so.
+export interface SessionReportSummary {
+  session_id: string;
+  source: "transcript" | "agent";
+  agent: string;
+  calls: number;
+  tasks: number;
+  peak_context: number;
+  total_context_tokens: number;
+  compactions: number;
+  /** `[category, re-read tokens]`, largest first. */
+  top_categories: [string, number][];
+  resets: ResetSim[];
 }
 
 // Mirrors `agentops_api::usage::SessionBreakdown`. `peak_context_tokens` is

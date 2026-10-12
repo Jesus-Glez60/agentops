@@ -649,6 +649,60 @@ pub struct SessionUsage {
     pub recorded_at: String,
 }
 
+/// One simulated session reset (see `agentops-cli usage report`): what the
+/// session's summed context would have been had it reset to baseline +
+/// handoff whenever context passed `threshold`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResetSim {
+    pub threshold: i64,
+    pub resets: usize,
+    pub simulated_tokens: i64,
+    /// `1 - simulated / actual`; an upper bound (re-exploration after a
+    /// reset isn't modelled).
+    pub savings: f64,
+}
+
+/// Where one session's tokens went -- both the store input and the wire
+/// type of `POST /repos/{id}/usage/sync`'s `reports`. `source` is
+/// `"transcript"` (exact, parsed from a local transcript) or `"agent"`
+/// (self-reported via the `report_usage` MCP tool, an estimate). A
+/// transcript row is never overwritten by an agent one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct NewSessionReport {
+    /// Set by whoever stores the report, never trusted from the wire.
+    #[serde(default)]
+    pub repo: String,
+    pub session_id: String,
+    pub source: String,
+    pub agent: String,
+    #[serde(default)]
+    pub calls: i64,
+    #[serde(default)]
+    pub tasks: i64,
+    #[serde(default)]
+    pub baseline_tokens: i64,
+    #[serde(default)]
+    pub peak_context: i64,
+    #[serde(default)]
+    pub total_context_tokens: i64,
+    #[serde(default)]
+    pub output_tokens: i64,
+    #[serde(default)]
+    pub compactions: i64,
+    /// Re-read cost per category: calibrated tokens x calls carrying them.
+    #[serde(default)]
+    pub categories: std::collections::BTreeMap<String, i64>,
+    #[serde(default)]
+    pub resets: Vec<ResetSim>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SessionReport {
+    #[serde(flatten)]
+    pub report: NewSessionReport,
+    pub recorded_at: String,
+}
+
 /// One AgentOps-initiated LLM API call — the server's *own* model spend
 /// (`explain_symbol`, note classification, docgen module grouping, ...),
 /// as opposed to `SessionUsage`'s coding-agent session totals. Append-only,
@@ -871,6 +925,13 @@ pub trait GraphStore {
     /// the raw material `agentops-api::usage`'s heuristic join aggregates
     /// against `session_events`' `"hit"`-kind rows.
     fn session_usage_for_repo(&self, repo: &str) -> Result<Vec<SessionUsage>>;
+
+    /// Upserts one session's token breakdown, keyed `(repo, session_id)`.
+    /// `Ok(None)` when ignored: an `"agent"` report never replaces a
+    /// `"transcript"` one.
+    fn upsert_session_report(&self, report: NewSessionReport) -> Result<Option<i64>>;
+    /// Every `SessionReport` for `repo`, most recently recorded first.
+    fn session_reports_for_repo(&self, repo: &str) -> Result<Vec<SessionReport>>;
 
     /// Appends one `NewLlmUsage` row — plain insert, never an upsert (each
     /// call is its own row, unlike `upsert_session_usage`'s running total).

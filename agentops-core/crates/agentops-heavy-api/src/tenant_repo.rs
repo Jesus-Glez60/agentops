@@ -79,10 +79,14 @@ fn unauthorized() -> Response {
 /// literal filesystem path. See `mcp_http`'s module doc comment for why.
 pub(crate) fn resolve_connection_path(state: &AppState, tenant: &str, connection_ref: &str) -> Result<std::path::PathBuf, String> {
     let store = state.store.lock().unwrap();
-    let connection = store
-        .get_connection(tenant, connection_ref)
-        .ok()
-        .flatten()
+    // Also accepts a connection's store repo name (`<id>--<tenant>`, what
+    // `repo_name(checkout_path(..))` yields and what /gotchas, /search and
+    // /activity label results with). Only the caller's own tenant suffix is
+    // stripped, so another tenant's name never resolves here. Without this
+    // every curation POST from the Gotchas screen 404'd.
+    let by_id = |id: &str| store.get_connection(tenant, id).ok().flatten();
+    let connection = by_id(connection_ref)
+        .or_else(|| connection_ref.strip_suffix(&format!("--{tenant}")).and_then(by_id))
         .or_else(|| store.list_connections(tenant).ok()?.into_iter().find(|c| c.repo_url == connection_ref));
     let Some(connection) = connection else {
         return Err(format!(

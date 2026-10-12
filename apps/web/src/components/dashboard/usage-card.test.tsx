@@ -90,4 +90,38 @@ describe("UsageCard model spend", () => {
     expect(screen.getByText("390.2K")).toBeInTheDocument();
     expect(screen.getByText(/4\.1M subagents/)).toBeInTheDocument();
   });
+
+  it("shows where each session's tokens went, labelling agent-reported rows as estimated", () => {
+    const usage = summary([], true);
+    usage.reports = [
+      {
+        session_id: "3c358101-e726",
+        source: "transcript",
+        agent: "claude-code",
+        calls: 234,
+        tasks: 15,
+        peak_context: 496_657,
+        total_context_tokens: 69_860_039,
+        compactions: 0,
+        top_categories: [
+          ["tool:Bash", 17_660_000],
+          ["baseline", 11_960_000],
+          ["reminders", 8_140_000],
+          ["own:Bash", 7_870_000],
+        ],
+        resets: [{ threshold: 150_000, resets: 5, simulated_tokens: 26_341_039, savings: 0.6229 }],
+      },
+      { session_id: "cursor-1", source: "agent", agent: "cursor", calls: 0, tasks: 0, peak_context: 0, total_context_tokens: 5000, compactions: 0, top_categories: [], resets: [] },
+    ];
+    renderCard(usage);
+    expect(screen.getByText("Where tokens went")).toBeInTheDocument();
+    expect(screen.getByText("tool:Bash 25% · baseline 17% · reminders 12%")).toBeInTheDocument();
+    expect(screen.getByText("−62%")).toBeInTheDocument();
+    expect(screen.getByText("(estimated)")).toBeInTheDocument();
+  });
+
+  it("renders no breakdown section for a server that predates reports", () => {
+    renderCard(summary([], true));
+    expect(screen.queryByText("Where tokens went")).not.toBeInTheDocument();
+  });
 });

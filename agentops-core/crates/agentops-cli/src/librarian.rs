@@ -270,8 +270,10 @@ pub struct ModelReport {
     gated_out: Option<String>,
     attempted: usize,
     valid: usize,
-    /// Correct scope calls / attempted — a failed call counts as wrong.
-    scope_accuracy: f64,
+    /// Correct scope calls / attempted *labeled* notes — a failed call
+    /// counts as wrong. `None` when no attempted note has a label yet
+    /// (cost-only run).
+    scope_accuracy: Option<f64>,
     confusion: Confusion,
     /// Matches / notes whose label has a technology, among valid verdicts.
     technology_match_rate: Option<f64>,
@@ -312,9 +314,12 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
 /// arithmetic is unit-testable without any provider.
 fn score(entry_name: &str, provider: &str, model: &str, gated_out: Option<String>, outcomes: Vec<NoteOutcome>, records: &[LlmCallRecord], labels: &BTreeMap<i64, Label>, total_notes: usize) -> ModelReport {
     let mut confusion = Confusion::default();
-    let (mut correct, mut tech_hits, mut tech_total) = (0usize, 0usize, 0usize);
+    let (mut correct, mut labeled_attempted, mut tech_hits, mut tech_total) = (0usize, 0usize, 0usize, 0usize);
     for o in &outcomes {
-        let label = &labels[&o.node_id];
+        // Unlabeled notes still count toward tokens/cost/latency below,
+        // just not toward accuracy.
+        let Some(label) = labels.get(&o.node_id) else { continue };
+        labeled_attempted += 1;
         let Some(v) = &o.verdict else {
             confusion.failed += 1;
             continue;
@@ -355,7 +360,7 @@ fn score(entry_name: &str, provider: &str, model: &str, gated_out: Option<String
         gated_out,
         attempted,
         valid,
-        scope_accuracy: ratio(correct, attempted),
+        scope_accuracy: (labeled_attempted > 0).then(|| ratio(correct, labeled_attempted)),
         confusion,
         technology_match_rate: (tech_total > 0).then(|| ratio(tech_hits, tech_total)),
         json_validity_rate: (answered_calls > 0).then(|| ratio(answered_calls - bad_json_calls, answered_calls)),
@@ -433,10 +438,10 @@ fn verdict_line(report: &ModelReport, t: &Thresholds) -> String {
         (None, _) => format!("{name}: not set"),
         (Some(th), Some(true)) => format!("{name} {th}: PASS"),
         (Some(th), Some(false)) => format!("{name} {th}: FAIL"),
-        (Some(th), None) => format!("{name} {th}: UNKNOWN (no rate for this model)"),
+        (Some(th), None) => format!("{name} {th}: UNKNOWN (no labels or no rate for this model)"),
     };
     let parts = [
-        check("accuracy ≥", t.min_accuracy.map(|v| format!("{:.0}%", v * 100.0)), t.min_accuracy.map(|v| report.scope_accuracy >= v)),
+        check("accuracy ≥", t.min_accuracy.map(|v| format!("{:.0}%", v * 100.0)), t.min_accuracy.and_then(|v| report.scope_accuracy.map(|a| a >= v))),
         check("cost/classification ≤", t.max_cost_usd.map(|v| format!("${v}")), t.max_cost_usd.and_then(|v| report.mean_cost_per_classification_usd.map(|c| c <= v))),
         check("429 rate ≤", t.max_rate_limited_rate.map(|v| format!("{:.0}%", v * 100.0)), t.max_rate_limited_rate.map(|v| report.rate_limited_rate <= v)),
     ];
@@ -459,13 +464,13 @@ fn render_markdown(reports: &[ModelReport], notes: &[NoteRecord], labels: &BTree
     md.push_str("\n## Per model\n\n| Model | Attempted | Scope accuracy | Tech match | JSON valid | Mean in/out tokens | p95 in/out | Cost / classification | Projected (all notes) | Mean latency | 429s |\n|---|---|---|---|---|---|---|---|---|---|---|\n");
     for r in reports {
         md.push_str(&format!(
-            "| {} ({}/{}){} | {} | {:.1}% | {} | {} | {:.0} / {:.0} | {} / {} | {} | {} | {:.0} ms | {} |\n",
+            "| {} ({}/{}){} | {} | {} | {} | {} | {:.0} / {:.0} | {} / {} | {} | {} | {:.0} ms | {} |\n",
             r.name,
             r.provider,
             r.model,
             if r.gated_out.is_some() { " ⛔" } else { "" },
             r.attempted,
-            r.scope_accuracy * 100.0,
+            r.scope_accuracy.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_else(|| "— (unlabeled)".into()),
             r.technology_match_rate.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_else(|| "—".into()),
             r.json_validity_rate.map(|v| format!("{:.1}%", v * 100.0)).unwrap_or_else(|| "—".into()),
             r.mean_input_tokens,
@@ -492,7 +497,9 @@ fn render_markdown(reports: &[ModelReport], notes: &[NoteRecord], labels: &BTree
             .outcomes
             .iter()
             .filter_map(|o| match &o.verdict {
+                // Failures are worth listing whether or not the note is labeled.
                 None => Some((o.node_id, "FAILED".to_string())),
+                _ if !labels.contains_key(&o.node_id) => None,
                 Some(v) if v.scope != labels[&o.node_id].scope => Some((o.node_id, format!("{:?} (you said {:?})", v.scope, labels[&o.node_id].scope))),
                 Some(_) => None,
             })
@@ -519,16 +526,20 @@ pub fn dry_run(models_path: &Path, labels_dir: &Path, out_dir: &Path, limit: Opt
     let models: ModelsFile = toml::from_str(&std::fs::read_to_string(models_path).with_context(|| format!("reading {}", models_path.display()))?).with_context(|| format!("parsing {}", models_path.display()))?;
     let notes: Vec<NoteRecord> = serde_json::from_str(&std::fs::read_to_string(labels_dir.join("notes.json")).context("reading notes.json -- run `agentops librarian export-labels` first")?)?;
     let labels = parse_labels(&std::fs::read_to_string(labels_dir.join("labels.csv")).context("reading labels.csv")?)?;
-    if labels.is_empty() {
-        anyhow::bail!("labels.csv has no labeled rows yet -- fill in the scope column (portable / project_specific) first");
-    }
-
-    let mut labeled: Vec<&NoteRecord> = notes.iter().filter(|n| labels.contains_key(&n.node_id)).collect();
+    // No labels yet = cost-only run over every note: tokens, cost,
+    // latency, JSON validity and rewrites are all label-independent; only
+    // accuracy needs the answer key. Once any label exists, only labeled
+    // notes are classified, so labeling doesn't pay for unscored calls.
+    let mut labeled: Vec<&NoteRecord> = if labels.is_empty() { notes.iter().collect() } else { notes.iter().filter(|n| labels.contains_key(&n.node_id)).collect() };
     if let Some(n) = limit {
         labeled.truncate(n);
     }
     let rewrite_ids: Vec<i64> = labeled.iter().take(REWRITE_SAMPLE).map(|n| n.node_id).collect();
-    eprintln!("{} labeled note(s) of {} total; {} model(s)", labeled.len(), notes.len(), models.model.len());
+    if labels.is_empty() {
+        eprintln!("labels.csv has no labels yet -- cost-only run over {} note(s), {} model(s); accuracy will show as unlabeled", labeled.len(), models.model.len());
+    } else {
+        eprintln!("{} labeled note(s) of {} total; {} model(s)", labeled.len(), notes.len(), models.model.len());
+    }
 
     let reports: Vec<ModelReport> = models.model.iter().map(|m| run_model(m, &labeled, &labels, notes.len())).collect();
 
@@ -595,7 +606,7 @@ mod tests {
 
         let r = score("m", "anthropic", "m", None, outcomes, &records, &labels, 135);
         assert_eq!(r.attempted, 4);
-        assert!((r.scope_accuracy - 0.5).abs() < 1e-9, "2 correct of 4 attempted (the failure counts as wrong)");
+        assert!((r.scope_accuracy.unwrap() - 0.5).abs() < 1e-9, "2 correct of 4 attempted (the failure counts as wrong)");
         assert_eq!(r.confusion, Confusion { portable_as_portable: 2, portable_as_project: 0, project_as_portable: 1, project_as_project: 0, failed: 1 });
         assert_eq!(r.technology_match_rate, Some(0.5), "css grid == CSS-Grid after normalizing; sqlite != rusqlite");
         assert_eq!(r.rate_limited_calls, 1);
@@ -608,6 +619,17 @@ mod tests {
         let labels: BTreeMap<i64, Label> = [(1, Label { scope: Scope::Portable, technology: None }), (2, Label { scope: Scope::Portable, technology: None })].into();
         let r = score("m", "groq", "m", None, vec![outcome(1, Some(Scope::Portable), None, Some(0.01)), outcome(2, Some(Scope::Portable), None, None)], &[], &labels, 2);
         assert_eq!(r.mean_cost_per_classification_usd, None);
+    }
+
+    #[test]
+    fn unlabeled_notes_count_toward_cost_but_not_accuracy() {
+        let labels: BTreeMap<i64, Label> = [(1, Label { scope: Scope::Portable, technology: None })].into();
+        let r = score("m", "anthropic", "m", None, vec![outcome(1, Some(Scope::Portable), None, Some(0.01)), outcome(2, Some(Scope::ProjectSpecific), None, Some(0.03))], &[], &labels, 2);
+        assert_eq!(r.scope_accuracy, Some(1.0), "only the labeled note is scored");
+        assert!((r.mean_cost_per_classification_usd.unwrap() - 0.02).abs() < 1e-9, "both notes count toward cost");
+
+        let none = score("m", "anthropic", "m", None, vec![outcome(2, Some(Scope::Portable), None, Some(0.01))], &[], &BTreeMap::new(), 1);
+        assert_eq!(none.scope_accuracy, None);
     }
 
     #[test]

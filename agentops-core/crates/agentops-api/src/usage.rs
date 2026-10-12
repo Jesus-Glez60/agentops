@@ -47,6 +47,9 @@ pub struct UsageSummary {
     /// Most recent sessions first, at most `RECENT_SESSIONS` — the
     /// per-improvement view: what one working session cost.
     pub sessions: Vec<SessionBreakdown>,
+    /// Every synced main-agent session (subagent buckets excluded), not
+    /// capped like `sessions`.
+    pub session_count: i64,
     /// Count of `session_events` rows tagged `event_kind: "hit"` — a real,
     /// exact count, unlike everything below it.
     pub hit_count: i64,
@@ -59,6 +62,60 @@ pub struct UsageSummary {
     /// model) — kept apart from `tokens` above, which is coding-agent
     /// session usage, so neither skews the other or the savings estimate.
     pub llm_spend: Vec<LlmSpend>,
+    /// Where recent sessions' tokens went (`session_report`), in `sessions`
+    /// order, then up to `RECENT_SESSIONS` agent-reported sessions that have
+    /// no transcript totals.
+    /// `source: "agent"` rows are self-reported estimates -- consumers must
+    /// label them so.
+    pub reports: Vec<SessionReportSummary>,
+}
+
+/// How many categories `SessionReportSummary::top_categories` keeps.
+const TOP_CATEGORIES: usize = 5;
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+pub struct SessionReportSummary {
+    pub session_id: String,
+    pub source: String,
+    pub agent: String,
+    pub calls: i64,
+    pub tasks: i64,
+    pub peak_context: i64,
+    pub total_context_tokens: i64,
+    pub compactions: i64,
+    /// `(category, re-read tokens)`, largest first.
+    pub top_categories: Vec<(String, i64)>,
+    pub resets: Vec<agentops_graph::ResetSim>,
+}
+
+fn report_summaries(sessions: &[SessionBreakdown], reports: Vec<agentops_graph::SessionReport>) -> Vec<SessionReportSummary> {
+    let mut by_id: std::collections::HashMap<String, agentops_graph::SessionReport> = reports.into_iter().map(|r| (r.report.session_id.clone(), r)).collect();
+    let mut ordered: Vec<agentops_graph::NewSessionReport> = sessions.iter().filter_map(|s| by_id.remove(&s.session_id)).map(|r| r.report).collect();
+    let mut agent_only: Vec<_> = by_id.into_values().filter(|r| r.report.source == "agent").collect();
+    agent_only.sort_by(|a, b| b.recorded_at.cmp(&a.recorded_at));
+    // Capped separately: `sessions` already holds up to RECENT_SESSIONS
+    // transcript sessions, so a shared cap would always drop agent rows.
+    ordered.extend(agent_only.into_iter().take(RECENT_SESSIONS).map(|r| r.report));
+    ordered
+        .into_iter()
+        .map(|r| {
+            let mut top: Vec<(String, i64)> = r.categories.into_iter().collect();
+            top.sort_by(|a, b| b.1.cmp(&a.1));
+            top.truncate(TOP_CATEGORIES);
+            SessionReportSummary {
+                session_id: r.session_id,
+                source: r.source,
+                agent: r.agent,
+                calls: r.calls,
+                tasks: r.tasks,
+                peak_context: r.peak_context,
+                total_context_tokens: r.total_context_tokens,
+                compactions: r.compactions,
+                top_categories: top,
+                resets: r.resets,
+            }
+        })
+        .collect()
 }
 
 /// How many recent sessions `UsageSummary::sessions` lists.
@@ -205,6 +262,12 @@ pub fn usage_summary(store: &dyn GraphStore, repo: &str) -> anyhow::Result<Usage
         }
     }
     let sessions = session_breakdowns(&usage_rows);
+    let session_count = usage_rows
+        .iter()
+        .filter(|r| !r.session_id.ends_with(agentops_graph::SUBAGENT_SESSION_SUFFIX))
+        .map(|r| r.session_id.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len() as i64;
 
     let hits = store.session_events_for_repo(repo, Some("hit"))?;
     let hit_count = hits.len() as i64;
@@ -214,7 +277,9 @@ pub fn usage_summary(store: &dyn GraphStore, repo: &str) -> anyhow::Result<Usage
 
     let llm_spend = llm_spend(&store.llm_usage_for_repo(repo)?);
 
-    Ok(UsageSummary { repo: repo.to_string(), tokens, subagent_tokens, sessions, hit_count, estimated_tokens_saved, estimated_cost_saved_usd, llm_spend })
+    let reports = report_summaries(&sessions, store.session_reports_for_repo(repo)?);
+
+    Ok(UsageSummary { repo: repo.to_string(), tokens, subagent_tokens, sessions, session_count, hit_count, estimated_tokens_saved, estimated_cost_saved_usd, llm_spend, reports })
 }
 
 #[cfg(test)]
@@ -236,6 +301,51 @@ mod tests {
             session_started_at: "2026-09-03T00:00:00Z".into(),
             session_ended_at: "2026-09-03T01:00:00Z".into(),
         }
+    }
+
+    /// Live bug, 2026-10-09: with RECENT_SESSIONS transcript sessions
+    /// already listed, a shared cap silently dropped every agent row.
+    #[test]
+    fn agent_reports_still_appear_when_recent_sessions_is_full() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        for i in 0..RECENT_SESSIONS + 2 {
+            let id = format!("s{i:02}");
+            store.upsert_session_usage(usage_row("repo-a", &id, 1, 1, 0.0)).unwrap();
+            store.upsert_session_report(agentops_graph::NewSessionReport { repo: "repo-a".into(), session_id: id, source: "transcript".into(), agent: "claude-code".into(), ..Default::default() }).unwrap();
+        }
+        store.upsert_session_report(agentops_graph::NewSessionReport { repo: "repo-a".into(), session_id: "cursor-1".into(), source: "agent".into(), agent: "cursor".into(), ..Default::default() }).unwrap();
+
+        let reports = usage_summary(&store, "repo-a").unwrap().reports;
+        assert_eq!(reports.iter().filter(|r| r.source == "transcript").count(), RECENT_SESSIONS);
+        assert_eq!(usage_summary(&store, "repo-a").unwrap().session_count, (RECENT_SESSIONS + 2) as i64, "session_count is uncapped");
+        assert!(reports.iter().any(|r| r.session_id == "cursor-1"), "agent row was truncated away");
+    }
+
+    #[test]
+    fn reports_follow_session_order_keep_top_categories_and_include_agent_only_rows() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let mut older = usage_row("repo-a", "old", 1, 1, 0.0);
+        older.session_started_at = "2026-09-01T00:00:00Z".into();
+        store.upsert_session_usage(older).unwrap();
+        store.upsert_session_usage(usage_row("repo-a", "new", 1, 1, 0.0)).unwrap();
+        let report = |id: &str, source: &str| agentops_graph::NewSessionReport {
+            repo: "repo-a".into(),
+            session_id: id.into(),
+            source: source.into(),
+            agent: "x".into(),
+            categories: (1..=7).map(|i| (format!("c{i}"), i * 10)).collect(),
+            ..Default::default()
+        };
+        for (id, source) in [("old", "transcript"), ("new", "transcript"), ("cursor-1", "agent")] {
+            store.upsert_session_report(report(id, source)).unwrap();
+        }
+
+        let summary = usage_summary(&store, "repo-a").unwrap();
+        let ids: Vec<&str> = summary.reports.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(ids, ["new", "old", "cursor-1"]);
+        assert_eq!(summary.reports[0].top_categories.len(), TOP_CATEGORIES);
+        assert_eq!(summary.reports[0].top_categories[0], ("c7".to_string(), 70));
+        assert_eq!(summary.reports[2].source, "agent");
     }
 
     #[test]
@@ -267,10 +377,12 @@ mod tests {
                 tokens: UsageTotals::default(),
                 subagent_tokens: UsageTotals::default(),
                 sessions: vec![],
+                session_count: 0,
                 hit_count: 0,
                 estimated_tokens_saved: 0,
                 estimated_cost_saved_usd: 0.0,
                 llm_spend: vec![],
+                reports: vec![],
             }
         );
     }

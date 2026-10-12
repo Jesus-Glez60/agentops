@@ -410,6 +410,9 @@ pub(crate) struct UsageSyncEntry {
 #[derive(Debug, Deserialize)]
 pub(crate) struct UsageSyncBody {
     entries: Vec<UsageSyncEntry>,
+    /// Per-session token breakdowns; absent from CLIs older than this field.
+    #[serde(default)]
+    reports: Vec<agentops_graph::NewSessionReport>,
 }
 
 /// `POST /repos/{id}/usage/sync` -- the hosted counterpart to
@@ -449,6 +452,10 @@ pub(crate) async fn usage_sync_json(State(state): State<AppState>, user: Option<
                 session_started_at: entry.session_started_at.clone(),
                 session_ended_at: entry.session_ended_at.clone(),
             })?;
+        }
+        for report in &body.reports {
+            // `repo` comes from the resolved connection, never the wire.
+            store.upsert_session_report(agentops_graph::NewSessionReport { repo: repo.clone(), ..report.clone() })?;
         }
         Ok(Some(body.entries.len()))
     })
@@ -717,6 +724,45 @@ mod tests {
         assert_eq!(other_resp.status(), axum::http::StatusCode::NOT_FOUND, "a different tenant must never resolve another tenant's connection id");
     }
 
+    /// Live bug, 2026-10-09: /gotchas labels each gotcha with its store
+    /// repo name (`<id>--<tenant>`), and the Gotchas screen posts curation
+    /// with that -- every one 404'd ("153 of 153 couldn't be updated").
+    #[tokio::test]
+    async fn curation_accepts_the_store_repo_name_gotchas_lists_but_never_another_tenants() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&other.tenant, other.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+
+        let path = crate::indexing::checkout_path(checkouts_dir.path(), &owner.tenant, &connection_id);
+        let repo = agentops_mcp::repo_name(&path);
+        assert_eq!(repo, format!("{connection_id}--{}", owner.tenant));
+        let node_id = agentops_mcp::open_store(&path)
+            .unwrap()
+            .add_node(agentops_graph::NewNode { kind: agentops_graph::NodeKind::Gotcha, repo: repo.clone(), path: None, name: Some("g".into()), container: None, start_line: None, end_line: None, content: Some("body".into()) })
+            .unwrap();
+
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let post = |token: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/repos/{repo}/nodes/{node_id}/curation"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "prominence": "full", "reason": null }).to_string()))
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(post(&owner_token)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let resp = app.oneshot(post(&other_token)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never resolve the owner's store name");
+    }
+
     #[tokio::test]
     async fn usage_sync_then_usage_json_round_trips_and_never_crosses_tenants() {
         let (store, secrets) = test_state();
@@ -768,6 +814,42 @@ mod tests {
         let usage_body = body_json(usage_resp).await;
         assert_eq!(usage_body["tokens"]["input_tokens"], 1000, "{usage_body:?}");
         assert_eq!(usage_body["tokens"]["output_tokens"], 500, "{usage_body:?}");
+
+        // A newer CLI also sends per-session breakdowns; `repo` on the wire
+        // is ignored in favour of the resolved connection.
+        let with_reports = json!({ "entries": [], "reports": [{
+            "repo": "someone-elses-repo",
+            "session_id": "sess-1",
+            "source": "transcript",
+            "agent": "claude-code",
+            "calls": 3,
+            "total_context_tokens": 9000,
+            "categories": { "tool:Bash": 6000, "baseline": 3000 },
+            "resets": [{ "threshold": 150000, "resets": 0, "simulated_tokens": 9000, "savings": 0.0 }],
+        }] });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/repos/{connection_id}/usage/sync"))
+                    .header("authorization", format!("Bearer {owner_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(with_reports.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let usage_body = body_json(
+            app.clone()
+                .oneshot(Request::builder().uri(format!("/repos/{connection_id}/usage")).header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap())
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(usage_body["reports"][0]["total_context_tokens"], 9000, "{usage_body:?}");
+        assert_eq!(usage_body["reports"][0]["top_categories"][0][0], "tool:Bash", "{usage_body:?}");
 
         let other_resp = app
             .oneshot(
