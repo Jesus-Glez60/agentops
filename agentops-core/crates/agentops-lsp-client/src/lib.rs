@@ -55,6 +55,20 @@ use async_lsp::LanguageServer;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tower::ServiceBuilder;
 
+/// Pause between retries of a request rust-analyzer rejected as
+/// `ContentModified` -- see `is_content_modified`.
+const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// rust-analyzer answers `ContentModified` (-32801) when its view of the
+/// workspace changed mid-request -- typically while it's still loading the
+/// project right after spawn. The LSP spec expects the client to retry, so
+/// position-based requests here do, until their `request_timeout` is spent.
+/// Seen live in CI on a loaded box: `references` failed outright on the
+/// first attempt.
+fn is_content_modified(e: &async_lsp::Error) -> bool {
+    matches!(e, async_lsp::Error::Response(r) if r.code == async_lsp::ErrorCode::CONTENT_MODIFIED)
+}
+
 /// One resolved symbol from a real language server's own
 /// `textDocument/documentSymbol` response -- deliberately a plain, minimal
 /// shape, not `lsp_types::SymbolInformation`/`DocumentSymbol` themselves, so
@@ -204,16 +218,18 @@ impl LspClient {
                 .did_open(DidOpenTextDocumentParams { text_document: TextDocumentItem { uri: uri.clone(), language_id: "rust".into(), version: 0, text } })
                 .context("sending didOpen")?;
 
-            let response = tokio::time::timeout(
-                request_timeout,
-                server.document_symbol(DocumentSymbolParams {
-                    text_document: TextDocumentIdentifier { uri },
+            let deadline = tokio::time::Instant::now() + request_timeout;
+            let response = loop {
+                let params = DocumentSymbolParams {
+                    text_document: TextDocumentIdentifier { uri: uri.clone() },
                     work_done_progress_params: Default::default(),
                     partial_result_params: Default::default(),
-                }),
-            )
-            .await
-            .context("rust-analyzer did not respond to documentSymbol within the timeout")??;
+                };
+                match tokio::time::timeout_at(deadline, server.document_symbol(params)).await.context("rust-analyzer did not respond to documentSymbol within the timeout")? {
+                    Err(e) if is_content_modified(&e) && tokio::time::Instant::now() + CONTENT_MODIFIED_RETRY_DELAY < deadline => tokio::time::sleep(CONTENT_MODIFIED_RETRY_DELAY).await,
+                    other => break other?,
+                }
+            };
 
             Ok(flatten_document_symbol_response(response))
         })
@@ -239,17 +255,19 @@ impl LspClient {
                 .did_open(DidOpenTextDocumentParams { text_document: TextDocumentItem { uri: uri.clone(), language_id: "rust".into(), version: 0, text } })
                 .context("sending didOpen")?;
 
-            let response = tokio::time::timeout(
-                request_timeout,
-                server.references(ReferenceParams {
-                    text_document_position: TextDocumentPositionParams { text_document: TextDocumentIdentifier { uri }, position: Position { line, character } },
+            let deadline = tokio::time::Instant::now() + request_timeout;
+            let response = loop {
+                let params = ReferenceParams {
+                    text_document_position: TextDocumentPositionParams { text_document: TextDocumentIdentifier { uri: uri.clone() }, position: Position { line, character } },
                     work_done_progress_params: Default::default(),
                     partial_result_params: Default::default(),
                     context: ReferenceContext { include_declaration: true },
-                }),
-            )
-            .await
-            .context("rust-analyzer did not respond to references within the timeout")??;
+                };
+                match tokio::time::timeout_at(deadline, server.references(params)).await.context("rust-analyzer did not respond to references within the timeout")? {
+                    Err(e) if is_content_modified(&e) && tokio::time::Instant::now() + CONTENT_MODIFIED_RETRY_DELAY < deadline => tokio::time::sleep(CONTENT_MODIFIED_RETRY_DELAY).await,
+                    other => break other?,
+                }
+            };
 
             Ok(response
                 .unwrap_or_default()
