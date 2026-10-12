@@ -1,36 +1,38 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# apps/web
 
-## Getting Started
+The AgentOps web app (Next.js 16, React 19): Search, Knowledge Graph, Documentation Viewer, Gotchas, Libraries, Repositories (connect wizard + indexing), Settings, Profile, plus the `/login`, `/setup`, `/welcome`, `/invite/[token]` and `/cli-auth` (CLI device-login approval) flows.
 
-First, run the development server:
+It's a frontend only. Every screen reads from `agentops-server`, so run that first or the screens will look empty.
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+## Develop
+
+```sh
+# from the repo root: the API on :8420
+cargo run --bin agentops-server
+
+# in this directory
+npm ci
+npm run dev      # http://localhost:3000/suite
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+The app lives under a base path, `/suite` by default (`AGENTOPS_WEB_APP_BASE_PATH`, read in `next.config.ts`), because the marketing site owns the root in production.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+| Env var | Default | Purpose |
+|---|---|---|
+| `AGENTOPS_HEAVY_API_URL` | `http://127.0.0.1:8420` | Where server-side code reaches `agentops-server`. |
+| `AGENTOPS_PUBLIC_API_URL` | guessed from the request | The API address shown to users in connect instructions (`connect.sh`, `--remote`). Set it whenever the guess is wrong, e.g. behind a reverse proxy. |
+| `AGENTOPS_WEB_APP_BASE_PATH` | `/suite` | URL prefix for the whole app. |
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Scripts
 
-## Learn More
+| Command | Action |
+|---|---|
+| `npm run dev` | Dev server. |
+| `npm run build` | Production build (`output: "standalone"`, used by the root `Dockerfile`). |
+| `npm run start` | Serve a production build. |
+| `npm run lint` | ESLint. |
+| `npm test` | Vitest. |
 
-To learn more about Next.js, take a look at the following resources:
+`public/llms.txt` and `public/llms-full.txt` are copies of the repo-root files; update them together.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+See [`CLAUDE.md`](CLAUDE.md) before writing code here: this Next.js version differs from older ones, and its bundled docs in `node_modules/next/dist/docs/` are the reference.

@@ -33,6 +33,7 @@ export const config = {
   // invite link isn't signed in yet -- that's the whole point), the PM2
   // deployment's infra-config wizard (/setup) and its API route (runs
   // before any account exists on the instance, so there's no session to
-  // have yet), and Next.js internals/static assets.
-  matcher: ["/((?!login|api/auth|invite/|api/invites|setup|api/bootstrap|_next/static|_next/image|favicon.ico).*)"],
+  // have yet), the public llms.txt/llms-full.txt docs (the README points
+  // agents at them), and Next.js internals/static assets.
+  matcher: ["/((?!login|api/auth|invite/|api/invites|setup|api/bootstrap|llms.txt|llms-full.txt|_next/static|_next/image|favicon.ico).*)"],
 };

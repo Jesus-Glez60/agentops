@@ -28,6 +28,8 @@ info:
 servers:
   - url: http://127.0.0.1:8420
     description: Default local bind address (AGENTOPS_ADDR) — change to whatever host/reverse-proxy this instance is actually deployed behind.
+  - url: https://api.agentops.dedyn.io
+    description: Public hosted instance.
 
 tags:
   - name: Health
@@ -512,6 +514,111 @@ paths:
                 properties:
                   backup_codes: { type: array, items: { type: string } }
 
+  /auth/cli/device:
+    post:
+      tags: [Auth]
+      summary: "CLI device login, step 1: request a device/user code pair"
+      description: RFC 8628 device-authorization flow (`gh auth login`-style), used by `agentops connect --remote` and `connect.sh`. The CLI shows `verification_uri_complete` for the person to open on any device with a browser.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_name]
+              properties:
+                device_name: { type: string }
+      responses:
+        "200":
+          description: Code pair issued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  device_code: { type: string }
+                  user_code: { type: string }
+                  verification_uri: { type: string }
+                  verification_uri_complete: { type: string }
+                  expires_in: { type: integer }
+                  interval: { type: integer }
+
+  /auth/cli/device/approve:
+    post:
+      tags: [Auth]
+      summary: "CLI device login, step 2: approve or deny from the browser"
+      description: Called by the web app's `/cli-auth` page from the logged-in user's session.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user_code, action]
+              properties:
+                user_code: { type: string }
+                action: { type: string, enum: [approve, deny] }
+      responses:
+        "200": { description: Recorded }
+        "400": { description: "Bad action, or unknown/expired user code" }
+
+  /auth/cli/device/token:
+    post:
+      tags: [Auth]
+      summary: "CLI device login, step 3: poll for the API key"
+      description: The CLI polls until the response stops being `authorization_pending`. On approval a personal API key is minted just-in-time and returned exactly once.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [device_code]
+              properties:
+                device_code: { type: string }
+      responses:
+        "200":
+          description: "Always 200 while the flow is live: `{error: authorization_pending | access_denied | expired_token}` (RFC 8628 codes), or `{status: approved, api_key}` once approved"
+        "503": { description: "(on step 1) AGENTOPS_WEB_APP_URL unset, so no verification link can be built" }
+
+  /connect.sh:
+    get:
+      tags: [Auth]
+      summary: One-command remote connect script
+      description: "`curl -fsSL <server>/connect.sh | sh` installs the `agentops` CLI if needed, then runs `agentops connect --remote <this server> --device-login`. Open it in a browser first to review it before piping."
+      security: []
+      responses:
+        "200":
+          description: POSIX shell script
+          content:
+            text/plain:
+              schema: { type: string }
+
+  /contact-leads:
+    post:
+      tags: [Health]
+      summary: Marketing-site contact form submission
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [need, email, company, message]
+              properties:
+                need: { type: string }
+                email: { type: string }
+                company: { type: string }
+                message: { type: string }
+      responses:
+        "200": { description: Recorded }
+        "400": { description: Invalid submission }
+        "429": { description: Rate limited }
+
   # ---------------------------------------------------------------------
   # Integrations
   # ---------------------------------------------------------------------
@@ -713,6 +820,8 @@ paths:
                   roles: { type: array, items: { type: object } }
                   matrix: { type: array, items: { type: object } }
                   custom_roles: { type: array, items: { type: object } }
+
+  /team/roles/custom:
     post:
       tags: [Team]
       summary: Create a custom role cloned from a fixed one
@@ -759,6 +868,66 @@ paths:
       responses:
         "200": { description: Deleted }
         "409": { description: Still held by at least one member }
+
+  /team/mcp-access-mode:
+    get:
+      tags: [Team]
+      summary: Get whether `/mcp` write tools are enabled for this org
+      description: Any member can view. Falls back to `advisor` (read-only), matching the deployment-level `AGENTOPS_ACCESS_MODE` default.
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: string, enum: [advisor, full] }
+    put:
+      tags: [Team]
+      summary: Set this org's `/mcp` access mode
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { type: string, enum: [advisor, full] }
+      responses:
+        "200": { description: Updated }
+        "400": { description: Invalid mode string }
+        "403": { description: Caller lacks the capability to change it }
+
+  /me/memberships:
+    get:
+      tags: [Team]
+      summary: List every org the caller belongs to (backs the org switcher)
+      security: [{ sessionAuth: [] }]
+      responses:
+        "200": { description: OK }
+
+  /me/switch-tenant:
+    post:
+      tags: [Team]
+      summary: Switch the caller's active org
+      description: Only into a tenant the caller is an active member of. No new session token is issued; the existing token resolves to the new tenant from the next request on.
+      security: [{ sessionAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [tenant]
+              properties:
+                tenant: { type: string }
+      responses:
+        "200": { description: Switched; returns the caller's new tenant/role/name }
+        "403": { description: Not a member of that tenant }
 
   /team/transfer-ownership:
     post:
@@ -1061,6 +1230,105 @@ paths:
       responses:
         "200": { description: New keypair; status reset to pending }
 
+  /repos/{id}:
+    delete:
+      tags: [Repositories]
+      summary: Unregister a connection
+      description: Wipes the connection's graph data (nodes, edges, notes, doc pages) first when Postgres is configured, then deletes the connection row last.
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: Deleted }
+        "404": { description: No such connection }
+
+  /repos/{id}/attach-ssh:
+    post:
+      tags: [Repositories]
+      summary: Upgrade a discovered/local-only connection to an SSH deploy-key remote, in place
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [repo_url]
+              properties:
+                tenant: { type: string }
+                repo_url: { type: string }
+      responses:
+        "200": { description: Attached; returns the public deploy key to add }
+        "409": { description: "Not eligible, or that remote is already connected" }
+
+  /repos/{id}/attach-github-app:
+    post:
+      tags: [Repositories]
+      summary: Upgrade a discovered/local-only connection to the GitHub App method, in place
+      description: Keeps the original connection id. Push-triggered reindexing still works (`webhook_autoreindex` is always true on success) via a `repo_url` fallback lookup in the webhook handler.
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [installation_id, full_name]
+              properties:
+                tenant: { type: string }
+                installation_id: { type: string }
+                full_name: { type: string, description: "`owner/repo`" }
+      responses:
+        "200": { description: Attached }
+        "409": { description: "Not eligible, or that remote is already connected" }
+
+  /repos/{id}/branches:
+    get:
+      tags: [Repositories]
+      summary: List the connection's remote branches (dashboard branch picker)
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /repos/{id}/branch:
+    patch:
+      tags: [Repositories]
+      summary: Set (or clear) the tracked branch and reindex
+      description: "`branch: null` clears the override, back to the clone's default branch. Spawns a reindex job immediately."
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                tenant: { type: string }
+                branch: { type: string, nullable: true }
+      responses:
+        "202": { description: Saved; reindex job started }
+
+  /repos/github-app/installations:
+    get:
+      tags: [Repositories]
+      summary: List this tenant's GitHub App installations
+      description: Read-only status for the Integrations cards. Any member with repo-view access can call it.
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
   /repos/github-app/install-url:
     get:
       tags: [Repositories]
@@ -1266,54 +1534,6 @@ paths:
       responses:
         "200": { description: Rescanned }
 
-  /repos/{name}/nodes/{id}:
-    get:
-      tags: [Search & Graph]
-      summary: Get a graph node's detail
-      security: [{ apiKeyAuth: [] }]
-      parameters:
-        - { name: name, in: path, required: true, schema: { type: string } }
-        - { name: id, in: path, required: true, schema: { type: string } }
-      responses:
-        "200": { description: OK }
-        "404": { description: No such node }
-
-  /repos/{name}/nodes/{id}/curation:
-    post:
-      tags: [Search & Graph]
-      summary: Set a Gotcha/Decision node's curation state (bucket, reason, prominence)
-      security: [{ apiKeyAuth: [] }]
-      parameters:
-        - { name: name, in: path, required: true, schema: { type: string } }
-        - { name: id, in: path, required: true, schema: { type: string } }
-      requestBody:
-        content:
-          application/json:
-            schema: { type: object }
-      responses:
-        "200": { description: Updated }
-
-  /repos/{name}/nodes/{id}/graph:
-    get:
-      tags: [Search & Graph]
-      summary: Get a node's local subgraph (neighbors within N hops)
-      security: [{ apiKeyAuth: [] }]
-      parameters:
-        - { name: name, in: path, required: true, schema: { type: string } }
-        - { name: id, in: path, required: true, schema: { type: string } }
-      responses:
-        "200": { description: OK }
-
-  /repos/{name}/graph:
-    get:
-      tags: [Search & Graph]
-      summary: Get the whole-repo graph view
-      security: [{ apiKeyAuth: [] }]
-      parameters:
-        - { name: name, in: path, required: true, schema: { type: string } }
-      responses:
-        "200": { description: OK }
-
   /repos/{name}/edges/{id}/reinforce:
     post:
       tags: [Search & Graph]
@@ -1325,21 +1545,107 @@ paths:
       responses:
         "200": { description: Reinforced }
 
-  /repos/{name}/docs:
+  /repos/{id}/nodes/{node_id}:
+    get:
+      tags: [Search & Graph]
+      summary: Get a graph node's detail
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: node_id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "404": { description: No such node }
+
+  /repos/{id}/nodes/{node_id}/curation:
+    post:
+      tags: [Search & Graph]
+      summary: Set a Gotcha/Decision node's curation state (bucket, reason, prominence)
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: node_id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        "200": { description: Updated }
+
+  /repos/{id}/nodes/{node_id}/graph:
+    get:
+      tags: [Search & Graph]
+      summary: Get a node's local subgraph (neighbors within N hops)
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: node_id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /repos/{id}/graph:
+    get:
+      tags: [Search & Graph]
+      summary: Get the whole-repo graph view
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /repos/{id}/docs:
     get:
       tags: [Search & Graph]
       summary: Get generated documentation for a repo
-      security: [{ apiKeyAuth: [] }]
+      security: [{ sessionOrApiKey: [] }]
       parameters:
-        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: tenant, in: query, schema: { type: string } }
       responses:
         "200": { description: OK }
+
+  /repos/{id}/usage:
+    get:
+      tags: [Search & Graph]
+      summary: Usage and knowledge-reuse summary for a connection (token tally, LLM spend, reuse counts)
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: tenant, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+
+  /repos/{id}/usage/sync:
+    post:
+      tags: [Search & Graph]
+      summary: Push parsed Claude Code session usage from the CLI
+      description: Hosted counterpart to `agentops usage sync`'s local-store path. A repo connected via `agentops connect --remote` has no local graph store, so the CLI pushes per-session entries here with its personal API key. Upserts, so re-sending a still-active session is safe.
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: tenant, in: query, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [entries]
+              properties:
+                entries: { type: array, items: { type: object } }
+                reports: { type: array, items: { type: object }, description: Optional per-session context reports }
+      responses:
+        "200": { description: Upserted }
 
   /activity:
     get:
       tags: [Search & Graph]
       summary: Recent scan/note/curation activity across repos
-      security: [{ apiKeyAuth: [] }]
+      security: [{ sessionOrApiKey: [] }]
       responses:
         "200": { description: OK }
 
@@ -1347,7 +1653,7 @@ paths:
     get:
       tags: [Search & Graph]
       summary: Hybrid (dense + lexical + graph-expanded) local search
-      security: [{ apiKeyAuth: [] }]
+      security: [{ sessionOrApiKey: [] }]
       parameters:
         - { name: q, in: query, required: true, schema: { type: string } }
         - { name: path, in: query, schema: { type: string } }
@@ -1358,7 +1664,7 @@ paths:
     get:
       tags: [Search & Graph]
       summary: List Gotcha nodes across repos, for the curation dashboard
-      security: [{ apiKeyAuth: [] }]
+      security: [{ sessionOrApiKey: [] }]
       responses:
         "200": { description: OK }
 

@@ -20,11 +20,11 @@ const ARCH = [
   { n: '02', stage: 'Scan', arrow: '→', title: 'AST-aware scanner', items: ['Python · JS/TS · Go', 'Rust · C++ · C#', 'zero network access'] },
   { n: '03', stage: 'Store', arrow: '→', title: 'Knowledge graph', items: ['files · symbols · deps', 'gotchas · decisions', 'SQLite or Postgres'] },
   { n: '04', stage: 'Retrieve', arrow: '→', title: 'Hybrid search', items: ['dense + BM25', 'exact name + PPR', 'gist → detail'] },
-  { n: '05', stage: 'Serve', arrow: '', title: 'MCP, REST, web UI', items: ['3 MCP servers · 35 tools', 'REST API · ~90 routes', 'web UI for humans'] },
+  { n: '05', stage: 'Serve', arrow: '', title: 'MCP, REST, web UI', items: ['1 MCP server · ~40 tools', 'REST API · ~100 routes', 'web UI for humans'] },
 ];
 
 const CLAIMS = [
-  { n: '02', t: '35 MCP tools across three servers.', d: 'Repo scanning, notes and search; semantic search and consolidation; library docs and changelogs.', check: 'connect an agent, then list its tools' },
+  { n: '02', t: '~40 MCP tools, one server.', d: 'Repo scanning, notes and search; tasks and sessions; library docs and changelogs. Local stdio or hosted /mcp.', check: 'connect an agent, then list its tools' },
   { n: '03', t: 'Read-only is structural, not a prompt.', d: 'Write-capable tools are filtered out of what the agent is told is available.', check: 'compare tools/list with read-only on and off' },
   { n: '04', t: 'The scanner can’t reach the network.', d: 'The core engine’s zero-network guarantee is verified when it’s built, not promised in a policy.', check: 'build the core engine yourself' },
   { n: '05', t: 'It documents itself with itself.', d: 'On first boot AgentOps registers its own docs as a docbrain library.', check: 'scrape_library slug: agentops, then search_docs' },
@@ -51,7 +51,7 @@ const INTEGRATIONS = [
       <span>Regression-gated local consolidation</span>
     </span>
     <h1 style="margin:0;max-width:15em;font-size:clamp(44px,6.4vw,88px);line-height:1;letter-spacing:-0.045em;font-weight:800;text-wrap:balance;color:var(--text-0)">A map of your codebase that agents <span style="background:linear-gradient(95deg,#cba6f7 10%,#f5c2e7 50%,#fab387 90%);-webkit-background-clip:text;background-clip:text;color:transparent">query instead of guessing.</span></h1>
-    <p style="margin:0;font-size:clamp(17px,1.6vw,21px);line-height:1.5;color:var(--text-2);max-width:40em;text-wrap:pretty">Turn your codebase into a knowledge graph AI coding agents can actually query — scanning, hybrid search, curated gotchas/decisions, and 35 MCP tools, all self-hosted.</p>
+    <p style="margin:0;font-size:clamp(17px,1.6vw,21px);line-height:1.5;color:var(--text-2);max-width:40em;text-wrap:pretty">Turn your codebase into a knowledge graph AI coding agents can actually query — scanning, hybrid search, curated gotchas/decisions, and library docs, exposed over MCP and all self-hosted.</p>
     <div style="display:flex;flex-wrap:wrap;gap:12px;justify-content:center;align-items:center">
       <a href={DEPLOY_URL} target="_blank" rel="noopener" style="padding:14px 24px;border-radius:999px;background:var(--accent-primary);color:var(--bg-0);font-weight:700;font-size:16px;box-shadow:0 0 0 1px rgba(203,166,247,0.5),0 10px 40px -8px rgba(203,166,247,0.7)">Get started &rarr;</a>
       <div style="display:flex;align-items:center;gap:12px;padding:8px 8px 8px 20px;border-radius:999px;border:1px solid var(--border-1);background:rgba(24,24,37,0.85);font-family:var(--font-mono);font-size:14px;color:var(--text-0)">
@@ -93,9 +93,9 @@ const INTEGRATIONS = [
   </div>
   <div style="position:relative;border-top:1px solid var(--border-0);background:var(--bg-0)">
     <div style="max-width:1240px;margin:0 auto;padding:0 32px;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))">
-      <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-primary)">35</span><span style="font-size:14px;color:var(--text-2)">MCP tools</span></div>
-      <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-pink)">3</span><span style="font-size:14px;color:var(--text-2)">MCP servers</span></div>
-      <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-orange)">~90</span><span style="font-size:14px;color:var(--text-2)">REST routes, OpenAPI-documented</span></div>
+      <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-primary)">~40</span><span style="font-size:14px;color:var(--text-2)">MCP tools</span></div>
+      <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-pink)">1</span><span style="font-size:14px;color:var(--text-2)">MCP server, local or hosted</span></div>
+      <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-orange)">~100</span><span style="font-size:14px;color:var(--text-2)">REST routes, OpenAPI-documented</span></div>
       <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-teal)">6</span><span style="font-size:14px;color:var(--text-2)">languages parsed by AST</span></div>
       <div style="padding:30px 20px;display:flex;flex-direction:column;gap:6px;align-items:center;text-align:center"><span style="font-size:44px;font-weight:800;letter-spacing:-0.04em;color:var(--accent-blue)">1</span><span style="font-size:14px;color:var(--text-2)">required env var to self-host</span></div>
     </div>

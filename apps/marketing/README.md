@@ -1,43 +1,27 @@
-# Astro Starter Kit: Minimal
+# apps/marketing
+
+The public AgentOps site (Astro + one React island for the knowledge-graph hero), live at https://agentops.dedyn.io. Pages: home (`index.astro`), `pricing.astro`, and one page per feature (`features/[id].astro`, generated from `src/data/features`).
+
+There's deliberately no login/register flow here. Calls to action link to the self-host quick start in the main README (`src/lib/external-links.ts`). The only backend call is the contact form (`src/components/ContactForm.astro`), which posts to `POST /contact-leads` on the API.
+
+## Develop
 
 ```sh
-npm create astro@latest -- --template minimal
+npm ci
+npm run dev        # http://localhost:4321
 ```
 
-> 🧑‍🚀 **Seasoned astronaut?** Delete this file. Have fun!
+| Command | Action |
+|---|---|
+| `npm run dev` | Dev server on `:4321`. |
+| `npm run build` | Static build to `./dist/`. |
+| `npm run preview` | Preview the build locally. |
+| `npm test` | Builds first (`pretest`), then runs Vitest route smoke tests (`src/lib/route-smoke.test.ts`). |
 
-## 🚀 Project Structure
+## Config
 
-Inside of your Astro project, you'll see the following folders and files:
+`AGENTOPS_PUBLIC_API_URL` is read **at build time** and baked into the static output (default `https://api.agentops.dedyn.io`); it's where the contact form posts. `site` in `astro.config.mjs` sets canonical/Open Graph URLs.
 
-```text
-/
-├── public/
-├── src/
-│   └── pages/
-│       └── index.astro
-└── package.json
-```
+## Deploy
 
-Astro looks for `.astro` or `.md` files in the `src/pages/` directory. Each page is exposed as a route based on its file name.
-
-There's nothing special about `src/components/`, but that's where we like to put any Astro/React/Vue/Svelte/Preact components.
-
-Any static assets, like images, can be placed in the `public/` directory.
-
-## 🧞 Commands
-
-All commands are run from the root of the project, from a terminal:
-
-| Command                   | Action                                           |
-| :------------------------ | :----------------------------------------------- |
-| `npm install`             | Installs dependencies                            |
-| `npm run dev`             | Starts local dev server at `localhost:4321`      |
-| `npm run build`           | Build your production site to `./dist/`          |
-| `npm run preview`         | Preview your build locally, before deploying     |
-| `npm run astro ...`       | Run CLI commands like `astro add`, `astro check` |
-| `npm run astro -- --help` | Get help using the Astro CLI                     |
-
-## 👀 Want to learn more?
-
-Feel free to check [our documentation](https://docs.astro.build) or jump into our [Discord server](https://astro.build/chat).
+The `Dockerfile` here is a multi-stage build that serves `dist/` with `serve` on `:4321` (pass `--build-arg AGENTOPS_PUBLIC_API_URL=...` for a different API). It runs as the `marketing` service in the root `docker-compose.yml`, and as `deploy/k8s/marketing-*.yaml` on Kubernetes. The bundled Caddy/Ingress config routes the site root here and `/suite/*` to the web app.

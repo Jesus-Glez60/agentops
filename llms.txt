@@ -1,34 +1,39 @@
 # AgentOps
 
-> Turns a codebase into a knowledge graph AI coding agents can query — scanning, hybrid search, curated gotchas/decisions, and 35 MCP tools, all self-hosted as a single open-core product (one Rust server, one Next.js frontend, no price gate).
+> Turns a codebase into a knowledge graph AI coding agents can query — scanning, hybrid search, curated gotchas/decisions, and library docs, exposed over MCP and self-hosted as a single open-core product (one Rust server, one Next.js frontend, no price gate).
 
-AgentOps scans a repo into a persistent graph of files/symbols/dependencies, layers hybrid dense+lexical search on top, and adds a curated Gotchas/Decisions notes system for tribal knowledge. All of it is exposed to AI coding agents over MCP (35 tools across three servers) and to humans via a REST API and web UI. `docbrain`, a bundled subsystem, does the same scan-and-search treatment for third-party library documentation — including AgentOps's own docs, registered as a library automatically on first boot.
+AgentOps scans a repo into a persistent graph of files/symbols/dependencies, layers hybrid dense+lexical search on top, and adds a curated Gotchas/Decisions notes system for tribal knowledge. Agents reach all of it over one MCP server (about 40 tools: code graph, notes, tasks, sessions/usage, library docs), either as a local stdio binary or through a hosted server's authenticated `/mcp` endpoint. Humans use a REST API and web UI. `docbrain`, a bundled subsystem, gives third-party library documentation the same scan-and-search treatment, including AgentOps's own docs, which are registered as a library automatically on first boot.
 
-Self-hosting needs exactly one required value (`AGENTOPS_SECRETS_MASTER_KEY`) and supports Docker, a classic binary install, PM2, or Kubernetes.
+Self-hosting needs exactly one required value (`AGENTOPS_SECRETS_MASTER_KEY`) and supports Docker, a classic binary install, PM2, or Kubernetes. Client machines connect with `curl -fsSL <server>/connect.sh | sh` (browser device login) or `npx agentops-cli connect`.
 
 ## Docs
 
-- [README](README.md): features, quick start for all four deployment methods, CLI reference, architecture overview.
-- [OpenAPI spec](docs/openapi.yaml): full REST API reference, ~90 routes across auth, team, repos, search, graph, docbrain, and webhooks.
+- [README](README.md): features, server quick start for all four deployment methods, connecting a coding tool, CLI reference, architecture overview.
+- [OpenAPI spec](docs/openapi.yaml): full REST API reference, ~100 routes across auth (including CLI device login), team, repos/indexing, search, graph, usage, docbrain, and webhooks.
 - [Rendered API docs](docs/index.html): browsable version of the OpenAPI spec.
+- [Notes vault protocol](docs/vault-protocol.md): how agents record gotchas/decisions (remote `add_note` vs. local Markdown).
 - [llms-full.txt](llms-full.txt): the full plain-text content of this project's docs in one file, for loading complete context in a single request.
 - [repo-map.md](repo-map.md): a generated architecture/centrality map of the codebase, produced by AgentOps scanning itself.
 
 ## Deployment
 
-- [Dockerfile](Dockerfile) / [docker-compose.yml](docker-compose.yml): single-image Docker deployment.
+- [Dockerfile](Dockerfile) / [docker-compose.yml](docker-compose.yml): `app` (API + web UI) and `marketing` services; optional `postgres` and `caddy` profiles.
 - [install.sh](install.sh): classic terminal installer — downloads binaries, hands off to `agentops init`.
 - [ecosystem.config.js](ecosystem.config.js): PM2 deployment (server + web UI as two managed processes).
-- [deploy/k8s/](deploy/k8s/): raw Kubernetes manifests (Deployment, Service, Ingress, PVC, optional Postgres StatefulSet).
+- [deploy/k8s/](deploy/k8s/): raw Kubernetes manifests (Deployment, Service, Ingress, PVC, marketing site, optional Postgres StatefulSet).
 - [.env.example](.env.example): every configuration variable, with the one required value called out.
 
 ## CLI
 
 - `agentops install|status|repos|forget|docgen|changelog|note|ingest-notes|search|explain|watch` — scan a repo into the graph and work with it.
-- `agentops serve|serve-api|docbrain-serve` — run the stdio MCP server, the REST API server, or the docbrain MCP server.
-- `agentops sync-docs|api-key|task|init` — dependency doc auto-registration, API key generation, native task management, first-run setup wizard.
-- `agentops connect [--remote <server-url>]` — connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, or any other Ruler-supported agent) by registering agentops's MCP server and distributing AGENTS.md/skills. Without `--remote`, registers a local stdio server against a locally-scanned repo (solo self-host). With `--remote`, points at a server-hosted instance's `/mcp` endpoint instead (authenticated with a personal API key), for team members connecting to a shared deployment.
+- `agentops connect [--remote <server-url>] [--global] [--with-hooks [--compress-commands]]` — connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, or any other Ruler-supported agent) by registering the MCP server and distributing AGENTS.md/skills. Without `--remote`: local stdio server against a locally scanned repo. With `--remote`: the hosted server's `/mcp` endpoint, authenticated via browser device login (default) or a personal API key.
+- `agentops usage sync|report` — Claude Code session token/cost tracking, and offline replay of where context went.
+- `agentops librarian export-labels|dry-run` — evaluate cheap models (Anthropic or OpenAI-compatible) at cataloguing gotchas.
+- `agentops task ...` — native task management with Linear sync.
+- `agentops serve|serve-api|docbrain-serve` — run the stdio MCP server, the REST API server, or the docbrain-only MCP server.
+- `agentops sync-docs|api-key|init|migrate-graph` — dependency doc auto-registration, instance API key generation, first-run setup wizard, SQLite→Postgres graph migration.
 
 ## Optional
 
+- [CONTRIBUTING.md](CONTRIBUTING.md) / [SECURITY.md](SECURITY.md): contribution status and vulnerability reporting.
 - [LICENSE-MIT](LICENSE-MIT) / [LICENSE-APACHE](LICENSE-APACHE): dual-licensed, MIT OR Apache-2.0.

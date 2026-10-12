@@ -1,12 +1,12 @@
 # AgentOps Marketing Page — Brief
 
-*Written for: a design-focused session building the public marketing site (planned in Astro, separate app, living at the site root `/`). This brief is factual positioning + content input, not a visual spec — the design itself should be original and should NOT default to generic SaaS/AI-tool visual patterns (see "Design direction" at the end).*
+*Historical input brief (the site has since shipped in `apps/marketing`; facts below updated 2026-10-12 where they'd gone stale). Written for: a design-focused session building the public marketing site (planned in Astro, separate app, living at the site root `/`). This brief is factual positioning + content input, not a visual spec — the design itself should be original and should NOT default to generic SaaS/AI-tool visual patterns (see "Design direction" at the end).*
 
 ---
 
 ## One-line pitch
 
-> **Turn your codebase into a knowledge graph AI coding agents can actually query — scanning, hybrid search, curated gotchas/decisions, and 35 MCP tools, all self-hosted.**
+> **Turn your codebase into a knowledge graph AI coding agents can actually query — scanning, hybrid search, curated gotchas/decisions, and library docs, exposed over MCP and all self-hosted.**
 
 (Source: project README / `llms.txt` — this is the canonical line, not copy invented for this brief.)
 
@@ -21,7 +21,7 @@ AgentOps scans a codebase into a **persistent, queryable knowledge graph** — f
 - **Hybrid search** — dense embeddings + lexical/BM25 + exact-name matching + personalized-PageRank graph expansion, plus a two-tier "gist then detail" retrieval mode.
 - **Curated Gotchas & Decisions** — the tribal knowledge that never makes it into code comments, tied directly to the exact symbol it's about via a real graph edge, so it surfaces automatically instead of depending on someone remembering to mention it.
 - **CLS-inspired local consolidation** — the system can locally fine-tune a small model on a repo's own curated notes, gated so a new version only ships if it doesn't regress retrieval quality against a held-out eval. The tool genuinely gets better at *your* repo over time — a real technical claim, not marketing fluff.
-- **35 MCP tools** across three servers, giving any MCP-speaking coding agent structured access to all of the above.
+- **About 40 MCP tools** through one MCP server (local stdio, or a hosted server's `/mcp`), giving any MCP-speaking coding agent structured access to all of the above.
 
 It's a single open-core product: one Rust server process, one Next.js frontend, no price gate, minimal required config (one env var to self-host).
 
@@ -41,7 +41,7 @@ It's a single open-core product: one Rust server process, one Next.js frontend, 
 
 - A **persistent header/nav**, visible on every page, with exactly two always-visible links:
   - **Documentation** — should point at the project's public API docs (`docs/` — Redoc-style OpenAPI viewer), *not* the in-app "Documentation Viewer" screen (see naming note below, which is an authenticated per-repo feature, not a public docs page).
-  - **Login / Register** — routes into the AgentOps suite's auth entry point (the existing Next.js app, moving to `/suite` — link to `/suite/login`).
+  - ~~**Login / Register**~~ — *superseded (2026-09-28): the shipped site has no login/register by design; calls to action link to the README's self-host quick start instead (see `apps/marketing/src/lib/external-links.ts`).*
 - A landing page structure that supports **one section/sub-page per feature**, not a single flat scroll — see feature list below.
 
 ### ⚠️ Naming collision to resolve before wiring the Documentation link
