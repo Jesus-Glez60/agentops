@@ -188,7 +188,10 @@ pub fn call_tool(store: &dyn DocbrainStore, db_path: &Path, name: &str, args: &V
     };
     Ok(match (spec.handler)(store, db_path, args) {
         Ok(text) => CallToolResult::success(text),
-        Err(e) => CallToolResult::error(e.to_string()),
+        // `{e:#}`, not `to_string()`: the plain form shows only the outermost
+        // context ("fetching docs page ...") and hides the cause, such as
+        // a refused non-public address. Same fix as `agentops_mcp::call_tool`.
+        Err(e) => CallToolResult::error(format!("{e:#}")),
     })
 }
 
@@ -543,6 +546,19 @@ mod tests {
             assert!(result.is_error, "{bad} must be rejected");
         }
         assert!(store.get_library("bad").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_scrape_of_a_local_address_reports_the_resolver_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docbrain.db");
+        let store = SqliteDocbrainStore::open(&db_path).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://127.0.0.1:{}/", listener.local_addr().unwrap().port());
+        call_tool(&store, &db_path, "register_library", &json!({ "slug": "local", "name": "Local", "docs_url": url })).unwrap();
+        let result = call_tool(&store, &db_path, "scrape_library", &json!({ "slug": "local", "version": "0" })).unwrap();
+        assert!(result.is_error);
+        assert!(result.content[0].text.contains("non-public"), "the refusal reason must reach the caller: {}", result.content[0].text);
     }
     use docbrain_graph::{NodeKind, SqliteDocbrainStore};
     use docbrain_ingest::Embedder;
