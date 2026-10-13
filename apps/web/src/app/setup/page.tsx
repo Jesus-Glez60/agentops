@@ -34,6 +34,7 @@ export default function SetupPage() {
   const [pending, setPending] = useState(false);
   const [errors, setErrors] = useState<string[]>([]);
   const [done, setDone] = useState(false);
+  const [instanceApiKey, setInstanceApiKey] = useState<string | null>(null);
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
@@ -57,6 +58,7 @@ export default function SetupPage() {
         toast.error(problems.length === 1 ? problems[0] : "Please fix the highlighted problems.");
         return;
       }
+      setInstanceApiKey(typeof data?.instance_api_key === "string" ? data.instance_api_key : null);
       setDone(true);
     } catch {
       toast.error("Unable to reach the backend.");
@@ -73,6 +75,12 @@ export default function SetupPage() {
             <CardTitle className="text-page-title">Config saved</CardTitle>
             <CardDescription>Wrote .env — restart the app for it to take effect (e.g. pm2 restart ecosystem.config.js), then continue to sign in.</CardDescription>
           </CardHeader>
+          {instanceApiKey && (
+            <CardContent className="space-y-2">
+              <p className="text-sm">Instance API key for operator and machine access to the REST API. It is shown only once; only its hash was saved.</p>
+              <code className="block break-all rounded-md border px-3 py-2 font-mono text-sm">{instanceApiKey}</code>
+            </CardContent>
+          )}
           <CardFooter>
             <Button size="cta" className="w-full justify-center" onClick={() => router.push("/login")}>
               Continue to sign in

@@ -59,10 +59,12 @@ struct AccountsState {
     /// when this is unset rather than minting a device code that would
     /// point at a dead link.
     web_app_url: Option<String>,
+    /// Brute-force brake for the auth routes; see `rate_limit.rs`.
+    limiter: Arc<crate::rate_limit::FixedWindowLimiter>,
 }
 
 pub fn build_accounts_integrations_router(accounts: AccountStore, credentials: CredentialStore, secrets: Arc<dyn SecretsProvider + Send + Sync>, teams: TeamStore, web_app_url: Option<String>) -> Router {
-    let state = AccountsState { accounts: Arc::new(Mutex::new(accounts)), credentials: Arc::new(Mutex::new(credentials)), secrets, teams: Arc::new(Mutex::new(teams)), web_app_url };
+    let state = AccountsState { accounts: Arc::new(Mutex::new(accounts)), credentials: Arc::new(Mutex::new(credentials)), secrets, teams: Arc::new(Mutex::new(teams)), web_app_url, limiter: Arc::default() };
 
     Router::new()
         .route("/integrations", get(list_integrations))
@@ -118,15 +120,36 @@ async fn require_session(State(state): State<AccountsState>, mut req: Request, n
 }
 
 /// Best-effort request metadata for the Active Sessions UI -- `User-Agent`
-/// is always present from a real browser; `ip_address` prefers
-/// `X-Forwarded-For` (set by a reverse proxy) and falls back to empty
-/// rather than requiring `ConnectInfo` wiring this deployment doesn't set
-/// up yet (self-hosted, typically local/behind a proxy that already sets
-/// this header).
-fn request_metadata(headers: &axum::http::HeaderMap) -> (String, String) {
+/// is always present from a real browser; `ip_address` is the trusted
+/// client address from `client_ip` (empty when unknown). It used to take
+/// the first `X-Forwarded-For` hop, which a client can set to anything.
+fn request_metadata(headers: &axum::http::HeaderMap, peer: Option<std::net::SocketAddr>) -> (String, String) {
     let user_agent = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
-    let ip_address = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()).and_then(|v| v.split(',').next()).unwrap_or("").trim().to_string();
+    let ip_address = crate::client_ip::client_ip(peer, headers).map(|ip| ip.to_string()).unwrap_or_default();
     (user_agent, ip_address)
+}
+
+type PeerInfo = Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>;
+
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const SIGNUP_WINDOW: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+/// Per account and per address, over `LOGIN_WINDOW`.
+const MAX_LOGINS_PER_ACCOUNT: u32 = 10;
+const MAX_AUTH_ATTEMPTS_PER_IP: u32 = 30;
+/// Wrong codes a single 2FA challenge survives before it is revoked.
+const MAX_2FA_ATTEMPTS_PER_CHALLENGE: u32 = 5;
+const MAX_SIGNUPS_PER_IP: u32 = 10;
+const MAX_DEVICE_APPROVALS_PER_USER: u32 = 10;
+
+/// Applies `(key, max, window)` limits in order; the first one exceeded
+/// becomes a 429. Address-based keys are skipped when the address is unknown.
+fn check_limits(state: &AccountsState, limits: &[(Option<String>, u32, std::time::Duration)]) -> Result<(), Response> {
+    for (key, max, window) in limits {
+        if let Some(key) = key {
+            state.limiter.check(key, *max, *window).map_err(crate::rate_limit::too_many_requests)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -243,7 +266,7 @@ async fn bootstrap_status(State(state): State<AccountsState>) -> (StatusCode, Js
 /// from — see the Method 2/3 deployment docs); the frontend tells the user
 /// to restart (`pm2 restart ecosystem.config.js`) since there's no
 /// hot-reload of env-derived config.
-async fn bootstrap_config(State(state): State<AccountsState>, Json(config): Json<agentops_manifest::BootstrapConfig>) -> (StatusCode, Json<serde_json::Value>) {
+async fn bootstrap_config(State(state): State<AccountsState>, Json(mut config): Json<agentops_manifest::BootstrapConfig>) -> (StatusCode, Json<serde_json::Value>) {
     match state.accounts.lock().unwrap().any_account_exists() {
         Ok(true) => return (StatusCode::FORBIDDEN, Json(json!({ "error": "this instance is already set up; edit .env by hand and restart to change infra config" }))),
         Ok(false) => {}
@@ -254,13 +277,28 @@ async fn bootstrap_config(State(state): State<AccountsState>, Json(config): Json
         return (StatusCode::BAD_REQUEST, Json(json!({ "errors": errors })));
     }
 
+    // `agentops-server` refuses to start on a non-loopback address without
+    // an instance key, so generate one here and return the raw key once.
+    let instance_api_key = match config.ensure_instance_key() {
+        Ok(raw) => raw,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("generating instance API key: {e}") }))),
+    };
     match std::fs::write(".env", config.to_env_file()) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "instance_api_key": instance_api_key }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("writing .env: {e}") }))),
     }
 }
 
-async fn signup(State(state): State<AccountsState>, headers: axum::http::HeaderMap, Json(req): Json<SignupRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn signup(State(state): State<AccountsState>, peer: PeerInfo, headers: axum::http::HeaderMap, Json(req): Json<SignupRequest>) -> Response {
+    let peer = crate::client_ip::peer_of(&peer);
+    let ip = crate::client_ip::client_ip(peer, &headers);
+    if let Err(resp) = check_limits(&state, &[(ip.map(|ip| format!("signup:ip:{ip}")), MAX_SIGNUPS_PER_IP, SIGNUP_WINDOW)]) {
+        return resp;
+    }
+    signup_inner(state, peer, headers, req).await.into_response()
+}
+
+async fn signup_inner(state: AccountsState, peer: Option<std::net::SocketAddr>, headers: axum::http::HeaderMap, req: SignupRequest) -> (StatusCode, Json<serde_json::Value>) {
     let first_name = req.first_name.trim();
     let last_name = req.last_name.trim();
     if first_name.is_empty() || last_name.is_empty() {
@@ -301,7 +339,7 @@ async fn signup(State(state): State<AccountsState>, headers: axum::http::HeaderM
         Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({ "error": e.to_string() }))),
     };
 
-    let (user_agent, ip_address) = request_metadata(&headers);
+    let (user_agent, ip_address) = request_metadata(&headers, peer);
     let accounts = state.accounts.lock().unwrap();
     let _ = accounts.record_session_metadata(&session_token, &user_agent, &ip_address);
     (StatusCode::CREATED, Json(serde_json::to_value(AuthResponse { user: user_view(&accounts, user), session_token }).unwrap()))
@@ -316,7 +354,20 @@ async fn signup(State(state): State<AccountsState>, headers: axum::http::HeaderM
 /// that challenge with a valid code. Any client of `POST /auth/login`
 /// (this app's `loginWithPassword`, any other caller) must handle both
 /// response shapes now.
-async fn login(State(state): State<AccountsState>, headers: axum::http::HeaderMap, Json(req): Json<LoginRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn login(State(state): State<AccountsState>, peer: PeerInfo, headers: axum::http::HeaderMap, Json(req): Json<LoginRequest>) -> Response {
+    let peer = crate::client_ip::peer_of(&peer);
+    let ip = crate::client_ip::client_ip(peer, &headers);
+    let limits = [
+        (Some(format!("login:acct:{}", req.email.trim().to_lowercase())), MAX_LOGINS_PER_ACCOUNT, LOGIN_WINDOW),
+        (ip.map(|ip| format!("login:ip:{ip}")), MAX_AUTH_ATTEMPTS_PER_IP, LOGIN_WINDOW),
+    ];
+    if let Err(resp) = check_limits(&state, &limits) {
+        return resp;
+    }
+    login_inner(state, peer, headers, req).await.into_response()
+}
+
+async fn login_inner(state: AccountsState, peer: Option<std::net::SocketAddr>, headers: axum::http::HeaderMap, req: LoginRequest) -> (StatusCode, Json<serde_json::Value>) {
     let user = { state.accounts.lock().unwrap().verify_credentials(&req.email, &req.password) };
     let Ok(user) = user else {
         return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "invalid email or password" })));
@@ -335,7 +386,7 @@ async fn login(State(state): State<AccountsState>, headers: axum::http::HeaderMa
             let session_token = { state.accounts.lock().unwrap().issue_session(user.id) };
             match session_token {
                 Ok(session_token) => {
-                    let (user_agent, ip_address) = request_metadata(&headers);
+                    let (user_agent, ip_address) = request_metadata(&headers, peer);
                     let accounts = state.accounts.lock().unwrap();
                     let _ = accounts.record_session_metadata(&session_token, &user_agent, &ip_address);
                     (StatusCode::OK, Json(serde_json::to_value(AuthResponse { user: user_view(&accounts, user), session_token }).unwrap()))
@@ -353,11 +404,28 @@ struct Login2faRequest {
     code: String,
 }
 
-async fn login_2fa(State(state): State<AccountsState>, headers: axum::http::HeaderMap, Json(req): Json<Login2faRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn login_2fa(State(state): State<AccountsState>, peer: PeerInfo, headers: axum::http::HeaderMap, Json(req): Json<Login2faRequest>) -> Response {
+    let peer = crate::client_ip::peer_of(&peer);
+    let ip = crate::client_ip::client_ip(peer, &headers);
+    if let Err(resp) = check_limits(&state, &[(ip.map(|ip| format!("2fa:ip:{ip}")), MAX_AUTH_ATTEMPTS_PER_IP, LOGIN_WINDOW)]) {
+        return resp;
+    }
+    // A wrong code leaves the challenge valid for retry, so cap the tries
+    // per challenge and revoke it after that: the password is needed again.
+    let challenge_key = format!("2fa:chal:{}", agentops_security::api_key::hash_api_key(&req.challenge_token));
+    if state.limiter.check(&challenge_key, MAX_2FA_ATTEMPTS_PER_CHALLENGE, LOGIN_WINDOW).is_err() {
+        let _ = state.accounts.lock().unwrap().revoke_login_challenge(&req.challenge_token);
+        state.limiter.clear(&challenge_key);
+        return (StatusCode::UNAUTHORIZED, Json(json!({ "error": "too many wrong codes; log in again" }))).into_response();
+    }
+    login_2fa_inner(state, peer, headers, req).await.into_response()
+}
+
+async fn login_2fa_inner(state: AccountsState, peer: Option<std::net::SocketAddr>, headers: axum::http::HeaderMap, req: Login2faRequest) -> (StatusCode, Json<serde_json::Value>) {
     let result = { state.accounts.lock().unwrap().complete_login_challenge(state.secrets.as_ref(), &req.challenge_token, &req.code) };
     match result {
         Ok((user, session_token)) => {
-            let (user_agent, ip_address) = request_metadata(&headers);
+            let (user_agent, ip_address) = request_metadata(&headers, peer);
             let accounts = state.accounts.lock().unwrap();
             let _ = accounts.record_session_metadata(&session_token, &user_agent, &ip_address);
             (StatusCode::OK, Json(serde_json::to_value(AuthResponse { user: user_view(&accounts, user), session_token }).unwrap()))
@@ -414,7 +482,14 @@ struct CliDeviceApproveRequest {
     action: String,
 }
 
-async fn cli_device_approve(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<CliDeviceApproveRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn cli_device_approve(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<CliDeviceApproveRequest>) -> Response {
+    if let Err(resp) = check_limits(&state, &[(Some(format!("device:user:{}", user.id)), MAX_DEVICE_APPROVALS_PER_USER, LOGIN_WINDOW)]) {
+        return resp;
+    }
+    cli_device_approve_inner(state, user, req).into_response()
+}
+
+fn cli_device_approve_inner(state: AccountsState, user: User, req: CliDeviceApproveRequest) -> (StatusCode, Json<serde_json::Value>) {
     let approve = match req.action.as_str() {
         "approve" => true,
         "deny" => false,
@@ -1366,6 +1441,44 @@ mod tests {
         let body = body_json(good_code_response).await;
         assert_eq!(body["user"]["email"], "dev@example.com");
         assert!(body["session_token"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_2fa_challenge_is_revoked_after_too_many_wrong_codes() {
+        let app = test_router();
+        let (_, totp) = signup_and_enable_2fa(&app, "dev@example.com").await;
+        let login_response = app.clone().oneshot(HttpRequest::post("/auth/login").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"correct horse battery staple"}"#)).unwrap()).await.unwrap();
+        let challenge_token = body_json(login_response).await["challenge_token"].as_str().unwrap().to_string();
+        let attempt = |code: String| {
+            let app = app.clone();
+            let challenge_token = challenge_token.clone();
+            async move {
+                app.oneshot(HttpRequest::post("/auth/login/2fa").header("content-type", "application/json").body(Body::from(format!(r#"{{"challenge_token":"{challenge_token}","code":"{code}"}}"#))).unwrap()).await.unwrap()
+            }
+        };
+
+        for _ in 0..MAX_2FA_ATTEMPTS_PER_CHALLENGE {
+            assert_eq!(attempt("000000".to_string()).await.status(), StatusCode::UNAUTHORIZED);
+        }
+        let revoked = attempt(totp.generate_current().unwrap()).await;
+        assert_eq!(revoked.status(), StatusCode::UNAUTHORIZED);
+        assert!(body_json(revoked).await["error"].as_str().unwrap().contains("log in again"));
+        let after = attempt(totp.generate_current().unwrap()).await;
+        assert_eq!(after.status(), StatusCode::UNAUTHORIZED, "even a correct code must fail once the challenge is revoked");
+    }
+
+    #[tokio::test]
+    async fn login_attempts_for_one_account_are_rate_limited() {
+        let app = test_router();
+        let bad_login = || HttpRequest::post("/auth/login").header("content-type", "application/json").body(Body::from(r#"{"email":"Victim@Example.com","password":"wrong"}"#)).unwrap();
+        for _ in 0..MAX_LOGINS_PER_ACCOUNT {
+            assert_eq!(app.clone().oneshot(bad_login()).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+        }
+        let limited = app.clone().oneshot(bad_login()).await.unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(limited.headers().get(axum::http::header::RETRY_AFTER).is_some());
+        let same_account_other_case = HttpRequest::post("/auth/login").header("content-type", "application/json").body(Body::from(r#"{"email":"victim@example.com","password":"wrong"}"#)).unwrap();
+        assert_eq!(app.oneshot(same_account_other_case).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS, "the key must not be bypassed by changing case");
     }
 
     #[tokio::test]

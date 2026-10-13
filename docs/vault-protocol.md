@@ -13,9 +13,12 @@ exists in the repo root (the same marker `agentops connect --remote` and
 `agentops-core/crates/agentops-cli/src/main.rs`'s `remote_marker_path`).
 
 - **If it exists**: this repo's real graph lives on a remote,
-  Postgres-backed server. The `add_note`/`ingest_notes` MCP tool (or
-  `POST /tools/add_note` over REST with an API key) is always reachable
-  and is the *only* correct way to record a note. **Never write a local
+  Postgres-backed server. The `add_note`/`ingest_notes` MCP tool over the
+  server's `/mcp` endpoint is always reachable and is the *only* correct
+  way to record a note. (REST `POST /tools/add_note` is not an alternative
+  for this: it accepts only the operator's instance-wide key and treats
+  `path` as a literal server path, so a personal API key and a connection
+  id don't work there.) **Never write a local
   Markdown file in this case** — if the agent doing the recording doesn't
   have the MCP tool available, that's a reason to escalate to one that
   does (or call the tool directly instead of delegating), not a reason to
@@ -34,7 +37,7 @@ history on the subject).
 
 **Remote-connected (preferred, and mandatory when the marker exists):**
 call `add_note` (single note) or `ingest_notes` (a whole folder at once)
-over MCP, or the equivalent REST route. Required fields: `path` (the repo
+over the server's `/mcp` endpoint. Required fields: `path` (the repo
 connection id), `title`, `body`. Optional: `note_type`
 (`gotcha`/`decision`/`knowledge` — omit to auto-classify),
 `tags`, `with_embeddings` (set true to make it semantic-search-findable),

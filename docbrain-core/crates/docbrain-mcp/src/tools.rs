@@ -192,6 +192,36 @@ pub fn call_tool(store: &dyn DocbrainStore, db_path: &Path, name: &str, args: &V
     })
 }
 
+/// Upper bound on `scrape_library`'s `max_pages`. Each page is a separate
+/// outbound fetch, and the argument comes from any caller of the tool.
+const MAX_SCRAPE_PAGES: usize = 200;
+
+/// Background jobs (`scrape_library`, `sync_changelogs`) allowed to run at
+/// once per process. Each holds a thread, sockets and a store connection;
+/// a stress test of 68 concurrent jobs already saw store-open failures
+/// (see `run_scrape_job`).
+const MAX_BACKGROUND_JOBS: usize = 4;
+static RUNNING_BACKGROUND_JOBS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A running-job slot, released on drop, so a job that panics still frees it.
+struct JobSlot;
+
+impl JobSlot {
+    fn acquire() -> Result<Self> {
+        use std::sync::atomic::Ordering;
+        RUNNING_BACKGROUND_JOBS
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_BACKGROUND_JOBS).then_some(n + 1))
+            .map(|_| JobSlot)
+            .map_err(|_| anyhow::anyhow!("too many background jobs running (limit {MAX_BACKGROUND_JOBS}); retry shortly"))
+    }
+}
+
+impl Drop for JobSlot {
+    fn drop(&mut self) {
+        RUNNING_BACKGROUND_JOBS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn get_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(|v| v.as_str())
 }
@@ -234,7 +264,10 @@ fn tool_discover_library(store: &dyn DocbrainStore, _db_path: &Path, args: &Valu
 
     match docbrain_ingest::RegistryDiscovery.discover(ecosystem, name)? {
         Some(found) => {
-            store.add_library(name, name, found.description.as_deref(), found.repo_url.as_deref(), found.docs_url.as_deref())?;
+            // A registry's docs URL is outside our control; keep only http(s)
+            // ones, since scrape_library fetches whatever is stored here.
+            let docs_url = found.docs_url.as_deref().filter(|url| docbrain_ingest::validate_docs_url(url).is_ok());
+            store.add_library(name, name, found.description.as_deref(), found.repo_url.as_deref(), docs_url)?;
             Ok(format!(
                 "Discovered and registered '{name}'. docs: {} repo: {}",
                 found.docs_url.as_deref().unwrap_or("(none published)"),
@@ -256,6 +289,7 @@ fn tool_register_library(store: &dyn DocbrainStore, _db_path: &Path, args: &Valu
     let docs_url = get_str(args, "docs_url").ok_or_else(|| anyhow::anyhow!("missing required 'docs_url'"))?;
     let github_repo = get_str(args, "github_repo");
     let description = get_str(args, "description");
+    docbrain_ingest::validate_docs_url(docs_url)?;
 
     store.add_library(slug, name, description, github_repo, Some(docs_url))?;
     Ok(format!("Registered '{slug}' ({name}). docs: {docs_url}"))
@@ -264,7 +298,7 @@ fn tool_register_library(store: &dyn DocbrainStore, _db_path: &Path, args: &Valu
 fn tool_scrape_library(store: &dyn DocbrainStore, db_path: &Path, args: &Value) -> Result<String> {
     let slug = get_str(args, "slug").ok_or_else(|| anyhow::anyhow!("missing required 'slug'"))?.to_string();
     let version = get_str(args, "version").ok_or_else(|| anyhow::anyhow!("missing required 'version'"))?.to_string();
-    let max_pages = args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let max_pages = (args.get("max_pages").and_then(|v| v.as_u64()).unwrap_or(1) as usize).min(MAX_SCRAPE_PAGES);
     let background = args.get("background").and_then(|v| v.as_bool()).unwrap_or(false);
     // Injected by `agentops-heavy-api::mcp_http::call_docbrain_tool` from
     // the caller's tenant vault, not a user-supplied arg — absent (and
@@ -284,9 +318,13 @@ fn tool_scrape_library(store: &dyn DocbrainStore, db_path: &Path, args: &Value) 
         return Ok(format!("Scraped {docs_url} -> {} chunk(s), {inserted} new, persisted as {slug}@{version}.", outcomes.len()));
     }
 
+    let slot = JobSlot::acquire()?;
     let job_id = store.create_job("scrape_library", &slug)?;
     let db_path = db_path.to_path_buf();
-    std::thread::spawn(move || run_scrape_job(db_path, slug, version, docs_url, max_pages, job_id, firecrawl_api_key));
+    std::thread::spawn(move || {
+        let _slot = slot;
+        run_scrape_job(db_path, slug, version, docs_url, max_pages, job_id, firecrawl_api_key)
+    });
     Ok(format!("Started background scrape job {job_id}. Poll get_job_status with job_id: {job_id}."))
 }
 
@@ -339,9 +377,13 @@ fn tool_sync_changelogs(store: &dyn DocbrainStore, db_path: &Path, args: &Value)
         return Ok(format!("Synced {} changelog entr{} for {slug} from {owner}/{name}.", entries.len(), if entries.len() == 1 { "y" } else { "ies" }));
     }
 
+    let slot = JobSlot::acquire()?;
     let job_id = store.create_job("sync_changelogs", &slug)?;
     let db_path = db_path.to_path_buf();
-    std::thread::spawn(move || run_sync_changelogs_job(db_path, slug, owner, name, token, job_id));
+    std::thread::spawn(move || {
+        let _slot = slot;
+        run_sync_changelogs_job(db_path, slug, owner, name, token, job_id)
+    });
     Ok(format!("Started background changelog sync job {job_id}. Poll get_job_status with job_id: {job_id}."))
 }
 
@@ -476,6 +518,32 @@ fn tool_get_job_status(store: &dyn DocbrainStore, _db_path: &Path, args: &Value)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_slots_are_capped_and_released_on_drop_even_after_a_panic() {
+        let slots: Vec<JobSlot> = (0..MAX_BACKGROUND_JOBS).map(|_| JobSlot::acquire().unwrap()).collect();
+        assert!(JobSlot::acquire().is_err(), "one more than the limit must be refused");
+        let one = slots.into_iter().next();
+        let handle = std::thread::spawn(move || {
+            let _slot = one;
+            panic!("job failed");
+        });
+        assert!(handle.join().is_err());
+        let again = JobSlot::acquire().expect("the panicking job's slot must be free again");
+        drop(again);
+    }
+
+    #[test]
+    fn register_library_rejects_non_http_docs_urls_and_stores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docbrain.db");
+        let store = SqliteDocbrainStore::open(&db_path).unwrap();
+        for bad in ["file:///etc/passwd", "ftp://example.com/docs"] {
+            let result = call_tool(&store, &db_path, "register_library", &json!({ "slug": "bad", "name": "Bad", "docs_url": bad })).unwrap();
+            assert!(result.is_error, "{bad} must be rejected");
+        }
+        assert!(store.get_library("bad").unwrap().is_none());
+    }
     use docbrain_graph::{NodeKind, SqliteDocbrainStore};
     use docbrain_ingest::Embedder;
 

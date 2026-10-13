@@ -44,6 +44,7 @@ use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnect
 use agentops_teams::TeamStore;
 
 mod accounts_integrations;
+mod client_ip;
 mod contact_routes;
 mod dashboard;
 mod github_app_routes;
@@ -51,6 +52,7 @@ mod indexing;
 mod libraries_http;
 mod linear_webhook;
 mod mcp_http;
+mod rate_limit;
 mod team;
 mod tenant_repo;
 pub use accounts_integrations::build_accounts_integrations_router;
@@ -2599,6 +2601,42 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["result"]["isError"], false, "{body:?}");
         assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no scans recorded yet"), "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_refuses_notes_path_so_a_caller_cannot_read_or_write_outside_its_checkout() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        {
+            let keypair = agentops_repo_access::generate_deploy_keypair_for_repo(secrets.as_ref(), &user.tenant, "own-repo").unwrap();
+            store.create_ssh_connection(&user.tenant, "own-repo", "git@github.com:acme/own.git", &keypair).unwrap();
+        }
+        let checkouts = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), checkouts.path().to_path_buf(), None);
+
+        let target = elsewhere.path().join("planted");
+        let calls = [
+            ("add_note", json!({ "path": "own-repo", "title": "x", "body": "y", "notes_path": target })),
+            ("ingest_notes", json!({ "path": "own-repo", "notes_path": elsewhere.path() })),
+            ("init_agents_md", json!({ "path": "own-repo", "notes_path": target })),
+        ];
+        for (i, (name, arguments)) in calls.into_iter().enumerate() {
+            let mut req = mcp_request("tools/call", json!({ "name": name, "arguments": arguments }), i as i64 + 1);
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let body = body_json(app.clone().oneshot(req).await.unwrap()).await;
+            assert_eq!(body["result"]["isError"], true, "{name}: {body:?}");
+            assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("notes_path"), "{name}: {body:?}");
+        }
+        assert!(!target.exists(), "a refused call must not create anything at the caller's path");
+
+        // Without `notes_path`, add_note still works, inside the checkout.
+        let mut req = mcp_request("tools/call", json!({ "name": "add_note", "arguments": { "path": "own-repo", "title": "Real note", "body": "plain text" } }), 9);
+        req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+        let body = body_json(app.oneshot(req).await.unwrap()).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains(&checkouts.path().display().to_string()), "{body:?}");
     }
 
     #[tokio::test]

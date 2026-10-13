@@ -658,6 +658,14 @@ impl AccountStore {
         Ok((user, session_token))
     }
 
+    /// Deletes a login challenge, so its holder must log in with the
+    /// password again. Called once a challenge has seen too many wrong 2FA
+    /// codes; a no-op for an unknown or already-used token.
+    pub fn revoke_login_challenge(&self, raw_challenge_token: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM login_challenges WHERE token_hash = ?1", [hash_api_key(raw_challenge_token)])?;
+        Ok(())
+    }
+
     /// Starts a `gh auth login`-style device-authorization flow: a CLI
     /// with no browser of its own (or on a headless/SSH-only machine)
     /// gets a long secret (`device_code`, hashed before storage like
