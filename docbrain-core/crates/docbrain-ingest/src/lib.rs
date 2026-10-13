@@ -11,6 +11,7 @@ mod changelog;
 mod chunk;
 mod classify;
 mod discover;
+mod net;
 pub mod retrieve;
 mod scrape;
 
@@ -19,6 +20,7 @@ pub use changelog::{ChangelogFetchEntry, ChangelogSync, GitHubReleasesSync};
 pub use chunk::{chunk_and_store, ChunkOutcome, MAX_CHUNK_TOKENS};
 pub use classify::classify_dependency;
 pub use discover::{DiscoveredLibrary, Ecosystem, LibraryDiscovery, RegistryDiscovery};
+pub use net::{is_public_ip, validate_docs_url};
 pub use scrape::{scrape_docs, ScrapedPage};
 
 use anyhow::Result;
@@ -31,6 +33,7 @@ use docbrain_graph::DocbrainStore;
 /// `firecrawl_api_key` is passed straight through to `scrape_docs` — see
 /// its doc comment; `None` is the common case and changes nothing.
 pub fn scrape_chunk_and_store(store: &dyn DocbrainStore, slug: &str, version: &str, docs_url: &str, max_pages: usize, firecrawl_api_key: Option<&str>) -> Result<Vec<ChunkOutcome>> {
+    validate_docs_url(docs_url)?;
     let pages = scrape_docs(docs_url, max_pages, firecrawl_api_key)?;
     chunk_and_store(store, slug, version, &pages, &LocalEmbedder)
 }

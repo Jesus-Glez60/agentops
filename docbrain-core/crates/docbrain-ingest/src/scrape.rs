@@ -134,7 +134,7 @@ fn fetch_llms_txt_links(base: &Url) -> Option<Vec<Url>> {
 }
 
 fn fetch_and_parse_llms_txt(url: &Url) -> Option<Vec<Url>> {
-    let mut resp = ureq::get(url.as_str()).header("User-Agent", "docbrain-ingest").call().ok()?;
+    let mut resp = crate::net::DOC_AGENT.get(url.as_str()).header("User-Agent", "docbrain-ingest").call().ok()?;
     let body = resp.body_mut().read_to_string().ok()?;
     Some(extract_markdown_links(&body, url))
 }
@@ -248,7 +248,7 @@ fn fetch_via_firecrawl(url: &str, api_key: &str) -> Result<String> {
 /// not assumed from a 200 status), then a `.md` URL suffix. Returns `None`
 /// if neither works — the HTML fallback path handles that case.
 fn fetch_markdown_export(url: &str) -> Option<String> {
-    if let Ok(mut resp) = ureq::get(url).header("User-Agent", "docbrain-ingest").header("Accept", "text/markdown").call() {
+    if let Ok(mut resp) = crate::net::DOC_AGENT.get(url).header("User-Agent", "docbrain-ingest").header("Accept", "text/markdown").call() {
         let is_markdown = resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()).is_some_and(|ct| ct.contains("markdown"));
         if is_markdown {
             if let Ok(body) = resp.body_mut().read_to_string() {
@@ -259,7 +259,7 @@ fn fetch_markdown_export(url: &str) -> Option<String> {
 
     if !url.ends_with(".md") {
         let md_url = format!("{}.md", url.trim_end_matches('/'));
-        if let Ok(mut resp) = ureq::get(&md_url).header("User-Agent", "docbrain-ingest").call() {
+        if let Ok(mut resp) = crate::net::DOC_AGENT.get(&md_url).header("User-Agent", "docbrain-ingest").call() {
             let is_markdown = resp.headers().get("Content-Type").and_then(|v| v.to_str().ok()).is_none_or(|ct| !ct.contains("html"));
             if is_markdown {
                 if let Ok(body) = resp.body_mut().read_to_string() {
@@ -327,7 +327,7 @@ fn extract_markdown_anchor_links(markdown: &str) -> Vec<(String, String)> {
 }
 
 fn fetch(url: &str) -> Result<String> {
-    let mut response = ureq::get(url).header("User-Agent", "docbrain-ingest").call().with_context(|| format!("fetching docs page '{url}'"))?;
+    let mut response = crate::net::DOC_AGENT.get(url).header("User-Agent", "docbrain-ingest").call().with_context(|| format!("fetching docs page '{url}'"))?;
     response.body_mut().read_to_string().with_context(|| format!("reading response body for '{url}'"))
 }
 
