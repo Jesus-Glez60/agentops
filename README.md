@@ -26,12 +26,12 @@ It's a single open-core product: one Rust server process, one Next.js frontend, 
 
 ## Quick start: run the server
 
-Every method needs exactly one required value: `AGENTOPS_SECRETS_MASTER_KEY` (generate with `openssl rand -hex 32`). Everything else is optional and documented in [`.env.example`](.env.example).
+Every method needs `AGENTOPS_SECRETS_MASTER_KEY` (generate with `openssl rand -hex 32`). Any deployment reachable from another machine (Docker, Kubernetes, PM2, a LAN or public host) also needs `AGENTOPS_API_KEY_HASH` (generate with `agentops api-key generate`); the server refuses to start on a non-loopback address without it. `agentops init` and the `/setup` page generate one for you. Everything else is optional and documented in [`.env.example`](.env.example).
 
 ### Docker (recommended)
 
 ```sh
-cp .env.example .env   # fill in AGENTOPS_SECRETS_MASTER_KEY
+cp .env.example .env   # fill in AGENTOPS_SECRETS_MASTER_KEY and AGENTOPS_API_KEY_HASH
 docker compose up
 ```
 

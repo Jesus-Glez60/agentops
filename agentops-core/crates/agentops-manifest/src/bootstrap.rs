@@ -15,6 +15,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct BootstrapConfig {
     pub secrets_master_key: String,
+    /// `AGENTOPS_API_KEY_HASH`. `agentops-server` refuses to start on a
+    /// non-loopback address without it, so every wizard fills it in via
+    /// `ensure_instance_key` rather than leaving it to the operator.
+    pub api_key_hash: Option<String>,
     pub database_url: Option<String>,
     pub addr: Option<String>,
     pub access_mode: Option<String>,
@@ -70,6 +74,7 @@ impl BootstrapConfig {
                 lines.push(format!("{key}={v}"));
             }
         };
+        push("AGENTOPS_API_KEY_HASH", &self.api_key_hash);
         push("AGENTOPS_DATABASE_URL", &self.database_url);
         push("AGENTOPS_ADDR", &self.addr);
         push("AGENTOPS_ACCESS_MODE", &self.access_mode);
@@ -81,6 +86,20 @@ impl BootstrapConfig {
         push("AGENTOPS_GITHUB_WEBHOOK_SECRET", &self.github_webhook_secret);
         push("AGENTOPS_QDRANT_URL", &self.qdrant_url);
         lines.join("\n") + "\n"
+    }
+}
+
+impl BootstrapConfig {
+    /// Generates an instance API key when none is configured yet, stores
+    /// its hash, and returns the raw key so the wizard can show it once.
+    /// Returns `None` when a hash was already supplied.
+    pub fn ensure_instance_key(&mut self) -> Result<Option<String>> {
+        if self.api_key_hash.as_deref().is_some_and(|h| !h.trim().is_empty()) {
+            return Ok(None);
+        }
+        let (raw, hash) = agentops_security::api_key::generate_api_key()?;
+        self.api_key_hash = Some(hash);
+        Ok(Some(raw))
     }
 }
 
@@ -123,6 +142,17 @@ mod tests {
         let config = BootstrapConfig { addr: Some("not-an-addr".to_string()), ..valid_config() };
         let errors = config.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("addr")));
+    }
+
+    #[test]
+    fn ensure_instance_key_generates_once_and_writes_the_hash() {
+        let mut config = valid_config();
+        let raw = config.ensure_instance_key().unwrap().expect("a key is generated when none is set");
+        let hash = config.api_key_hash.clone().unwrap();
+        assert_eq!(hash, agentops_security::api_key::hash_api_key(&raw));
+        assert!(config.to_env_file().contains(&format!("AGENTOPS_API_KEY_HASH={hash}")));
+        assert!(config.ensure_instance_key().unwrap().is_none(), "an existing hash must not be replaced");
+        assert_eq!(config.api_key_hash.as_deref(), Some(hash.as_str()));
     }
 
     #[test]

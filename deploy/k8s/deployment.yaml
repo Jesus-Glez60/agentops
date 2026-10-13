@@ -36,6 +36,13 @@ spec:
                   name: agentops-secrets
                   key: AGENTOPS_DATABASE_URL
                   optional: true
+            # Required: the server binds 0.0.0.0 in this image and refuses to
+            # start without it.
+            - name: AGENTOPS_API_KEY_HASH
+              valueFrom:
+                secretKeyRef:
+                  name: agentops-secrets
+                  key: AGENTOPS_API_KEY_HASH
           livenessProbe:
             httpGet:
               path: /health

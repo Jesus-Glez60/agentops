@@ -243,7 +243,7 @@ async fn bootstrap_status(State(state): State<AccountsState>) -> (StatusCode, Js
 /// from — see the Method 2/3 deployment docs); the frontend tells the user
 /// to restart (`pm2 restart ecosystem.config.js`) since there's no
 /// hot-reload of env-derived config.
-async fn bootstrap_config(State(state): State<AccountsState>, Json(config): Json<agentops_manifest::BootstrapConfig>) -> (StatusCode, Json<serde_json::Value>) {
+async fn bootstrap_config(State(state): State<AccountsState>, Json(mut config): Json<agentops_manifest::BootstrapConfig>) -> (StatusCode, Json<serde_json::Value>) {
     match state.accounts.lock().unwrap().any_account_exists() {
         Ok(true) => return (StatusCode::FORBIDDEN, Json(json!({ "error": "this instance is already set up; edit .env by hand and restart to change infra config" }))),
         Ok(false) => {}
@@ -254,8 +254,14 @@ async fn bootstrap_config(State(state): State<AccountsState>, Json(config): Json
         return (StatusCode::BAD_REQUEST, Json(json!({ "errors": errors })));
     }
 
+    // `agentops-server` refuses to start on a non-loopback address without
+    // an instance key, so generate one here and return the raw key once.
+    let instance_api_key = match config.ensure_instance_key() {
+        Ok(raw) => raw,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("generating instance API key: {e}") }))),
+    };
     match std::fs::write(".env", config.to_env_file()) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))),
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true, "instance_api_key": instance_api_key }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("writing .env: {e}") }))),
     }
 }

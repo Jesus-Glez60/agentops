@@ -891,7 +891,7 @@ fn init(yes: bool, path: &Path) -> Result<()> {
 
     println!("agentops init — sets up a classic (non-Docker, non-PM2) deployment.\n");
 
-    let config = if yes {
+    let mut config = if yes {
         BootstrapConfig { secrets_master_key: agentops_manifest::bootstrap::generate_master_key()?, signup_mode: Some("first-user-only".to_string()), ..Default::default() }
     } else {
         let generate = dialoguer::Confirm::new().with_prompt("Generate a new AGENTOPS_SECRETS_MASTER_KEY?").default(true).interact()?;
@@ -924,6 +924,11 @@ fn init(yes: bool, path: &Path) -> Result<()> {
             eprintln!("error: {e}");
         }
         anyhow::bail!("invalid configuration, see errors above");
+    }
+    // The server refuses to start on a non-loopback address without this,
+    // and generating it now costs nothing for a loopback-only setup.
+    if let Some(raw) = config.ensure_instance_key()? {
+        println!("Generated an instance API key for operator/machine REST access (shown once; only its hash is saved):\n  {raw}");
     }
 
     let env_path = path.join(".env");

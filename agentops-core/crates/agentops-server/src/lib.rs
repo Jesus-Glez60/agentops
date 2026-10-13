@@ -54,6 +54,10 @@ pub async fn run() -> anyhow::Result<()> {
         _ => AccessMode::Advisor,
     };
     let api_key_hash = std::env::var("AGENTOPS_API_KEY_HASH").ok();
+    // Checked before anything binds or connects, so a misconfigured deploy
+    // exits with this message instead of briefly serving open routes.
+    let allow_unauthenticated = matches!(std::env::var("AGENTOPS_ALLOW_UNAUTHENTICATED").as_deref(), Ok("1") | Ok("true"));
+    startup_auth_check(&addr, api_key_hash.as_deref().filter(|h| !h.trim().is_empty()), allow_unauthenticated)?;
     let manifest_path = std::env::var("AGENTOPS_MANIFEST_PATH").map(PathBuf::from).unwrap_or_else(|_| agentops_manifest::default_manifest_path());
     // `_without_dashboard_routes`, not just `_without_health` — this
     // process also mounts `agentops-heavy-api`'s tenant-scoped equivalents
@@ -104,6 +108,59 @@ pub async fn run() -> anyhow::Result<()> {
     println!("agentops-server listening on {addr}");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Refuses to serve without `AGENTOPS_API_KEY_HASH` on anything but a
+/// loopback address. Every route that falls back to the instance key
+/// (`agentops_security::api_key::check_bearer_api_key`) treats a missing
+/// hash as "no auth at all", so on a network-reachable bind that would let
+/// anonymous callers name any tenant on the REST routes and call `/tools`
+/// with literal server paths (engineering docs finding F37, live in
+/// production until 2026-10-13). A solo loopback setup (`agentops
+/// serve-api`, default `127.0.0.1:8420`) keeps working without a key.
+/// An address that doesn't resolve counts as non-loopback (fail closed).
+fn startup_auth_check(addr: &str, api_key_hash: Option<&str>, allow_unauthenticated: bool) -> anyhow::Result<()> {
+    if api_key_hash.is_some() || allow_unauthenticated {
+        return Ok(());
+    }
+    use std::net::ToSocketAddrs;
+    let loopback_only = addr.to_socket_addrs().map(|mut addrs| addrs.all(|a| a.ip().is_loopback())).unwrap_or(false);
+    if loopback_only {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to start: AGENTOPS_ADDR={addr} is not a loopback address and AGENTOPS_API_KEY_HASH is unset, \
+         which would leave the REST API unauthenticated. Generate a key with `agentops api-key generate` and set \
+         AGENTOPS_API_KEY_HASH to its hash, or set AGENTOPS_ALLOW_UNAUTHENTICATED=1 if this really is a trusted network."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::startup_auth_check;
+
+    #[test]
+    fn a_non_loopback_bind_without_a_key_is_refused() {
+        assert!(startup_auth_check("0.0.0.0:8420", None, false).is_err());
+        assert!(startup_auth_check("[::]:8420", None, false).is_err());
+    }
+
+    #[test]
+    fn loopback_binds_need_no_key() {
+        assert!(startup_auth_check("127.0.0.1:8420", None, false).is_ok());
+        assert!(startup_auth_check("[::1]:8420", None, false).is_ok());
+    }
+
+    #[test]
+    fn a_key_or_the_explicit_opt_out_allows_any_bind() {
+        assert!(startup_auth_check("0.0.0.0:8420", Some("abc123"), false).is_ok());
+        assert!(startup_auth_check("0.0.0.0:8420", None, true).is_ok());
+    }
+
+    #[test]
+    fn an_unresolvable_address_fails_closed() {
+        assert!(startup_auth_check("not a socket address", None, false).is_err());
+    }
 }
 
 /// `AGENTOPS_DATA_DIR` (default `~/.agentops`) — see `agentops-manifest`'s
