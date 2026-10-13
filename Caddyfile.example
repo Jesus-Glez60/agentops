@@ -6,7 +6,14 @@
 # the container, so external routing is only needed for direct
 # API-key-authed access from outside. Uncomment /api-external for that.
 your-domain.example.com {
-	reverse_proxy /suite/* app:3000
-	reverse_proxy / marketing:4321
-	# reverse_proxy /api-external/* app:8420
+	# X-Real-IP is what the app trusts for the client address (rate limits,
+	# Active Sessions); set it to the real peer on every upstream.
+	reverse_proxy /suite/* app:3000 {
+		header_up X-Real-IP {remote_host}
+	}
+	# `/*`, not `/`: a bare `/` matches only the exact root path.
+	reverse_proxy /* marketing:4321
+	# reverse_proxy /api-external/* app:8420 {
+	# 	header_up X-Real-IP {remote_host}
+	# }
 }

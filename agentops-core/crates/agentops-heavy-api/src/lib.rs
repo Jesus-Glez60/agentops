@@ -44,6 +44,7 @@ use agentops_repo_access::store::{ConnectionStatus, ConnectionStore, RepoConnect
 use agentops_teams::TeamStore;
 
 mod accounts_integrations;
+mod client_ip;
 mod contact_routes;
 mod dashboard;
 mod github_app_routes;
@@ -51,6 +52,7 @@ mod indexing;
 mod libraries_http;
 mod linear_webhook;
 mod mcp_http;
+mod rate_limit;
 mod team;
 mod tenant_repo;
 pub use accounts_integrations::build_accounts_integrations_router;

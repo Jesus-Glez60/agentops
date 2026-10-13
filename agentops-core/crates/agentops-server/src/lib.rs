@@ -106,7 +106,9 @@ pub async fn run() -> anyhow::Result<()> {
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     println!("agentops-server listening on {addr}");
-    axum::serve(listener, app).await?;
+    // Connect info gives handlers the TCP peer, which decides whether an
+    // `X-Real-IP` header may be trusted (`agentops-heavy-api`'s `client_ip`).
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
 }
 

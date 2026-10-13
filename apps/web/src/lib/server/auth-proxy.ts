@@ -7,6 +7,22 @@ import { HeavyApiError, heavyApiFetch } from "@/lib/server/heavy-api";
 import { setSessionCookie } from "@/lib/auth/session";
 import type { AuthResponse, TwoFactorChallenge } from "@/lib/auth/types";
 
+/**
+ * The browser's address, for the backend's per-address rate limits and the
+ * Active Sessions list. Without it every login reaches the backend from
+ * 127.0.0.1 and shares one limit. Prefers `x-real-ip`, which the reverse
+ * proxy sets to the real client (nginx: `proxy_set_header X-Real-IP
+ * $remote_addr`), then the last `x-forwarded-for` hop, which that proxy
+ * appended; the first hop is client-controlled. The header sent is always
+ * this value, never a client-supplied `X-Real-IP` passed through.
+ */
+export function clientIpHeaders(req: NextRequest): Record<string, string> {
+  const realIp = req.headers.get("x-real-ip")?.trim();
+  const lastForwarded = req.headers.get("x-forwarded-for")?.split(",").pop()?.trim();
+  const ip = realIp || lastForwarded;
+  return ip ? { "X-Real-IP": ip } : {};
+}
+
 export async function proxyCredentialsAuth(req: NextRequest, backendPath: "/auth/signup" | "/auth/login", successStatus: 200 | 201): Promise<NextResponse> {
   const body = await req.json().catch(() => null);
   if (!body || typeof body.email !== "string" || typeof body.password !== "string") {
@@ -22,6 +38,7 @@ export async function proxyCredentialsAuth(req: NextRequest, backendPath: "/auth
     const data = await heavyApiFetch<AuthResponse | TwoFactorChallenge>(backendPath, {
       method: "POST",
       body: JSON.stringify(body),
+      headers: clientIpHeaders(req),
     });
     // `fetch`'s `res.ok` is true for any 2xx, so a 202 two-factor
     // challenge doesn't throw -- it just comes back shaped differently
@@ -49,7 +66,7 @@ export async function proxyLogin2fa(req: NextRequest): Promise<NextResponse> {
   }
 
   try {
-    const data = await heavyApiFetch<AuthResponse>("/auth/login/2fa", { method: "POST", body: JSON.stringify(body) });
+    const data = await heavyApiFetch<AuthResponse>("/auth/login/2fa", { method: "POST", body: JSON.stringify(body), headers: clientIpHeaders(req) });
     const response = NextResponse.json({ user: data.user }, { status: 200 });
     setSessionCookie(response, data.session_token, req);
     return response;

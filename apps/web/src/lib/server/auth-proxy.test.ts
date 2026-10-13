@@ -8,7 +8,7 @@ vi.mock("@/lib/server/heavy-api", async () => {
 });
 
 import { HeavyApiError } from "@/lib/server/heavy-api";
-import { proxyCredentialsAuth, proxyLogin2fa } from "@/lib/server/auth-proxy";
+import { clientIpHeaders, proxyCredentialsAuth, proxyLogin2fa } from "@/lib/server/auth-proxy";
 
 function jsonRequest(body: unknown) {
   return new NextRequest("http://localhost/api/auth/login", {
@@ -111,5 +111,35 @@ describe("proxyLogin2fa", () => {
 
     expect(response.status).toBe(401);
     expect(await response.json()).toEqual({ error: "invalid verification code" });
+  });
+});
+
+describe("clientIpHeaders", () => {
+  function withHeaders(headers: Record<string, string>) {
+    return new NextRequest("http://localhost/api/auth/login", { method: "POST", headers });
+  }
+
+  it("prefers the proxy-set x-real-ip", () => {
+    expect(clientIpHeaders(withHeaders({ "x-real-ip": "203.0.113.7", "x-forwarded-for": "6.6.6.6, 198.51.100.1" }))).toEqual({ "X-Real-IP": "203.0.113.7" });
+  });
+
+  it("falls back to the last x-forwarded-for hop, not the client-controlled first one", () => {
+    expect(clientIpHeaders(withHeaders({ "x-forwarded-for": "6.6.6.6, 198.51.100.1" }))).toEqual({ "X-Real-IP": "198.51.100.1" });
+  });
+
+  it("sends nothing when neither header is present", () => {
+    expect(clientIpHeaders(withHeaders({}))).toEqual({});
+  });
+
+  it("forwards the address to the backend on login", async () => {
+    heavyApiFetch.mockReset();
+    heavyApiFetch.mockResolvedValue({ user: { id: 1, email: "dev@example.com", tenant: "t" }, session_token: "tok" });
+    const req = new NextRequest("http://localhost/api/auth/login", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-real-ip": "203.0.113.7" },
+      body: JSON.stringify({ email: "dev@example.com", password: "pw" }),
+    });
+    await proxyCredentialsAuth(req, "/auth/login", 200);
+    expect(heavyApiFetch.mock.calls[0][1].headers).toEqual({ "X-Real-IP": "203.0.113.7" });
   });
 });
