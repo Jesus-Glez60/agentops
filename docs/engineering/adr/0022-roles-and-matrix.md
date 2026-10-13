@@ -22,7 +22,7 @@ Four fixed roles (`admin`, `member`, `viewer`, `billing`) plus per-org custom ro
 ## Consequences
 
 - Capability keys are constants, so a typo is a compile error.
-- Two capabilities are defined but never enforced (`findings.md` F12, F13). MCP and curation sit outside the matrix (`findings.md` F38).
+- Two capabilities are defined but never enforced (`findings.md` F12, F13). MCP and curation sit outside the matrix on purpose (`findings.md` F38, author decision 2026-10-13).
 
 ## Evidence
 

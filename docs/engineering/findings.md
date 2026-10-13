@@ -8,16 +8,17 @@ Status values: **confirmed** (proven from repo artifacts), **likely** (read from
 
 | Group | Findings |
 | --- | --- |
-| **Security (hosted server)** | F31 `notes_path` unchecked on `/mcp`; F35 scraping fetches internal URLs; F37 REST auth fails open without the instance key; F38 roles skip MCP and curation; F39 no auth rate limits |
+| Security (hosted server), resolved | F31, F35, F37, F39 (fixed); F38 (by design) |
+| Security, open | F38 personal-key tenant mismatch; F46 no per-user limits on authenticated account endpoints |
 | Hosted data correctness | F27 stages 7–8 ignore Postgres; F28 web search finds no code; F30 hosted note files wiped on reindex; F36 `sync_docs` store; F3 self-seed |
 | Cost | F24 paid LLM call on every scan; F29 LoRA adapter unused |
 | Dead or unreachable code | F8, F25, F17 |
-| Configuration and deployment | F15, F16, F41, F42, F43 |
-| Docs and comments out of date | F1, F2, F4–F6, F11, F14, F18, F21, F22, F23, F33, F40 |
-| Small defects | F7, F9, F12, F13, F19, F20, F26, F32, F34, F44 |
+| Configuration and deployment | F16, F41, F42, F45 (F15, F43 resolved) |
+| Docs and comments out of date | F1, F2, F4–F6, F11, F14, F18, F21, F22, F23 (F33, F40 resolved) |
+| Small defects | F7, F9, F12, F13, F19, F20, F26, F32, F34, F44, F47 |
 | Resolved | F10 |
 
-Keep the security entries out of any public commit until they are fixed (`SECURITY.md`).
+The security findings were fixed on 2026-10-13 (branch `security/hosted-hardening`); each entry names its commit.
 
 ## Documentation inaccuracies
 
@@ -110,6 +111,7 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F15. Env vars read by the code but missing from `.env.example`
 
+- **Resolved in `d9f447b`** (branch `security/hosted-hardening`, 2026-10-13): `.env.example` now documents all six variables.
 - Status: confirmed (2026-10-12, `grep 'env::var("..")'` over all crates).
 - Missing operator-facing vars: `AGENTOPS_ANTHROPIC_MODEL`, `AGENTOPS_ANTHROPIC_MODEL_CHEAP`, `AGENTOPS_GITHUB_INSTALL_STATE_SECRET`, `AGENTOPS_PG_CONNECT_RETRY_SECS`, `AGENTOPS_PG_POOL_MAX_SIZE`, `AGENTOPS_INSTALL_DIR`.
 - Test-only, fine to omit: `AGENTOPS_TEST_DATABASE_URL`, `AGENTOPS_TEST_QDRANT_URL`.
@@ -220,7 +222,8 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F31. Hosted `/mcp` passes `notes_path` through unchecked
 
-- **Security. Status: confirmed by reading the code; not exploited or tested live.** `SECURITY.md` asks for private reporting; keep this entry out of any public commit until it is fixed.
+- **Resolved in `17a0407`** (branch `security/hosted-hardening`, 2026-10-13): hosted `/mcp` rejects `notes_path` for every tool; `add_note`'s schema declares it for local servers.
+- **Security. Status: confirmed by reading the code; not exploited or tested live.**
 - `handle_tools_call` (`agentops-core/crates/agentops-heavy-api/src/mcp_http.rs`) rewrites only the `path` argument. Its module doc states the rule: a remote caller's path "is never trusted as a literal filesystem path".
 - `tool_add_note` and `tool_ingest_notes` also read `notes_path` (`agentops-core/crates/agentops-mcp/src/tools.rs`). `resolve_notes_path` returns an explicit path unchanged (`agentops-core/crates/agentops-notes/src/config.rs`). `add_note`'s schema does not even declare `notes_path`, but the handler reads it.
 - Both tools are Advisor-mode, so any authenticated user of any org can call them in the default mode.
@@ -237,6 +240,7 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F33. The REST note path does not work for hosted users
 
+- **Resolved in `7026b45`** (branch `security/hosted-hardening`, 2026-10-13): `docs/vault-protocol.md` points hosted users to `/mcp` only; the prompt-pack copy says REST works on local servers only. `docs/openapi.yaml` still describes `apiKeyAuth` loosely.
 - Status: confirmed by reading the code.
 - `docs/vault-protocol.md` (Step 1) offers "`POST /tools/add_note` over REST with an API key" as an alternative to MCP for remote-connected repos. `docs/openapi.yaml` describes `apiKeyAuth` on `/tools/*` as a key from `agentops api-key generate` or `POST /auth/api-keys`.
 - `/tools/{name}` is `agentops-api`'s route. Its `require_api_key` checks only the instance-wide `AGENTOPS_API_KEY_HASH` (`check_bearer_api_key`, `agentops-core/crates/agentops-security/src/api_key.rs`). A personal key from `POST /auth/api-keys` is rejected.
@@ -251,7 +255,8 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F35. Hosted scraping fetches any URL, including internal ones
 
-- **Security. Status: confirmed by reading the code; not tested live.** Keep out of public commits until fixed.
+- **Resolved in `ffd9c1e`** (branch `security/hosted-hardening`, 2026-10-13): doc-page fetches go through a resolver that refuses non-public addresses on every connection; `docs_url` must be http(s); `max_pages` is capped at 200 and background jobs at 4. `AGENTOPS_ALLOW_PRIVATE_DOC_URLS` opts out.
+- **Security. Status: confirmed by reading the code; not tested live.**
 - `register_library` stores any `docs_url` (`docbrain-core/crates/docbrain-mcp/src/tools.rs`). `scrape_library` then fetches it from the server with `ureq` (`scrape_docs`, `docbrain-core/crates/docbrain-ingest/src/scrape.rs`). There is no check against loopback, private, link-local or container-internal addresses.
 - The response is chunked into the tenant's docbrain file, so the caller can read it back with `get_docs`. This is server-side request forgery with the response returned.
 - Reachable by any authenticated user on hosted `/mcp` in Advisor mode, since docbrain tools are ungated.
@@ -267,6 +272,7 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F37. Hosted REST auth fails open when the instance key is unset
 
+- **Resolved in `d9f447b`** (branch `security/hosted-hardening`, 2026-10-13): `agentops-server` refuses to start on a non-loopback address without `AGENTOPS_API_KEY_HASH` (opt-out `AGENTOPS_ALLOW_UNAUTHENTICATED`); the wizards generate a key. Production got the key on 2026-10-13 before the code change, and anonymous `/tools` now returns 401.
 - **Security. Status: confirmed by reading the code. Whether the hosted deployment sets the key is unknown.**
 - `check_bearer_api_key` returns OK when `AGENTOPS_API_KEY_HASH` is unset (`agentops-core/crates/agentops-security/src/api_key.rs`); `.env.example` documents this as "unauthenticated".
 - On `agentops-server` with accounts enabled, `require_api_key_or_session` falls back to that check. An anonymous request then passes with no `User`. `resolve_tenant` trusts its `tenant` parameter, and `require_session_capability` skips all checks.
@@ -276,6 +282,7 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F38. Roles do not apply to MCP or curation
 
+- **By design** (author decision, 2026-10-13): any authorized member of an org may write knowledge over `/mcp` and curate, since that knowledge comes from working on the codebase. Code comments now say so (`17a0407`, `7026b45`). The personal-key tenant mismatch in the last bullet is still open.
 - Status: confirmed by reading the code.
 - `/mcp` authenticates the caller but checks no capability (`mcp_http.rs`). A `viewer` can call every tool the org's access mode allows, including `add_note`, and in Full mode `scan_repo`, `explain_symbol` and task writes.
 - Curation (`POST /repos/{id}/nodes/{node_id}/curation`) checks only `repos.view`, so a viewer can demote or pin gotchas. F12 covers the unused `gotchas.resolve`.
@@ -283,6 +290,7 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F39. No rate limiting on authentication
 
+- **Resolved in `2232420`** (branch `security/hosted-hardening`, 2026-10-13): per-account, per-address, per-challenge and per-user limits on login, 2FA, signup and device approval, with 429 and `Retry-After`; a challenge is revoked after five wrong codes. The client address comes from `X-Real-IP` only via a loopback or private peer, and the web auth proxy forwards it.
 - Status: confirmed by reading the code.
 - No limiter exists on `POST /auth/login`, `POST /auth/login/2fa`, `POST /auth/cli/device/approve` or `POST /auth/signup` (searched `agentops-heavy-api` and `agentops-accounts` for limiter code). Passwords use Argon2, which slows but does not stop online guessing.
 - The comment on `USER_CODE_CHARSET` quotes RFC 8628: enough entropy that, "combined with rate-limiting", brute force is infeasible. No rate limit exists. Approving a guessed code needs a logged-in account and would connect someone else's CLI to the guesser's account, so the impact is low.
@@ -290,6 +298,7 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F40. `.env.example` misdescribes Advisor mode
 
+- **Resolved in `d9f447b`** (branch `security/hosted-hardening`, 2026-10-13): `.env.example` describes both modes correctly.
 - Status: confirmed.
 - `.env.example` says Full mode "adds write-capable tools like scan_repo/add_note". `add_note` is available in Advisor mode (`ToolSpec.access` in `agentops-core/crates/agentops-mcp/src/tools.rs`).
 
@@ -307,6 +316,7 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 
 ### F43. `Caddyfile.example` routes only the exact root to the marketing site
 
+- **Resolved in `2232420`** (branch `security/hosted-hardening`, 2026-10-13): `Caddyfile.example` uses `/*` and sets `X-Real-IP`.
 - Status: likely, from Caddy's matcher rules; not run.
 - `reverse_proxy / marketing:4321` uses the path matcher `/`, which in Caddy matches only the exact path `/`. `/pricing`, `/features/*` and built assets would not reach the marketing service. `/*` would.
 - `deploy/k8s/ingress.yaml` uses its own path rules and is not affected.
@@ -316,6 +326,22 @@ Keep the security entries out of any public commit until they are fixed (`SECURI
 - Status: confirmed live on 2026-10-13 against the hosted server.
 - `local_semantic_search` returns each hit's kind, title, score and `vault:` path, but no node id. `fetch_content` needs a node id, so a decision found by search cannot be read in full over MCP.
 - Effect: decisions recorded only on the hosted graph (for example "Small local models (≤4GB): recommended for the cheap LLM tier only, never bundled") could not be used as ADR sources.
+
+### F45. The PM2 `/setup` page cannot run on a fresh install
+
+- Status: confirmed by reading the code.
+- The README's PM2 method says to visit `/setup` on first run to write `.env`. But `build_full_router` requires `AGENTOPS_SECRETS_MASTER_KEY` (`EnvSecretsProvider::from_env()?` in `agentops-core/crates/agentops-heavy-api/src/lib.rs`), so without an existing `.env` the server never starts and `/setup` is unreachable.
+- Since `d9f447b`, `/setup` also generates an instance API key; the master-key chicken-and-egg problem is unchanged.
+
+### F46. Authenticated account endpoints have no per-user limits
+
+- Status: confirmed by reading the code; left out of the F39 fix on purpose.
+- Password change, API-key creation and 2FA enable/disable need a live session, so the threat is a hijacked session rather than guessing. They have no rate limits.
+
+### F47. The LSP cross-file reference test is flaky
+
+- Status: observed on 2026-10-13.
+- `scan::tests::scan_and_persist_with_lsp_adds_a_cross_file_reference_edge` (`agentops-core/crates/agentops-mcp/src/scan.rs`) failed once on the server and passed on an immediate re-run with no code change. It depends on rust-analyzer timing.
 
 ## Stale recorded knowledge
 

@@ -4,7 +4,7 @@ Who can call what, how each caller proves who it is, and how secrets and repo cr
 
 Crate detail is in [02-crates/accounts-teams-integrations.md](02-crates/accounts-teams-integrations.md) and [02-crates/foundations.md](02-crates/foundations.md). Tool-level access rules are in [07-mcp-and-rest-contracts.md](07-mcp-and-rest-contracts.md).
 
-> **Open security findings.** `findings.md` F31, F35, F37 and F38 describe exposures on the hosted server. They are confirmed by reading code, not tested live. Keep those entries out of public commits until fixed (`SECURITY.md`).
+> **Security fixes, 2026-10-13.** Findings F31, F35, F37 and F39 were fixed on branch `security/hosted-hardening` (`d9f447b`, `17a0407`, `ffd9c1e`, `2232420`); F38 is by design. This doc describes the code after those fixes. ADR 0036 records the design.
 
 ## Trust boundaries
 
@@ -76,9 +76,9 @@ All tokens and keys are random, opaque, hashed at rest and looked up by hash. Th
 
 ### Unset instance key
 
-`check_bearer_api_key` returns OK when no hash is configured. `.env.example` says it plainly: "unset means the REST API is unauthenticated". In a multi-tenant deployment that combines with the rules above. An anonymous request reaches step 3, passes, names any `tenant`, and skips every capability check. `/tools` and `/docbrain/*` are then open with literal paths too (`findings.md` F37).
+`check_bearer_api_key` returns OK when no hash is configured. Combined with the rules above, an anonymous request would reach step 3, pass, name any `tenant`, and skip every capability check; `/tools` and `/docbrain/*` would be open with literal paths too. That was live in production until 2026-10-13 (`findings.md` F37).
 
-Nothing at start-up requires the hash when accounts are enabled. `agentops-server` prints no warning; only the standalone `agentops_api::run` does.
+`agentops-server` now refuses to start in that state (`startup_auth_check` in `agentops-core/crates/agentops-server/src/lib.rs`). Before binding, it requires `AGENTOPS_API_KEY_HASH` unless `AGENTOPS_ADDR` resolves only to loopback addresses or `AGENTOPS_ALLOW_UNAUTHENTICATED` is `1` or `true`. An address that doesn't resolve counts as non-loopback. `agentops init` and the `/setup` page generate a key (`BootstrapConfig::ensure_instance_key`) and show the raw key once.
 
 ## Accounts and sessions
 
@@ -88,7 +88,24 @@ Nothing at start-up requires the hash when accounts are enabled. `agentops-serve
 - **Signup** follows `AGENTOPS_SIGNUP_MODE`: `open` or `first-user-only`. An `invite_token` lets a person sign up when signup is otherwise closed. Signup does not accept the invite; the user accepts it separately (decision "Signup's invite_token gates open signup, but must NOT accept/consume the invite itself").
 - **Sessions** last 30 days. The web app sets the cookie `httpOnly`, `sameSite: lax`, with `secure` only when the request arrived over HTTPS. Keying `secure` on `NODE_ENV` broke logins on plain-HTTP self-hosts silently (gotcha 54081).
 - **Two-factor** is TOTP. The secret is encrypted with the per-tenant AES-256-GCM scheme. A correct password without the code yields a short-lived challenge token, not a session (decision "2FA login flow uses separate challenge token, not real session"). Backup codes can be regenerated.
-- **Not implemented**: email verification and password reset (module doc). There is no rate limit on login, 2FA or device-code approval (`findings.md` F39).
+- **Not implemented**: email verification and password reset (module doc).
+
+### Rate limits
+
+`FixedWindowLimiter` (`agentops-core/crates/agentops-heavy-api/src/rate_limit.rs`) keeps in-memory counters per key. Over a limit, the route returns 429 with `Retry-After`. Counters reset on restart, which fits the single-instance deployment (`findings.md` F42).
+
+| Route | Key | Limit |
+| --- | --- | --- |
+| `POST /auth/login` | lowercased email | 10 per 15 min |
+| `POST /auth/login` | client address | 30 per 15 min |
+| `POST /auth/login/2fa` | client address | 30 per 15 min |
+| `POST /auth/login/2fa` | challenge token | 5 wrong codes, then the challenge is revoked (`revoke_login_challenge`) |
+| `POST /auth/signup` | client address | 10 per hour |
+| `POST /auth/cli/device/approve` | user | 10 per 15 min |
+
+The client address comes from `client_ip` (`agentops-core/crates/agentops-heavy-api/src/client_ip.rs`). It trusts `X-Real-IP` only when the TCP peer is loopback or private, which needs `agentops-server` to serve with connect info. The first `X-Forwarded-For` hop is never used, because behind an appending proxy it is client-controlled. The web auth proxy forwards the browser's address as `X-Real-IP` (`clientIpHeaders` in `apps/web/src/lib/server/auth-proxy.ts`). The reverse proxy must set `X-Real-IP` to the real peer and overwrite any client value. The same address now feeds the Active Sessions list.
+
+Authenticated account routes (password change, API keys, 2FA changes) have no limits (`findings.md` F46).
 
 ## Device-flow login
 
@@ -147,7 +164,9 @@ An organization is a tenant. The `tenant` string on a user is the organization i
 Where the matrix does not reach:
 
 - **Curation.** `POST /repos/{id}/nodes/{node_id}/curation` checks `repos.view`, so a viewer can reduce or pin a gotcha (`tenant_and_capability` in `agentops-core/crates/agentops-heavy-api/src/dashboard.rs`).
-- **MCP.** `/mcp` checks no capability. Any member, including a viewer, can call every tool the org's access mode allows, including `add_note` and, in Full mode, `scan_repo` (`findings.md` F38).
+- **MCP.** `/mcp` checks no capability. Any member, including a viewer, can call every tool the org's access mode allows, including `add_note` and, in Full mode, `scan_repo`.
+
+Both are intended: any authorized member may write knowledge and curate, since that knowledge comes from working on the codebase (author decision, 2026-10-13; `findings.md` F38).
 - **The instance key.** It bypasses the matrix by design.
 
 ### Invites
@@ -213,11 +232,12 @@ Every network-reachable input that names a file, a URL or a tenant must be check
 | Input | Where | Status |
 | --- | --- | --- |
 | `path` on `/mcp` | `resolve_connection_path` | Resolved within the caller's tenant. |
-| `notes_path` on `/mcp` | `add_note`, `ingest_notes` | **Not checked** (`findings.md` F31). |
-| `docs_url` via `register_library`, then `scrape_library` | `scrape_docs` | **No address check**; the server fetches any URL, including internal ones, and stores the response (`findings.md` F35). |
-| `max_pages` on `scrape_library` | `scrape_docs` | No upper bound; each background job is a new thread. |
+| `notes_path` on `/mcp` | `add_note`, `ingest_notes`, `init_agents_md` | Refused (`HOSTED_FORBIDDEN_ARGS` in `mcp_http.rs`). |
+| `docs_url` via `register_library`, `discover_library`, then `scrape_library` | `validate_docs_url`, `DOC_AGENT` | http(s) only; every fetch resolves through `PublicOnlyResolver`, which refuses non-public addresses, including on redirects. |
+| `max_pages` on `scrape_library` | `MAX_SCRAPE_PAGES` | Capped at 200; at most 4 background jobs run at once (`JobSlot`). |
 | `tenant` query parameter | `resolve_tenant` | Ignored with a session or personal key; trusted with the instance key. |
-| Missing instance key | `check_bearer_api_key` | **Fails open** (`findings.md` F37). |
+| Missing instance key | `startup_auth_check` | The server refuses to start on a non-loopback address. |
+| Client address | `client_ip` | `X-Real-IP` trusted only from a loopback or private peer. |
 | `local_id` on `register_repo` | `register_repo` | Restricted to 1–128 letters, digits, `-` and `_`. |
 | Connection id in a checkout path | `checkout_path` | Tenant suffix keeps tenants apart, tested against delimiter tricks. |
 
@@ -230,4 +250,3 @@ Every network-reachable input that names a file, a URL or a tenant must be check
 
 - [Q5b](questions.md): why the access mode is per org on `/mcp` but per process on `/tools`.
 - [Q6](questions.md): which write tools are meant to be open in Advisor mode.
-- Not a doc question: whether the hosted deployment sets `AGENTOPS_API_KEY_HASH` (F37). The repo cannot show deployment secrets.

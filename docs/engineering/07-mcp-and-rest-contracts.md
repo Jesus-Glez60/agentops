@@ -189,7 +189,7 @@ On hosted `/mcp`, `path` is never trusted as a literal path (`mcp_http.rs` modul
 
 It returns the checkout path `<repo_checkouts_dir>/<connection_id>--<tenant>`. The store's repo name is therefore `<connection_id>--<tenant>`, not the connection id (gotcha 54242). An unknown value returns an error result that suggests `register_repo`.
 
-Only the `path` argument is rewritten. Other arguments reach the tool unchanged; `notes_path` is the known problem case (`findings.md` F31).
+Only the `path` argument is rewritten. Arguments listed in `HOSTED_FORBIDDEN_ARGS` (currently `notes_path`) are refused with an `isError` result before dispatch, because the handler would treat them as literal server paths (`findings.md` F31).
 
 Hosted calls run inside `spawn_blocking` and `with_shared_postgres_store`. The first avoids a nested Tokio runtime panic in the Postgres adapter. The second reuses one connection pool; per-call pools deadlocked Postgres under load (comments in `handle_tools_call`).
 
@@ -233,11 +233,11 @@ REST mirrors the tool tables, not each tool:
 
 The two REST routes differ from hosted `/mcp` in three ways:
 
-1. Auth is the instance-wide key only; a personal API key is rejected (`check_bearer_api_key`). Without `AGENTOPS_API_KEY_HASH`, the routes are unauthenticated. The standalone `agentops_api::run` prints a warning; `agentops-server` does not.
+1. Auth is the instance-wide key only; a personal API key is rejected (`check_bearer_api_key`). Without `AGENTOPS_API_KEY_HASH` the routes would be unauthenticated, so `agentops-server` refuses to start on a non-loopback address without it ([09-auth-teams-security.md](09-auth-teams-security.md), "Unset instance key").
 2. `path` is a literal server path, not a connection id. The routes assume a trusted operator.
 3. The mode is the process's `AGENTOPS_ACCESS_MODE`, not the org's setting.
 
-So a hosted user cannot record a note with `POST /tools/add_note` and a personal key. `docs/vault-protocol.md` and `docs/openapi.yaml` suggest otherwise (`findings.md` F33).
+So a hosted user cannot record a note with `POST /tools/add_note` and a personal key. `docs/vault-protocol.md` now says so; `docs/openapi.yaml` still describes `apiKeyAuth` loosely (`findings.md` F33).
 
 Dashboard REST routes such as `/gotchas`, `/local-search` and `/repos/{id}/nodes/{node_id}/curation` are separate handlers for the web UI, not tool wrappers. Their behavior can differ from the matching tool; `/local-search` is dense-only, for example ([05-retrieval.md](05-retrieval.md)).
 

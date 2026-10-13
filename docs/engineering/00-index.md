@@ -19,7 +19,7 @@ The entry point to AgentOps's engineering documentation: which document answers 
 | [11-deployment-and-operations.md](11-deployment-and-operations.md) | Configuration, storage, deploy methods, upgrades, health, and the runbook. |
 | [12-development-workflow.md](12-development-workflow.md) | Building, testing, supply chain, releases, and the repo's own Claude Code setup. |
 | [13-agent-integration.md](13-agent-integration.md) | `agentops connect`, supported tools, prompt pack and Ruler, hooks, usage tracking. |
-| [adr/](adr/README.md) | 35 architecture decision records, plus candidates waiting for a recorded reason. |
+| [adr/](adr/README.md) | 36 architecture decision records, plus candidates waiting for a recorded reason. |
 | [findings.md](findings.md) | Bugs, doc inaccuracies, dead code and stale gotchas found while writing these docs. Nothing in it is fixed yet. |
 | [questions.md](questions.md) | Questions only the author can answer, and the answers received. |
 
@@ -33,7 +33,7 @@ Supporting material: [survey/](survey/) holds the Phase 1 measurements (layers, 
 
 **Operator:** 11 → 09 → `findings.md` items tagged Security.
 
-**Reviewer of a security change:** 09 → 07 ("Hosted path resolution") → `findings.md` F31, F35, F37, F38, F39.
+**Reviewer of a security change:** 09 ("Hosted exposure checklist") → 07 ("Hosted path resolution") → ADR 0036 → `findings.md` F46 and the resolved security entries.
 
 ## Glossary
 

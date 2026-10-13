@@ -23,7 +23,7 @@ Accounts needed second-factor login, and the TOTP secret must be stored recovera
 ## Consequences
 
 - A leaked challenge token grants nothing but code attempts for one user.
-- A failed code leaves the challenge valid for retry, and there is no rate limit (`findings.md` F39).
+- A failed code leaves the challenge valid for retry. Since `2232420`, five wrong codes revoke it, and login and 2FA are rate-limited (`findings.md` F39).
 
 ## Evidence
 

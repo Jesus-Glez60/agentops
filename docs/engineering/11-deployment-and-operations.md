@@ -20,7 +20,7 @@ Developers and agents run `agentops-mcp-server` locally over stdio; it is not pa
 
 Configuration comes from the process environment only. No Rust crate loads a `.env` file (gotcha 54032). Docker Compose reads `.env` through `env_file`, and the PM2 config parses it itself (`loadDotEnv` in `ecosystem.config.js`).
 
-`.env.example` documents the variables below. Exactly one is required: `AGENTOPS_SECRETS_MASTER_KEY`.
+`.env.example` documents the variables below. `AGENTOPS_SECRETS_MASTER_KEY` is always required. `AGENTOPS_API_KEY_HASH` is required whenever `AGENTOPS_ADDR` is not loopback-only, which includes Docker, Kubernetes and PM2; the server refuses to start without it.
 
 | Concern | Variables | Default |
 | --- | --- | --- |
@@ -29,13 +29,14 @@ Configuration comes from the process environment only. No Rust crate loads a `.e
 | Code graph backend | `AGENTOPS_DATABASE_URL` | unset = SQLite per repo |
 | Per-store overrides | `AGENTOPS_ACCOUNTS_DB`, `AGENTOPS_TEAMS_DB`, `AGENTOPS_INTEGRATIONS_DB`, `AGENTOPS_MODULES_DB`, `AGENTOPS_HEAVY_API_DB`, `DOCBRAIN_DB_DIR`, `AGENTOPS_DOCBRAIN_DB`, `AGENTOPS_MANIFEST_PATH`, `AGENTOPS_REPO_CHECKOUTS_DIR` | under `AGENTOPS_DATA_DIR` |
 | Network | `AGENTOPS_ADDR`, `AGENTOPS_PUBLIC_API_URL`, `AGENTOPS_WEB_APP_URL`, `AGENTOPS_WEB_APP_BASE_PATH` | `127.0.0.1:8420` locally, `0.0.0.0:8420` in the image; base path `/suite` |
-| Access | `AGENTOPS_API_KEY_HASH`, `AGENTOPS_ACCESS_MODE`, `AGENTOPS_SIGNUP_MODE` | unset = unauthenticated (F37); `advisor`; `open` |
+| Access | `AGENTOPS_API_KEY_HASH`, `AGENTOPS_ALLOW_UNAUTHENTICATED`, `AGENTOPS_ACCESS_MODE`, `AGENTOPS_SIGNUP_MODE` | required off loopback; unset (start-up refused without a key); `advisor`; `open` |
+| Doc scraping | `AGENTOPS_ALLOW_PRIVATE_DOC_URLS` | unset = only public addresses are fetched |
 | LLM | `AGENTOPS_ANTHROPIC_API_KEY` | unset = no LLM features |
 | Linear | `AGENTOPS_LINEAR_API_KEY`, `AGENTOPS_LINEAR_WEBHOOK_URL` | unset |
 | GitHub App | `AGENTOPS_GITHUB_APP_ID`, `AGENTOPS_GITHUB_APP_PRIVATE_KEY` or `..._PATH`, `AGENTOPS_GITHUB_WEBHOOK_SECRET`, `AGENTOPS_GITHUB_APP_SLUG` | unset = SSH deploy keys only |
 | Semantic index | `AGENTOPS_QDRANT_URL`, `AGENTOPS_QDRANT_COLLECTION` | unset; `agentops_semantic` |
 
-Read by the code but missing from `.env.example` (`findings.md` F15):
+Also in `.env.example` since `d9f447b` (`findings.md` F15):
 
 | Variable | Effect | Default |
 | --- | --- | --- |
@@ -99,11 +100,11 @@ To change ports or other lists on a host, use `docker-compose.override.yml`. Com
 
 `deploy/k8s/` holds a `Deployment` with one replica, `/health` probes and data on a PVC. It also has a `Service`, an `Ingress`, a Postgres `StatefulSet` with the same pinned image, marketing manifests and `secret.yaml.example`.
 
-The example secret sets only `AGENTOPS_SECRETS_MASTER_KEY` and `AGENTOPS_DATABASE_URL`. Add `AGENTOPS_API_KEY_HASH` before exposing the API (`findings.md` F37).
+The example secret holds `AGENTOPS_SECRETS_MASTER_KEY`, `AGENTOPS_API_KEY_HASH` (required) and `AGENTOPS_DATABASE_URL`.
 
 ### PM2 on a host
 
-`ecosystem.config.js` runs the release binary and the standalone web server. It reads `.env` and passes it to `agentops-server`. The web process gets only `PORT`, `HOSTNAME` and `AGENTOPS_HEAVY_API_URL` from that file; other web variables must be in the real environment (`findings.md` F41). The `/setup` page writes the first `.env` for this method.
+`ecosystem.config.js` runs the release binary and the standalone web server. It reads `.env` and passes it to `agentops-server`. The web process gets only `PORT`, `HOSTNAME` and `AGENTOPS_HEAVY_API_URL` from that file; other web variables must be in the real environment (`findings.md` F41). The `/setup` page writes the first `.env` for this method, including a generated instance key it shows once. It can only run if the server already starts, which needs a master key first (`findings.md` F45).
 
 ### Classic install
 
@@ -111,9 +112,9 @@ The example secret sets only `AGENTOPS_SECRETS_MASTER_KEY` and `AGENTOPS_DATABAS
 
 ### Reverse proxy
 
-`Caddyfile.example` routes `/suite/*` to the web app and the root to the marketing site. The API is deliberately not routed: the web app reaches it inside the container, and `/api-external` is left commented out for direct API-key access. The same split is in `deploy/k8s/ingress.yaml`.
+`Caddyfile.example` routes `/suite/*` to the web app and everything else (`/*`) to the marketing site. The API is deliberately not routed: the web app reaches it inside the container, and `/api-external` is left commented out for direct API-key access. The same split is in `deploy/k8s/ingress.yaml`.
 
-Caddy's `reverse_proxy /` matches only the exact path `/`. Marketing subpages and assets need `/*` (`findings.md` F43).
+Any reverse proxy in front of the web app or the API must set `X-Real-IP` to the real client address and overwrite a client-sent value: nginx `proxy_set_header X-Real-IP $remote_addr`, Caddy `header_up X-Real-IP {remote_host}`. Rate limits and the Active Sessions list depend on it ([09-auth-teams-security.md](09-auth-teams-security.md), "Rate limits").
 
 ## Start-up and upgrades
 
@@ -161,8 +162,12 @@ To move per-repo SQLite graphs into Postgres, use `agentops migrate-graph` ([03-
 | Override did not change ports | Compose appends lists | Use `!override` | gotchas 53992, 54246 |
 | Deploy script stops without rolling back | `set -e` exits on `compose up -d` failure | Handle the failure explicitly and re-check health after rollback | gotcha 54250 |
 | `docker builder prune --keep-storage` fails | Removed in Docker 29 | Use `--max-used-space` | gotcha 54252 |
+| Server exits with "refusing to start: AGENTOPS_ADDR=... is not a loopback address" | No `AGENTOPS_API_KEY_HASH` on a network-reachable bind | Run `agentops api-key generate` and set the hash | `startup_auth_check` |
+| Users get 429 "too many attempts" | Auth rate limit hit | Wait for `Retry-After`; if everyone shares one bucket, the proxy isn't setting `X-Real-IP` | `rate_limit.rs` |
+| `scrape_library` fails with "resolves to the non-public address" | `docs_url` points at a private or internal host | Use a public URL, or set `AGENTOPS_ALLOW_PRIVATE_DOC_URLS=1` on a trusted self-host | `net.rs` |
+| `/mcp` returns "'notes_path' is not accepted on the hosted server" | Client passed `notes_path` | Drop the argument; hosted notes use the connection's folder | `mcp_http.rs` |
 
 ## Open questions
 
 - [Q8](questions.md): where CI runs before merge and deploy. Nothing in the repo describes a test gate besides `release.yml`.
-- Findings for operators: F15, F16, F27, F28, F37, F41, F42, F43.
+- Findings for operators: F16, F27, F28, F41, F42, F45.

@@ -108,7 +108,7 @@ So hosted `add_note` writes its Markdown file into the server-side checkout and 
 - The every-scan re-match ("Note linking" in [04-indexing-pipeline.md](04-indexing-pipeline.md)) never sees hosted notes. A hosted note is matched to symbols only once, when it is added.
 - A note added before the repo's first index finds no symbols and never attaches. This is gotcha 54035 again, on the hosted path.
 
-Hosted `/mcp` rewrites only the `path` argument. Other arguments reach the tool unchanged, including `notes_path` (`findings.md` F31).
+Hosted `/mcp` refuses `notes_path`, so hosted notes always land in the connection's own notes folder (`HOSTED_FORBIDDEN_ARGS`, fixed in `17a0407`; `findings.md` F31).
 
 ### Local-file guard
 

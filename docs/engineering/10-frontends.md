@@ -30,7 +30,7 @@ Routes live in `apps/web/src/app`:
 | `login`, `welcome` | Sign-in, first-run onboarding | public / session |
 | `invite` | Invite preview and accept | public |
 | `cli-auth` | Device-flow approval ([09-auth-teams-security.md](09-auth-teams-security.md)) | session |
-| `setup` | First-run infrastructure wizard for the PM2 install | public, before any account exists |
+| `setup` | First-run infrastructure wizard for the PM2 install; shows the generated instance API key once | public, before any account exists |
 | `api/auth/*`, `api/bootstrap/config`, `api/invites/[token]`, `api/heavy/[...path]` | Route handlers | see below |
 
 `(app)/layout.tsx` calls `requireUser()` once per request, which validates the session against the backend. Components are grouped by screen under `apps/web/src/components/`, with shared pieces in `shared/`, `shell/` and the shadcn primitives in `ui/`.
@@ -70,6 +70,7 @@ sequenceDiagram
 | `heavyApiFetch`, `HEAVY_API_URL` | `apps/web/src/lib/server/heavy-api.ts` | Server-only client. Base URL `AGENTOPS_HEAVY_API_URL`, default `http://127.0.0.1:8420`, deliberately not `NEXT_PUBLIC_`. |
 | Session helpers | `apps/web/src/lib/auth/session.ts` | The only place the cookie is read. Sets it `httpOnly`, `sameSite: lax`, `secure` by request scheme (gotcha 54081). |
 | `httpFetchJson` | `apps/web/src/lib/http-fetch.ts` | Shared fetch, JSON and error core for both clients. |
+| `proxyCredentialsAuth`, `proxyLogin2fa`, `clientIpHeaders` | `apps/web/src/lib/server/auth-proxy.ts` | Login, signup and 2FA proxies. They forward the browser's address as `X-Real-IP` (the proxy-set `x-real-ip`, else the last `x-forwarded-for` hop), which the backend's rate limits need. |
 
 `ALLOWED_PREFIXES` lists `auth/me`, `auth/sessions`, `auth/2fa`, `auth/api-keys`, `auth/cli/device/approve`, `team`, `invites`, `repos`, `integrations`, `gotchas`, `local-search`, `activity` and `libraries`. A new backend route the browser needs must be added there. Only the approve step of the device flow is listed; the CLI calls the other device routes directly.
 

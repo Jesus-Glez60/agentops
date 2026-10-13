@@ -41,6 +41,7 @@ Decisions with a recorded reason, one file each. A record exists only when its "
 | [0033](0033-suite-base-path-and-marketing.md) | Web app under /suite; marketing site without login | T4 |
 | [0034](0034-linear-auto-kickoff-opt-in.md) | Linear auto-kickoff as a per-account module | T5 |
 | [0035](0035-no-precompact-hook.md) | Session resume without a PreCompact hook | M5 (follow-up) |
+| [0036](0036-hosted-input-and-auth-hardening.md) | Hosted input and auth hardening | F31, F35, F37–F39 |
 
 ## Pending: rationale not recorded
 

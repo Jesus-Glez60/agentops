@@ -91,7 +91,7 @@ Link following (`max_pages` > 1):
 - **No crawl on code hosts.** For `github.com`, `gitlab.com` and `bitbucket.org` only the landing page is scraped. A 200-page crawl of a GitHub repo once produced ~1,625 chunks of error placeholders and commit history (inline comment).
 - A failed follow-up page is logged and skipped; the landing page still counts.
 
-`max_pages` defaults to 1 and has no upper limit.
+`max_pages` defaults to 1 and is capped at 200 (`MAX_SCRAPE_PAGES`).
 
 ### Firecrawl key
 
@@ -179,7 +179,7 @@ Decision "Multi-tenant docbrain isolation via one SQLite file per tenant, not a 
 
 - **Self-seed.** `agentops_server::run` registers `agentops` as a library in the global store at every boot. Hosted orgs read their own files, so they never see it (`findings.md` F3). The author decided AgentOps's own docs will not be registered (`questions.md` A-1).
 - **Linear auto-kickoff.** `linear_webhook.rs` calls `agentops_mcp::sync_docs(.., None)`. With `None`, `sync_docs` uses its own hardcoded `~/.agentops/docbrain.db`, not the tenant's file and not `AGENTOPS_DATA_DIR` (`findings.md` F36).
-- **Outbound fetches.** Hosted `scrape_library` fetches whatever `docs_url` a tenant registered, from the server's network, with no address check (`findings.md` F35).
+- **Outbound fetches** (fixed in `ffd9c1e`). Page fetches go through `DOC_AGENT` (`docbrain-core/crates/docbrain-ingest/src/net.rs`), whose `PublicOnlyResolver` refuses loopback, private, link-local, CGNAT and other non-public addresses on every connection. `docs_url` must be http(s), `max_pages` is capped at 200, and at most 4 background jobs run at once. `AGENTOPS_ALLOW_PRIVATE_DOC_URLS` turns the address check off for intranet docs (`findings.md` F35).
 
 ## Open questions
 

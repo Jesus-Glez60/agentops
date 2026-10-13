@@ -22,7 +22,7 @@ Advisor mode exists to block destructive or costly actions, such as bulk rescans
 
 - Any client in the default mode can record notes.
 - `persist_blueprint_doc` is also Advisor with no stated reason (`questions.md` Q6).
-- Hosted `/mcp` does not sanitize these tools' `notes_path` (`findings.md` F31).
+- Hosted `/mcp` refuses these tools' `notes_path` argument (fixed in `17a0407`; `findings.md` F31).
 
 ## Evidence
 
