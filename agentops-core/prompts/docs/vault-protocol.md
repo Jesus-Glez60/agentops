@@ -58,8 +58,9 @@ it not been caught, it's worth a note.
 
 ## Preferred path: `add_note`
 
-Call the `add_note` MCP tool (or `POST /tools/add_note` over REST if no MCP
-connection is available) with:
+Call the `add_note` MCP tool with the fields below. For a local, single-operator
+server with no MCP connection, `POST /tools/add_note` over REST works too; a
+hosted server accepts notes only over its `/mcp` endpoint.
 
 ```json
 {

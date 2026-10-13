@@ -238,7 +238,10 @@ fn parse_prominence(s: &str) -> Option<NodeProminence> {
 }
 
 /// `POST /repos/{id}/nodes/{node_id}/curation` -- path resolution mirrors
-/// `node_detail_json` exactly.
+/// `node_detail_json` exactly. Gated only by `repos.view` (via
+/// `tenant_and_capability`), on purpose: any authorized member may curate,
+/// since the knowledge comes from working on the codebase (author decision,
+/// 2026-10-13). `gotchas.resolve` in the permissions matrix is not checked.
 pub(crate) async fn set_curation_json(
     State(state): State<AppState>,
     user: Option<axum::Extension<User>>,
