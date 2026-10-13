@@ -27,6 +27,13 @@
 //! tenant; it's resolved via `indexing::checkout_path` before reaching
 //! `agentops_mcp::call_tool`. This is what stops a remote caller from
 //! probing arbitrary paths on the server's filesystem.
+//! The same rule covers other path-like arguments: `HOSTED_FORBIDDEN_ARGS`
+//! (currently `notes_path`) is refused outright.
+//!
+//! **No role check here, by design**: any authenticated member of the org
+//! may call every tool its access mode allows, including knowledge writes,
+//! since that knowledge comes from working on the codebase (author decision,
+//! 2026-10-13). The org-wide `mcp_access_mode` is the only gate.
 //!
 //! **`docbrain-mcp`'s tools are also dispatched from here** (library
 //! docs/changelogs -- `list_libraries`, `search_docs`, etc.), mirroring
@@ -91,6 +98,11 @@ fn unregister_repo_tool_definition() -> agentops_mcp::ToolDefinition {
 }
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// Core-tool arguments a remote caller may not pass, because the handler
+/// would treat them as literal server filesystem paths. See the check in
+/// `handle_tools_call`.
+const HOSTED_FORBIDDEN_ARGS: &[&str] = &["notes_path"];
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
@@ -250,6 +262,16 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     if docbrain_mcp::list_tools().iter().any(|t| t.name == name) {
         let result = call_docbrain_tool(state, &caller.tenant, name, arguments.clone()).await;
         return ok(id, result);
+    }
+
+    // Only `path` is rewritten into the tenant's checkout below; any other
+    // argument naming a server path would reach the handler as a literal
+    // path. `notes_path` (add_note, ingest_notes, init_agents_md) did:
+    // a caller could read every tenant's checkouts or write files anywhere.
+    // Hosted notes always use the connection's own notes folder instead.
+    if let Some(forbidden) = HOSTED_FORBIDDEN_ARGS.iter().find(|key| arguments.get(**key).is_some()) {
+        let message = format!("'{forbidden}' is not accepted on the hosted server; notes go to the connection's own notes folder.");
+        return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": true }));
     }
 
     if let Some(connection_ref) = arguments.get("path").and_then(|v| v.as_str()).map(str::to_string) {

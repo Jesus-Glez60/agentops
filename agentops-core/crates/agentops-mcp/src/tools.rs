@@ -114,6 +114,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "tags": { "type": "array", "items": { "type": "string" } },
                         "with_embeddings": { "type": "boolean" },
                         "session_id": { "type": "string" },
+                        "notes_path": { "type": "string", "description": "Override the notes folder (local servers only; refused on a hosted server)." },
                     },
                     "required": ["path", "title", "body"],
                 })
