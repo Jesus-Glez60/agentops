@@ -15,7 +15,7 @@ Status values: **confirmed** (proven from repo artifacts), **likely** (read from
 | Open | F48 (flaky verify test) |
 | Resolved before the docs | F10 |
 
-The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-15 and ADRs 0037 to 0045.
+The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-15 and ADRs 0037 to 0045. Deployed as `5b13527`; live checks on 2026-10-14 confirmed F27 (onboarding doc of this repo: 372 files, 3,711 symbols), F28 (web search finds `startup_auth_check` by name), F30 (notes land in `.notes/` and attach to symbols) and F44 (search hits show `#<id>`).
 
 ## Documentation inaccuracies
 
@@ -200,7 +200,7 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 ### F26. Any push to any branch triggers a full re-clone and reindex
 
-- **Resolved in `9eb75fd`**: a push reindexes only when `ref` is the tracked (or default) branch; it fails open when either is missing. Field names still to be confirmed against a live delivery.
+- **Resolved in `9eb75fd`**: a push reindexes only when `ref` is the tracked (or default) branch; it fails open when either is missing. Confirmed live on 2026-10-14: a throwaway branch push got 200 `{"dispatched":false,"reason":"push to untracked ref"}` and started no job.
 - Status: confirmed by reading the code.
 - The `push` arm of the GitHub webhook handler (`agentops-core/crates/agentops-heavy-api/src/github_app_routes.rs`) never reads `ref`. A push to any branch of a GitHub-App-connected repo starts a `JobKind::Reindex` job.
 - Every job deletes the existing checkout and clones again from scratch (`run_job`, stage `repository_cloned`, `agentops-core/crates/agentops-heavy-api/src/indexing.rs`). The job then checks out the connection's tracked branch, so feature-branch pushes reindex unchanged content.
@@ -381,6 +381,13 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 - Status: observed on 2026-10-14.
 - `tests::verify_triggers_indexing_and_the_job_reaches_succeeded_over_http` (`agentops-core/crates/agentops-heavy-api/src/lib.rs`) failed once on the server (verify returned `failed`) and passed on the next run with no change. It clones a real local git repository.
+
+### F49. GitHub webhook deliveries fail signature verification in production
+
+- Status: confirmed on 2026-10-14 from the server's nginx access logs.
+- Every `POST /webhooks/github` from GitHub returns 401 with a 29-byte body, the length of `{"error":"invalid signature"}`, at least since 2026-10-05. The last reindex of this repo before 2026-10-14 ran on 2026-09-24.
+- The server has `AGENTOPS_GITHUB_WEBHOOK_SECRET` set, so the GitHub App's webhook secret no longer matches it. Pushes therefore never reindex, and nothing reports it.
+- **Resolved** (2026-10-14, configuration only, author-approved): the App's webhook secret was set to the server's value through `PATCH /app/hook/config`; the next delivery returned 200. Recorded as a gotcha on the hosted graph.
 
 ### Observation: a scratch docbrain library on the hosted server
 

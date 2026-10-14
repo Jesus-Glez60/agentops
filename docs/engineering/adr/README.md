@@ -51,16 +51,13 @@ Decisions with a recorded reason, one file each. A record exists only when its "
 | [0043](0043-remove-billing-role.md) | Remove the billing role and dead capabilities | F12, F13 |
 | [0044](0044-reuse-module-labels.md) | Reuse module labels while the file set is unchanged | F24 |
 | [0045](0045-hosted-notes-outside-the-checkout.md) | Hosted note files live beside the checkout | F30 |
+| [0046](0046-small-local-models-for-the-cheap-tier.md) | Small local models only for the cheap tier, never bundled (proposed) | R6 |
+| [0047](0047-bge-m3-and-qdrant.md) | BGE-M3 and Qdrant for the semantic index | R1 |
+| [0048](0048-optional-rust-analyzer-pass.md) | The rust-analyzer pass is opt-in | R7 |
 
 ## Pending: rationale not recorded
 
-These candidates have a known *what* but no recorded *why*. They become records once the author answers.
-
-| Candidate | Decision | Blocked on |
-| --- | --- | --- |
-| R1 | BGE-M3 and Qdrant for the semantic index | no note found |
-| R6 | Small local models only for the cheap LLM tier | hosted note body; reachable once search results carry node ids (F44, fixed) are deployed |
-| R7 | Optional rust-analyzer LSP pass | no decision note; gotchas 53903, 53905 describe it |
+None. Every survey candidate now has a record (R1, R6 and R7 resolved on 2026-10-14).
 
 ## Format
 

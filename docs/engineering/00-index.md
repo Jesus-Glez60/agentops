@@ -19,7 +19,7 @@ The entry point to AgentOps's engineering documentation: which document answers 
 | [11-deployment-and-operations.md](11-deployment-and-operations.md) | Configuration, storage, deploy methods, upgrades, health, and the runbook. |
 | [12-development-workflow.md](12-development-workflow.md) | Building, testing, supply chain, releases, and the repo's own Claude Code setup. |
 | [13-agent-integration.md](13-agent-integration.md) | `agentops connect`, supported tools, prompt pack and Ruler, hooks, usage tracking. |
-| [adr/](adr/README.md) | 45 architecture decision records, plus candidates waiting for a recorded reason. |
+| [adr/](adr/README.md) | 48 architecture decision records, plus candidates waiting for a recorded reason. |
 | [findings.md](findings.md) | Bugs, doc inaccuracies, dead code and stale gotchas found while writing these docs. Nothing in it is fixed yet. |
 | [questions.md](questions.md) | Questions only the author can answer, and the answers received. |
 
