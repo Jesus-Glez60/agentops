@@ -9,10 +9,10 @@ Status values: **confirmed** (proven from repo artifacts), **likely** (read from
 | Group | Findings |
 | --- | --- |
 | Resolved, security (2026-10-13) | F15, F31, F33, F35, F37, F39, F40, F43; F38 by design (its last bullet was wrong) |
-| Resolved (2026-10-14, `9eb75fd`) | F1, F2, F7, F8, F12, F13, F14, F16, F18, F19, F21–F28, F30, F34, F36, F41, F42, F44–F47; F29 hidden until a consumer exists |
+| Resolved (2026-10-14, `9eb75fd`; F9 by deleting the files) | F1, F2, F9, F7, F8, F12, F13, F14, F16, F18, F19, F21–F28, F30, F34, F36, F41, F42, F44–F47; F29 hidden until a consumer exists |
 | Won't fix (author) | F3, F11, F17, F20, F32 |
 | Accepted (historical brief) | F4, F5, F6 |
-| Open | F9 (stray backups, waiting on the author), F48 (flaky verify test) |
+| Open | F48 (flaky verify test) |
 | Resolved before the docs | F10 |
 
 The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-15 and ADRs 0037 to 0045.
@@ -83,7 +83,7 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 ### F9. Stray backups at the repo root
 
-- **Open, waiting on the author** (2026-10-14): both backups are older generated versions of the current files; delete them once the author confirms.
+- **Resolved** (2026-10-14): both were older generated copies of the current files, and were deleted with the author's approval (they were untracked, so no commit).
 - Status: confirmed.
 - `AGENTS.md.bak` and `CLAUDE.md.bak` exist at the root. They are likely left by `init_agents_md`, which fully overwrites both files (gotcha 54112, "AGENTS.md/CLAUDE.md have no hand-edit-preserved zone -- init_agents_md fully overwrites them every install, and they're not even git-tracked").
 
