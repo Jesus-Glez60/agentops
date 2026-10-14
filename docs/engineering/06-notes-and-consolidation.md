@@ -103,10 +103,7 @@ sequenceDiagram
 
 When a repo is connected to a hosted server, notes go through hosted `/mcp` or `POST /tools/add_note`. The hosted `path` argument is a connection id or URL, never a literal path. `resolve_connection_path` maps it to the tenant's checkout directory, `<repo_checkouts_dir>/<connection_id>--<tenant>` (`checkout_path`, `agentops-core/crates/agentops-heavy-api/src/indexing.rs`; gotcha 54242).
 
-So hosted `add_note` writes its Markdown file into the server-side checkout and its node into the shared store. Every indexing job deletes the checkout before cloning (`remove_dir_all` in stage 2). The note nodes and their edges survive, but the files do not. Two effects follow (`findings.md` F30):
-
-- The every-scan re-match ("Note linking" in [04-indexing-pipeline.md](04-indexing-pipeline.md)) never sees hosted notes. A hosted note is matched to symbols only once, when it is added.
-- A note added before the repo's first index finds no symbols and never attaches. This is gotcha 54035 again, on the hosted path.
+Hosted `add_note` writes its Markdown file to the connection's notes folder beside the checkout, `<repo_checkouts_dir>/.notes/<connection_id>--<tenant>` (`notes_dir_for_checkout`), and its node into the shared store. Every indexing job deletes and re-clones the checkout, then points the clone's `.agentops/config.json` at that folder (`point_checkout_at_notes`), so the every-scan re-match ("Note linking" in [04-indexing-pipeline.md](04-indexing-pipeline.md)) sees hosted notes too, including notes added before the first index (ADR 0045; fixed for `findings.md` F30). Removing a repository or an org removes the folder.
 
 Hosted `/mcp` refuses `notes_path`, so hosted notes always land in the connection's own notes folder (`HOSTED_FORBIDDEN_ARGS`, fixed in `17a0407`; `findings.md` F31).
 
@@ -198,10 +195,10 @@ Consolidation is the "Part B" of decision "CLS-inspired cleanup/optimization/loc
 | Cap per run | 500 pairs (`MAX_REPLAY_PAIRS`) | 30 examples (`MAX_EXAMPLES`) |
 | Eval metric | recall@5 | Mean cosine similarity of a generation to the note text |
 | Trigger | MCP `end_session` (Full) | MCP `consolidate_model` (stdio with Qdrant), `POST /consolidate/model` |
-| Used by | Hybrid search, through `EmbeddingProjector` | Nothing yet (`findings.md` F29) |
+| Used by | Hybrid search, through `EmbeddingProjector` | Nothing yet; the tool is hidden until a consumer exists (ADR 0042) |
 | Artifacts | `~/.agentops/models/{repo}/proj_head_v{N}.safetensors` | `~/.agentops/models/{repo}`, `active_model_version` file |
 
-Both artifact folders ignore `AGENTOPS_DATA_DIR` (`findings.md` F16). Both crates are the only places `candle-core`/`candle-nn` enter the build; training must not leak into the inference path (`agentops-embeddings-train` module doc).
+Both artifact folders live under `AGENTOPS_DATA_DIR/models/<repo>` (fixed for `findings.md` F16). Both crates are the only places `candle-core`/`candle-nn` enter the build; training must not leak into the inference path (`agentops-embeddings-train` module doc).
 
 Too little data is a normal state for a young repo. Both functions return a report with `attempted: false` and a reason, never an error.
 
@@ -266,7 +263,7 @@ LoRA is hand-rolled because `candle-lora` was never published to crates.io. `B` 
 
 Gotcha 53983 records the cost. A run at full defaults (30 examples, 3 epochs, 64 eval tokens) was still running after 45 minutes on CPU and was abandoned. One gradient step took about 18 s. A reduced run (6 examples, 1 epoch, 4 tokens) took about 10 minutes.
 
-`consolidate_model` has no access-mode gate: `agentops-heavy-mcp` has none (`questions.md` Q6). It is reachable on stdio when `AGENTOPS_QDRANT_URL` is set, and over REST at `POST /consolidate/model`. It is not on hosted `/mcp`, which excludes all heavy-mcp tools.
+`consolidate_model` is not exposed: it was removed from the heavy tool list and `POST /consolidate/model` was removed, because nothing uses a promoted adapter yet (ADR 0042, `findings.md` F29). The crate and its trainer remain for the future consumer, a local-first `explain_symbol`.
 
 ### Deferred work
 
@@ -288,9 +285,9 @@ Both gates promote a candidate when its score is greater than or equal to the ac
 | Fewer than 5 examples | train and eval on the same set | cannot happen (`MIN_EXAMPLES = 5`) |
 | Baseline | active head, or raw embeddings | active adapter, or zero adapter |
 | Metric | recall@5 against the run's own example pool | mean cosine to the note text under the frozen embedder |
-| Tie | promotes | promotes |
+| Tie | keeps the active model | keeps the active model |
 
-The held-out split is drawn fresh from each run's data, so two runs' scores are not comparable. The LoRA module doc says the gate "reduces regression risk, it does not guarantee quality". Whether a tie should promote is open (`questions.md` Q7).
+The held-out split is drawn fresh from each run's data, so two runs' scores are not comparable. The LoRA module doc says the gate "reduces regression risk, it does not guarantee quality". Both gates promote only on strict improvement (`should_promote`, ADR 0042).
 
 ## Librarian
 
@@ -305,6 +302,4 @@ Each model must classify 5 notes cleanly before the full run (`SMOKE_GATE`). The
 
 ## Open questions
 
-- [Q6](questions.md): why `persist_blueprint_doc`, hosted `unregister_repo`, the docbrain writes and `consolidate_model` are open in Advisor mode. `ingest_notes` now has a stated reason: the same as `add_note` (comment on its `ToolSpec`).
-- [Q7](questions.md): whether a tie on either gate should promote.
-- [Q13](questions.md): whether the LoRA deferrals still stand now that the tier boundary is gone (`findings.md` F29).
+None. Q6, Q7 and Q13 were answered (ADRs 0041, 0042).

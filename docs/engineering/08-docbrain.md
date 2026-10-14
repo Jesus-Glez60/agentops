@@ -177,11 +177,10 @@ Decision "Multi-tenant docbrain isolation via one SQLite file per tenant, not a 
 
 ### Known gaps
 
-- **Self-seed.** `agentops_server::run` registers `agentops` as a library in the global store at every boot. Hosted orgs read their own files, so they never see it (`findings.md` F3). The author decided AgentOps's own docs will not be registered (`questions.md` A-1).
-- **Linear auto-kickoff.** `linear_webhook.rs` calls `agentops_mcp::sync_docs(.., None)`. With `None`, `sync_docs` uses its own hardcoded `~/.agentops/docbrain.db`, not the tenant's file and not `AGENTOPS_DATA_DIR` (`findings.md` F36).
+- **Self-seed.** `agentops_server::run` registers `agentops` as a library in the global store at every boot. Hosted orgs read their own files, so they never see it; `README.md` and `llms.txt` now say so (`findings.md` F3, won't fix). The author decided AgentOps's own docs will not be registered (`questions.md` A-1).
+- **Linear auto-kickoff.** `linear_webhook.rs` passes the tenant's own docbrain file (`docbrain_db_path_for_org`) to `agentops_mcp::sync_docs`. Without a path, `sync_docs` resolves the store like `docbrain_mcp::default_db_path`: `AGENTOPS_DOCBRAIN_DB`, then `AGENTOPS_DATA_DIR` (fixed for `findings.md` F36).
 - **Outbound fetches** (fixed in `ffd9c1e`). Page fetches go through `DOC_AGENT` (`docbrain-core/crates/docbrain-ingest/src/net.rs`), whose `PublicOnlyResolver` refuses loopback, private, link-local, CGNAT and other non-public addresses on every connection. `docs_url` must be http(s), `max_pages` is capped at 200, and at most 4 background jobs run at once. `AGENTOPS_ALLOW_PRIVATE_DOC_URLS` turns the address check off for intranet docs (`findings.md` F35).
 
 ## Open questions
 
-- [Q6](questions.md): whether docbrain's write tools should stay ungated in Advisor mode.
-- Related findings: F3 (self-seed), F7 (no tool annotations), F22 (stale doc comments), F35 (outbound fetches), F36 (auto-kickoff store).
+None. Q6 was answered: `scrape_library` and `sync_changelogs` are Full-only on hosted `/mcp`, and need `libraries.manage` on the web (ADR 0041). Findings F7, F22, F35 and F36 are resolved; F3 is won't fix.

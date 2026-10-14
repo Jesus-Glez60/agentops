@@ -42,6 +42,15 @@ Decisions with a recorded reason, one file each. A record exists only when its "
 | [0034](0034-linear-auto-kickoff-opt-in.md) | Linear auto-kickoff as a per-account module | T5 |
 | [0035](0035-no-precompact-hook.md) | Session resume without a PreCompact hook | M5 (follow-up) |
 | [0036](0036-hosted-input-and-auth-hardening.md) | Hosted input and auth hardening | F31, F35, F37–F39 |
+| [0037](0037-sqlite-default-postgres-for-graph.md) | SQLite by default, Postgres for the code graph only | A3 |
+| [0038](0038-one-cli-binary-with-the-server.md) | One `agentops` binary that embeds the server | A5 |
+| [0039](0039-access-mode-per-org-on-mcp.md) | Access mode per org on hosted `/mcp`, per process on REST | M3 |
+| [0040](0040-no-public-ci.md) | No public CI | T3 |
+| [0041](0041-hosted-full-only-tools.md) | Full-only network and destructive tools on hosted `/mcp`; `libraries.manage` | Q6 |
+| [0042](0042-strict-promotion-note-recency-hidden-lora.md) | Strict promotion, note-only recency, LoRA hidden | R3 (follow-up) |
+| [0043](0043-remove-billing-role.md) | Remove the billing role and dead capabilities | F12, F13 |
+| [0044](0044-reuse-module-labels.md) | Reuse module labels while the file set is unchanged | F24 |
+| [0045](0045-hosted-notes-outside-the-checkout.md) | Hosted note files live beside the checkout | F30 |
 
 ## Pending: rationale not recorded
 
@@ -49,13 +58,9 @@ These candidates have a known *what* but no recorded *why*. They become records 
 
 | Candidate | Decision | Blocked on |
 | --- | --- | --- |
-| A3 | SQLite by default, Postgres optional for the code graph | `questions.md` Q10 |
-| A5 | `agentops-cli` embeds the full server | `questions.md` Q1 |
-| M3 | Access mode per org on hosted `/mcp` | `questions.md` Q5b |
 | R1 | BGE-M3 and Qdrant for the semantic index | no note found |
-| R6 | Small local models only for the cheap LLM tier | hosted note body not reachable over MCP (no node id in search results) |
+| R6 | Small local models only for the cheap LLM tier | hosted note body; reachable once search results carry node ids (F44, fixed) are deployed |
 | R7 | Optional rust-analyzer LSP pass | no decision note; gotchas 53903, 53905 describe it |
-| T3 | Where CI runs | `questions.md` Q8 |
 
 ## Format
 

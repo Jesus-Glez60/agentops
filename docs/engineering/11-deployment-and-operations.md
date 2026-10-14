@@ -58,7 +58,7 @@ Web-app-only variables: `AGENTOPS_HEAVY_API_URL` (API base for server-side calls
 | docbrain | `<data dir>/docbrain-tenants/<tenant>.db` (hosted), `<data dir>/docbrain.db` (CLI) | SQLite, always |
 | Code graph | `<repo>/.context/graph.db` per repo, or one Postgres database | SQLite or Postgres |
 | Repo checkouts | `<data dir>/repo-checkouts/<connection_id>--<tenant>` | files; deleted and re-cloned on every index |
-| Consolidation models | `~/.agentops/models/<repo>` | files; ignores `AGENTOPS_DATA_DIR` (F16) |
+| Consolidation models | `$AGENTOPS_DATA_DIR/models/<repo>` | files |
 | Scan manifest | `<data dir>/manifest.json` | JSON file |
 
 Postgres replaces only the code graph. Everything else stays in SQLite files on the server's disk, whatever `AGENTOPS_DATABASE_URL` says.
@@ -104,7 +104,7 @@ The example secret holds `AGENTOPS_SECRETS_MASTER_KEY`, `AGENTOPS_API_KEY_HASH` 
 
 ### PM2 on a host
 
-`ecosystem.config.js` runs the release binary and the standalone web server. It reads `.env` and passes it to `agentops-server`. The web process gets only `PORT`, `HOSTNAME` and `AGENTOPS_HEAVY_API_URL` from that file; other web variables must be in the real environment (`findings.md` F41). The `/setup` page writes the first `.env` for this method, including a generated instance key it shows once. It can only run if the server already starts, which needs a master key first (`findings.md` F45).
+`ecosystem.config.js` runs the release binary and the standalone web server. It reads `.env` and passes it to `agentops-server`. The web process gets `PORT`, `HOSTNAME`, `AGENTOPS_HEAVY_API_URL` and the variables it reads (`AGENTOPS_PUBLIC_API_URL`, `AGENTOPS_WEB_APP_BASE_PATH`), but not the server's secrets. On the first PM2 start outside a container, the file generates whatever is missing of `AGENTOPS_SECRETS_MASTER_KEY` and `AGENTOPS_API_KEY_HASH` into `.env` (mode 0600) and prints the raw API key once, so the server starts and `/setup` is reachable. `/setup` then writes the full `.env`, keeping the running keys (fixed for `findings.md` F41, F45). Containers set `AGENTOPS_CONTAINER=1` and never generate keys: a key written inside a container would change on every recreate.
 
 ### Classic install
 
@@ -148,8 +148,6 @@ To move per-repo SQLite graphs into Postgres, use `agentops migrate-graph` ([03-
 | Hosted repo never picks up new commits after `scan_repo` | `scan_repo` rescans the existing checkout only | Use `POST /repos/{id}/index` or the Reindex button | gotcha 54077 |
 | Push webhook does not reindex | Connection id changed when a Discovered connection was upgraded | Fixed by `repo_url` fallback; check the connection's `repo_url` matches the GitHub repo | gotchas 54150, 54215 |
 | Semantic search finds zero nodes | Raw path used instead of `repo_name` | Use the store repo name | gotcha 54006 |
-| Semantic index empty on a Postgres deployment | Indexing stages 7–8 read SQLite | Known bug | `findings.md` F27 |
-| Web Search finds no code on a hosted repo | Hosted indexing writes no core embeddings | Use MCP hybrid search | `findings.md` F28 |
 | Concurrent `/mcp` calls deadlock Postgres | Per-call pools | Fixed; check the shared pool is in use | gotchas 54023 (stale), 54028 |
 | Login works but the session is lost | `Secure` cookie over plain HTTP | Serve HTTPS, or check `x-forwarded-proto` | gotcha 54081 |
 | Public route redirects to login | Missing from the `proxy.ts` matcher exclusions | Add it | gotchas 54056, 54031 |
@@ -169,5 +167,4 @@ To move per-repo SQLite graphs into Postgres, use `agentops migrate-graph` ([03-
 
 ## Open questions
 
-- [Q8](questions.md): where CI runs before merge and deploy. Nothing in the repo describes a test gate besides `release.yml`.
-- Findings for operators: F16, F27, F28, F41, F42, F45.
+None. Q8 was answered: there is no public CI (ADR 0040). Operator findings F16, F27, F28, F41, F42 and F45 are resolved.

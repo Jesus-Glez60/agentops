@@ -102,10 +102,12 @@ All tokens and keys are random, opaque, hashed at rest and looked up by hash. Th
 | `POST /auth/login/2fa` | challenge token | 5 wrong codes, then the challenge is revoked (`revoke_login_challenge`) |
 | `POST /auth/signup` | client address | 10 per hour |
 | `POST /auth/cli/device/approve` | user | 10 per 15 min |
+| `POST /auth/me/password`, `/auth/2fa/confirm`, `/auth/2fa/disable`, `/auth/2fa/backup-codes/regenerate` | user, per route | 5 per 15 min |
+| `POST /auth/api-keys` | user | 20 per hour |
 
 The client address comes from `client_ip` (`agentops-core/crates/agentops-heavy-api/src/client_ip.rs`). It trusts `X-Real-IP` only when the TCP peer is loopback or private, which needs `agentops-server` to serve with connect info. The first `X-Forwarded-For` hop is never used, because behind an appending proxy it is client-controlled. The web auth proxy forwards the browser's address as `X-Real-IP` (`clientIpHeaders` in `apps/web/src/lib/server/auth-proxy.ts`). The reverse proxy must set `X-Real-IP` to the real peer and overwrite any client value. The same address now feeds the Active Sessions list.
 
-Authenticated account routes (password change, API keys, 2FA changes) have no limits (`findings.md` F46).
+Authenticated account routes are limited per user, to cap password and code guessing from a hijacked session (`findings.md` F46).
 
 ## Device-flow login
 
@@ -139,7 +141,7 @@ An organization is a tenant. The `tenant` string on a user is the organization i
 ### Roles
 
 - **Owner** is a column on `organizations`, not a role. Ownership moves with `POST /team/transfer-ownership`.
-- **Fixed roles**: `admin`, `member`, `viewer`, `billing` (`ROLES`).
+- **Fixed roles**: `admin`, `member`, `viewer` (`ROLES`). A `billing` role was removed; `migrate_drop_billing_role` moves its rows to `viewer` (ADR 0043).
 - **Custom roles** live in `custom_roles`. A role name is valid if it is fixed or custom (decision "Roles are fixed + custom, validated at both hardcoded enum and database table").
 - **Membership rows are created lazily.** `ensure_membership` runs before every capability check. Without it, a fresh signup was refused on every `/repos` route (gotcha 53997; comment in `require_session_capability`).
 
@@ -147,19 +149,19 @@ An organization is a tenant. The `tenant` string on a user is the organization i
 
 `PERMISSIONS_MATRIX` drives both the Roles & Permissions screen and enforcement through `has_capability` (decision "Permissions matrix is the single source of truth for both display and enforcement").
 
-| Capability | admin | member | viewer | billing |
-| --- | --- | --- | --- | --- |
-| `repos.connect` | ✓ | | | |
-| `repos.reindex` | ✓ | ✓ | | |
-| `repos.view` | ✓ | ✓ | ✓ | |
-| `search.query`, `graph.view`, `gotchas.view`, `libraries.view` | ✓ | ✓ | ✓ | |
-| `gotchas.comment`, `gotchas.resolve` | ✓ | ✓ | | |
-| `api_keys.personal` | ✓ | ✓ | | |
-| `api_keys.org`, `team.manage_members`, `team.manage_roles` | ✓ | | | |
-| `team.billing` | ✓ | | | ✓ |
-| `integrations.manage`, `mcp.manage_access_mode` | ✓ | | | |
+| Capability | admin | member | viewer |
+| --- | --- | --- | --- |
+| `repos.connect` | ✓ | | |
+| `repos.reindex` | ✓ | ✓ | |
+| `repos.view` | ✓ | ✓ | ✓ |
+| `search.query`, `graph.view`, `gotchas.view`, `libraries.view` | ✓ | ✓ | ✓ |
+| `gotchas.comment` | ✓ | ✓ | |
+| `libraries.manage` (scrape and sync on the web, ADR 0041) | ✓ | ✓ | |
+| `api_keys.personal` | ✓ | ✓ | |
+| `api_keys.org`, `team.manage_members`, `team.manage_roles` | ✓ | | |
+| `integrations.manage`, `mcp.manage_access_mode` | ✓ | | |
 
-`gotchas.resolve` and `team.billing` are never checked by any route (`findings.md` F12, F13).
+`gotchas.resolve` and `team.billing` were removed (ADR 0043; `findings.md` F12, F13).
 
 Where the matrix does not reach:
 
@@ -180,8 +182,9 @@ The access mode limits which tools an MCP client sees and may call; see [07-mcp-
 The mode is not a permission system:
 
 - It applies to every caller in the org equally, regardless of role.
-- Advisor mode still allows knowledge writes (`add_note`, `ingest_notes`, `persist_blueprint_doc`) and every docbrain and hosted-only tool.
-- REST `/tools` uses the process-wide `AGENTOPS_ACCESS_MODE` instead (`questions.md` Q5b).
+- Advisor mode still allows knowledge writes (`add_note`, `ingest_notes`, `persist_blueprint_doc`) and the docbrain reads and registrations. On hosted `/mcp` it refuses `unregister_repo`, `scrape_library` and `sync_changelogs` (ADR 0041).
+- REST `/tools` uses the process-wide `AGENTOPS_ACCESS_MODE` instead: its only caller is the operator holding the instance key (ADR 0039).
+- The web Libraries page ignores the mode; scraping and syncing there need the `libraries.manage` capability (admin and member by default).
 
 ## Secrets
 
@@ -248,5 +251,4 @@ Every network-reachable input that names a file, a URL or a tenant must be check
 
 ## Open questions
 
-- [Q5b](questions.md): why the access mode is per org on `/mcp` but per process on `/tools`.
-- [Q6](questions.md): which write tools are meant to be open in Advisor mode.
+None. Q5b and Q6 were answered (ADRs 0039, 0041).

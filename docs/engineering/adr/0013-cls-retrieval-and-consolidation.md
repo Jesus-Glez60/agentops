@@ -4,7 +4,7 @@ Survey candidate R3. Rationale is taken only from the sources under "Evidence"; 
 
 ## Status
 
-Accepted, 2026-08-21 (`4d5ffff`).
+Accepted, 2026-08-21 (`4d5ffff`). Amended by ADR 0042 (strict promotion, note-only recency, LoRA consolidation hidden).
 
 ## Context
 

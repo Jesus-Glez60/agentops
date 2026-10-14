@@ -4,7 +4,7 @@ Survey candidate A7. Rationale is taken only from the sources under "Evidence"; 
 
 ## Status
 
-Accepted, 2026-08-13 (`0b0f553`).
+Accepted, 2026-08-13 (`0b0f553`). Amended by ADR 0044 (module labels reused while the file set is unchanged).
 
 ## Context
 

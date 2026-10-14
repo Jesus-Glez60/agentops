@@ -6,84 +6,62 @@ Format: question, what the code already shows, and what the answer unblocks. Ans
 
 ## Open
 
-### Q1. Is embedding the full server in the CLI binary intended long-term?
-
-- Code shows: `agentops-cli` depends on `agentops-server`. `agentops_server::run` is documented as "the one entry point both this crate's own binary and `agentops-cli`'s `serve-api` subcommand call" (`agentops-core/crates/agentops-server/src/lib.rs`). So the coupling is deliberate, not accidental.
-- Still unknown: why ship one `agentops` binary that contains the full multi-tenant server (all heavy crates included) instead of telling users to run `agentops-server`? Is binary size or compile time an accepted cost?
-- Unblocks: ADR A5, `01-architecture.md` binaries section.
-
-### Q5b. Why is the access mode per-org on hosted `/mcp` but per-process on REST `/tools`?
-
-- Follow-up to answered A-5 (why `advisor` is the default).
-- Code shows: hosted `/mcp` reads `organizations.mcp_access_mode` per call (added `ee9b7e9`, 2026-08-31). REST `/tools` on the same `agentops-server` process reads env `AGENTOPS_ACCESS_MODE` once.
-- Ask: is the mismatch intended? Why per-org rather than per-API-key?
-- Unblocks: ADR M3, `09-auth-teams-security.md`.
-
-### Q6. Which write tools are meant to be available in Advisor mode?
-
-- Code shows these writes available in Advisor:
-  - `add_note`, with a stated reason (`agentops-core/crates/agentops-mcp/src/tools.rs:96-102`).
-  - `ingest_notes` and `persist_blueprint_doc`, with no reason given.
-  - All docbrain writes (`register_library`, `scrape_library`, `sync_changelogs`), because docbrain has no access mode.
-  - Stdio heavy tools, including the long-running `consolidate_model`.
-  - Hosted `unregister_repo`, which is annotated `destructive_hint: true`.
-- Code already explains two groups:
-  - docbrain and heavy tools: "retrofitting a shared capability system into two more crates is out of scope for this merge, whose goal is removing tiering" (`agentops-core/crates/agentops-mcp-server/src/lib.rs`, module doc).
-  - heavy tools: "every tool this server has is read/index-only (no code modification), so there's no write-capable variant to structurally gate" (`agentops-core/crates/agentops-heavy-mcp/src/lib.rs`).
-- `ingest_notes` also has a stated reason: its `ToolSpec` comment says "same reasoning as `add_note`".
-- Still unexplained: `persist_blueprint_doc`, hosted `unregister_repo`, and whether "deferred, not designed" is still the intended state for docbrain writes.
-- Related: both note tools accept a `notes_path` that hosted `/mcp` does not sanitize (`findings.md` F31). That is a bug whatever the answer here.
-- Ask: is each of these intended? If yes, why? If not, they go to `findings.md`.
-- Unblocks: `07-mcp-and-rest-contracts.md`, `09-auth-teams-security.md`.
-
-### Q7. Is the consolidation no-regression gate tuned as intended?
-
-- Brief's question ("what does the eval measure, and what counts as a regression?"). Code now answers most of it:
-  - Embedding consolidation (`agentops-core/crates/agentops-embeddings-train/src/lib.rs`): recall@5 (`RECALL_K = 5`) on a 20% held-out split (`HELD_OUT_FRACTION = 0.2`) of replay pairs drawn from `Affects`/`References` edges. Promoted iff `candidate_recall >= baseline_recall`.
-  - LoRA consolidation (`agentops-core/crates/agentops-heavy-consolidate/src/eval.rs`, `src/lib.rs`): mean cosine similarity between a greedy generation and the curated note text, scored by the frozen base embedder so the eval cannot reward drift toward the trained projection. Promoted iff `candidate_score >= baseline_score`. The module doc says the gate "reduces regression risk, it does not guarantee quality".
-  - A regression is therefore any candidate scoring strictly below the active model on the held-out split.
-- Still unknown: is promoting on a tie (`>=`) intended, given it lets an unchanged-quality candidate replace the active one? Is there a minimum improvement margin you wanted?
-- Unblocks: `06-notes-and-consolidation.md`, ADR R3.
-
-### Q8. Where does CI run?
-
-- Code shows: `.github/workflows/` has only `release.yml`. Nothing in the repo describes a test gate.
-- Ask: where do tests run before merge or deploy, and should `12-development-workflow.md` document it (or is it private infrastructure)?
-- Unblocks: `12-development-workflow.md`, `11-deployment-and-operations.md`, ADR T3.
-
-### Q9. Should `repo-map.md` be committed, or the README link changed?
-
-- See `findings.md` F2. The docs need to know whether to link `repo-map.md` at all.
-- Unblocks: `00-index.md`, `01-architecture.md`.
-
-### Q10. Why SQLite by default, and Postgres for the code graph only?
-
-- Brief's question. Code shows: SQLite core from `7a393e7` (2026-07-28); Postgres `GraphStore` from `0385f5e` (2026-07-28), the paid heavy tier (see A-2). docbrain, accounts and teams stay on SQLite even when `AGENTOPS_DATABASE_URL` is set (to confirm in Phase 3).
-- Ask: was Postgres only ever meant for the hosted SaaS scale, and is that still the reason now that the suite is open source?
-- Unblocks: ADR A3, `03-data-model.md`.
-
-### Q11. Why one unified MCP server instead of the earlier three?
-
-- Brief's question. Decision note "Backend merge: 3 REST APIs + 3 stdio MCP servers collapsed into agentops-server + agentops-mcp-server" exists. Commit `218c3fc` says "no price gate, single REST/MCP process, minimal env vars". With A-2, the price gate is the likely driver.
-- Decision note text (read in Phase 5): the split "existed only because `agentops-heavy` was a separate Cargo workspace licensed `LicenseRef-Commercial`", and there was never a runtime licence check. ADR 0002 records this.
-- Ask: is that the whole reason, or did client config friction (one MCP entry instead of three) also matter?
-- Unblocks: ADR A1.
-
-### Q12. Should node recency use the 30-day `Affects` half-life?
-
-- Code shows: hybrid ranking multiplies each hit by `effective_weight(1.0, age_days(last_touched_at))` (`recency_multiplier`, `agentops-core/crates/agentops-retrieval/src/lib.rs`). `effective_weight` defaults to `AFFECTS_EDGE_HALF_LIFE_DAYS = 30`. A symbol not edited for 60 days ranks at 0.25× a freshly edited one with the same fused score.
-- Postgres never populates `last_touched_at`, so the same query ranks differently on SQLite and Postgres.
-- Ask: is penalizing stable, unchanged code intended? Was a separate node half-life considered?
-- Unblocks: `05-retrieval.md`, ADR R3.
-
-### Q13. Do the LoRA consolidation deferrals still stand?
-
-- Code shows: `consolidate_model` promotes a LoRA adapter that nothing uses for generation (`findings.md` F29). The shipping decision deferred three follow-ups: a local-first `explain_symbol`, a consolidation-status endpoint, and an `agentops consolidate --model` command.
-- The stated blocker was the paid-tier crate boundary, which the open-core merge removed.
-- Ask: are these still planned, dropped, or should `consolidate_model` be hidden until a consumer exists?
-- Unblocks: `06-notes-and-consolidation.md`, ADR R3.
+None. All questions were answered on 2026-10-13/14; see below.
 
 ## Answered
+
+### A-6. Is embedding the full server in the CLI binary intended long-term? (was Q1)
+
+- Answer (author, 2026-10-13): yes. One install matters more than binary size or compile time.
+- Recorded in ADR 0038.
+
+### A-7. Why is the access mode per org on hosted `/mcp` but per process on REST `/tools`? (was Q5b)
+
+- Answer (author, 2026-10-13): intended. REST `/tools` accepts only the instance key, so its caller is the operator and one process-wide mode fits. Hosted `/mcp` is multi-tenant, so each org sets its own.
+- Recorded in ADR 0039.
+
+### A-8. Which write tools are meant to be available in Advisor mode? (was Q6)
+
+- Answer (author, 2026-10-13/14):
+  - `persist_blueprint_doc`, `register_library` and `discover_library`: intended in Advisor, as knowledge writes.
+  - `unregister_repo`, `scrape_library` and `sync_changelogs`: Full only, on hosted `/mcp` (`HOSTED_FULL_ONLY_TOOLS`, `mcp_http.rs`).
+  - The local stdio server does not gate them: its user owns the machine.
+  - The web Libraries page needs the new `libraries.manage` capability (admin and member) to scrape or sync; the org's access mode does not apply there.
+- Recorded in ADR 0041.
+
+### A-9. Is the consolidation no-regression gate tuned as intended? (was Q7)
+
+- Answer (author, 2026-10-13): no; a candidate should promote only on strict improvement. Both gates now use `candidate > baseline` (`should_promote` in `agentops-embeddings-train` and `agentops-heavy-consolidate`). A tie keeps the active model.
+- Recorded in ADR 0013.
+
+### A-10. Where does CI run? (was Q8)
+
+- Answer (author, 2026-10-13): there is no public CI; the docs say only that. A GitHub Actions test workflow may come later.
+- Recorded in ADR 0040.
+
+### A-11. Should `repo-map.md` be committed, or the README link changed? (was Q9)
+
+- Answer (author, 2026-10-13, through the F2 decision): change the link. README and `llms.txt` now point to `docs/engineering/00-index.md`; `repo-map.md` stays a locally generated file.
+
+### A-12. Why SQLite by default, and Postgres for the code graph only? (was Q10)
+
+- Answer (author, 2026-10-13): SQLite needs no setup for a solo user. Postgres is used only where graph size and concurrency on the hosted server need it; the other stores are small.
+- Recorded in ADR 0037.
+
+### A-13. Why one unified MCP server instead of the earlier three? (was Q11)
+
+- Answer (author, 2026-10-13): both reasons. The licence and workspace split was gone, and a client needs one MCP entry instead of three.
+- Recorded in ADR 0002.
+
+### A-14. Should node recency use the 30-day `Affects` half-life? (was Q12)
+
+- Answer (author, 2026-10-13): only for notes. `recency_multiplier` now decays gotchas, decisions and notes only; code is never ranked down for being stable. This also makes code ranking the same on SQLite and Postgres.
+- Recorded in ADR 0013.
+
+### A-15. Do the LoRA consolidation deferrals still stand? (was Q13)
+
+- Answer (author, 2026-10-13): hide `consolidate_model` until its consumer, a local-first `explain_symbol`, exists. The tool and `POST /consolidate/model` are no longer exposed; the crate stays.
+- Recorded in ADR 0013 and `findings.md` F29.
 
 ### A-1. Should AgentOps's own docs be registered in docbrain?
 

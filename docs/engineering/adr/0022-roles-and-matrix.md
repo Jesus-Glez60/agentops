@@ -4,7 +4,7 @@ Survey candidate S3. Rationale is taken only from the sources under "Evidence"; 
 
 ## Status
 
-Accepted, 2026-08-17 (`1ec773a`).
+Accepted, 2026-08-17 (`1ec773a`). Amended by ADR 0043 (billing role and dead capabilities removed) and ADR 0041 (`libraries.manage` added).
 
 ## Context
 

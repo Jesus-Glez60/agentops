@@ -45,11 +45,11 @@ Index and field definitions: [02-crate-reference.md](../02-crate-reference.md).
 - **Path**: `agentops-core/crates/agentops-heavy-mcp`
 - **Purpose**: The tool table for the semantic index and model consolidation. `agentops-mcp-server` merges it in when Qdrant is configured.
 - **Entry points**: `list_tools()`, `call_tool(index, name, args)` (async), `run_stdio`, `handle_message`, plus its own JSON-RPC types.
-- **Tools**: `semantic_search`, `semantic_index`, `search_docs_indexed`, `index_docs_indexed`, `consolidate_model`. Full inventory in `survey/mcp-inventory.md`.
+- **Tools**: `semantic_search`, `semantic_index`, `search_docs_indexed`, `index_docs_indexed`, each with MCP annotations. `consolidate_model` is no longer listed (ADR 0042). Full inventory in `survey/mcp-inventory.md`.
 - **Depends on**: `graph`, `heavy-consolidate`, `heavy-embeddings`, `store-open`, `docbrain-graph`.
 - **Used by**: `heavy-api`, `mcp-server`.
 - **Invariants**:
-  - No access mode. The module doc reasons that every tool is "read/index-only (no code modification)". `consolidate_model` still trains and writes a model, and it is long-running (`questions.md` Q6).
+  - No access mode. The module doc reasons that every tool is "read/index-only (no code modification)".
   - Not exposed on hosted `/mcp`, because the index is not tenant-safe (`agentops-heavy-api/src/mcp_http.rs` module doc).
   - Its `search_docs_indexed`/`index_docs_indexed` were renamed from `search_docs`/`index_docs` to avoid clashing with docbrain's tools. The `agentops-mcp-server` module doc notes they "may turn out to be redundant".
 - **Tests**: 6 (`src/server.rs`). Some need `AGENTOPS_TEST_QDRANT_URL`.

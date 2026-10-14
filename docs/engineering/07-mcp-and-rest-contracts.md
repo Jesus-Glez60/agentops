@@ -11,11 +11,11 @@ Tools are defined in four places. Each surface composes some of them.
 | Table | Defined in | Tools | Access mode | MCP annotations |
 | --- | --- | --- | --- | --- |
 | Core | `tool_specs` in `agentops-core/crates/agentops-mcp/src/tools.rs` | 22 | yes, `ToolSpec.access` | yes |
-| docbrain | `docbrain-core/crates/docbrain-mcp/src/tools.rs` | 12 | no | no |
-| Semantic index | `agentops-core/crates/agentops-heavy-mcp/src/tools.rs` | 5 | no | no |
-| Hosted-only | `agentops-core/crates/agentops-heavy-api/src/mcp_http.rs` | 2 | no | yes |
+| docbrain | `docbrain-core/crates/docbrain-mcp/src/tools.rs` | 12 | hosted `/mcp` only, for 2 tools (`HOSTED_FULL_ONLY_TOOLS`) | yes |
+| Semantic index | `agentops-core/crates/agentops-heavy-mcp/src/tools.rs` | 4 | no | yes |
+| Hosted-only | `agentops-core/crates/agentops-heavy-api/src/mcp_http.rs` | 2 | `unregister_repo` is Full-only | yes |
 
-41 distinct names exist. No name appears in two tables: collisions were renamed before the tables were merged (module doc of `agentops-core/crates/agentops-mcp-server/src/lib.rs`):
+40 distinct names exist (`consolidate_model` is no longer exposed; ADR 0042). No name appears in two tables: collisions were renamed before the tables were merged (module doc of `agentops-core/crates/agentops-mcp-server/src/lib.rs`):
 
 | Old name | Table | New name | Kept by |
 | --- | --- | --- | --- |
@@ -28,14 +28,14 @@ Tools are defined in four places. Each surface composes some of them.
 
 | Surface | Transport | Tables | Advisor | Full | Auth |
 | --- | --- | --- | --- | --- | --- |
-| `agentops-mcp-server` | stdio | core + docbrain (+ semantic index if `AGENTOPS_QDRANT_URL` is set) | 26 (31) | 34 (39) | none; local process |
-| `POST /mcp` on `agentops-server` | Streamable HTTP, stateless | core + docbrain + hosted-only | 28 | 36 | session or personal API key (`require_tenant_auth`) |
+| `agentops-mcp-server` | stdio | core + docbrain (+ semantic index if `AGENTOPS_QDRANT_URL` is set) | 26 (30) | 34 (38) | none; local process |
+| `POST /mcp` on `agentops-server` | Streamable HTTP, stateless | core + docbrain + hosted-only | 25 | 36 | session or personal API key (`require_tenant_auth`) |
 | `GET /tools`, `POST /tools/{name}` | REST | core | 14 | 22 | instance key `AGENTOPS_API_KEY_HASH`, or none if unset |
 | `GET /docbrain/tools`, `POST /docbrain/tools/{name}` | REST | docbrain | 12 | 12 | instance key |
 | `agentops serve` | stdio | core | 14 | 22 | none |
 | `agentops docbrain-serve` | stdio | docbrain | 12 | 12 | none |
 
-`agentops connect` registers `agentops-mcp-server` with the client, or the hosted `/mcp` URL with `--remote`. The two CLI stdio servers predate the merge (`findings.md` F17).
+`agentops connect` registers `agentops-mcp-server` with the client, or the hosted `/mcp` URL with `--remote`. The two CLI stdio servers predate the merge (`findings.md` F17, won't fix).
 
 Hosted `/mcp` excludes the semantic-index table. Qdrant has no tenant concept, so those tools would need "tenant-safe `SemanticIndex` threading" first (`mcp_http.rs` module doc).
 
@@ -55,9 +55,9 @@ All MCP surfaces hand-roll JSON-RPC 2.0 instead of using an SDK. The core and do
 | Notification (no `id`) | stdio: no reply. HTTP: `202 Accepted`, empty body. |
 | Unknown method | JSON-RPC error `-32601` |
 | `tools/call` without `name` | JSON-RPC error `-32602` |
-| Unparseable request | JSON-RPC error `-32603` with "parse error"; HTTP also returns 400 |
+| Unparseable request | JSON-RPC error `-32700` with "parse error"; HTTP also returns 400 |
 
-The JSON-RPC spec's parse-error code is -32700; these servers send `-32603` (`findings.md` F34).
+All five servers use the JSON-RPC parse-error code -32700 (fixed for `findings.md` F34).
 
 `serverInfo.name` differs per surface: `agentops-mcp`, `agentops-mcp-server`, or `agentops-heavy-api` on hosted `/mcp`.
 
@@ -86,7 +86,7 @@ The default is `Advisor` because the MCP client can be any editor or agent, and 
 
 A Full-only tool is both hidden and refused. `list_tools(mode)` omits it; `call_tool` refuses it as a "defensive backstop" for a client that calls a tool it was never shown.
 
-Only the core table is gated. docbrain, semantic-index and hosted-only tools are available in both modes. The `agentops-mcp-server` module doc says retrofitting a capability system into those crates was out of scope for the merge.
+The core table is gated everywhere. On hosted `/mcp` only, `unregister_repo`, `scrape_library` and `sync_changelogs` are also Full-only (`HOSTED_FULL_ONLY_TOOLS`, ADR 0041); every other docbrain, semantic-index and hosted-only tool is available in both modes. The local stdio server does not gate them, since its user owns the machine. The web Libraries page is gated differently: scraping and syncing need the per-user `libraries.manage` capability, and the org's mode does not apply.
 
 ### Where the mode comes from
 
@@ -96,11 +96,11 @@ Only the core table is gated. docbrain, semantic-index and hosted-only tools are
 | REST `/tools` | same env var | at start |
 | Hosted `/mcp` | `organizations.mcp_access_mode`, default `'advisor'` (`agentops-core/crates/agentops-teams/src/lib.rs`) | every call (`resolve_access_mode`) |
 
-An org admin changes the hosted mode with `PUT /team/mcp-access-mode`. Hosted `/mcp` falls back to the process mode when no teams store is configured. Why REST and hosted `/mcp` use different sources is open (`questions.md` Q5b).
+An org admin changes the hosted mode with `PUT /team/mcp-access-mode`. Hosted `/mcp` falls back to the process mode when no teams store is configured. REST `/tools` takes only the instance key, so its caller is the operator and one process-wide mode fits; hosted `/mcp` is multi-tenant (ADR 0039).
 
 ### Knowledge writes in Advisor mode
 
-Three core write tools are Advisor-mode on purpose. The comment on `add_note` explains: Advisor mode "exists to block destructive/costly actions"; recording a gotcha or decision is neither. `ingest_notes` uses "same reasoning". `persist_blueprint_doc` gives no reason (`questions.md` Q6).
+Three core write tools are Advisor-mode on purpose. The comment on `add_note` explains: Advisor mode "exists to block destructive/costly actions"; recording a gotcha or decision is neither. `ingest_notes` uses "same reasoning". `persist_blueprint_doc` is in Advisor mode for the same reason (author answer A-8).
 
 Read tools also write, in a small way. Calls such as `get_symbol` and `list_gotchas` record a "hit" session event, under `session_id` or `UNATTRIBUTED_SESSION` ("unattributed") when none is passed (`maybe_record_session_event`).
 
@@ -122,8 +122,8 @@ Read tools also write, in a small way. Calls such as `get_symbol` and `list_gotc
 | `get_session` | Advisor | R | `path*`, `session_id*` | The session's recorded events. |
 | `list_tasks` | Advisor | R | `path*` | Tasks for the repo. |
 | `get_task_activity` | Advisor | R | `path*`, `task_id*` | Events recorded under the task's `session_id`. |
-| `local_semantic_search` | Advisor | R | `path*`, `query*`, `top_k`, `kind`, `mode`, `graph_expand` | Ranked hits; see [05-retrieval.md](05-retrieval.md). |
-| `add_note` | Advisor | **W** | `path*`, `title*`, `body*`, `note_type`, `tags`, `with_embeddings`, `session_id`; also reads undeclared `notes_path` | "Wrote <file> (<type>) and ingested it" with edge counts. |
+| `local_semantic_search` | Advisor | R | `path*`, `query*`, `top_k`, `kind`, `mode`, `graph_expand` | Ranked hits, each starting with its node id (`#123`) for `fetch_content`; see [05-retrieval.md](05-retrieval.md). |
+| `add_note` | Advisor | **W** | `path*`, `title*`, `body*`, `note_type`, `tags`, `with_embeddings`, `session_id`, `notes_path` (local servers only; hosted `/mcp` refuses it and sets the connection's notes folder itself) | "Wrote <file> (<type>) and ingested it" with edge counts. |
 | `ingest_notes` | Advisor | **W** | `path*`, `notes_path`, `with_embeddings`, `session_id` | Notes ingested, edges written and reinforced. |
 | `persist_blueprint_doc` | Advisor | **W** | `path*`, `doc_id*`, `title*`, `markdown*`, `note_title*`, `note_type`, `session_id` | "Merged '<doc_id>' into <repo>'s Blueprint doc group." |
 | `scan_repo` | Full | W | `path*`, `with_embeddings`, `session_id` | Files, symbols and dependency edges written; files and symbols pruned. |
@@ -135,7 +135,7 @@ Read tools also write, in a small way. Calls such as `get_symbol` and `list_gotc
 | `init_agents_md` | Full | W | `path*`, `notes_path` | "Wrote <AGENTS.md path> (NOTES_PATH: ...)". Overwrites `AGENTS.md` (gotcha 54112). |
 | `generate_docs` | Full | W | `path*` | "Wrote <repo-map.md path>". |
 
-`local_semantic_search`'s `kind` enum omits `doc_section` and `tool_output` (`findings.md` F19). `update_task_status` accepts `todo`, `in_progress`, `in_review`, `done` and `cancelled` (`parse_task_status`).
+`local_semantic_search`'s `kind` accepts all eight node kinds, parsed by `NodeKind::parse` (fixed for `findings.md` F19). `update_task_status` accepts `todo`, `in_progress`, `in_review`, `done` and `cancelled` (`parse_task_status`).
 
 ### docbrain tools
 
@@ -164,7 +164,6 @@ docbrain tools take no `path`. On stdio they use one SQLite file; on hosted `/mc
 | `semantic_index` | W | `path*` |
 | `search_docs_indexed` | R | `slug*`, `query*`, `top_k` |
 | `index_docs_indexed` | W | `slug*`, `db_path`, `org` |
-| `consolidate_model` | W, 10 to 45+ minutes of CPU | `path*` |
 
 The `agentops-mcp-server` module doc says `search_docs_indexed` and `index_docs_indexed` "may turn out to be redundant" with docbrain's own search.
 
@@ -254,7 +253,7 @@ Dashboard REST routes such as `/gotchas`, `/local-search` and `/repos/{id}/nodes
 | Kind | Where | What you get for free |
 | --- | --- | --- |
 | Core | one `ToolSpec` row in `tool_specs()`: `name`, `description`, `access`, `annotations`, `input_schema`, `handler` | Listing, dispatch and access gating on stdio, hosted `/mcp`, REST `/tools` and CLI `serve` |
-| docbrain | `docbrain-core/crates/docbrain-mcp/src/tools.rs` | stdio, hosted `/mcp` (per-tenant store), REST `/docbrain/tools` |
+| docbrain | `docbrain-core/crates/docbrain-mcp/src/tools.rs`, with an `annotations` value | stdio, hosted `/mcp` (per-tenant store), REST `/docbrain/tools`. A network-fetching tool must also go in `HOSTED_FULL_ONLY_TOOLS` and the web route's `MANAGE_TOOLS` |
 | Needs the tenant or app state | a special case in `handle_tools_call`, plus a `ToolDefinition` added to the hosted `tools/list` | hosted `/mcp` only |
 
 Rules for a core tool:
@@ -271,6 +270,4 @@ Rules for a core tool:
 
 ## Open questions
 
-- [Q5b](questions.md): why hosted `/mcp` reads the mode per org but REST `/tools` per process.
-- [Q6](questions.md): which write tools are meant to be open in Advisor mode.
-- Related findings: F17 (CLI stdio servers), F19 (`kind` enum), F31 (hosted `notes_path`), F33 (REST note path for hosted users), F34 (parse-error code).
+None. Q5b and Q6 were answered (ADRs 0039, 0041). Related findings: F17 (CLI stdio servers, won't fix); F7, F19, F31, F33, F34 and F44 are resolved.

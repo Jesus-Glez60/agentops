@@ -4,7 +4,7 @@ Survey candidate T2. Rationale is taken only from the sources under "Evidence"; 
 
 ## Status
 
-Accepted.
+Accepted. Amended by ADR 0045 (hosted note files live beside the checkout).
 
 ## Context
 

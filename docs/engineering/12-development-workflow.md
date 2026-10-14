@@ -54,7 +54,7 @@ A green run without the Postgres URL says nothing about Postgres. A Postgres-onl
 
 ## Continuous integration
 
-`.github/workflows/` contains only `release.yml`, which builds and publishes but runs no tests. Nothing in the repo describes where tests run before merge or deploy (`questions.md` Q8). Until that is answered, run the relevant tests yourself before pushing.
+`.github/workflows/` contains only `release.yml`, which builds and publishes but runs no tests. There is no public CI (ADR 0040): run the relevant tests yourself before pushing.
 
 ## Supply chain
 
@@ -137,4 +137,4 @@ The five-persona council's cost is driven mostly by the Completeness-checker's t
 
 ## Open questions
 
-- [Q8](questions.md): where CI runs and whether this doc should describe it.
+None. Q8 was answered (ADR 0040).

@@ -63,7 +63,7 @@ Index and field definitions: [02-crate-reference.md](../02-crate-reference.md).
 - **Depends on**: `graph`, `graph-pg`.
 - **Used by**: `heavy-mcp`, `mcp`. `agentops-mcp` re-exports it as `agentops_mcp::store`.
 - **Invariants**:
-  - Request handling should open stores only through this crate. One known exception: hosted indexing stages 7-8 call `SqliteGraphStore::open` directly (`findings.md` F27).
+  - Request handling should open stores only through this crate. Hosted indexing stages 7-8 did not, until the F27 fix.
   - A connection string is never printed in full (`redact_credentials`).
   - `AGENTOPS_PG_CONNECT_RETRY_SECS=0` (or invalid) means "try once", not "use the default" (doc comment on `retry_budget`; gotcha 54156).
 - **Tests**: 10 (`src/lib.rs`, 1 `#[ignore]`). Some need `AGENTOPS_TEST_DATABASE_URL`.

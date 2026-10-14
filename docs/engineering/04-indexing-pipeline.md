@@ -116,7 +116,7 @@ At the end of every `persist`:
 
 Any error in this step is logged and swallowed; it never fails the scan.
 
-> Because step 2 runs on every scan, a configured API key means one paid LLM call per scan, including each `agentops watch` batch and each push-triggered reindex. This contradicts `agentops-llm`'s "never called automatically during a scan" rule (`findings.md` F24).
+Step 2 makes a paid LLM call only when the ranked file set changed since the stored page (`module_set_hash`); otherwise it reuses the stored labels, so `agentops watch` batches and push-triggered reindexes of the same files cost nothing (ADR 0044).
 
 `repo-map.md` is a separate output. `agentops docgen`, the `generate_docs` tool and hosted stage 8 render it with `agentops_docgen::render_onboarding_doc`.
 
@@ -130,7 +130,7 @@ Any error in this step is logged and swallowed; it never fails the scan.
 
 Every failure is skipped, never fatal: a missing binary, a workspace that does not build, a timeout, or a `#[derive(...)]` macro (which `expandMacro` cannot expand). Requests rejected with `ContentModified` are retried (commit `8565155`).
 
-A cross-file `References` step (`find_cross_file_references`, in `scan_and_persist_with_lsp`) exists and is tested, but no command calls it (`findings.md` F25).
+A cross-file `References` step (`find_cross_file_references`) runs with `agentops install --with-lsp`, through `persist_with_lsp` (fixed for `findings.md` F25).
 
 Decision context: the pilot's original motivation, container disambiguation, turned out mostly redundant with a tree-sitter fix (gotcha 53903). Macro expansion is the remaining value (`agentops-lsp-client` module doc).
 
@@ -163,7 +163,7 @@ Checkouts live at a path stable per `(tenant, connection_id)`, so two tenants wi
 Known gaps, all from the code or its comments:
 - No graceful shutdown. A job running when the process exits stays `running` forever, and the status endpoint does not correct for it (module doc).
 - Without `spawn_blocking` around `persist`, a Postgres deployment panics and leaves the job `running`. This happened twice before the fix (inline comment).
-- Stages 7 and 8 open SQLite directly and miss a Postgres-backed graph (gotcha 54007; `findings.md` F27).
+- Stages 7 and 8 read the configured store (Postgres when set) under the checkout's repo key `<connection_id>--<tenant>`, and stage 8 reuses the job's PageRank ordering instead of rescanning (fixed for `findings.md` F27; gotcha 54007 is now stale).
 - Each job re-clones from scratch rather than fetching.
 
 ## Push-triggered reindex
@@ -176,8 +176,8 @@ GitHub calls `POST /webhooks/github` (`agentops-core/crates/agentops-heavy-api/s
 4. `push` derives the connection id `owner--repo` from `repository.full_name`. If that misses, it falls back to a `repo_url` lookup, needed for connections upgraded in place that kept their original id (gotchas 54150, 54215). Only `GitHubApp` connections are dispatched, and the result is a `Reindex` job.
 5. Other events are acknowledged with `dispatched: false`.
 
-The handler does not look at `ref`: a push to any branch reindexes the tracked branch (`findings.md` F26).
+A push reindexes only when its `ref` is `refs/heads/<tracked_branch>`, or the repository's default branch when none is tracked; other branches and tags return `dispatched: false`. When either field is missing it reindexes as before (`pushes_tracked_ref`; fixed for `findings.md` F26).
 
 ## Open questions
 
-None new. Related findings: F24, F25, F26, F27.
+None. Findings F24 to F27 are resolved.

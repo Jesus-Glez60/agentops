@@ -16,7 +16,7 @@ Crate detail is in [02-crates/knowledge-and-retrieval.md](02-crates/knowledge-an
 | REST `GET /search` (hosted) | `search_query_handler` (`agentops-heavy-api/src/lib.rs`) | same Qdrant path; HTTP 503 (`search_not_configured`) without `AGENTOPS_QDRANT_URL` |
 | MCP `get_symbol` | exact lookup | returns the symbol with the gotchas and decisions that affect it |
 
-Only the MCP tool and the CLI expose hybrid search. The web Search page is dense-only. On hosted repos that matters, because hosted indexing writes no core embeddings (`findings.md` F28).
+The MCP tool, the CLI and the web Search page (`/local-search`) all use hybrid search, so a repo indexed without core embeddings (the hosted default) is still searchable by name and text (fixed for `findings.md` F28). The web page shows `HybridHit::relevance`, the fused score scaled to 0..1.
 
 ## Retrieval modes
 
@@ -76,7 +76,7 @@ If the repo has a promoted projection head, `DenseCandidateSource` re-ranks the 
 
 Each hit carries `dense_rank`, `lexical_rank`, `exact_rank` (`None` if that source missed it) and `graph_score`, so callers can show why it ranked where it did. The MCP output prints them as `signals: dense+lexical+exact`, plus `graph`, a reduced-prominence warning with its reason, and a `via:` citation trail.
 
-> Recency halves a node's rank weight every 30 days without edits, including stable code that matters. The half-life is shared with `Affects` edges rather than chosen for nodes. Whether that is intended is not recorded; see `questions.md` Q12.
+Recency halves a note's rank weight every 30 days without edits, reusing the `Affects` half-life. It applies to gotchas, decisions and notes only: code is never ranked down for being stable, so code ranking is also the same on SQLite and Postgres, which does not record `last_touched_at` (ADR 0042).
 
 ## Graph expansion
 
@@ -166,5 +166,4 @@ Environment: `AGENTOPS_QDRANT_URL`, `AGENTOPS_QDRANT_COLLECTION` enable the Qdra
 
 ## Open questions
 
-- Q12: recency half-life on nodes.
-- Related findings: F19 (two node kinds not filterable), F28 (hosted web search).
+None. Q12 was answered (ADR 0042). F19 (node-kind filters) and F28 (hosted web search, now hybrid) are resolved.

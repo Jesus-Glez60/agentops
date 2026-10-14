@@ -162,4 +162,4 @@ Costs come from `agentops-llm`'s `pricing` table (`rates_for`, `cost_estimate_us
 
 ## Open questions
 
-- None open for this doc. Access-mode questions Q5b and Q6 affect what a connected tool can call ([07-mcp-and-rest-contracts.md](07-mcp-and-rest-contracts.md)).
+- None. What a connected tool can call per access mode is in [07-mcp-and-rest-contracts.md](07-mcp-and-rest-contracts.md) (ADRs 0039, 0041).

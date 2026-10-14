@@ -17,15 +17,15 @@ What AgentOps stores, where it stores it, and how the schema evolves. Read this 
 | Repo connections, indexing jobs, GitHub App installs | SQLite | `<data>/heavy-api.sqlite` | `AGENTOPS_HEAVY_API_DB` | `agentops-repo-access` |
 | Server-side repo clones | Filesystem | `<data>/repo-checkouts/` | `AGENTOPS_REPO_CHECKOUTS_DIR` | `agentops-heavy-api` |
 | Local scan registry | JSON file | `<data>/manifest.json` | `AGENTOPS_MANIFEST_PATH` | `agentops-manifest` |
-| Embedding projection heads | safetensors files | `~/.agentops/models/<repo>/` | none (`findings.md` F16) | `agentops-embeddings-train` |
-| LoRA adapters | files | `~/.agentops/models/<repo>/` | none (F16) | `agentops-heavy-consolidate` |
+| Embedding projection heads | safetensors files | `$AGENTOPS_DATA_DIR/models/<repo>/` | `AGENTOPS_DATA_DIR` | `agentops-embeddings-train` |
+| LoRA adapters | files | `$AGENTOPS_DATA_DIR/models/<repo>/` | `AGENTOPS_DATA_DIR` | `agentops-heavy-consolidate` |
 | Semantic index | Qdrant | `AGENTOPS_QDRANT_URL`, collection `agentops_semantic` | `AGENTOPS_QDRANT_COLLECTION` | `agentops-heavy-embeddings` |
 
 `<data>` is `AGENTOPS_DATA_DIR`, default `~/.agentops` (`agentops_manifest::agentops_data_dir`; `.env.example`). Gotcha 53950 warns that two deployment methods on one host share this default.
 
 Only the code graph has a Postgres option. Every other store is SQLite or files whatever `AGENTOPS_DATABASE_URL` says (store constructors in `agentops-heavy-api/src/lib.rs`, `build_full_router`).
 
-> Unverified: the reason only the code graph can use Postgres. See `questions.md` Q10.
+SQLite needs no setup for a solo user; Postgres is used only where graph size and concurrency on the hosted server need it, and the other stores are small (ADR 0037).
 
 ## Graph model
 
@@ -44,7 +44,7 @@ Only the code graph has a Postgres option. Every other store is SQLite or files 
 | `DocSection` | `doc_section` | One generated doc section, as searchable text | docgen; path `doc_section:{id}` |
 | `ToolOutput` | `tool_output` | Large output of a client's own tool call | `agentops hook-capture`; path `tool_output:{session_id}:{n}` |
 
-`DocSection` and `ToolOutput` cannot be selected by the `kind` filter of `local_semantic_search` (`findings.md` F19).
+Every kind, `DocSection` and `ToolOutput` included, can be selected by the `kind` filter of `local_semantic_search` (`NodeKind::parse`; fixed for `findings.md` F19).
 
 ### Edge relations
 
@@ -55,10 +55,10 @@ Only the code graph has a Postgres option. Every other store is SQLite or files 
 | `DependsOn` | `depends_on` | file → file | Import dependency. |
 | `Documents` | `documents` | `Definition` → symbol | LLM explanation of a symbol. Its sole reader assumes a one-line `Definition` source. |
 | `Affects` | `affects` | note → symbol | A gotcha or decision applies to a symbol. Reversing it silently breaks docgen badges. |
-| `References` | `references` | symbol → symbol, same file | Identifier reference found syntactically; not a call graph. A cross-file LSP variant exists in code but no command reaches it (`findings.md` F25). |
+| `References` | `references` | symbol → symbol, same file | Identifier reference found syntactically; not a call graph. `agentops install --with-lsp` also adds cross-file edges from rust-analyzer (fixed for `findings.md` F25). |
 | `Covers` | `covers` | `DocSection` → symbol/file | What a doc section documents; walked by `search_gist_then_detail`. |
 
-Source: doc comments on each variant. `EdgeRelation::from_db_str` maps any unknown string to `DependsOn` (`findings.md` F19).
+Source: doc comments on each variant. `EdgeRelation::from_db_str` maps an unknown string to `DependsOn` and logs a warning.
 
 ### Node identity
 
@@ -69,7 +69,7 @@ The key is not always unique. The scanner can emit two symbols with the same key
 - 54079: "Root cause of the duplicate-natural-key symbols: the scanner's (path, name, container) identity doesn't distinguish different impl blocks or nested closures sharing a name".
 - 53901: "Fixed: inherent-vs-trait-impl same-method-name collision (one sub-case of the natural-key collision gotcha)".
 
-The repo key for a local repo is the canonical directory's basename (`agentops_store_open::repo_name`). Hosted connections use `<connection_id>--<tenant>` (gotcha 54242). See `findings.md` F20.
+The repo key for a local repo is the canonical directory's basename (`agentops_store_open::repo_name`). Hosted connections use `<connection_id>--<tenant>` (gotcha 54242). See `findings.md` F20 (won't fix).
 
 ### Node fields
 
@@ -251,7 +251,7 @@ The vector table is created separately (`vec_table_migration`).
 | `doc_page`, `session_usage`, `llm_usage`, `session_report`, tasks and links | copied |
 | `repo_state` | recomputed (`refresh_repo_state`) |
 | `node_versions` | not copied, deliberately: replaying through `snapshot_node_version` would stamp false `valid_from` times; history restarts at the target's next scan (doc comment on `MigrateGraph`) |
-| `session_events` | not copied; includes knowledge-reuse hits (`findings.md` F23) |
+| `session_events` | copied, `node_id` remapped; timestamps reset to the migration time (fixed for `findings.md` F23) |
 
 `--wipe-target` calls `PostgresGraphStore::wipe_repo` first, instead of failing on or merging into existing data.
 
@@ -263,4 +263,4 @@ The vector table is created separately (`vec_table_migration`).
 
 ## Open questions
 
-- Q10: why only the code graph has a Postgres option.
+None. Q10 was answered (ADR 0037).

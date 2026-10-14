@@ -29,7 +29,7 @@ Index and field definitions: [02-crate-reference.md](../02-crate-reference.md).
 - **Purpose**: Organizations, memberships, fixed and custom roles, invites, the permission matrix, per-repo access overrides, the audit log and the org's MCP access mode.
 - **Entry points**:
   - `TeamStore` (organizations, memberships, invites, custom roles, audit log, `mcp_access_mode`, ownership).
-  - Roles: `ROLES = ["admin", "member", "viewer", "billing"]`, `ROLE_DESCRIPTIONS`. The owner is a column on `organizations`, not a role.
+  - Roles: `ROLES = ["admin", "member", "viewer"]`, `ROLE_DESCRIPTIONS`; `migrate_drop_billing_role` removed the old `billing` role (ADR 0043). The owner is a column on `organizations`, not a role.
   - `PERMISSIONS_MATRIX` with 16 capabilities (`CAP_*` constants). `has_capability` (`src/capabilities.rs`) is the single enforcement point.
 - **Tables**: `organizations`, `memberships`, `custom_roles`, `invites`, `repo_access_overrides`, `audit_log` (file `teams.sqlite`, env `AGENTOPS_TEAMS_DB`).
 - **Depends on**: `security`.
@@ -42,7 +42,7 @@ Index and field definitions: [02-crate-reference.md](../02-crate-reference.md).
   - Membership rows are created lazily on first touch (`ensure_membership`). Every capability consumer must call it first (gotcha 53997; decision "New tenants/orgs get membership row lazily via first-touch backfill, not at signup").
   - The audit log is insert-only and visible to Owner/Admin only, outside the matrix (decisions "Audit log is insert-only by design", "Audit log visibility is hardcoded Owner/Admin-only, not part of toggleable matrix").
   - `organizations.mcp_access_mode` defaults to `'advisor'` (`src/lib.rs:127`). Changing it needs `CAP_MCP_MANAGE_ACCESS_MODE`.
-- **Known issues**: `CAP_GOTCHAS_RESOLVE` and `CAP_TEAM_BILLING` are defined but never enforced (`findings.md` F12, F13).
+- **Known issues**: none. The unenforced `gotchas.resolve` and `team.billing` capabilities were removed (ADR 0043).
 - **Tests**: 50 (`src/lib.rs` 42, `src/capabilities.rs` 8).
 
 ## agentops-integrations
@@ -70,6 +70,6 @@ Index and field definitions: [02-crate-reference.md](../02-crate-reference.md).
   - `external_id` is Linear's human-readable identifier (e.g. `ENG-123`), not its UUID (module doc).
   - `sync-linear --push` must push before pulling; only one task's local edit survives per sync (gotcha 54096).
   - Calls use `ureq`, following `agentops-llm`'s precedent (module doc).
-- **Known issues**: the module doc still says sync is poll-only with no webhook infrastructure (`findings.md` F14).
+- **Known issues**: none (the module doc was corrected for `findings.md` F14).
 - **Decisions**: "Module 7 task manager and Linear sync: what shipped and what's unverified", "Phase 6 core implemented and live-verified: Linear webhook auto-kickoff".
 - **Tests**: 12 (`src/lib.rs`).

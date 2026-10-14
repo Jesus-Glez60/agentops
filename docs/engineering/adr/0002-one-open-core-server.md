@@ -8,7 +8,7 @@ Accepted, 2026-08-24 (`218c3fc`).
 
 ## Context
 
-Three REST binaries (`agentops-api` :8420, `docbrain-api` :8421, `agentops-heavy-api` :8978) and three stdio MCP servers existed. The split existed only because the heavy crates were a separate, commercially licensed workspace. It was kept out of the MIT/Apache root so the CLI would not absorb commercial code. There was never a runtime license check (decision note, "confirmed by direct audit").
+Three REST binaries (`agentops-api` :8420, `docbrain-api` :8421, `agentops-heavy-api` :8978) and three stdio MCP servers existed. The split existed only because the heavy crates were a separate, commercially licensed workspace. It was kept out of the MIT/Apache root so the CLI would not absorb commercial code. There was never a runtime license check (decision note, "confirmed by direct audit"). Clients also had to register up to three MCP servers (author answer A-13).
 
 ## Decision
 
@@ -36,4 +36,4 @@ Merge into two binaries: `agentops-server` (one Axum process, one port, default 
 - Decision "Backend merge: 3 REST APIs + 3 stdio MCP servers collapsed into agentops-server + agentops-mcp-server".
 - Commit `218c3fc` "Merge into one open-core: no price gate, single REST/MCP process, minimal env vars".
 - Module doc of `agentops-core/crates/agentops-mcp-server/src/lib.rs`.
-- `questions.md` Q11 asks whether anything beyond the licence split drove it.
+- Author answer A-13 (`questions.md`, 2026-10-13): both the removed licence split and client configuration drove it; a client needs one MCP entry instead of three.

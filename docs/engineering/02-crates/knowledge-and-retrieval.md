@@ -57,15 +57,13 @@ Index and field definitions: [02-crate-reference.md](../02-crate-reference.md).
 - **Depends on**: `embeddings`, `graph`, `notes`, `retrieval`, `scanner`.
 - **Used by**: `cli`, `heavy-api`, `mcp`.
 - **Invariants**:
-  - Never called automatically during a scan. `explain_symbol` is opt-in per symbol (module doc).
+  - `explain_symbol` is opt-in per symbol. The one scan-time call is `group_core_modules` (module labels), skipped while the file set is unchanged (ADR 0044).
   - Every call through `send_messages` (behind `call_anthropic` and `call_json`) reports to the spend ledger (`llm_usage` table), failures included, **when** `LlmConfig.usage_sink` is set. With no sink, nothing is recorded.
   - 401 and 429 responses map to distinct, labelled errors (doc comment on `call_anthropic`).
-  - Defaults: `DEFAULT_MODEL = "claude-sonnet-5"`, `DEFAULT_MODEL_CHEAP = "claude-haiku-4-5-20251001"`. Overridden by `AGENTOPS_ANTHROPIC_MODEL` and `AGENTOPS_ANTHROPIC_MODEL_CHEAP`.
+  - Defaults: `DEFAULT_MODEL = "claude-sonnet-5-5"`, `DEFAULT_MODEL_CHEAP = "claude-haiku-4-5-20251001"`. Overridden by `AGENTOPS_ANTHROPIC_MODEL` and `AGENTOPS_ANTHROPIC_MODEL_CHEAP`.
 - **Known history**: gotchas 54234 (stale cost rates overstate Opus 5.5 about 3.75x), 54235 (OpenAI-compatible providers differ in structured-output shape), 53924 (`tiktoken-rs` API).
 - **Decision**: "Small local models (≤4GB): recommended for the cheap LLM tier only, never bundled".
 - **Tests**: 47 (`src/lib.rs` 37, `src/pricing.rs` 4, `src/librarian.rs` 3, `src/tokens.rs` 3).
-
-> Unverified: whether `claude-sonnet-5` is a valid Anthropic model id. See `findings.md` F21.
 
 ## agentops-embeddings-train
 

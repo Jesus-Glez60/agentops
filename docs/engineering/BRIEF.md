@@ -1,5 +1,7 @@
 # AgentOps engineering docs — Claude Code brief
 
+> Historical input, kept as written. Three statements in it turned out wrong: `add_note` does not need Full mode, CI is not in `.github/`, and the layer table is not a dependency layering. See `findings.md` F4–F6.
+
 Oct 12, 2026 · @Jesus Gonzalez
 
 ## How to use this brief
