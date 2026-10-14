@@ -419,8 +419,8 @@ async fn spawn_and_handshake(workspace_root: std::path::PathBuf, binary: String,
     let mainloop_task = tokio::spawn(async move { mainloop.run_buffered(stdout, stdin).await });
 
     let root_uri = Url::from_directory_path(&workspace_root).map_err(|_| anyhow::anyhow!("workspace root is not a valid file:// URI: {}", workspace_root.display()))?;
-    #[allow(deprecated)]
     let capabilities = ClientCapabilities { window: Some(WindowClientCapabilities { work_done_progress: Some(true), ..Default::default() }), ..Default::default() };
+    #[allow(deprecated)]
     let init_params = InitializeParams { root_uri: Some(root_uri), capabilities, ..Default::default() };
     tokio::time::timeout(handshake_timeout, server.initialize(init_params)).await.context("rust-analyzer did not respond to `initialize` within the timeout")??;
     server.initialized(InitializedParams {}).context("sending `initialized`")?;
