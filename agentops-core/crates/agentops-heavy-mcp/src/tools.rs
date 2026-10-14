@@ -3,16 +3,27 @@
 //! boundary), this server's whole tool set is available whenever Qdrant is
 //! configured — no advisor-mode distinction, since semantic search has no
 //! write-capable variant to restrict in the first place.
+//!
+//! `consolidate_model` (LoRA consolidation, `agentops-heavy-consolidate`)
+//! is not exposed: nothing uses a promoted adapter yet, so a run costs
+//! 10-45 minutes of CPU for no effect (finding F29). Re-expose it together
+//! with its consumer, a local-first `explain_symbol` (author decision,
+//! 2026-10-13).
 
 use agentops_heavy_embeddings::SemanticIndex;
 use serde_json::{json, Value};
 
-use crate::protocol::{CallToolResult, ToolDefinition};
+use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
+
+const READ_ONLY: ToolAnnotations = ToolAnnotations { read_only_hint: true, destructive_hint: false, idempotent_hint: true, open_world_hint: false };
+/// Writes embeddings into the Qdrant index; rerunning overwrites them.
+const INDEX_WRITE: ToolAnnotations = ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: false };
 
 pub fn list_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "semantic_search",
+            annotations: READ_ONLY,
             description: "Find the most relevant symbols/gotchas/decisions for a plain-language query, ranked by meaning rather than keyword overlap. Requires semantic_index to have been run for this repo at least once. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             input_schema: json!({
                 "type": "object",
@@ -27,6 +38,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "semantic_index",
+            annotations: INDEX_WRITE,
             description: "Embed and index every symbol/gotcha/decision node from an already-scanned repo's graph store, so semantic_search has something to find. Run this after agentops install, and again after any rescan.",
             input_schema: json!({
                 "type": "object",
@@ -43,6 +55,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
             // backends), not just a naming accident — flagged as a
             // follow-up product decision, not resolved here.
             name: "search_docs_indexed",
+            annotations: READ_ONLY,
             description: "Find the most relevant library documentation sections for a plain-language query, ranked by meaning rather than keyword overlap. Requires index_docs_indexed to have been run for this library at least once. Never returns codebrain symbol/gotcha results, even from the same underlying index.",
             input_schema: json!({
                 "type": "object",
@@ -56,6 +69,7 @@ pub fn list_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "index_docs_indexed",
+            annotations: INDEX_WRITE,
             description: "Embed and index every doc node docbrain has for a library (across all its scraped versions), so search_docs_indexed has something to find. Run this after scrape_library.",
             input_schema: json!({
                 "type": "object",
@@ -67,15 +81,6 @@ pub fn list_tools() -> Vec<ToolDefinition> {
                 "required": ["slug"],
             }),
         },
-        ToolDefinition {
-            name: "consolidate_model",
-            description: "On-demand: LoRA fine-tune a small local code model on this repo's own curated Gotcha/Decision notes (CLS-inspired plan, Initiative 6), so future code-explanation assistance can be grounded in this repo's own reviewed knowledge instead of only a frontier model's frozen training data. Downloads the base model on first run, trains a fresh adapter, and only promotes it if it doesn't regress a held-out eval versus whatever's currently active. Heavier and slower than semantic_index/end_session (real CPU training, not just embedding) — never run automatically, invoke explicitly when there's enough newly curated knowledge to be worth consolidating.",
-            input_schema: json!({
-                "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"],
-            }),
-        },
     ]
 }
 
@@ -85,7 +90,6 @@ pub async fn call_tool(index: &mut SemanticIndex, name: &str, args: &Value) -> C
         "semantic_index" => tool_semantic_index(index, args).await,
         "search_docs_indexed" => tool_search_docs(index, args).await,
         "index_docs_indexed" => tool_index_docs(index, args).await,
-        "consolidate_model" => tool_consolidate_model(args).await,
         other => return CallToolResult::error(format!("unknown tool '{other}'")),
     };
 
@@ -238,33 +242,3 @@ async fn tool_index_docs(index: &mut SemanticIndex, args: &Value) -> anyhow::Res
     Ok(format!("Indexed {count} doc section(s) for {slug}"))
 }
 
-/// Runs a full Initiative 6 consolidation pass. Unlike every other tool in
-/// this file, this one is fully synchronous internally (`consolidate_model`
-/// does its own blocking model download/training/eval, no async I/O at
-/// all) — no `&mut SemanticIndex` needed, and no `.await` inside the
-/// `{ ... }` block that owns the `SqliteGraphStore` for the same
-/// !Sync-across-await reason `tool_semantic_index` documents, even though
-/// here the whole call happens to be synchronous anyway.
-async fn tool_consolidate_model(args: &Value) -> anyhow::Result<String> {
-    let path = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path' argument"))?;
-
-    let repo_path = std::path::Path::new(path);
-    let store = agentops_store_open::open_store(repo_path).map_err(|e| anyhow::anyhow!("opening graph store for {path}: {e}"))?;
-    let repo = agentops_heavy_embeddings::repo_name(repo_path);
-
-    let report = agentops_heavy_consolidate::consolidate_model(&*store, &repo)?;
-
-    if !report.attempted {
-        return Ok(format!("Skipped: {}", report.reason));
-    }
-
-    Ok(format!(
-        "{}\nexamples used: {}\ncandidate score: {:.3}\nbaseline score: {:.3}\npromoted: {}{}",
-        report.reason,
-        report.examples_used,
-        report.candidate_score,
-        report.baseline_score,
-        report.promoted,
-        report.promoted_version.map(|v| format!("\npromoted version: v{v}")).unwrap_or_default(),
-    ))
-}

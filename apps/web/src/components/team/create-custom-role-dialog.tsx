@@ -11,8 +11,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
-const BASE_ROLES: MemberRole[] = ["admin", "member", "viewer", "billing"];
-const BASE_ROLE_LABELS: Record<MemberRole, string> = { admin: "Admin", member: "Member", viewer: "Viewer", billing: "Billing" };
+const BASE_ROLES: MemberRole[] = ["admin", "member", "viewer"];
+const BASE_ROLE_LABELS: Record<MemberRole, string> = { admin: "Admin", member: "Member", viewer: "Viewer" };
 
 export function CreateCustomRoleDialog({ matrix }: { matrix: Capability[] }) {
   const { mutate } = useSWRConfig();

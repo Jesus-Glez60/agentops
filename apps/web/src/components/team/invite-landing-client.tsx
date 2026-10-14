@@ -9,7 +9,7 @@ import { getInvitePreview, acceptInvite } from "@/lib/api/team-api";
 import { Button } from "@/components/ui/button";
 import { AuthSplitLayout, GradientText } from "@/components/auth/auth-split-layout";
 
-const ROLE_LABELS: Record<string, string> = { admin: "Admin", member: "Member", viewer: "Viewer", billing: "Billing" };
+const ROLE_LABELS: Record<string, string> = { admin: "Admin", member: "Member", viewer: "Viewer" };
 
 export function InviteLandingClient({ token, isSignedIn }: { token: string; isSignedIn: boolean }) {
   const router = useRouter();

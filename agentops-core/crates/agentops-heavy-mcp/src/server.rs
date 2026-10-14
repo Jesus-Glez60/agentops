@@ -4,7 +4,7 @@
 use agentops_heavy_embeddings::SemanticIndex;
 use serde_json::{json, Value};
 
-use crate::protocol::{JsonRpcRequest, JsonRpcResponse, MCP_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, INTERNAL_ERROR};
+use crate::protocol::{JsonRpcRequest, JsonRpcResponse, MCP_PROTOCOL_VERSION, METHOD_NOT_FOUND, INVALID_PARAMS, PARSE_ERROR};
 use crate::tools;
 
 /// Handles one raw JSON-RPC message. Returns `None` for notifications (no
@@ -13,7 +13,7 @@ pub async fn handle_message(index: &mut SemanticIndex, raw: &str) -> Option<Stri
     let request: JsonRpcRequest = match serde_json::from_str(raw) {
         Ok(r) => r,
         Err(e) => {
-            let resp = JsonRpcResponse::err(Value::Null, INTERNAL_ERROR, format!("parse error: {e}"));
+            let resp = JsonRpcResponse::err(Value::Null, PARSE_ERROR, format!("parse error: {e}"));
             return Some(serde_json::to_string(&resp).unwrap());
         }
     };
@@ -77,7 +77,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_includes_all_five_tools() {
+    async fn tools_list_includes_all_four_tools() {
         let Some(mut index) = test_index() else { return };
         let resp = handle_message(&mut index, r#"{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}"#).await.unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
@@ -86,7 +86,7 @@ mod tests {
         assert!(names.contains(&"semantic_index"));
         assert!(names.contains(&"search_docs_indexed"));
         assert!(names.contains(&"index_docs_indexed"));
-        assert!(names.contains(&"consolidate_model"));
+        assert!(!names.contains(&"consolidate_model"), "hidden until a consumer exists (F29)");
     }
 
     #[tokio::test]

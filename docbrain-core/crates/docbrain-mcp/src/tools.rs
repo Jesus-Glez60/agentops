@@ -16,7 +16,7 @@ use docbrain_graph::{DocbrainStore, JobStatus, SqliteDocbrainStore};
 use docbrain_ingest::{ChangelogSync, LibraryDiscovery};
 use serde_json::{json, Value};
 
-use crate::protocol::{CallToolResult, ToolDefinition};
+use crate::protocol::{CallToolResult, ToolAnnotations, ToolDefinition};
 
 type Handler = fn(&dyn DocbrainStore, &Path, &Value) -> Result<String>;
 
@@ -25,7 +25,14 @@ struct ToolSpec {
     description: &'static str,
     input_schema: fn() -> Value,
     handler: Handler,
+    annotations: ToolAnnotations,
 }
+
+const READ_ONLY: ToolAnnotations = ToolAnnotations { read_only_hint: true, destructive_hint: false, idempotent_hint: true, open_world_hint: false };
+/// Writes the store only (`register_library`, a background job's status).
+const WRITE_IDEMPOTENT: ToolAnnotations = ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: false };
+/// Fetches from the network and writes what it finds to the store.
+const NETWORK_WRITE: ToolAnnotations = ToolAnnotations { read_only_hint: false, destructive_hint: false, idempotent_hint: true, open_world_hint: true };
 
 fn tool_specs() -> Vec<ToolSpec> {
     vec![
@@ -34,12 +41,14 @@ fn tool_specs() -> Vec<ToolSpec> {
             description: "List every registered library.",
             input_schema: || json!({ "type": "object", "properties": {} }),
             handler: tool_list_libraries,
+            annotations: READ_ONLY,
         },
         ToolSpec {
             name: "get_library",
             description: "Get metadata for a library by slug.",
             input_schema: || json!({ "type": "object", "properties": { "slug": { "type": "string" } }, "required": ["slug"] }),
             handler: tool_get_library,
+            annotations: READ_ONLY,
         },
         ToolSpec {
             name: "discover_library",
@@ -52,6 +61,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 })
             },
             handler: tool_discover_library,
+            annotations: NETWORK_WRITE,
         },
         ToolSpec {
             name: "register_library",
@@ -70,6 +80,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 })
             },
             handler: tool_register_library,
+            annotations: WRITE_IDEMPOTENT,
         },
         ToolSpec {
             name: "scrape_library",
@@ -87,6 +98,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 })
             },
             handler: tool_scrape_library,
+            annotations: NETWORK_WRITE,
         },
         ToolSpec {
             name: "sync_changelogs",
@@ -103,6 +115,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 })
             },
             handler: tool_sync_changelogs,
+            annotations: NETWORK_WRITE,
         },
         ToolSpec {
             name: "get_docs",
@@ -120,6 +133,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                 })
             },
             handler: tool_get_docs,
+            annotations: READ_ONLY,
         },
         ToolSpec {
             name: "search_docs",
@@ -138,12 +152,14 @@ fn tool_specs() -> Vec<ToolSpec> {
                 })
             },
             handler: tool_search_docs,
+            annotations: READ_ONLY,
         },
         ToolSpec {
             name: "get_code_examples",
             description: "Fetches the code example(s) linked to a specific doc node (found via list_libraries/get_docs/search_docs's node ids) — the implementation-stage counterpart to a planning-stage search_docs call.",
             input_schema: || json!({ "type": "object", "properties": { "node_id": { "type": "integer" } }, "required": ["node_id"] }),
             handler: tool_get_code_examples,
+            annotations: READ_ONLY,
         },
         ToolSpec {
             name: "get_changelog",
@@ -156,24 +172,27 @@ fn tool_specs() -> Vec<ToolSpec> {
                 })
             },
             handler: tool_get_changelog,
+            annotations: READ_ONLY,
         },
         ToolSpec {
             name: "list_changelog",
             description: "Every synced changelog entry for a library, most recent first -- unlike get_changelog, not scoped to one exact version pair. Use this to show/summarize a library's changelog history; use get_changelog only when you already know the exact consecutive release tags to diff.",
             input_schema: || json!({ "type": "object", "properties": { "slug": { "type": "string" } }, "required": ["slug"] }),
             handler: tool_list_changelog,
+            annotations: READ_ONLY,
         },
         ToolSpec {
             name: "get_job_status",
             description: "Polls a background scrape_library/sync_changelogs job's status and result message.",
             input_schema: || json!({ "type": "object", "properties": { "job_id": { "type": "integer" } }, "required": ["job_id"] }),
             handler: tool_get_job_status,
+            annotations: READ_ONLY,
         },
     ]
 }
 
 pub fn list_tools() -> Vec<ToolDefinition> {
-    tool_specs().into_iter().map(|s| ToolDefinition { name: s.name, description: s.description, input_schema: (s.input_schema)() }).collect()
+    tool_specs().into_iter().map(|s| ToolDefinition { name: s.name, description: s.description, input_schema: (s.input_schema)(), annotations: s.annotations }).collect()
 }
 
 /// `db_path` is only used by tools that can run in the background
@@ -213,7 +232,7 @@ impl JobSlot {
     fn acquire() -> Result<Self> {
         use std::sync::atomic::Ordering;
         RUNNING_BACKGROUND_JOBS
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_BACKGROUND_JOBS).then_some(n + 1))
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < MAX_BACKGROUND_JOBS).then_some(n + 1))
             .map(|_| JobSlot)
             .map_err(|_| anyhow::anyhow!("too many background jobs running (limit {MAX_BACKGROUND_JOBS}); retry shortly"))
     }
@@ -562,6 +581,21 @@ mod tests {
     }
     use docbrain_graph::{NodeKind, SqliteDocbrainStore};
     use docbrain_ingest::Embedder;
+
+    /// F7: clients see which tools only read and which fetch from the
+    /// network or write.
+    #[test]
+    fn tools_publish_annotations_that_mark_network_writes() {
+        let tools = list_tools();
+        let hint = |name: &str| tools.iter().find(|t| t.name == name).unwrap().annotations;
+        assert!(hint("get_docs").read_only_hint);
+        for writer in ["scrape_library", "sync_changelogs", "discover_library"] {
+            assert!(!hint(writer).read_only_hint && hint(writer).open_world_hint, "{writer}");
+        }
+        assert!(!hint("register_library").read_only_hint);
+        let json = serde_json::to_value(&tools[0]).unwrap();
+        assert!(json["annotations"]["readOnlyHint"].is_boolean(), "{json}");
+    }
 
     /// Closes the exact gap `main` left open: every tool `list_tools()`
     /// advertises must actually be dispatchable, not just present in the

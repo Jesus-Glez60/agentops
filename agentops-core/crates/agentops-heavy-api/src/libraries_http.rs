@@ -24,6 +24,9 @@ use serde_json::{json, Value};
 
 use crate::{require_session_capability, resolve_tenant, AppState, TenantQuery};
 
+/// Library tools that need `libraries.manage` on this route.
+const MANAGE_TOOLS: &[&str] = &["scrape_library", "sync_changelogs"];
+
 async fn tenant_and_capability(state: &AppState, user: &Option<axum::Extension<agentops_accounts::User>>, provided_tenant: Option<&str>) -> Result<String, (StatusCode, Json<Value>)> {
     let tenant = resolve_tenant(user, provided_tenant)?;
     require_session_capability(state, user, &tenant, agentops_teams::CAP_LIBRARIES_VIEW)?;
@@ -122,6 +125,15 @@ pub(crate) async fn call_library_tool_json(State(state): State<AppState>, user: 
         Ok(t) => t,
         Err(e) => return e,
     };
+    // Scraping and changelog sync fetch from the network on the shared
+    // server, so they need `libraries.manage` (admin and member by default);
+    // every other library tool needs only `libraries.view`. The org's MCP
+    // access mode does not apply to this web route (author decision).
+    if MANAGE_TOOLS.contains(&name.as_str()) {
+        if let Err(e) = require_session_capability(&state, &user, &tenant, agentops_teams::CAP_LIBRARIES_MANAGE) {
+            return e;
+        }
+    }
 
     let arguments = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
     let result = crate::mcp_http::call_docbrain_tool(&state, &tenant, &name, arguments).await;

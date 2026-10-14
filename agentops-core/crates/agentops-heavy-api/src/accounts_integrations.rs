@@ -140,6 +140,12 @@ const MAX_AUTH_ATTEMPTS_PER_IP: u32 = 30;
 const MAX_2FA_ATTEMPTS_PER_CHALLENGE: u32 = 5;
 const MAX_SIGNUPS_PER_IP: u32 = 10;
 const MAX_DEVICE_APPROVALS_PER_USER: u32 = 10;
+/// Per user, per action, over `LOGIN_WINDOW`: password change, 2FA
+/// confirm/disable and backup-code regeneration. Each needs a live session;
+/// the limit caps password or code guessing from a hijacked one.
+const MAX_ACCOUNT_CHANGES_PER_USER: u32 = 5;
+/// Per user, over `SIGNUP_WINDOW`.
+const MAX_API_KEYS_PER_USER: u32 = 20;
 
 /// Applies `(key, max, window)` limits in order; the first one exceeded
 /// becomes a 429. Address-based keys are skipped when the address is unknown.
@@ -276,6 +282,9 @@ async fn bootstrap_config(State(state): State<AccountsState>, Json(mut config): 
     if let Err(errors) = config.validate() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "errors": errors })));
     }
+    // A PM2 first start already generated these (`ecosystem.config.js`);
+    // replacing the master key would orphan every secret encrypted with it.
+    config.keep_running_keys(std::env::var("AGENTOPS_SECRETS_MASTER_KEY").ok().as_deref(), std::env::var("AGENTOPS_API_KEY_HASH").ok().as_deref());
 
     // `agentops-server` refuses to start on a non-loopback address without
     // an instance key, so generate one here and return the raw key once.
@@ -611,7 +620,14 @@ async fn update_me_password(
     headers: axum::http::HeaderMap,
     axum::Extension(user): axum::Extension<User>,
     Json(req): Json<UpdateMePasswordRequest>,
-) -> (StatusCode, Json<serde_json::Value>) {
+) -> Response {
+    if let Err(resp) = check_limits(&state, &[(Some(format!("password:user:{}", user.id)), MAX_ACCOUNT_CHANGES_PER_USER, LOGIN_WINDOW)]) {
+        return resp;
+    }
+    update_me_password_inner(state, headers, user, req).into_response()
+}
+
+fn update_me_password_inner(state: AccountsState, headers: axum::http::HeaderMap, user: User, req: UpdateMePasswordRequest) -> (StatusCode, Json<serde_json::Value>) {
     let result = { state.accounts.lock().unwrap().change_password(user.id, &req.current_password, &req.new_password) };
     match result {
         Ok(()) => {
@@ -712,7 +728,14 @@ struct CreateApiKeyRequest {
     name: String,
 }
 
-async fn create_api_key(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<CreateApiKeyRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn create_api_key(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<CreateApiKeyRequest>) -> Response {
+    if let Err(resp) = check_limits(&state, &[(Some(format!("api-key:user:{}", user.id)), MAX_API_KEYS_PER_USER, SIGNUP_WINDOW)]) {
+        return resp;
+    }
+    create_api_key_inner(state, user, req).into_response()
+}
+
+fn create_api_key_inner(state: AccountsState, user: User, req: CreateApiKeyRequest) -> (StatusCode, Json<serde_json::Value>) {
     if req.name.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": "name is required" })));
     }
@@ -749,7 +772,14 @@ struct Confirm2faRequest {
     code: String,
 }
 
-async fn confirm_2fa(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<Confirm2faRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn confirm_2fa(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<Confirm2faRequest>) -> Response {
+    if let Err(resp) = check_limits(&state, &[(Some(format!("2fa-confirm:user:{}", user.id)), MAX_ACCOUNT_CHANGES_PER_USER, LOGIN_WINDOW)]) {
+        return resp;
+    }
+    confirm_2fa_inner(state, user, req).into_response()
+}
+
+fn confirm_2fa_inner(state: AccountsState, user: User, req: Confirm2faRequest) -> (StatusCode, Json<serde_json::Value>) {
     let result = { state.accounts.lock().unwrap().confirm_2fa_enrollment(state.secrets.as_ref(), user.id, &req.code) };
     match result {
         Ok(backup_codes) => (StatusCode::OK, Json(json!({ "backup_codes": backup_codes }))),
@@ -762,7 +792,14 @@ struct PasswordGatedRequest {
     password: String,
 }
 
-async fn disable_2fa(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<PasswordGatedRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn disable_2fa(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<PasswordGatedRequest>) -> Response {
+    if let Err(resp) = check_limits(&state, &[(Some(format!("2fa-disable:user:{}", user.id)), MAX_ACCOUNT_CHANGES_PER_USER, LOGIN_WINDOW)]) {
+        return resp;
+    }
+    disable_2fa_inner(state, user, req).into_response()
+}
+
+fn disable_2fa_inner(state: AccountsState, user: User, req: PasswordGatedRequest) -> (StatusCode, Json<serde_json::Value>) {
     let result = { state.accounts.lock().unwrap().disable_2fa(user.id, &req.password) };
     match result {
         Ok(()) => (StatusCode::OK, Json(json!({ "disabled": true }))),
@@ -770,7 +807,14 @@ async fn disable_2fa(State(state): State<AccountsState>, axum::Extension(user): 
     }
 }
 
-async fn regenerate_backup_codes(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<PasswordGatedRequest>) -> (StatusCode, Json<serde_json::Value>) {
+async fn regenerate_backup_codes(State(state): State<AccountsState>, axum::Extension(user): axum::Extension<User>, Json(req): Json<PasswordGatedRequest>) -> Response {
+    if let Err(resp) = check_limits(&state, &[(Some(format!("backup-codes:user:{}", user.id)), MAX_ACCOUNT_CHANGES_PER_USER, LOGIN_WINDOW)]) {
+        return resp;
+    }
+    regenerate_backup_codes_inner(state, user, req).into_response()
+}
+
+fn regenerate_backup_codes_inner(state: AccountsState, user: User, req: PasswordGatedRequest) -> (StatusCode, Json<serde_json::Value>) {
     let result = { state.accounts.lock().unwrap().regenerate_backup_codes(user.id, &req.password) };
     match result {
         Ok(backup_codes) => (StatusCode::OK, Json(json!({ "backup_codes": backup_codes }))),
@@ -1479,6 +1523,31 @@ mod tests {
         assert!(limited.headers().get(axum::http::header::RETRY_AFTER).is_some());
         let same_account_other_case = HttpRequest::post("/auth/login").header("content-type", "application/json").body(Body::from(r#"{"email":"victim@example.com","password":"wrong"}"#)).unwrap();
         assert_eq!(app.oneshot(same_account_other_case).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS, "the key must not be bypassed by changing case");
+    }
+
+    // F46: password- and code-gated account changes need a live session,
+    // but a hijacked one could otherwise guess the password or a TOTP code
+    // without limit.
+    #[tokio::test]
+    async fn authenticated_account_changes_are_rate_limited_per_user() {
+        let app = test_router();
+        let signup_response =
+            app.clone().oneshot(HttpRequest::post("/auth/signup").header("content-type", "application/json").body(Body::from(r#"{"email":"dev@example.com","password":"pw","first_name":"Ada","last_name":"Lovelace"}"#)).unwrap()).await.unwrap();
+        let token = body_json(signup_response).await["session_token"].as_str().unwrap().to_string();
+        assert_limited_after(&app, &token, "/auth/me/password", r#"{"current_password":"wrong","new_password":"whatever else"}"#, MAX_ACCOUNT_CHANGES_PER_USER).await;
+        assert_limited_after(&app, &token, "/auth/2fa/confirm", r#"{"code":"000000"}"#, MAX_ACCOUNT_CHANGES_PER_USER).await;
+        assert_limited_after(&app, &token, "/auth/api-keys", r#"{"name":"k"}"#, MAX_API_KEYS_PER_USER).await;
+    }
+
+    /// `max` authenticated POSTs to `path` pass the limiter; the next is a 429.
+    async fn assert_limited_after(app: &Router, token: &str, path: &str, body: &str, max: u32) {
+        let post = || HttpRequest::post(path).header("authorization", format!("Bearer {token}")).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        for _ in 0..max {
+            assert_ne!(app.clone().oneshot(post()).await.unwrap().status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+        }
+        let limited = app.clone().oneshot(post()).await.unwrap();
+        assert_eq!(limited.status(), StatusCode::TOO_MANY_REQUESTS, "{path}");
+        assert!(limited.headers().get(axum::http::header::RETRY_AFTER).is_some(), "{path}");
     }
 
     #[tokio::test]

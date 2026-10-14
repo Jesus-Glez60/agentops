@@ -2,7 +2,7 @@
 
 > Turns a codebase into a knowledge graph AI coding agents can query — scanning, hybrid search, curated gotchas/decisions, and library docs, exposed over MCP and self-hosted as a single open-core product (one Rust server, one Next.js frontend, no price gate).
 
-AgentOps scans a repo into a persistent graph of files/symbols/dependencies, layers hybrid dense+lexical search on top, and adds a curated Gotchas/Decisions notes system for tribal knowledge. Agents reach all of it over one MCP server (about 40 tools: code graph, notes, tasks, sessions/usage, library docs), either as a local stdio binary or through a hosted server's authenticated `/mcp` endpoint. Humans use a REST API and web UI. `docbrain`, a bundled subsystem, gives third-party library documentation the same scan-and-search treatment, including AgentOps's own docs, which are registered as a library automatically on first boot.
+AgentOps scans a repo into a persistent graph of files/symbols/dependencies, layers hybrid dense+lexical search on top, and adds a curated Gotchas/Decisions notes system for tribal knowledge. Agents reach all of it over one MCP server (up to 38 tools, depending on the surface and access mode: code graph, notes, tasks, sessions/usage, library docs), either as a local stdio binary or through a hosted server's authenticated `/mcp` endpoint. Humans use a REST API and web UI. `docbrain`, a bundled subsystem, scrapes and indexes third-party library documentation for search. A local server registers AgentOps's own docs as a library (metadata only) on boot; run `scrape_library` with `slug: agentops` to ingest them.
 
 Self-hosting needs exactly one required value (`AGENTOPS_SECRETS_MASTER_KEY`) and supports Docker, a classic binary install, PM2, or Kubernetes. Client machines connect with `curl -fsSL <server>/connect.sh | sh` (browser device login) or `npx agentops-cli connect`.
 
@@ -13,7 +13,7 @@ Self-hosting needs exactly one required value (`AGENTOPS_SECRETS_MASTER_KEY`) an
 - [Rendered API docs](docs/index.html): browsable version of the OpenAPI spec.
 - [Notes vault protocol](docs/vault-protocol.md): how agents record gotchas/decisions (remote `add_note` vs. local Markdown).
 - [llms-full.txt](llms-full.txt): the full plain-text content of this project's docs in one file, for loading complete context in a single request.
-- [repo-map.md](repo-map.md): a generated architecture/centrality map of the codebase, produced by AgentOps scanning itself.
+- [Engineering docs](docs/engineering/00-index.md): architecture, data model, MCP/REST contracts, security, operations and ADRs.
 
 ## Deployment
 

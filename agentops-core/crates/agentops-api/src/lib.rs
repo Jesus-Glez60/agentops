@@ -211,15 +211,7 @@ struct NodesQuery {
 /// the same string-to-`NodeKind` mapping, and so does `agentops-heavy-api`'s
 /// own kind-filter parsing for its tenant-scoped dashboard routes.
 pub fn parse_kind(s: &str) -> Option<NodeKind> {
-    match s.to_lowercase().as_str() {
-        "symbol" => Some(NodeKind::Symbol),
-        "file" => Some(NodeKind::File),
-        "gotcha" => Some(NodeKind::Gotcha),
-        "decision" => Some(NodeKind::Decision),
-        "definition" => Some(NodeKind::Definition),
-        "note" => Some(NodeKind::Note),
-        _ => None,
-    }
+    NodeKind::parse(s)
 }
 
 /// Structured JSON for a dashboard's node browser — `/tools/*` returns

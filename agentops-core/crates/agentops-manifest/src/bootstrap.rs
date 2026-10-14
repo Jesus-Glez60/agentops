@@ -90,6 +90,20 @@ impl BootstrapConfig {
 }
 
 impl BootstrapConfig {
+    /// Keeps the keys the running server already uses (non-empty values
+    /// only) instead of the submitted ones. The master key encrypts every
+    /// stored secret, so writing a different one to `.env` would make them
+    /// unreadable after the next restart; a running instance key keeps the
+    /// key the operator was already shown (finding F45).
+    pub fn keep_running_keys(&mut self, running_master_key: Option<&str>, running_api_key_hash: Option<&str>) {
+        if let Some(key) = running_master_key.filter(|k| !k.trim().is_empty()) {
+            self.secrets_master_key = key.to_string();
+        }
+        if let Some(hash) = running_api_key_hash.filter(|h| !h.trim().is_empty()) {
+            self.api_key_hash = Some(hash.to_string());
+        }
+    }
+
     /// Generates an instance API key when none is configured yet, stores
     /// its hash, and returns the raw key so the wizard can show it once.
     /// Returns `None` when a hash was already supplied.
@@ -142,6 +156,22 @@ mod tests {
         let config = BootstrapConfig { addr: Some("not-an-addr".to_string()), ..valid_config() };
         let errors = config.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("addr")));
+    }
+
+    #[test]
+    fn keep_running_keys_overrides_the_submitted_keys_but_ignores_blank_ones() {
+        let mut config = valid_config();
+        config.api_key_hash = Some("submitted-hash".into());
+        let submitted_master = config.secrets_master_key.clone();
+
+        config.keep_running_keys(Some("  "), None);
+        assert_eq!((config.secrets_master_key.as_str(), config.api_key_hash.as_deref()), (submitted_master.as_str(), Some("submitted-hash")));
+
+        config.keep_running_keys(Some("running-master"), Some("running-hash"));
+        assert_eq!(config.secrets_master_key, "running-master");
+        assert_eq!(config.api_key_hash.as_deref(), Some("running-hash"));
+        assert_eq!(config.ensure_instance_key().unwrap(), None, "a kept instance key is not replaced");
+        assert!(config.to_env_file().contains("AGENTOPS_SECRETS_MASTER_KEY=running-master"));
     }
 
     #[test]

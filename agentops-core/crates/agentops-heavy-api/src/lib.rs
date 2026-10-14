@@ -195,38 +195,12 @@ pub fn build_router(
     build_router_with_tools_flag(store, secrets, github_app_slug, api_key_hash, search_index, docbrain_db_dir, accounts, teams, indexing, repo_checkouts_dir, github_app_config, pg_store, true)
 }
 
-/// Same as [`build_router`] minus `/tools`/`/tools/{name}` — `agentops-api`
-/// registers the same two paths for its own tool table, so a process
-/// composing both (e.g. `agentops-server`) can only mount one of them
-/// as-is; the other needs a merged dispatcher covering both tool tables,
-/// not yet built (tracked for the MCP-server-merge follow-up, same as
-/// `docbrain-api`'s identical situation). Until then, the merged process
-/// keeps `agentops-api`'s `/tools` and mounts this variant instead.
-#[allow(clippy::too_many_arguments)]
-pub fn build_router_without_tools(
-    store: ConnectionStore,
-    secrets: Arc<dyn SecretsProvider + Send + Sync>,
-    github_app_slug: Option<String>,
-    api_key_hash: Option<String>,
-    search_index: Option<Arc<AsyncMutex<SemanticIndex>>>,
-    docbrain_db_dir: std::path::PathBuf,
-    accounts: Option<AccountStore>,
-    teams: Option<TeamStore>,
-    indexing: agentops_repo_access::indexing_store::IndexingStore,
-    repo_checkouts_dir: std::path::PathBuf,
-    github_app_config: Option<github_app_routes::GitHubAppConfig>,
-) -> Router {
-    // See `build_router`'s identical comment just above.
-    let pg_store = agentops_mcp::open_shared_postgres_store().expect("connect to AGENTOPS_DATABASE_URL");
-    build_router_with_tools_flag(store, secrets, github_app_slug, api_key_hash, search_index, docbrain_db_dir, accounts, teams, indexing, repo_checkouts_dir, github_app_config, pg_store, false)
-}
-
 /// `pg_store` is connected by the caller, not internally -- unlike this
-/// function's two sync public callers just above (safe to connect directly,
+/// function's sync public caller just above (safe to connect directly,
 /// since they're only ever invoked from genuinely sync contexts),
 /// `build_full_router` below is `async` and gets awaited from inside an
-/// already-running Tokio runtime in production (`agentops-server::run`,
-/// this crate's own `run`) -- `PostgresGraphStore::connect()` spins up and
+/// already-running Tokio runtime in production (`agentops-server::run`)
+/// -- `PostgresGraphStore::connect()` spins up and
 /// enters its own dedicated `Runtime` internally (see that struct's own doc
 /// comment), which panics ("Cannot start a runtime from within a runtime")
 /// if attempted from a thread that already has one entered. Confirmed live:
@@ -299,7 +273,6 @@ fn build_router_with_tools_flag(
         .route("/search", get(search_query_handler))
         .route("/docs/search/index", post(docs_search_index_handler))
         .route("/docs/search", get(docs_search_query_handler))
-        .route("/consolidate/model", post(consolidate_model_handler))
         // Dashboard unification (Initiative 1) -- tenant-scoped equivalents
         // of agentops-api's single-operator dashboard routes, at the exact
         // same paths. See `agentops_api::build_router_without_dashboard_routes`'s
@@ -430,7 +403,7 @@ fn default_modules_db_path() -> std::path::PathBuf {
 /// when no `org` is given (a single self-hosted operator with no
 /// multi-tenant needs). See the module doc comment for why this replaces
 /// `main`'s `TenantContext` parameter.
-fn docbrain_db_path_for_org(dir: &std::path::Path, org: Option<&str>) -> std::path::PathBuf {
+pub(crate) fn docbrain_db_path_for_org(dir: &std::path::Path, org: Option<&str>) -> std::path::PathBuf {
     match org {
         Some(org) => dir.join(format!("{org}.db")),
         None => dir.join("default.db"),
@@ -520,16 +493,21 @@ fn resolve_anthropic_config(credentials: &agentops_integrations::CredentialStore
     let cred = credentials
         .get_credential(secrets, tenant, "anthropic")?
         .ok_or_else(|| anyhow::anyhow!("no Anthropic credential stored for tenant {tenant:?} — add one via POST /integrations/anthropic"))?;
-    Ok(agentops_llm::AnthropicConfig { api_key: cred.secret.to_string(), model: "claude-sonnet-5".to_string(), max_tokens: 1024, api_url: "https://api.anthropic.com/v1/messages".to_string(), ..Default::default() })
+    // The crate's default model, honoring `AGENTOPS_ANTHROPIC_MODEL` like
+    // `AnthropicConfig::from_env`, rather than a second hardcoded id.
+    let mut config = agentops_llm::AnthropicConfig { api_key: cred.secret.to_string(), max_tokens: 1024, ..Default::default() };
+    if let Ok(model) = std::env::var("AGENTOPS_ANTHROPIC_MODEL") {
+        config.model = model;
+    }
+    Ok(config)
 }
 
 /// Builds this service's complete, ready-to-serve `Router` — every route
 /// table this crate owns (`/repos/*`, `/search*`, `/docs/search*`,
-/// `/consolidate/model`, the GitHub/Linear webhook receivers, `/auth/*`,
-/// `/integrations*`, `/team*`) merged together, plus `/health`. Split out of
-/// [`run`] so a merged multi-service process (e.g. `agentops-server`) can
-/// compose this alongside `agentops-api`'s and `docbrain-api`'s routers
-/// without also binding a socket itself. Reads `AGENTOPS_SECRETS_MASTER_KEY`
+/// the GitHub/Linear webhook receivers, `/auth/*`,
+/// `/integrations*`, `/team*`) merged together, plus `/health`, for
+/// `agentops-server` to compose alongside `agentops-api`'s and
+/// `docbrain-api`'s routers. Reads `AGENTOPS_SECRETS_MASTER_KEY`
 /// (required — see `agentops_repo_access::secrets::EnvSecretsProvider`),
 /// `AGENTOPS_API_KEY_HASH` (optional — unset means unauthenticated,
 /// matching `agentops-api`/`docbrain-api`'s convention), `AGENTOPS_GITHUB_APP_SLUG`
@@ -537,10 +515,9 @@ fn resolve_anthropic_config(credentials: &agentops_integrations::CredentialStore
 /// its own; loading the BGE-M3 model can take real time on first run,
 /// downloading it if not already cached).
 ///
-/// `include_tools` mirrors [`build_router`]/[`build_router_without_tools`]'s
-/// split: `false` when composing into a process that already mounts
-/// `agentops-api`'s `/tools` (see that function's doc comment for why only
-/// one of the three tool tables can be mounted at that exact path today).
+/// `include_tools`: `false` when composing into a process that already
+/// mounts `agentops-api`'s `/tools` (`agentops-server`); `true` only in
+/// tests, through [`build_router`].
 pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -> anyhow::Result<Router> {
     let store = ConnectionStore::open(db_path)?;
     let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(agentops_repo_access::secrets::EnvSecretsProvider::from_env()?);
@@ -664,7 +641,7 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
     // pattern; `PostgresGraphStore::clone()` is cheap (see its own doc
     // comment) and every connect() this crate performs already goes through
     // this one `spawn_blocking`-wrapped call above.
-    app = linear_webhook::merge_linear_webhook_route(app, linear_modules.clone(), linear_credentials_2.clone(), secrets.clone(), pg_store.clone());
+    app = linear_webhook::merge_linear_webhook_route(app, linear_modules.clone(), linear_credentials_2.clone(), secrets.clone(), pg_store.clone(), docbrain_db_dir.clone());
     app = linear_webhook::merge_linear_module_routes(app, linear_modules, linear_credentials_2, secrets.clone(), accounts_for_linear, pg_store);
     if std::env::var("AGENTOPS_LINEAR_WEBHOOK_URL").is_err() {
         println!("AGENTOPS_LINEAR_WEBHOOK_URL is not set — POST /linear/auto-kickoff will report 503 until it's configured.");
@@ -703,18 +680,6 @@ pub async fn build_full_router(db_path: &std::path::Path, include_tools: bool) -
     println!("Team Management live: GET /team, GET /team/members, PATCH/DELETE /team/members/{{id}}, GET/PUT /team/repo-access, POST /team/delete-organization.");
 
     Ok(app.merge(health_router()).merge(contact_routes::contact_router()))
-}
-
-/// Binds `addr` and serves [`build_full_router`]'s output until the process
-/// is killed.
-pub async fn run(addr: &str, db_path: &std::path::Path) -> anyhow::Result<()> {
-    let api_key_hash = std::env::var("AGENTOPS_API_KEY_HASH").ok();
-    let auth_status = if api_key_hash.is_some() { "API key required" } else { "UNAUTHENTICATED (set AGENTOPS_API_KEY_HASH to require a key)" };
-    let app = build_full_router(db_path, true).await?;
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    println!("agentops-heavy-api listening on {addr} (auth: {auth_status})");
-    axum::serve(listener, app).await?;
-    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -1102,6 +1067,7 @@ async fn delete_repo(State(state): State<AppState>, user: Option<axum::Extension
             eprintln!("delete_repo: failed to wipe graph data for {tenant}/{id}: {e} -- continuing to delete the connection row anyway");
         }
     }
+    indexing::remove_connection_notes(&state.repo_checkouts_dir, &tenant, &id);
 
     let store = state.store.lock().unwrap();
     match store.delete_connection(&tenant, &id) {
@@ -1392,59 +1358,6 @@ async fn docs_search_query_handler(State(state): State<AppState>, Query(q): Quer
             (StatusCode::OK, Json(json!({ "results": results })))
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct ConsolidateModelRequest {
-    path: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ConsolidateModelResponse {
-    attempted: bool,
-    promoted: bool,
-    examples_used: usize,
-    candidate_score: f64,
-    baseline_score: f64,
-    promoted_version: Option<u32>,
-    reason: String,
-}
-
-/// On-demand REST trigger for Initiative 6 (CLS-inspired retrieval plan):
-/// LoRA fine-tunes a small local code model on this repo's own curated
-/// Gotcha/Decision notes. No `search_index`/Qdrant dependency at all —
-/// unlike every other handler in this file, this one doesn't touch
-/// `AppState.search_index`. Runs on a blocking thread (`spawn_blocking`):
-/// `agentops_heavy_consolidate::consolidate_model` does real, synchronous
-/// CPU work (model download on first run, training, eval) that would
-/// otherwise stall this server's whole async runtime for the entire
-/// duration of a call, unlike every other handler here.
-async fn consolidate_model_handler(Json(req): Json<ConsolidateModelRequest>) -> (StatusCode, Json<Value>) {
-    let result = tokio::task::spawn_blocking(move || {
-        let repo_path = std::path::Path::new(&req.path);
-        let db_path = repo_path.join(".context").join("graph.db");
-        let store = agentops_graph::SqliteGraphStore::open(&db_path).map_err(|e| anyhow::anyhow!("opening graph store at {}: {e}", db_path.display()))?;
-        let repo = agentops_heavy_embeddings::repo_name(repo_path);
-        agentops_heavy_consolidate::consolidate_model(&store, &repo)
-    })
-    .await;
-
-    match result {
-        Ok(Ok(report)) => (
-            StatusCode::OK,
-            Json(json!(ConsolidateModelResponse {
-                attempted: report.attempted,
-                promoted: report.promoted,
-                examples_used: report.examples_used,
-                candidate_score: report.candidate_score,
-                baseline_score: report.baseline_score,
-                promoted_version: report.promoted_version,
-                reason: report.reason,
-            })),
-        ),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("consolidation task panicked: {e}") }))),
     }
 }
 
@@ -2631,12 +2544,14 @@ mod tests {
         }
         assert!(!target.exists(), "a refused call must not create anything at the caller's path");
 
-        // Without `notes_path`, add_note still works, inside the checkout.
+        // Without `notes_path`, add_note still works, writing to the
+        // connection's notes folder beside (not inside) its checkout.
         let mut req = mcp_request("tools/call", json!({ "name": "add_note", "arguments": { "path": "own-repo", "title": "Real note", "body": "plain text" } }), 9);
         req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
         let body = body_json(app.oneshot(req).await.unwrap()).await;
         assert_eq!(body["result"]["isError"], false, "{body:?}");
-        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains(&checkouts.path().display().to_string()), "{body:?}");
+        let notes_dir = crate::indexing::notes_dir_for_checkout(&crate::indexing::checkout_path(checkouts.path(), &user.tenant, "own-repo"));
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains(&notes_dir.display().to_string()), "{body:?}");
     }
 
     #[tokio::test]
@@ -2812,6 +2727,78 @@ mod tests {
         assert_eq!(body["result"]["isError"], false, "{body:?}");
     }
 
+    /// The web Libraries page scrapes over REST, gated by the
+    /// `libraries.manage` capability (admin and member), not by the org's
+    /// MCP access mode.
+    #[tokio::test]
+    async fn web_library_scraping_needs_libraries_manage_but_reading_needs_only_view() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (admin, _) = signup(&accounts, "admin@example.com");
+        let (viewer, viewer_token) = signup(&accounts, "viewer@example.com");
+        let (member, member_token) = signup(&accounts, "member@example.com");
+        accounts.switch_tenant(viewer.id, &admin.tenant).unwrap();
+        accounts.switch_tenant(member.id, &admin.tenant).unwrap();
+        let teams = TeamStore::open_in_memory().unwrap();
+        teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
+        teams.add_member(&admin.tenant, viewer.id, "viewer").unwrap();
+        teams.add_member(&admin.tenant, member.id, "member").unwrap();
+        let docbrain_dir = tempfile::tempdir().unwrap();
+        let app = build_router(store, secrets, None, None, None, docbrain_dir.path().to_path_buf(), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
+
+        let call = |token: &str, name: &str| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/libraries/tools/{name}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(json!({ "slug": "nope", "version": "1" }).to_string()))
+                .unwrap()
+        };
+        let resp = app.clone().oneshot(call(&viewer_token, "scrape_library")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(body_json(resp).await["error"].as_str().unwrap().contains("libraries.manage"));
+        let resp = app.clone().oneshot(call(&viewer_token, "get_docs")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a viewer can still read docs");
+        let resp = app.clone().oneshot(call(&member_token, "scrape_library")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "a member may scrape (the unknown slug fails inside the tool, not at the gate)");
+    }
+
+    /// Q6 (author decision): on hosted `/mcp`, `unregister_repo`,
+    /// `scrape_library` and `sync_changelogs` are Full-only.
+    #[tokio::test]
+    async fn hosted_mcp_hides_and_refuses_unregister_and_doc_fetching_tools_in_advisor_mode() {
+        for full in [false, true] {
+            let (store, secrets) = test_state();
+            let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+            let (user, token) = signup(&accounts, "dev@example.com");
+            let teams = TeamStore::open_in_memory().unwrap();
+            if full {
+                teams.set_mcp_access_mode(&user.tenant, "full").unwrap();
+            }
+            let docbrain_dir = tempfile::tempdir().unwrap();
+            let app = build_router(store, secrets, None, None, None, docbrain_dir.path().to_path_buf(), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
+
+            let mut req = mcp_request("tools/list", json!({}), 1);
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let body = body_json(app.clone().oneshot(req).await.unwrap()).await;
+            let names: Vec<&str> = body["result"]["tools"].as_array().unwrap().iter().filter_map(|t| t["name"].as_str()).collect();
+            for gated in ["unregister_repo", "scrape_library", "sync_changelogs"] {
+                assert_eq!(names.contains(&gated), full, "full={full}, {gated} listed: {names:?}");
+            }
+            assert!(names.contains(&"register_library"), "register_library stays available in every mode");
+
+            let calls = [("unregister_repo", json!({ "id": "nope" })), ("scrape_library", json!({ "slug": "nope", "version": "1" })), ("sync_changelogs", json!({ "slug": "nope" }))];
+            for (i, (name, arguments)) in calls.into_iter().enumerate() {
+                let mut req = mcp_request("tools/call", json!({ "name": name, "arguments": arguments }), i as i64 + 2);
+                req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+                let body = body_json(app.clone().oneshot(req).await.unwrap()).await;
+                let text = body["result"]["content"][0]["text"].as_str().unwrap_or_default();
+                assert_eq!(text.contains("requires Full access mode"), !full, "full={full}, {name}: {body:?}");
+            }
+        }
+    }
+
     /// MCP-side companion to `agentops-api::search`'s
     /// `fifty_four_concurrent_curation_requests_all_succeed_against_a_shared_postgres_pool`
     /// -- the original production incident was specifically a REST/dashboard
@@ -2883,9 +2870,8 @@ mod tests {
 
     /// Regression test for a real deploy-time incident: `build_full_router`
     /// is `async` and gets `.await`ed from inside an already-running Tokio
-    /// runtime in production (`agentops-server::run`, this crate's own
-    /// `run`) -- every other test in this file calls `build_router`/
-    /// `build_router_without_tools` with no `AGENTOPS_DATABASE_URL` set, so
+    /// runtime in production (`agentops-server::run`) -- every other test
+    /// in this file calls `build_router` with no `AGENTOPS_DATABASE_URL` set, so
     /// none of them exercised the Postgres-connect path from within an
     /// async context. The first version of the Postgres pool/batching plan
     /// connected internally inside `build_router_with_tools_flag` (a sync

@@ -1,8 +1,8 @@
 # SQLite lives under AGENTOPS_DATA_DIR (default ~/.agentops, i.e. /root/.agentops
-# in this image) -- persists across pod restarts. Since SQLite doesn't
-# support concurrent multi-writer access, this only works with
-# deployment.yaml's replicas: 1; scale beyond that only after switching to
-# Postgres (see postgres-statefulset.yaml) for the code-graph store.
+# in this image) -- persists across pod restarts. ReadWriteOnce, for
+# deployment.yaml's replicas: 1. Switching the code graph to Postgres
+# (postgres-statefulset.yaml) does not change that: the other stores and
+# the repo checkouts still live on this volume.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:

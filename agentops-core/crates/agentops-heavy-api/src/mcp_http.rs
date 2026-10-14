@@ -28,7 +28,9 @@
 //! `agentops_mcp::call_tool`. This is what stops a remote caller from
 //! probing arbitrary paths on the server's filesystem.
 //! The same rule covers other path-like arguments: `HOSTED_FORBIDDEN_ARGS`
-//! (currently `notes_path`) is refused outright.
+//! (currently `notes_path`) is refused outright when a caller sends it. For
+//! the note tools the server then sets `notes_path` itself, to the
+//! connection's notes folder outside its checkout.
 //!
 //! **No role check here, by design**: any authenticated member of the org
 //! may call every tool its access mode allows, including knowledge writes,
@@ -103,9 +105,19 @@ const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 /// would treat them as literal server filesystem paths. See the check in
 /// `handle_tools_call`.
 const HOSTED_FORBIDDEN_ARGS: &[&str] = &["notes_path"];
+/// Core tools whose `notes_path` the server sets to the connection's notes
+/// folder (`indexing::notes_dir_for_checkout`).
+const NOTES_TOOLS: &[&str] = &["add_note", "ingest_notes", "init_agents_md"];
+/// Tools outside `agentops-mcp`'s own access table that hosted `/mcp` serves
+/// only in Full mode (author decision, 2026-10-13): `unregister_repo` is
+/// destructive, and scraping and changelog sync fetch from the network on
+/// the shared server. Hosted only -- a local stdio server belongs to its
+/// user, and the web Libraries page gates by the `libraries.manage`
+/// capability instead.
+const HOSTED_FULL_ONLY_TOOLS: &[&str] = &["unregister_repo", "scrape_library", "sync_changelogs"];
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-const INTERNAL_ERROR: i64 = -32603;
+const PARSE_ERROR: i64 = -32700;
 
 #[derive(Deserialize)]
 pub(crate) struct JsonRpcRequest {
@@ -129,7 +141,7 @@ fn err(id: Value, code: i64, message: impl Into<String>) -> Value {
 pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, State(state): State<AppState>, body: Result<Json<JsonRpcRequest>, axum::extract::rejection::JsonRejection>) -> Response {
     let Json(request) = match body {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, Json(err(Value::Null, INTERNAL_ERROR, format!("parse error: {e}")))).into_response(),
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(err(Value::Null, PARSE_ERROR, format!("parse error: {e}")))).into_response(),
     };
     let Some(id) = request.id else {
         return StatusCode::ACCEPTED.into_response();
@@ -145,7 +157,8 @@ pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, Stat
             }),
         ),
         "tools/list" => {
-            let mut tools = agentops_mcp::list_tools(resolve_access_mode(&state, &caller.tenant));
+            let mode = resolve_access_mode(&state, &caller.tenant);
+            let mut tools = agentops_mcp::list_tools(mode);
             tools.push(register_repo_tool_definition());
             tools.push(unregister_repo_tool_definition());
             // `docbrain_mcp::ToolDefinition` is a structurally similar but
@@ -155,6 +168,9 @@ pub(crate) async fn mcp_handler(Extension(caller): Extension<TenantCaller>, Stat
             // across the two crates.
             let mut tools: Vec<Value> = tools.into_iter().map(|t| serde_json::to_value(t).unwrap()).collect();
             tools.extend(docbrain_mcp::list_tools().into_iter().map(|t| serde_json::to_value(t).unwrap()));
+            if mode == agentops_mcp::AccessMode::Advisor {
+                tools.retain(|t| !t["name"].as_str().is_some_and(|n| HOSTED_FULL_ONLY_TOOLS.contains(&n)));
+            }
             ok(id, json!({ "tools": tools }))
         }
         "tools/call" => handle_tools_call(&state, &caller, id, &request.params).await,
@@ -239,6 +255,11 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     };
     let empty = json!({});
     let mut arguments = params.get("arguments").cloned().unwrap_or(empty);
+    let mode = resolve_access_mode(state, &caller.tenant);
+    if mode == agentops_mcp::AccessMode::Advisor && HOSTED_FULL_ONLY_TOOLS.contains(&name) {
+        let message = format!("tool '{name}' requires Full access mode; an org admin can switch the org to Full on the Team page.");
+        return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": true }));
+    }
 
     if name == "register_repo" {
         let repo_url = arguments.get("repo_url").and_then(|v| v.as_str());
@@ -278,6 +299,16 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
         match resolve_connection_path(state, &caller.tenant, &connection_ref) {
             Ok(resolved) => {
                 arguments["path"] = json!(resolved.display().to_string());
+                // Server-set, never caller-set (refused above): the
+                // connection's notes folder outside its checkout, which
+                // indexing deletes and re-clones on every job.
+                if NOTES_TOOLS.contains(&name) {
+                    let notes_dir = crate::indexing::notes_dir_for_checkout(&resolved);
+                    if let Err(e) = std::fs::create_dir_all(&notes_dir) {
+                        return ok(id, json!({ "content": [{ "type": "text", "text": format!("creating the notes folder: {e}") }], "isError": true }));
+                    }
+                    arguments["notes_path"] = json!(notes_dir.display().to_string());
+                }
             }
             Err(message) => {
                 return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": true }));
@@ -297,7 +328,6 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
     // pool instead of connecting fresh. See that function's own doc
     // comment for the real incident (concurrent `/mcp` calls deadlocking
     // Postgres) this fixes.
-    let mode = resolve_access_mode(state, &caller.tenant);
     let name = name.to_string();
     let pg_store = state.pg_store.clone();
     let call_result = tokio::task::spawn_blocking(move || agentops_mcp::with_shared_postgres_store(pg_store.as_ref(), || agentops_mcp::call_tool(mode, &name, &arguments))).await;

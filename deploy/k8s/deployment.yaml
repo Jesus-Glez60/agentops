@@ -1,7 +1,9 @@
 # One image, both processes (pm2-runtime + ecosystem.config.js -- see the
-# repo-root Dockerfile). replicas: 1 is load-bearing with the default
-# SQLite backend; only raise it once AGENTOPS_DATABASE_URL points at
-# Postgres (see postgres-statefulset.yaml).
+# repo-root Dockerfile). replicas: 1 is load-bearing, Postgres or not:
+# AGENTOPS_DATABASE_URL moves only the code graph to Postgres. Accounts,
+# teams, integrations, repo connections, indexing jobs, docbrain and the
+# repo checkouts stay on this pod's volume, and auth rate limits are kept
+# in process memory, so a second replica would see different data.
 apiVersion: apps/v1
 kind: Deployment
 metadata:

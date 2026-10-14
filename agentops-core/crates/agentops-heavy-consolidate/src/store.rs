@@ -2,14 +2,14 @@
 //! CLS-inspired retrieval plan) -- deliberately mirrors
 //! `agentops-embeddings-train::ProjectionStore`'s exact shape (versioned
 //! `safetensors` + a plain "active" pointer file under
-//! `~/.agentops/models/{repo}/`), just with its own filename prefix so the
+//! `$AGENTOPS_DATA_DIR/models/{repo}/`), just with its own filename prefix so the
 //! two initiatives' artifacts coexist in the same per-repo directory
 //! without colliding.
 
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_nn::VarMap;
 
 pub struct AdapterStore {
@@ -18,8 +18,7 @@ pub struct AdapterStore {
 
 impl AdapterStore {
     pub fn open(repo: &str) -> Result<Self> {
-        let base = std::env::var_os("HOME").map(PathBuf::from).context("resolving home directory for ~/.agentops/models")?;
-        let dir = base.join(".agentops").join("models").join(repo);
+        let dir = agentops_manifest::agentops_data_dir().join("models").join(repo);
         fs::create_dir_all(&dir)?;
         Ok(Self { dir })
     }

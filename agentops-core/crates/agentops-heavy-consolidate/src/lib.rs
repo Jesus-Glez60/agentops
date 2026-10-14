@@ -87,7 +87,7 @@ pub fn consolidate_model(store: &dyn GraphStore, repo: &str) -> Result<ModelCons
     let candidate_score = eval::evaluate(&mut candidate_model, &tokenizer, &LocalEmbedder, &held_out, eos_token_id, eval::DEFAULT_MAX_NEW_TOKENS)?;
 
     let version = adapter_store.save_new_version(candidate_model.adapter_varmap())?;
-    let promoted = candidate_score >= baseline_score;
+    let promoted = should_promote(candidate_score, baseline_score);
     if promoted {
         adapter_store.promote(version)?;
     }
@@ -100,16 +100,29 @@ pub fn consolidate_model(store: &dyn GraphStore, repo: &str) -> Result<ModelCons
         baseline_score,
         promoted_version: promoted.then_some(version),
         reason: if promoted {
-            format!("promoted v{version}: candidate score {candidate_score:.3} >= baseline {baseline_score:.3}")
+            format!("promoted v{version}: candidate score {candidate_score:.3} > baseline {baseline_score:.3}")
         } else {
-            format!("kept previous version: candidate score {candidate_score:.3} regressed vs. baseline {baseline_score:.3}")
+            format!("kept previous version: candidate score {candidate_score:.3} did not improve on baseline {baseline_score:.3}")
         },
     })
+}
+
+/// A candidate adapter replaces the active one only when it scores strictly
+/// higher: a tie means no measured gain (author decision, 2026-10-13).
+fn should_promote(candidate: f64, baseline: f64) -> bool {
+    candidate > baseline
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tie_does_not_promote_only_a_strict_improvement_does() {
+        assert!(!should_promote(0.5, 0.5));
+        assert!(!should_promote(0.4, 0.5));
+        assert!(should_promote(0.51, 0.5));
+    }
 
     #[test]
     fn consolidate_model_skips_gracefully_with_too_few_examples() {

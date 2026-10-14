@@ -382,7 +382,7 @@ fn require_capability(teams: &TeamStore, tenant: &str, user_id: i64, capability:
 /// Requires the caller to be `tenant`'s Owner -- stricter than
 /// `require_admin`, used only for the handful of actions the Owner role
 /// exists specifically to gate (acting on another admin, ownership
-/// transfer, org deletion, billing).
+/// transfer, org deletion).
 fn require_owner(teams: &TeamStore, tenant: &str, user_id: i64) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     match teams.owner_user_id(tenant) {
         Ok(Some(owner_id)) if owner_id == user_id => Ok(()),
@@ -527,7 +527,7 @@ struct TransferOwnershipRequest {
 
 /// Owner-only -- the target must be an active admin (transferring
 /// ownership to a non-admin would leave the org with an Owner who can't do
-/// anything an Owner is meant to gate, and a viewer/member/billing role
+/// anything an Owner is meant to gate, and a viewer/member role
 /// isn't trusted with member management to begin with). A single
 /// `set_owner` call, atomic within `teams.sqlite`.
 async fn transfer_ownership(
@@ -629,6 +629,7 @@ async fn delete_organization(
                 if let Err(e) = crate::indexing::wipe_connection_graph(&pg, &repo_checkouts_dir, &tenant, id) {
                     eprintln!("org deletion: failed to wipe graph data for {tenant}/{id}: {e}");
                 }
+                crate::indexing::remove_connection_notes(&repo_checkouts_dir, &tenant, id);
             }
         })
         .await;
@@ -995,7 +996,7 @@ struct SaveRepoAccessRequest {
 
 /// Admin-only, matching every other team-mutation endpoint. Only writes
 /// overrides for members whose role is actually override-editable
-/// (member/viewer) -- a diff submitted for an admin or billing row is
+/// (member/viewer) -- a diff submitted for an admin row is
 /// silently ignored rather than erroring, since the frontend's own
 /// disabled checkboxes should never produce one, but a stale/replayed
 /// request shouldn't be able to defeat the "admin always has full access"
@@ -2109,15 +2110,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_repo_access_applies_role_defaults_admin_and_billing_are_not_editable() {
+    async fn get_repo_access_applies_role_defaults_and_admin_is_not_editable() {
         let accounts = AccountStore::open_in_memory().unwrap();
         let (admin, admin_token) = signup_user(&accounts, "admin@example.com");
         let (member, _) = signup_user(&accounts, "member@example.com");
-        let (biller, _) = signup_user(&accounts, "biller@example.com");
         let teams = TeamStore::open_in_memory().unwrap();
         teams.add_member(&admin.tenant, admin.id, "admin").unwrap();
         teams.add_member(&admin.tenant, member.id, "member").unwrap();
-        teams.add_member(&admin.tenant, biller.id, "billing").unwrap();
         let repos = ConnectionStore::open_in_memory().unwrap();
         seed_repo(&repos, &admin.tenant, "repo-1");
         let app = build_team_router(accounts, teams, repos, CredentialStore::open_in_memory().unwrap(), PathBuf::from("unused-docbrain-dir"));
@@ -2130,10 +2129,6 @@ mod tests {
         let admin_cell = cells.iter().find(|c| c["user_id"] == admin.id).unwrap();
         assert_eq!(admin_cell["allowed"], true);
         assert_eq!(admin_cell["editable"], false, "admin access is not override-editable");
-
-        let biller_cell = cells.iter().find(|c| c["user_id"] == biller.id).unwrap();
-        assert_eq!(biller_cell["allowed"], false);
-        assert_eq!(biller_cell["editable"], false, "billing access is not override-editable");
 
         let member_cell = cells.iter().find(|c| c["user_id"] == member.id).unwrap();
         assert_eq!(member_cell["allowed"], true, "member defaults to allowed");

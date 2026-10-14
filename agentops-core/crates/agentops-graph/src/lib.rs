@@ -82,6 +82,15 @@ impl NodeKind {
             _ => NodeKind::Symbol,
         }
     }
+
+    /// Strict, case-insensitive parse of a caller-supplied kind filter
+    /// (`as_db_str` names): `None` for anything unknown, unlike
+    /// `from_db_str`'s fallback. The one parser every kind filter uses, so
+    /// a new variant cannot again be left out of some of them (finding F19).
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.to_ascii_lowercase();
+        [NodeKind::Symbol, NodeKind::File, NodeKind::Gotcha, NodeKind::Decision, NodeKind::Definition, NodeKind::Note, NodeKind::DocSection, NodeKind::ToolOutput].into_iter().find(|k| k.as_db_str() == s)
+    }
 }
 
 /// Curation state for a `Gotcha` node's `prominence` field -- same
@@ -201,7 +210,13 @@ impl EdgeRelation {
             "affects" => EdgeRelation::Affects,
             "references" => EdgeRelation::References,
             "covers" => EdgeRelation::Covers,
-            _ => EdgeRelation::DependsOn,
+            "depends_on" => EdgeRelation::DependsOn,
+            other => {
+                // Kept as a fallback, since old rows may hold retired names,
+                // but no longer silent.
+                eprintln!("warning: unknown edge relation {other:?} in the store; reading it as depends_on");
+                EdgeRelation::DependsOn
+            }
         }
     }
 }
@@ -522,7 +537,7 @@ impl TaskStatus {
 }
 
 /// Module 7 (1.0 roadmap): AgentOps's own native task state, not just an
-/// activity tag — see `~/Vaults/agentops-vnext/decisions/hybrid-task-manager-linear.md`.
+/// activity tag.
 /// `external_source`/`external_id` are both `None` for a native task;
 /// `Some("linear")`/`Some(<issue id>)` for one pulled from Linear —
 /// `(external_source, external_id)` is the natural key a Linear-sync upsert
@@ -1306,6 +1321,15 @@ pub fn prune_stale_nodes(store: &dyn GraphStore, repo: &str, kind: NodeKind, kee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_kind_parse_accepts_every_kind_and_rejects_unknown_ones() {
+        for kind in [NodeKind::Symbol, NodeKind::File, NodeKind::Gotcha, NodeKind::Decision, NodeKind::Definition, NodeKind::Note, NodeKind::DocSection, NodeKind::ToolOutput] {
+            assert_eq!(NodeKind::parse(kind.as_db_str()), Some(kind));
+            assert_eq!(NodeKind::parse(&kind.as_db_str().to_uppercase()), Some(kind));
+        }
+        assert_eq!(NodeKind::parse("nonsense"), None);
+    }
 
     #[test]
     fn edge_relation_db_str_round_trips_for_every_variant() {

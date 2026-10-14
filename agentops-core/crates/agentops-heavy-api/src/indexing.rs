@@ -117,6 +117,37 @@ pub(crate) fn checkout_path(repo_checkouts_dir: &std::path::Path, tenant: &str, 
     repo_checkouts_dir.join(format!("{connection_id}--{tenant}"))
 }
 
+/// Where a hosted connection's note files live: `<checkouts>/.notes/<name>`,
+/// beside the checkout rather than inside it, because every indexing job
+/// deletes and re-clones the checkout. `.notes` cannot collide with a
+/// checkout, since every checkout name ends in `--<tenant>`. Indexing points
+/// the checkout's `.agentops/config.json` here so `persist` re-matches
+/// these notes on every scan; hosted `/mcp` passes it as `notes_path`.
+pub(crate) fn notes_dir_for_checkout(checkout: &std::path::Path) -> PathBuf {
+    let name = checkout.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    checkout.parent().unwrap_or(checkout).join(".notes").join(name)
+}
+
+/// Creates the checkout's notes folder and records it in the checkout's
+/// `.agentops/config.json`, which `agentops_notes::resolve_notes_path`
+/// reads. Run after every clone, since the clone has no config.
+pub(crate) fn point_checkout_at_notes(checkout: &std::path::Path) -> anyhow::Result<()> {
+    let notes_dir = notes_dir_for_checkout(checkout);
+    std::fs::create_dir_all(&notes_dir)?;
+    agentops_notes::write_notes_path(checkout, &notes_dir.display().to_string())
+}
+
+/// Removes a connection's note files. Notes recorded through it stay in
+/// the graph; only the files that feed re-matching go.
+pub(crate) fn remove_connection_notes(repo_checkouts_dir: &std::path::Path, tenant: &str, connection_id: &str) {
+    let dir = notes_dir_for_checkout(&checkout_path(repo_checkouts_dir, tenant, connection_id));
+    if dir.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            eprintln!("removing notes folder {}: {e}", dir.display());
+        }
+    }
+}
+
 /// Deletes every Postgres graph row (nodes, session events/usage, LLM
 /// spend, ...) for one tenant's connection, via `PostgresGraphStore::
 /// wipe_repo` under the same repo name every other store lookup derives
@@ -146,11 +177,11 @@ fn new_random_job_id() -> String {
 /// for the job to finish.
 pub fn create_and_spawn_job(deps: &IndexingDeps, tenant: String, connection: RepoConnection, kind: JobKind) -> anyhow::Result<String> {
     let local_path = checkout_path(&deps.repo_checkouts_dir, &tenant, &connection.id);
-    // Pre-clone: this equals connection.id today (see checkout_path's doc
-    // comment) -- computed via the same derivation `agentops_mcp::scan::
-    // repo_name()` will independently arrive at post-clone, not by calling
-    // that function on a path that doesn't exist yet.
-    let repo_name = connection.id.clone();
+    // Pre-clone: the checkout directory's own name, which is what
+    // `agentops_mcp::scan::repo_name()` derives post-clone and so the key
+    // every row `persist` writes is stored under -- not `connection.id`,
+    // which stages 7-8 used to query and found nothing under (gotcha 54242).
+    let repo_name = format!("{}--{tenant}", connection.id);
 
     let job_id = new_random_job_id();
     {
@@ -286,6 +317,11 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
             fail_and_return!(STAGE_ORDER[1], format!("checking out branch {branch:?}: {e}"));
         }
     }
+    // Notes live outside the checkout (deleted above on every job); point
+    // the fresh clone at them so `persist` re-matches them below.
+    if let Err(e) = point_checkout_at_notes(&local_path) {
+        fail_and_return!(STAGE_ORDER[1], format!("pointing the checkout at its notes folder: {e}"));
+    }
     finish_stage!(STAGE_ORDER[1], None, None);
 
     // Stage 3: files discovered.
@@ -317,6 +353,9 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
     // this task with no `Err` ever returned, so `indexing_jobs` is left at
     // `status = 'running'` forever with no failure recorded, looking
     // exactly like a hang.
+    // Ranked once here for stage 8, which used to re-scan the whole repo
+    // just to recompute this.
+    let ranked: Vec<PathBuf> = agentops_scanner::rank_files(&local_path, &report.files).into_iter().map(|(p, _)| p).collect();
     let local_path_for_blocking = local_path.clone();
     let persist_result = match tokio::task::spawn_blocking(move || agentops_mcp::scan::persist(&local_path_for_blocking, &report, false)).await {
         Ok(v) => v,
@@ -349,19 +388,18 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
             finish_stage!(STAGE_ORDER[6], Some(0), Some(0));
         }
         Some(search_index) => {
-            let items = {
-                let db_path = agentops_mcp::scan::graph_db_path(&local_path);
-                match agentops_graph::SqliteGraphStore::open(&db_path) {
-                    Ok(graph_store) => match agentops_heavy_embeddings::collect_index_items(&graph_store, &repo_name) {
-                        Ok(items) => Some(items),
-                        Err(e) => {
-                            fail_and_return!(STAGE_ORDER[6], format!("collecting items to embed: {e}"));
-                        }
-                    },
-                    Err(e) => {
-                        fail_and_return!(STAGE_ORDER[6], format!("opening graph store: {e}"));
-                    }
-                }
+            // The same store `persist` just wrote to (Postgres when
+            // configured), in `spawn_blocking` for the reason given above.
+            let (path, repo) = (local_path.clone(), repo_name.clone());
+            let collected = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let graph_store = agentops_mcp::open_store(&path)?;
+                agentops_heavy_embeddings::collect_index_items(graph_store.as_ref(), &repo)
+            })
+            .await;
+            let items = match collected {
+                Ok(Ok(items)) => Some(items),
+                Ok(Err(e)) => fail_and_return!(STAGE_ORDER[6], format!("collecting items to embed: {e}")),
+                Err(e) => fail_and_return!(STAGE_ORDER[6], format!("embedding task panicked: {e}")),
             };
             if let Some(items) = items {
                 let mut index = search_index.lock().await;
@@ -384,7 +422,9 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
     // (which needs an external docs URL most freshly-connected code repos
     // won't have).
     start_stage!(STAGE_ORDER[7]);
-    match generate_onboarding_doc(&local_path, &repo_name) {
+    let (path, repo) = (local_path.clone(), repo_name.clone());
+    let doc_result = tokio::task::spawn_blocking(move || generate_onboarding_doc(&path, &repo, &ranked)).await.unwrap_or_else(|e| Err(anyhow::anyhow!("documentation task panicked: {e}")));
+    match doc_result {
         Ok(out_path) => {
             log!("wrote {}", out_path.display());
             finish_stage!(STAGE_ORDER[7], None, None);
@@ -415,15 +455,12 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
 
 /// Mirrors `agentops-mcp::docgen::generate_docs` (private to that crate, so
 /// reimplemented here rather than exposed cross-crate for one call site) --
-/// re-scans read-only purely to recompute the PageRank file ordering
-/// (deliberately not persisted anywhere, cheap to recompute), then renders
-/// and writes `repo-map.md` under the checkout.
-fn generate_onboarding_doc(repo_path: &std::path::Path, repo_name: &str) -> anyhow::Result<PathBuf> {
-    let db_path = agentops_mcp::scan::graph_db_path(repo_path);
-    let store = agentops_graph::SqliteGraphStore::open(&db_path)?;
-    let report = agentops_scanner::scan_repo(repo_path)?;
-    let ranked: Vec<PathBuf> = agentops_scanner::rank_files(repo_path, &report.files).into_iter().map(|(p, _)| p).collect();
-    let doc = agentops_docgen::render_onboarding_doc(&store, repo_name, &ranked)?;
+/// renders from the configured store (Postgres when set, like `persist`)
+/// using the PageRank ordering the job already computed, then writes
+/// `repo-map.md` under the checkout. Blocking: call from `spawn_blocking`.
+fn generate_onboarding_doc(repo_path: &std::path::Path, repo_name: &str, ranked: &[PathBuf]) -> anyhow::Result<PathBuf> {
+    let store = agentops_mcp::open_store(repo_path)?;
+    let doc = agentops_docgen::render_onboarding_doc(store.as_ref(), repo_name, ranked)?;
     let out_path = repo_path.join("repo-map.md");
     agentops_docgen::write_to_file(&doc, &out_path)?;
     Ok(out_path)
@@ -569,6 +606,76 @@ pub async fn retry_indexing(State(state): State<AppState>, user: Option<axum::Ex
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Hosted notes used to live inside the checkout, which every job
+    // deletes, so they were matched to symbols only once (and never, if
+    // written before the first index).
+    #[test]
+    fn hosted_notes_outside_the_checkout_are_rematched_on_every_reindex() {
+        use agentops_graph::{EdgeRelation, NodeKind};
+        let dir = tempfile::tempdir().unwrap();
+        let path = checkout_path(&dir.path().join("repo-checkouts"), "tenant-a", "repo-1");
+        let notes_dir = notes_dir_for_checkout(&path);
+        assert!(!notes_dir.starts_with(&path), "the notes folder must not be inside the checkout");
+
+        // Written before the repo was ever indexed, as an early add_note is.
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("token-bug.md"), "---\ntitle: \"Token bug\"\ntype: gotcha\n---\n\nverify_token has a known workaround.\n").unwrap();
+
+        for _ in 0..2 {
+            // What each indexing job does: a fresh clone, then persist.
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+            point_checkout_at_notes(&path).unwrap();
+            let report = agentops_scanner::scan_repo(&path).unwrap();
+            agentops_mcp::scan::persist(&path, &report, false).unwrap();
+
+            let store = agentops_mcp::open_store(&path).unwrap();
+            let repo = agentops_mcp::repo_name(&path);
+            let gotcha = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().next().expect("the note must be ingested");
+            let edges: Vec<_> = store.edges_from(&repo, gotcha.id).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::Affects).collect();
+            assert_eq!(edges.len(), 1, "the note must be attached to verify_token after each reindex: {edges:?}");
+        }
+        assert!(notes_dir.join("token-bug.md").exists(), "the note file must survive the reindexes");
+    }
+
+    #[test]
+    fn removing_a_connections_notes_deletes_its_notes_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkouts = dir.path().join("repo-checkouts");
+        let notes_dir = notes_dir_for_checkout(&checkout_path(&checkouts, "tenant-a", "repo-1"));
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("n.md"), "x").unwrap();
+        remove_connection_notes(&checkouts, "tenant-a", "repo-1");
+        assert!(!notes_dir.exists());
+    }
+
+    // Stages 7-8 used to query the graph under `connection.id` while
+    // `persist` stored rows under the checkout directory's name
+    // (`<connection_id>--<tenant>`), so both stages silently found nothing.
+    #[test]
+    fn the_embedding_and_docs_stages_read_the_rows_persist_wrote_under_the_tenant_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkouts = dir.path().join("repo-checkouts");
+        let path = checkout_path(&checkouts, "tenant-a", "repo-1");
+        std::fs::create_dir_all(path.join("src")).unwrap();
+        std::fs::write(path.join("src/lib.rs"), "pub fn distinctive_symbol_name() {}\n").unwrap();
+
+        let report = agentops_scanner::scan_repo(&path).unwrap();
+        let ranked: Vec<PathBuf> = agentops_scanner::rank_files(&path, &report.files).into_iter().map(|(p, _)| p).collect();
+        agentops_mcp::scan::persist(&path, &report, false).unwrap();
+
+        // The same key `create_and_spawn_job` now hands `run_job`.
+        let repo_name = "repo-1--tenant-a";
+        let store = agentops_mcp::open_store(&path).unwrap();
+        let items = agentops_heavy_embeddings::collect_index_items(store.as_ref(), repo_name).unwrap();
+        assert!(!items.is_empty(), "stage 7 must find the nodes persist wrote");
+
+        let out = generate_onboarding_doc(&path, repo_name, &ranked).unwrap();
+        let doc = std::fs::read_to_string(out).unwrap();
+        assert!(!doc.contains("- Symbols indexed: 0\n"), "stage 8's doc must describe the persisted graph, got:\n{doc}");
+    }
 
     // Regression test for a real, confirmed bug: `checkout_path` used to
     // build a two-level `<tenant>/<connection_id>` directory, but

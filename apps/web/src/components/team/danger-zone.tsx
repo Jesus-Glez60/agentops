@@ -59,7 +59,7 @@ function TransferOwnershipRow({ admins }: { admins: TeamMember[] }) {
     <div className="flex items-center justify-between gap-4 px-6 py-4">
       <div className="min-w-0">
         <p className="text-body font-medium text-ink-100">Transfer Ownership</p>
-        <p className="text-mono-code text-ink-500">Hand off Owner-only controls (billing, org deletion, admin management) to another admin.</p>
+        <p className="text-mono-code text-ink-500">Hand off Owner-only controls (org deletion, admin management) to another admin.</p>
       </div>
       <Dialog
         open={open}

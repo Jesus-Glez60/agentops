@@ -23,6 +23,14 @@ pub struct DocPage {
     pub generated_at: String,
     pub node_count: i64,
     pub sections: Vec<DocSection>,
+    /// SHA-256 of the sorted ranked file paths the module labels were
+    /// computed from, and those labels. `agentops-mcp`'s `persist_doc_page`
+    /// reuses the labels while the hash matches, instead of paying for an
+    /// LLM call on every scan. Absent on pages saved before this existed.
+    #[serde(default)]
+    pub module_set_hash: Option<String>,
+    #[serde(default)]
+    pub module_labels: Vec<agentops_graph::ModuleLabel>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +212,8 @@ mod tests {
                     DocBlock::KnowledgeCallout { kind: NodeKind::Note, node_id: 7, title: "Our PRD".into(), body: "Status: Accepted".into(), affects: String::new(), source: None },
                 ],
             }],
+            module_set_hash: None,
+            module_labels: Vec::new(),
         };
         let json = serde_json::to_string(&page).unwrap();
         let round_tripped: DocPage = serde_json::from_str(&json).unwrap();

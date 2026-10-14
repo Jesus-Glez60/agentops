@@ -30,10 +30,9 @@ pub fn has_capability(teams: &TeamStore, tenant: &str, user_id: i64, capability:
 }
 
 /// A role's *default* repo access before any per-user override is applied
-/// -- admin and billing aren't override-editable at all (admin always has
-/// full access, billing never does), matching the Team Management
-/// mockup's disabled checkboxes for those two rows. Member/viewer default
-/// to allowed, overridable per user per repo.
+/// -- admin isn't override-editable at all (it always has full access),
+/// matching the Team Management mockup's disabled checkbox for that row.
+/// Member/viewer default to allowed, overridable per user per repo.
 ///
 /// Relocated from `agentops-heavy-api/src/team.rs` (pure move, unchanged
 /// behavior): both `/team/repo-access` and the session-authed `/repos`
@@ -43,7 +42,6 @@ pub fn has_capability(teams: &TeamStore, tenant: &str, user_id: i64, capability:
 pub fn role_default_repo_access(role: &str) -> (bool, bool) {
     match role {
         "admin" => (true, false),
-        "billing" => (false, false),
         _ => (true, true),
     }
 }
@@ -122,7 +120,6 @@ mod tests {
     #[test]
     fn role_default_repo_access_matches_the_mockups_disabled_rows() {
         assert_eq!(role_default_repo_access("admin"), (true, false));
-        assert_eq!(role_default_repo_access("billing"), (false, false));
         assert_eq!(role_default_repo_access("member"), (true, true));
         assert_eq!(role_default_repo_access("viewer"), (true, true));
     }
@@ -135,9 +132,6 @@ mod tests {
 
         store.set_repo_override("tenant-a", 1, "repo-1", false).unwrap();
         assert!(!effective_repo_access(&store, "tenant-a", 1, "repo-1").unwrap(), "explicit override wins");
-
-        store.add_member("tenant-a", 2, "billing").unwrap();
-        assert!(!effective_repo_access(&store, "tenant-a", 2, "repo-1").unwrap(), "billing defaults to no access");
     }
 
     #[test]

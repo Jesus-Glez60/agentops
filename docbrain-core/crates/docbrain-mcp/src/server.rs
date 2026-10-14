@@ -5,14 +5,14 @@ use std::path::Path;
 use docbrain_graph::DocbrainStore;
 use serde_json::{json, Value};
 
-use crate::protocol::{CallToolResult, JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS, MCP_PROTOCOL_VERSION, METHOD_NOT_FOUND};
+use crate::protocol::{CallToolResult, JsonRpcRequest, JsonRpcResponse, INVALID_PARAMS, PARSE_ERROR, MCP_PROTOCOL_VERSION, METHOD_NOT_FOUND};
 use crate::tools;
 
 pub fn handle_message(store: &dyn DocbrainStore, db_path: &Path, raw: &str) -> Option<String> {
     let request: JsonRpcRequest = match serde_json::from_str(raw) {
         Ok(r) => r,
         Err(e) => {
-            let resp = JsonRpcResponse::err(Value::Null, INTERNAL_ERROR, format!("parse error: {e}"));
+            let resp = JsonRpcResponse::err(Value::Null, PARSE_ERROR, format!("parse error: {e}"));
             return Some(serde_json::to_string(&resp).unwrap());
         }
     };

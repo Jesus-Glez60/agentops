@@ -1,8 +1,8 @@
-import { Crown, User, Eye, CreditCard } from "lucide-react";
+import { Crown, User, Eye } from "lucide-react";
 import type { RoleInfo, MemberRole } from "@/lib/api/team-api";
 import { Card, CardContent } from "@/components/ui/card";
 
-const ROLE_ICONS: Record<MemberRole, typeof Crown> = { admin: Crown, member: User, viewer: Eye, billing: CreditCard };
+const ROLE_ICONS: Record<MemberRole, typeof Crown> = { admin: Crown, member: User, viewer: Eye };
 
 export function RoleCard({ role }: { role: RoleInfo }) {
   const Icon = ROLE_ICONS[role.role];

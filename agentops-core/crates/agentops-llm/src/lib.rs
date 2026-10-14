@@ -1,8 +1,11 @@
 //! On-demand LLM interpretation of scanned code (Anthropic Messages API),
 //! stored as `Definition` nodes edge-connected to the symbol they explain
-//! via `EdgeRelation::Documents`. Deliberately never called automatically
-//! during a scan — `explain_symbol` is opt-in, triggered per-symbol by an
-//! agent/CLI, not a step `scan_and_persist` runs on every file.
+//! via `EdgeRelation::Documents`. `explain_symbol` is opt-in, triggered
+//! per-symbol by an agent/CLI, never per file during a scan. One call does
+//! run from a scan when an API key is set: `group_core_modules`, which
+//! labels the Documentation Viewer's modules (`agentops-mcp`'s
+//! `persist_doc_page`). It is skipped while the scanned file set is
+//! unchanged, so repeat scans reuse the stored labels.
 //!
 //! Also owns the two LLM-assisted adapters for `agentops-notes`' ports:
 //! `LlmAssistedMatcher` (`SymbolMatcher`) and `LlmAssistedClassifier`
@@ -27,7 +30,8 @@ pub use usage::{LlmCallRecord, LlmErrorKind, LlmUsageSink, UsageRecorder};
 
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
-const DEFAULT_MODEL: &str = "claude-sonnet-5";
+/// Current Sonnet id (`claude-sonnet-5` is not one; finding F21).
+const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
 /// Cheap tier for automated calls with no direct human reader of the raw
 /// output (note classification/symbol matching) — see
 /// `AnthropicConfig::from_env_cheap`.

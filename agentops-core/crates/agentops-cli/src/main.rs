@@ -46,9 +46,10 @@ enum Command {
         /// default.
         #[arg(long)]
         with_embeddings: bool,
-        /// Also runs an opt-in rust-analyzer-backed macro-expansion pass,
-        /// adding symbols for item-level macro invocations (`foo!(...);`)
-        /// Tree-sitter itself can never see through. Best-effort: degrades
+        /// Also runs an opt-in rust-analyzer pass: macro expansion, adding
+        /// symbols for item-level macro invocations (`foo!(...);`)
+        /// Tree-sitter itself can never see through, and cross-file
+        /// `References` edges from `textDocument/references`. Best-effort: degrades
         /// silently to nothing if `rust-analyzer` isn't installed (`rustup
         /// component add rust-analyzer`) or a given invocation doesn't
         /// expand (e.g. a `#[derive(...)]`, confirmed not supported by this
@@ -800,15 +801,17 @@ fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result
         println!("doc_page: copied");
     }
 
-    // --- session_events (no node_id column — nothing to remap) ---
-    // `GraphStore` has no bulk "all sessions for repo" accessor, so pull
-    // distinct session ids directly out of tasks (the only other place a
-    // session_id shows up) is not viable either — sessions unlinked from any
-    // task aren't otherwise discoverable via the trait. This is a known,
-    // accepted gap: session activity is a supplementary cross-tool feed (6
-    // rows locally), not part of the core knowledge this migration exists
-    // to preserve.
-    println!("session_events: skipped (no bulk-read accessor on GraphStore; see comment)");
+    // --- session_events (node_id remapped) ---
+    // These rows include the knowledge-reuse "hit" events the usage
+    // dashboard counts, so they are copied rather than skipped. Their
+    // original `created_at` is lost: `record_session_event` stamps the
+    // current time on both backends, and the trait has no way to set it.
+    let events = src.session_events_for_repo(repo, None)?;
+    for e in &events {
+        let node_id = e.node_id.map(|id| node_id_map.get(&id).copied().unwrap_or(id));
+        dst.record_session_event(repo, &e.session_id, &e.tool_name, &e.description, node_id, &e.event_kind)?;
+    }
+    println!("session_events: {} copied (timestamps reset to the migration time)", events.len());
 
     // --- session_usage + llm_usage + session_report (no node references -- straight copies) ---
     // Must be copied, not skipped: `wipe_repo` deletes both on the
@@ -1005,12 +1008,13 @@ fn install(path: &Path, notes_path: Option<&Path>, dry_run: bool, with_embedding
         return Ok(());
     }
 
-    if with_lsp {
-        println!("Running opt-in rust-analyzer macro-expansion pass (best-effort)...");
-        agentops_mcp::enrich_with_macro_expansions(path, &mut report, std::time::Duration::from_secs(60), std::time::Duration::from_secs(30));
+    let summary = if with_lsp {
+        println!("Running opt-in rust-analyzer pass: macro expansion and cross-file references (best-effort)...");
+        agentops_mcp::persist_with_lsp(path, &mut report, with_embeddings, std::time::Duration::from_secs(60), std::time::Duration::from_secs(30))
+    } else {
+        agentops_mcp::persist(path, &report, with_embeddings)
     }
-
-    let summary = agentops_mcp::persist(path, &report, with_embeddings).context("persisting scan to graph store")?;
+    .context("persisting scan to graph store")?;
     if summary.pruned_files > 0 || summary.pruned_symbols > 0 {
         println!("Pruned {} stale file node(s) and {} stale symbol node(s) from prior scans.", summary.pruned_files, summary.pruned_symbols);
     }
@@ -2505,12 +2509,16 @@ mod tests {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let (with, without) = (format!("mig-reports-{stamp}"), format!("mig-none-{stamp}"));
         src.upsert_session_report(agentops_graph::NewSessionReport { repo: with.clone(), session_id: "s1".into(), source: "transcript".into(), agent: "claude-code".into(), total_context_tokens: 42, ..Default::default() }).unwrap();
+        // A knowledge-reuse hit, which the usage dashboard counts (F23).
+        src.record_session_event(&with, "s1", "list_gotchas", "1 gotcha", None, "hit").unwrap();
         drop(src);
 
         migrate_graph(&db, &url, &with, true).unwrap();
         migrate_graph(&db, &url, &without, true).unwrap();
         let copied = dst.session_reports_for_repo(&with).unwrap();
         assert_eq!((copied.len(), copied[0].report.total_context_tokens), (1, 42));
+        let events = dst.session_events_for_repo(&with, Some("hit")).unwrap();
+        assert_eq!(events.len(), 1, "session events must be copied, not skipped");
         assert!(dst.session_reports_for_repo(&without).unwrap().is_empty());
         dst.wipe_repo(&with).unwrap();
     }

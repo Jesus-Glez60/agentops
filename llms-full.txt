@@ -8,9 +8,9 @@ This file concatenates AgentOps's full documentation in one place so an agent ca
 
 ## README
 
-AgentOps scans a repository into a persistent knowledge graph — files, symbols, dependencies, and how they relate — so an AI coding agent doesn't re-derive context from scratch every session. On top of that graph it layers hybrid search (dense embeddings + lexical/BM25 + exact-name matching, personalized-PageRank graph expansion), a curated Gotchas/Decisions notes system for the tribal knowledge that never makes it into code comments, and CLS-inspired local consolidation that can fine-tune a small model on a repo's own curated notes.
+AgentOps scans a repository into a persistent knowledge graph — files, symbols, dependencies, and how they relate — so an AI coding agent doesn't re-derive context from scratch every session. On top of that graph it layers hybrid search (dense embeddings + lexical/BM25 + exact-name matching, personalized-PageRank graph expansion), a curated Gotchas/Decisions notes system for the tribal knowledge that never makes it into code comments, and CLS-inspired local consolidation that tunes retrieval to a repo's own graph.
 
-All of it is exposed to AI coding agents (Claude Code, Cursor, Codex CLI, Gemini CLI, and anything else that speaks MCP) through one MCP server — about 40 tools — plus a REST API and a web UI for humans: team management, a repo connection wizard, an interactive graph viewer, a gotcha curation workspace, usage/token tracking, and a library/docs tracker (docbrain).
+All of it is exposed to AI coding agents (Claude Code, Cursor, Codex CLI, Gemini CLI, and anything else that speaks MCP) through one MCP server — up to 38 tools, depending on the surface and access mode — plus a REST API and a web UI for humans: team management, a repo connection wizard, an interactive graph viewer, a gotcha curation workspace, usage/token tracking, and a library/docs tracker (docbrain).
 
 It's a single open-core product: one Rust server process, one Next.js frontend, no price gate, one required env var to self-host.
 
@@ -24,7 +24,7 @@ It's a single open-core product: one Rust server process, one Next.js frontend, 
 - Usage & token tracking — per-session Claude Code token/cost totals, a ledger of AgentOps's own LLM spend, and offline session replay (`agentops usage`).
 - Claude Code hooks (opt-in) — capture oversized tool output as searchable, redacted nodes; optionally compress noisy command output before it reaches context.
 - Team management — orgs, fixed and custom roles, invites, per-repo access, audit log, multi-org switching. No external identity provider required.
-- Local model consolidation — fine-tunes a small model on a repo's curated notes locally, promoted only if it doesn't regress retrieval on a held-out eval.
+- Local consolidation — at end_session, trains a small projection head on the repo's own graph locally, promoted only if it improves retrieval on a held-out split.
 
 ### Quick start: run the server
 
@@ -79,7 +79,7 @@ Connect options: `--agents <ids>` (any Ruler-supported agent), `--global` (user-
 
 One Rust workspace (agentops-core/crates/*, docbrain-core/crates/*) builds `agentops-server` (merged REST API + `/mcp` + `/connect.sh`), `agentops-mcp-server` (unified stdio MCP server), and the `agentops` CLI. Two frontends: apps/web (Next.js, served under a configurable base path) and apps/marketing (Astro, site root). SQLite by default; Postgres (pgvector) for the code graph when AGENTOPS_DATABASE_URL is set. Embeddings run locally via ONNX.
 
-AgentOps registers itself as a docbrain library on first boot — run `scrape_library` with `slug: agentops` once, then `search_docs`/`get_docs` work against AgentOps's own docs.
+A local server registers AgentOps as a docbrain library (metadata only) on boot — run `scrape_library` with `slug: agentops` once, then `search_docs`/`get_docs` work against AgentOps's own docs. Hosted org members do not see this entry (each org has its own docbrain store).
 
 ### License
 
@@ -96,7 +96,7 @@ Full detail in docs/openapi.yaml / docs/index.html. The merged server (agentops-
 - **Team management** (session): GET /team, GET /team/members, PATCH/DELETE /team/members/{id}, GET /team/roles, POST /team/roles/custom, PATCH/DELETE /team/roles/custom/{key}, GET/PUT /team/mcp-access-mode, POST /team/transfer-ownership, POST /team/delete-organization, GET/POST /team/invites, POST /team/invites/{id}/resend, DELETE /team/invites/{id}, GET/PUT /team/repo-access, GET /team/audit-log, POST /invites/accept, GET /invites/{token}, GET /me/memberships, POST /me/switch-tenant.
 - **Integrations** (session): GET /integrations, POST/DELETE /integrations/{provider}, GET /integrations/{provider}/oauth/start|callback, GET /integrations/me, POST/DELETE /integrations/me/{provider}.
 - **Repositories & indexing** (session-or-api-key): POST /repos/connect, GET /repos, DELETE /repos/{id}, POST /repos/{id}/verify, POST /repos/{id}/attach-ssh|attach-github-app, POST /repos/{id}/index, GET /repos/{id}/index/status, POST /repos/{id}/index/retry, GET /repos/{id}/branches, PATCH /repos/{id}/branch, POST /repos/{id}/regenerate-key, GET /repos/github-app/install-url|callback|installations, GET /repos/github-app/installations/{id}/repos, POST /repos/github-app/installations/{id}/connect.
-- **Search, graph & usage** (session-or-api-key, keyed by connection id): GET /local-search, POST /search/index, GET /search, POST /docs/search/index, GET /docs/search, POST /consolidate/model, GET /nodes, GET /scans, POST /repos/{name}/rescan, POST /repos/{name}/edges/{id}/reinforce, GET /repos/{id}/nodes/{node_id}, POST /repos/{id}/nodes/{node_id}/curation, GET /repos/{id}/nodes/{node_id}/graph, GET /repos/{id}/graph, GET /repos/{id}/docs, GET /repos/{id}/usage, POST /repos/{id}/usage/sync, GET /activity, GET /gotchas.
+- **Search, graph & usage** (session-or-api-key, keyed by connection id): GET /local-search, POST /search/index, GET /search, POST /docs/search/index, GET /docs/search, GET /nodes, GET /scans, POST /repos/{name}/rescan, POST /repos/{name}/edges/{id}/reinforce, GET /repos/{id}/nodes/{node_id}, POST /repos/{id}/nodes/{node_id}/curation, GET /repos/{id}/nodes/{node_id}/graph, GET /repos/{id}/graph, GET /repos/{id}/docs, GET /repos/{id}/usage, POST /repos/{id}/usage/sync, GET /activity, GET /gotchas.
 - **Tools (MCP-over-REST)** (api-key): GET /tools, POST /tools/{name}; GET /docbrain/tools, POST /docbrain/tools/{name}. **MCP over HTTP**: /mcp (session or personal API key only).
 - **Libraries (docbrain)**: GET /docbrain/libraries, GET /docbrain/libraries/{slug}.
 - **Webhooks** (HMAC-verified): POST /webhooks/github (push → reindex), POST /webhooks/linear. Linear task sync (session): GET/POST /linear/auto-kickoff, DELETE /linear/auto-kickoff/{team_id}, POST /linear/tasks/{task_id}/push-status|summarize.
@@ -112,4 +112,4 @@ One MCP server — `agentops-mcp-server` over stdio, or `/mcp` on a hosted serve
 - **Sessions & usage**: get_session, get_session_guide, end_session, report_usage.
 - **Tasks**: create_task, list_tasks, update_task_status, get_task_activity.
 - **Libraries (docbrain)**: list_libraries, get_library, discover_library, register_library, scrape_library, sync_changelogs, get_docs, search_docs, get_code_examples, list_changelog, get_job_status.
-- **Heavy semantic tools** (only when AGENTOPS_QDRANT_URL is set): semantic_search, semantic_index, index_docs, consolidate_model.
+- **Heavy semantic tools** (only when AGENTOPS_QDRANT_URL is set): semantic_search, semantic_index, search_docs_indexed, index_docs_indexed.

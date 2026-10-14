@@ -201,6 +201,7 @@ pub fn handle_verified_payload(
     linear_config: &agentops_linear::LinearConfig,
     payload: &serde_json::Value,
     pg_store: Option<&agentops_mcp::PostgresGraphStore>,
+    docbrain_db: Option<&std::path::Path>,
 ) -> Result<DispatchResult> {
     if payload.get("type").and_then(|v| v.as_str()) != Some("Issue") {
         return Ok(DispatchResult { dispatched: false, reason: "not an Issue event" });
@@ -251,7 +252,9 @@ pub fn handle_verified_payload(
     // Doc-pull is a soft-fail step, same discipline as `sync_candidates`'s
     // own per-dependency warning-and-continue: a flaky registry/GitHub
     // lookup must not block the task/scan that already succeeded above.
-    if let Err(e) = agentops_mcp::sync_docs(&team_config.repo_path, None) {
+    // The tenant's own docbrain file (`docbrain_db_path_for_org`), so the
+    // discovered libraries show up for that org, not in a global store.
+    if let Err(e) = agentops_mcp::sync_docs(&team_config.repo_path, docbrain_db) {
         eprintln!("auto-kickoff sync_docs failed (non-fatal): {e:#}");
     }
 
@@ -280,6 +283,7 @@ struct WebhookState {
     secrets: Arc<dyn SecretsProvider + Send + Sync>,
     seen: Arc<SeenDeliveries>,
     pg_store: Option<agentops_mcp::PostgresGraphStore>,
+    docbrain_db_dir: std::path::PathBuf,
 }
 
 async fn linear_webhook_handler(State(state): State<Arc<WebhookState>>, headers: HeaderMap, body: Bytes) -> impl IntoResponse {
@@ -333,7 +337,8 @@ async fn linear_webhook_handler(State(state): State<Arc<WebhookState>>, headers:
     let linear_config_for_task = linear_config.clone();
     let payload_for_task = payload.clone();
     let pg_store_for_task = state.pg_store.clone();
-    let dispatch = tokio::task::spawn_blocking(move || handle_verified_payload(&tenant_for_task, &team_config_for_task, &linear_config_for_task, &payload_for_task, pg_store_for_task.as_ref())).await;
+    let docbrain_db_for_task = crate::docbrain_db_path_for_org(&state.docbrain_db_dir, Some(&tenant));
+    let dispatch = tokio::task::spawn_blocking(move || handle_verified_payload(&tenant_for_task, &team_config_for_task, &linear_config_for_task, &payload_for_task, pg_store_for_task.as_ref(), Some(&docbrain_db_for_task))).await;
 
     match dispatch {
         Ok(Ok(result)) => {
@@ -353,8 +358,8 @@ async fn linear_webhook_handler(State(state): State<Arc<WebhookState>>, headers:
     }
 }
 
-pub fn merge_linear_webhook_route(app: Router, modules: Arc<Mutex<ModuleStore>>, credentials: Arc<Mutex<CredentialStore>>, secrets: Arc<dyn SecretsProvider + Send + Sync>, pg_store: Option<agentops_mcp::PostgresGraphStore>) -> Router {
-    let state = Arc::new(WebhookState { modules, credentials, secrets, seen: Arc::new(SeenDeliveries::new(1000)), pg_store });
+pub fn merge_linear_webhook_route(app: Router, modules: Arc<Mutex<ModuleStore>>, credentials: Arc<Mutex<CredentialStore>>, secrets: Arc<dyn SecretsProvider + Send + Sync>, pg_store: Option<agentops_mcp::PostgresGraphStore>, docbrain_db_dir: std::path::PathBuf) -> Router {
+    let state = Arc::new(WebhookState { modules, credentials, secrets, seen: Arc::new(SeenDeliveries::new(1000)), pg_store, docbrain_db_dir });
     let webhook_router = Router::new().route("/webhooks/linear", post(linear_webhook_handler)).with_state(state);
     app.merge(webhook_router)
 }
@@ -755,7 +760,7 @@ mod tests {
         let linear_config = agentops_linear::LinearConfig { api_key: "unused".into(), api_url: "http://127.0.0.1:1".into() };
         let payload = issue_payload("some-other-team", "user-1", "create", false);
 
-        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None).unwrap();
+        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None, None).unwrap();
         assert!(!result.dispatched);
         assert_eq!(result.reason, "payload team id does not match the verified webhook's team");
     }
@@ -768,7 +773,7 @@ mod tests {
         // update, but no `updatedFrom.assigneeId` — some unrelated field changed.
         let payload = issue_payload("team-1", "user-1", "update", false);
 
-        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None).unwrap();
+        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None, None).unwrap();
         assert!(!result.dispatched);
         assert_eq!(result.reason, "not a new assignment");
     }
@@ -787,7 +792,7 @@ mod tests {
         let linear_config = agentops_linear::LinearConfig { api_key: "unused".into(), api_url: server.uri() };
         let payload = issue_payload("team-1", "user-1", "create", false);
 
-        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None).unwrap();
+        let result = handle_verified_payload("tenant-a", &team, &linear_config, &payload, None, None).unwrap();
         assert!(result.dispatched, "{result:?}");
 
         let store = agentops_mcp::open_store(dir.path()).unwrap();

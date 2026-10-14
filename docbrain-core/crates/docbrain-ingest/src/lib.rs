@@ -1,7 +1,5 @@
 //! Use-case layer: library discovery, doc scraping/chunking/embedding, and
-//! changelog sync. Rebuilt clean for the vnext pass — see
-//! ~/.claude/plans/let-s-start-module-1-robust-hummingbird.md for the full
-//! design and the confirmed `main`-branch gaps this closes.
+//! changelog sync. Rebuilt clean for the vnext pass.
 //!
 //! Like `main`, this crate is explicitly NOT under `agentops-scanner`'s
 //! zero-network-egress invariant — fetching from the network (registries,

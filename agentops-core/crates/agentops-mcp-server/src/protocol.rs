@@ -50,4 +50,5 @@ impl JsonRpcResponse {
 
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
-pub const INTERNAL_ERROR: i64 = -32603;
+/// JSON-RPC 2.0: invalid JSON was received.
+pub const PARSE_ERROR: i64 = -32700;

@@ -50,7 +50,7 @@ pub fn scan_and_persist(path: &Path, with_embeddings: bool) -> Result<ScanPersis
 }
 
 /// LSP-enrichment variant of `scan_and_persist` -- opt-in
-/// (`agentops scan --with-lsp`/`agentops install --with-lsp`), fully
+/// (`agentops install --with-lsp`, through `persist_with_lsp`), fully
 /// additive. Runs the identical normal scan, then (only if any Rust file
 /// has item-level macro invocations Tree-sitter itself can never expand --
 /// see `agentops_scanner::MacroInvocationSite`'s own doc comment) spawns
@@ -67,9 +67,16 @@ pub fn scan_and_persist(path: &Path, with_embeddings: bool) -> Result<ScanPersis
 /// floor.
 pub fn scan_and_persist_with_lsp(path: &Path, with_embeddings: bool, handshake_timeout: Duration, expand_timeout: Duration) -> Result<ScanPersistSummary> {
     let mut report = agentops_scanner::scan_repo(path)?;
-    enrich_with_macro_expansions(path, &mut report, handshake_timeout, expand_timeout);
-    let cross_file_references = find_cross_file_references(path, &report, handshake_timeout, expand_timeout);
-    persist_impl(path, &report, with_embeddings, &cross_file_references)
+    persist_with_lsp(path, &mut report, with_embeddings, handshake_timeout, expand_timeout)
+}
+
+/// The LSP half of `scan_and_persist_with_lsp`, for a caller that already
+/// holds a scan report (`agentops install --with-lsp`): macro expansion,
+/// then cross-file `References` edges, then `persist`.
+pub fn persist_with_lsp(path: &Path, report: &mut ScanReport, with_embeddings: bool, handshake_timeout: Duration, expand_timeout: Duration) -> Result<ScanPersistSummary> {
+    enrich_with_macro_expansions(path, report, handshake_timeout, expand_timeout);
+    let cross_file_references = find_cross_file_references(path, report, handshake_timeout, expand_timeout);
+    persist_impl(path, report, with_embeddings, &cross_file_references)
 }
 
 /// Finds cross-file `References` edges via a real `textDocument/references`

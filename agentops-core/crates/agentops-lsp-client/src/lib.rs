@@ -45,9 +45,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_lsp::concurrency::ConcurrencyLayer;
 use async_lsp::lsp_types::notification::{LogMessage, Progress, PublishDiagnostics, ShowMessage};
+use async_lsp::lsp_types::request::WorkDoneProgressCreate;
 use async_lsp::lsp_types::{
     ClientCapabilities, DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, InitializeParams, InitializedParams, Position, ReferenceContext, ReferenceParams,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    ProgressParamsValue, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url, WindowClientCapabilities, WorkDoneProgress,
 };
 use async_lsp::panic::CatchUnwindLayer;
 use async_lsp::router::Router;
@@ -58,6 +59,20 @@ use tower::ServiceBuilder;
 /// Pause between retries of a request rust-analyzer rejected as
 /// `ContentModified` -- see `is_content_modified`.
 const CONTENT_MODIFIED_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// How long to wait for rust-analyzer's first `$/progress` begin after the
+/// handshake before giving up on progress tracking (the old fixed settle
+/// delay), and how long no work must be in progress to count as settled.
+const FIRST_PROGRESS_WAIT: Duration = Duration::from_secs(5);
+const PROGRESS_QUIET: Duration = Duration::from_millis(500);
+
+/// rust-analyzer's open `$/progress` work: whether any has begun, and the
+/// tokens begun but not yet ended.
+#[derive(Default)]
+struct ProgressState {
+    begun: bool,
+    open: std::collections::HashSet<String>,
+}
 
 /// rust-analyzer answers `ContentModified` (-32801) when its view of the
 /// workspace changed mid-request -- typically while it's still loading the
@@ -368,14 +383,34 @@ async fn spawn_and_handshake(workspace_root: std::path::PathBuf, binary: String,
     let stdout = child.stdout.take().context("rust-analyzer child had no stdout pipe")?.compat();
     let stdin = child.stdin.take().context("rust-analyzer child had no stdin pipe")?.compat_write();
 
-    let (mainloop, mut server) = async_lsp::MainLoop::new_client(|_server| {
+    let progress = std::sync::Arc::new(std::sync::Mutex::new(ProgressState::default()));
+    let progress_for_router = progress.clone();
+    let (mainloop, mut server) = async_lsp::MainLoop::new_client(move |_server| {
         let mut router = Router::new(());
         // Registering these is not optional: an empty router breaks the
         // connection the moment rust-analyzer emits its first progress/
         // diagnostic notification during indexing -- confirmed live during
-        // this crate's own spike.
+        // this crate's own spike. With `window.workDoneProgress` advertised,
+        // rust-analyzer also asks the client to create each progress token
+        // first and waits for the answer.
         router
-            .notification::<Progress>(|_, _| ControlFlow::Continue(()))
+            .request::<WorkDoneProgressCreate, _>(|_, _| async { Ok(()) })
+            .notification::<Progress>(move |_, params| {
+                let ProgressParamsValue::WorkDone(work) = params.value;
+                let token = format!("{:?}", params.token);
+                let mut state = progress_for_router.lock().unwrap();
+                match work {
+                    WorkDoneProgress::Begin(_) => {
+                        state.begun = true;
+                        state.open.insert(token);
+                    }
+                    WorkDoneProgress::End(_) => {
+                        state.open.remove(&token);
+                    }
+                    WorkDoneProgress::Report(_) => {}
+                }
+                ControlFlow::Continue(())
+            })
             .notification::<PublishDiagnostics>(|_, _| ControlFlow::Continue(()))
             .notification::<ShowMessage>(|_, _| ControlFlow::Continue(()))
             .notification::<LogMessage>(|_, _| ControlFlow::Continue(()));
@@ -385,7 +420,8 @@ async fn spawn_and_handshake(workspace_root: std::path::PathBuf, binary: String,
 
     let root_uri = Url::from_directory_path(&workspace_root).map_err(|_| anyhow::anyhow!("workspace root is not a valid file:// URI: {}", workspace_root.display()))?;
     #[allow(deprecated)]
-    let init_params = InitializeParams { root_uri: Some(root_uri), capabilities: ClientCapabilities::default(), ..Default::default() };
+    let capabilities = ClientCapabilities { window: Some(WindowClientCapabilities { work_done_progress: Some(true), ..Default::default() }), ..Default::default() };
+    let init_params = InitializeParams { root_uri: Some(root_uri), capabilities, ..Default::default() };
     tokio::time::timeout(handshake_timeout, server.initialize(init_params)).await.context("rust-analyzer did not respond to `initialize` within the timeout")??;
     server.initialized(InitializedParams {}).context("sending `initialized`")?;
 
@@ -394,14 +430,45 @@ async fn spawn_and_handshake(workspace_root: std::path::PathBuf, binary: String,
     // background -- confirmed live this session: `expand_macro` called
     // immediately after the handshake unreliably returns a JSON `null`
     // (indistinguishable from the genuine "not expandable" case) rather
-    // than the real expansion, for a request that inherently needs more of
-    // the workspace loaded than a purely syntactic `documentSymbol` does. A
-    // fixed settle delay is a blunt fix -- the principled one (waiting on
-    // rust-analyzer's own progress-completion signal) is a real future
-    // improvement, not attempted here.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // than the real expansion, and `textDocument/references` returns an
+    // empty list (the flaky cross-file test, finding F47). So wait for
+    // rust-analyzer's own `$/progress` work (roots scanned, indexing, ...)
+    // to finish instead of a fixed delay.
+    wait_for_indexing(&progress, handshake_timeout).await;
 
     Ok((server, mainloop_task, child))
+}
+
+/// Waits until rust-analyzer has begun some `$/progress` work and then has
+/// none open for `PROGRESS_QUIET`, bounded by `timeout`. Falls back (with a
+/// warning) when no progress begins within `FIRST_PROGRESS_WAIT` or the
+/// timeout hits, so a server that reports no progress still proceeds.
+async fn wait_for_indexing(progress: &std::sync::Mutex<ProgressState>, timeout: Duration) {
+    let start = tokio::time::Instant::now();
+    let mut quiet_since: Option<tokio::time::Instant> = None;
+    loop {
+        let (begun, open) = {
+            let state = progress.lock().unwrap();
+            (state.begun, state.open.len())
+        };
+        let now = tokio::time::Instant::now();
+        if begun && open == 0 {
+            if now.duration_since(*quiet_since.get_or_insert(now)) >= PROGRESS_QUIET {
+                return;
+            }
+        } else {
+            quiet_since = None;
+        }
+        if !begun && now.duration_since(start) >= FIRST_PROGRESS_WAIT {
+            eprintln!("agentops-lsp-client: rust-analyzer reported no progress within {FIRST_PROGRESS_WAIT:?}; continuing without waiting for indexing");
+            return;
+        }
+        if now.duration_since(start) >= timeout {
+            eprintln!("agentops-lsp-client: rust-analyzer still had {open} progress item(s) open after {timeout:?}; continuing anyway");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// Flattens `lsp_types`'s two possible `documentSymbol` response shapes

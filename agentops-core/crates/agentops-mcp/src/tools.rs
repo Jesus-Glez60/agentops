@@ -308,7 +308,7 @@ fn tool_specs() -> Vec<ToolSpec> {
             // name, consistent with the REST-layer precedent (heavy's
             // meaning wins the clean path on a collision).
             name: "local_semantic_search",
-            description: "Dense-vector search over whatever symbols/gotchas/decisions/notes have been embedded (see scan_repo/add_note/ingest_notes's with_embeddings flag) — complements get_symbol's exact-name lookup with 'find something like this' search. Only returns hits among nodes that were actually embedded; nothing is embedded by default. Set mode to 'hybrid' to fuse in lexical (keyword/BM25) and exact-name-match signals too — no embedding required for a node to be found via those signals, and a literal function-name query reliably surfaces it even when nothing was ever embedded. With mode 'hybrid', set graph_expand to also spread activation from the fused top hits across Affects/References edges (Personalized PageRank) so graph-connected results can outrank a purely textual/semantic match — off by default. Set mode to 'gist_then_detail' for two-tier retrieval: first matches the repo's generated documentation sections (the compressed 'gist' of a module/repo), then searches only the symbols/gotchas/decisions those matched sections actually cover — sharper results for a broad/module-level query, at the cost of ignoring kind filtering and anything outside a matched section's coverage (falls back to an unscoped search if no section matches).",
+            description: "Dense-vector search over whatever symbols/gotchas/decisions/notes have been embedded (see scan_repo/add_note/ingest_notes's with_embeddings flag) — complements get_symbol's exact-name lookup with 'find something like this' search. Only returns hits among nodes that were actually embedded; nothing is embedded by default. Set mode to 'hybrid' to fuse in lexical (keyword/BM25) and exact-name-match signals too — no embedding required for a node to be found via those signals, and a literal function-name query reliably surfaces it even when nothing was ever embedded. With mode 'hybrid', set graph_expand to also spread activation from the fused top hits across Affects/References edges (Personalized PageRank) so graph-connected results can outrank a purely textual/semantic match — off by default. Set mode to 'gist_then_detail' for two-tier retrieval: first matches the repo's generated documentation sections (the compressed 'gist' of a module/repo), then searches only the symbols/gotchas/decisions those matched sections actually cover — sharper results for a broad/module-level query, at the cost of ignoring kind filtering and anything outside a matched section's coverage (falls back to an unscoped search if no section matches). Each hit starts with its node id (`#123`) for fetch_content (and, for a symbol, related_context).",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
             input_schema: || {
@@ -318,7 +318,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "path": { "type": "string" },
                         "query": { "type": "string" },
                         "top_k": { "type": "integer" },
-                        "kind": { "type": "string", "enum": ["symbol", "file", "gotcha", "decision", "note", "definition"] },
+                        "kind": { "type": "string", "enum": ["symbol", "file", "gotcha", "decision", "note", "definition", "doc_section", "tool_output"] },
                         "mode": { "type": "string", "enum": ["dense", "hybrid", "gist_then_detail"] },
                         "graph_expand": { "type": "boolean" },
                     },
@@ -796,15 +796,7 @@ fn tool_persist_blueprint_doc(args: &Value) -> anyhow::Result<String> {
 }
 
 fn parse_node_kind(s: &str) -> Option<NodeKind> {
-    match s {
-        "symbol" => Some(NodeKind::Symbol),
-        "file" => Some(NodeKind::File),
-        "gotcha" => Some(NodeKind::Gotcha),
-        "decision" => Some(NodeKind::Decision),
-        "note" => Some(NodeKind::Note),
-        "definition" => Some(NodeKind::Definition),
-        _ => None,
-    }
+    NodeKind::parse(s)
 }
 
 /// Renders a `HybridHit::path` citation as `"\n  via: A --[Rel]--> B ..."`,
@@ -852,7 +844,7 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
         }
         let rendered = hits
             .iter()
-            .map(|h| format!("- {:?} {} (score {:.4}){}", h.node.kind, h.node.name.as_deref().unwrap_or("(untitled)"), h.fused_score, h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default()))
+            .map(|h| format!("- #{} {:?} {} (score {:.4}){}", h.node.id, h.node.kind, h.node.name.as_deref().unwrap_or("(untitled)"), h.fused_score, h.node.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default()))
             .collect::<Vec<_>>()
             .join("\n");
         if let Some(path_str) = get_str(args, "path") {
@@ -899,7 +891,8 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
                 // or an unexpanded search leaves this blank, same as `graph`.
                 let citation = format_citation_trail(h.path.as_deref());
                 format!(
-                    "- {:?} {} (score {:.4}, signals: {signals}{graph}){}{reduced}{citation}",
+                    "- #{} {:?} {} (score {:.4}, signals: {signals}{graph}){}{reduced}{citation}",
+                    h.node.id,
                     h.node.kind,
                     h.node.name.as_deref().unwrap_or("(untitled)"),
                     h.fused_score,
@@ -943,7 +936,7 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
             } else {
                 String::new()
             };
-            format!("- {:?} {} (distance {distance:.4}){}{reduced}", n.kind, n.name.as_deref().unwrap_or("(untitled)"), n.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
+            format!("- #{} {:?} {} (distance {distance:.4}){}{reduced}", n.id, n.kind, n.name.as_deref().unwrap_or("(untitled)"), n.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
         })
         .collect::<Vec<_>>()
         .join("\n");

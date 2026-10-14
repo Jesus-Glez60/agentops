@@ -3,8 +3,8 @@ import { Check, X } from "lucide-react";
 import type { Capability, MemberRole } from "@/lib/api/team-api";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 
-const ROLE_ORDER: MemberRole[] = ["admin", "member", "viewer", "billing"];
-const ROLE_LABELS: Record<MemberRole, string> = { admin: "Admin", member: "Member", viewer: "Viewer", billing: "Billing" };
+const ROLE_ORDER: MemberRole[] = ["admin", "member", "viewer"];
+const ROLE_LABELS: Record<MemberRole, string> = { admin: "Admin", member: "Member", viewer: "Viewer" };
 
 export function PermissionsMatrixTable({ matrix }: { matrix: Capability[] }) {
   const groups = new Map<string, Capability[]>();

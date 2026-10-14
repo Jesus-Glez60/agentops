@@ -157,6 +157,15 @@ pub struct HybridHit {
     pub path: Option<Vec<GraphPathHop>>,
 }
 
+impl HybridHit {
+    /// `fused_score` scaled to 0..1 against the best possible fusion (rank 0
+    /// in all three sources), for UIs that bucket a 0..1 relevance. A hit
+    /// found only by exact name and lexical match tops out at about 0.67.
+    pub fn relevance(&self) -> f32 {
+        (self.fused_score / (3.0 / (RRF_K + 1.0))).min(1.0)
+    }
+}
+
 /// One hop in a `HybridHit::path` citation trail.
 #[derive(Debug, Clone)]
 pub struct GraphPathHop {
@@ -327,7 +336,15 @@ pub fn personalized_pagerank(neighborhood: &agentops_graph::BoundedNeighborhood,
 /// -- `PostgresGraphStore` doesn't populate it yet (see `schema.sql`), so
 /// this must never rank a Postgres-backed node lower just because the
 /// signal isn't available there.
+///
+/// Notes only (gotcha, decision, note): stable code that nobody has edited
+/// for months is not less relevant, so code nodes are never decayed
+/// (author decision, 2026-10-13). This also keeps code ranking identical on
+/// SQLite and Postgres.
 fn recency_multiplier(node: &Node) -> f32 {
+    if !matches!(node.kind, NodeKind::Gotcha | NodeKind::Decision | NodeKind::Note) {
+        return 1.0;
+    }
     match &node.last_touched_at {
         Some(ts) => effective_weight(1.0, age_days(ts)) as f32,
         None => 1.0,
@@ -921,20 +938,31 @@ mod tests {
     /// time in a fast unit test, and not something worth fighting. Testing
     /// the pure function directly is both simpler and actually deterministic.
     #[test]
-    fn recency_multiplier_favors_a_more_recently_touched_node() {
-        let mut older = symbol_node_for_test();
+    fn recency_multiplier_favors_a_more_recently_touched_note() {
+        let mut older = gotcha_node_for_test();
         older.last_touched_at = Some(format_test_timestamp(10.0));
-        let mut newer = symbol_node_for_test();
+        let mut newer = gotcha_node_for_test();
         newer.last_touched_at = Some(format_test_timestamp(0.0));
 
-        assert!(recency_multiplier(&newer) > recency_multiplier(&older), "a node touched 0 days ago must score higher than one touched 10 days ago");
+        assert!(recency_multiplier(&newer) > recency_multiplier(&older), "a note touched 0 days ago must score higher than one touched 10 days ago");
+    }
+
+    #[test]
+    fn recency_multiplier_never_decays_code() {
+        let mut stale = symbol_node_for_test();
+        stale.last_touched_at = Some(format_test_timestamp(120.0));
+        assert_eq!(recency_multiplier(&stale), 1.0, "unedited code is not less relevant");
     }
 
     #[test]
     fn recency_multiplier_is_a_no_op_when_last_touched_at_is_absent() {
-        let mut node = symbol_node_for_test();
+        let mut node = gotcha_node_for_test();
         node.last_touched_at = None;
         assert_eq!(recency_multiplier(&node), 1.0, "PostgresGraphStore doesn't populate last_touched_at yet -- must never penalize a node just because the signal is unavailable there");
+    }
+
+    fn gotcha_node_for_test() -> Node {
+        Node { kind: NodeKind::Gotcha, ..symbol_node_for_test() }
     }
 
     fn symbol_node_for_test() -> Node {

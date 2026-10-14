@@ -1,6 +1,6 @@
 //! Resolves where a repo's notes live — the actual fix for the write-back
-//! protocol found hardcoded to one personal vault path
-//! (`~/Vaults/dev-knowledge-base`) with no connection to what `AGENTS.md`
+//! protocol found hardcoded to one personal vault path with no
+//! connection to what `AGENTS.md`
 //! generation emitted. Resolution order: an explicit override → a
 //! `.agentops/config.json` in the repo if one sets `notes_path` → a default
 //! in-repo `.agentops/notes/` folder that always works with zero setup —
@@ -27,8 +27,8 @@ pub fn default_notes_path(repo_path: &Path) -> PathBuf {
 /// Resolves the effective notes path for `repo_path`. `explicit` (e.g. a
 /// caller-supplied `notes_path` argument) always wins; otherwise reads
 /// `.agentops/config.json`'s `notes_path` if present (relative paths are
-/// resolved against `repo_path`, so an external vault like
-/// `~/Vaults/my-project` can be configured without hardcoding it into any
+/// resolved against `repo_path`, so an external notes vault elsewhere on
+/// disk can be configured without hardcoding it into any
 /// generated file); otherwise falls back to `default_notes_path`.
 pub fn resolve_notes_path(repo_path: &Path, explicit: Option<&Path>) -> PathBuf {
     if let Some(explicit) = explicit {

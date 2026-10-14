@@ -46,6 +46,10 @@ agentops-api = { path = "../agentops-api" }
 # LocalEmbedder for GET /local-search -- distinct from the already-present
 # agentops-heavy-embeddings/SemanticIndex (Qdrant-backed), no type collision.
 agentops-embeddings = { path = "../agentops-embeddings" }
+# Points each fresh checkout at its notes folder outside the checkout (F30).
+agentops-notes = { path = "../agentops-notes" }
+# search_hybrid for GET /local-search (F28).
+agentops-retrieval = { path = "../agentops-retrieval" }
 
 [dev-dependencies]
 tempfile = "3"

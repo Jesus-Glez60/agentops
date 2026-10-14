@@ -149,6 +149,7 @@ version = "0.1.0"
 dependencies = [
  "agentops-embeddings",
  "agentops-graph",
+ "agentops-manifest",
  "anyhow",
  "candle-core",
  "candle-nn",
@@ -223,7 +224,9 @@ dependencies = [
  "agentops-llm",
  "agentops-manifest",
  "agentops-mcp",
+ "agentops-notes",
  "agentops-repo-access",
+ "agentops-retrieval",
  "agentops-scanner",
  "agentops-security",
  "agentops-teams",
@@ -252,6 +255,7 @@ version = "0.1.0"
 dependencies = [
  "agentops-embeddings",
  "agentops-graph",
+ "agentops-manifest",
  "agentops-retrieval",
  "anyhow",
  "candle-core",
@@ -386,6 +390,7 @@ dependencies = [
  "agentops-graph-pg",
  "agentops-llm",
  "agentops-lsp-client",
+ "agentops-manifest",
  "agentops-notes",
  "agentops-retrieval",
  "agentops-scanner",
@@ -398,6 +403,7 @@ dependencies = [
  "notify-debouncer-full",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
 ]

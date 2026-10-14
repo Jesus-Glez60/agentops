@@ -1,8 +1,7 @@
-//! Two-way Linear sync for Module 7's hybrid task manager — see
-//! `~/Vaults/agentops-vnext/decisions/hybrid-task-manager-linear.md`.
-//! Poll-based, not webhook-based, for this first pass: no inbound-webhook
-//! infrastructure exists anywhere in the codebase today (same gap already
-//! flagged against Module 4's hosted-rescan design). Follows the same
+//! Two-way Linear sync for Module 7's hybrid task manager. Task sync itself
+//! is poll-based; inbound Linear webhooks (the auto-kickoff module, with
+//! `ensure_webhook_registered` below) are handled by
+//! `agentops-heavy-api/src/linear_webhook.rs`. Follows the same
 //! `ureq`-based external-call precedent `agentops-llm` established for the
 //! Anthropic API.
 //!

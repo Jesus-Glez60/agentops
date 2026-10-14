@@ -14,7 +14,6 @@ const ROLE_OPTIONS: { value: string; label: string }[] = [
   { value: "member", label: "Member" },
   { value: "admin", label: "Admin" },
   { value: "viewer", label: "Viewer" },
-  { value: "billing", label: "Billing" },
 ];
 
 export function InviteMemberDialog() {

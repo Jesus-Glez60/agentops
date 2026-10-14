@@ -107,6 +107,34 @@ fn migrate_add_owner_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Removes the `billing` role and the `gotchas.resolve`/`team.billing`
+/// capabilities, leftovers of the abandoned paid tier and of a bug-tracker
+/// model for gotchas (findings F12/F13). Billing members and pending
+/// invites become `viewer`; custom roles cloned from `billing` are
+/// re-labelled as cloned from `viewer` (`cloned_from` is display-only), and
+/// the two keys are stripped from every custom role's capability list.
+/// Idempotent: a second run finds nothing to change.
+fn migrate_drop_billing_role(conn: &Connection) -> Result<()> {
+    const REMOVED_CAPABILITIES: &[&str] = &["gotchas.resolve", "team.billing"];
+    let members = conn.execute("UPDATE memberships SET role = 'viewer' WHERE role = 'billing'", [])?;
+    let invites = conn.execute("UPDATE invites SET role = 'viewer' WHERE role = 'billing'", [])?;
+    let mut roles = conn.execute("UPDATE custom_roles SET cloned_from = 'viewer' WHERE cloned_from = 'billing'", [])?;
+    let stale: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, capabilities FROM custom_roles")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().filter(|(_, caps)| caps.split(',').any(|c| REMOVED_CAPABILITIES.contains(&c))).collect()
+    };
+    for (id, caps) in &stale {
+        let kept: Vec<&str> = caps.split(',').filter(|c| !REMOVED_CAPABILITIES.contains(c)).collect();
+        conn.execute("UPDATE custom_roles SET capabilities = ?1 WHERE id = ?2", rusqlite::params![kept.join(","), id])?;
+    }
+    roles += stale.len();
+    if members + invites + roles > 0 {
+        eprintln!("teams: removed the billing role: {members} membership(s) and {invites} invite(s) moved to viewer, {roles} custom role update(s)");
+    }
+    Ok(())
+}
+
 /// Additive `organizations.mcp_access_mode` column -- same idiom as
 /// `migrate_add_owner_column` just above. `DEFAULT 'advisor'`: a brand-new
 /// org (and every pre-existing one, transparently, on next open) starts
@@ -135,12 +163,13 @@ fn migrate_add_mcp_access_mode_column(conn: &Connection) -> Result<()> {
 /// standing door into the organization.
 const INVITE_LIFETIME_DAYS: i64 = 7;
 
-/// Fixed, non-tenant-scoped role enum -- there is no custom-role concept
-/// here (matches the Team Management mockup's own "read-only, contact
-/// support for custom roles" copy), so an invalid role string passed to
-/// `add_member`/`update_member` is a caller bug to reject loudly, not user
-/// input to tolerate.
-pub const ROLES: &[&str] = &["admin", "member", "viewer", "billing"];
+/// The fixed, non-tenant-scoped roles. Tenant-scoped custom roles
+/// (`CustomRole`, `role = "custom:{id}"`) are cloned from one of these. An
+/// invalid role string passed to `add_member`/`update_member` is a caller
+/// bug to reject loudly, not user input to tolerate. (A `billing` role from
+/// the abandoned paid tier was removed; `migrate_drop_billing_role` moves
+/// its members to `viewer`.)
+pub const ROLES: &[&str] = &["admin", "member", "viewer"];
 
 pub struct RoleDescription {
     pub role: &'static str,
@@ -154,7 +183,6 @@ pub const ROLE_DESCRIPTIONS: &[RoleDescription] = &[
     RoleDescription { role: "admin", label: "Admin", description: "Full access to all features, repositories, settings, and member management." },
     RoleDescription { role: "member", label: "Member", description: "Standard developer access — read/write to shared resources, no admin controls." },
     RoleDescription { role: "viewer", label: "Viewer", description: "Read-only access to documentation, search, and gotcha reports. Cannot modify anything." },
-    RoleDescription { role: "billing", label: "Billing", description: "Access limited to billing, invoices, and seat management. No code or data access." },
 ];
 
 pub struct Capability {
@@ -174,13 +202,12 @@ pub const CAP_SEARCH_QUERY: &str = "search.query";
 pub const CAP_GRAPH_VIEW: &str = "graph.view";
 pub const CAP_GOTCHAS_VIEW: &str = "gotchas.view";
 pub const CAP_GOTCHAS_COMMENT: &str = "gotchas.comment";
-pub const CAP_GOTCHAS_RESOLVE: &str = "gotchas.resolve";
 pub const CAP_LIBRARIES_VIEW: &str = "libraries.view";
+pub const CAP_LIBRARIES_MANAGE: &str = "libraries.manage";
 pub const CAP_API_KEYS_PERSONAL: &str = "api_keys.personal";
 pub const CAP_API_KEYS_ORG: &str = "api_keys.org";
 pub const CAP_TEAM_MANAGE_MEMBERS: &str = "team.manage_members";
 pub const CAP_TEAM_MANAGE_ROLES: &str = "team.manage_roles";
-pub const CAP_TEAM_BILLING: &str = "team.billing";
 pub const CAP_INTEGRATIONS_MANAGE: &str = "integrations.manage";
 pub const CAP_MCP_MANAGE_ACCESS_MODE: &str = "mcp.manage_access_mode";
 
@@ -196,13 +223,12 @@ pub const PERMISSIONS_MATRIX: &[Capability] = &[
     Capability { key: CAP_GRAPH_VIEW, feature_area: "Search & Knowledge Graph", label: "View knowledge graph & node details", allowed_roles: &["admin", "member", "viewer"] },
     Capability { key: CAP_GOTCHAS_VIEW, feature_area: "Gotchas", label: "View gotcha list & detail", allowed_roles: &["admin", "member", "viewer"] },
     Capability { key: CAP_GOTCHAS_COMMENT, feature_area: "Gotchas", label: "Comment on gotchas", allowed_roles: &["admin", "member"] },
-    Capability { key: CAP_GOTCHAS_RESOLVE, feature_area: "Gotchas", label: "Resolve or dismiss gotchas", allowed_roles: &["admin", "member"] },
     Capability { key: CAP_LIBRARIES_VIEW, feature_area: "Libraries", label: "View library docs & version tracking", allowed_roles: &["admin", "member", "viewer"] },
+    Capability { key: CAP_LIBRARIES_MANAGE, feature_area: "Libraries", label: "Scrape and sync library docs", allowed_roles: &["admin", "member"] },
     Capability { key: CAP_API_KEYS_PERSONAL, feature_area: "API & Keys", label: "Generate personal API keys", allowed_roles: &["admin", "member"] },
     Capability { key: CAP_API_KEYS_ORG, feature_area: "API & Keys", label: "View & revoke org-wide API keys", allowed_roles: &["admin"] },
-    Capability { key: CAP_TEAM_MANAGE_MEMBERS, feature_area: "Team & Billing", label: "Invite & remove members", allowed_roles: &["admin"] },
-    Capability { key: CAP_TEAM_MANAGE_ROLES, feature_area: "Team & Billing", label: "Assign & change member roles", allowed_roles: &["admin"] },
-    Capability { key: CAP_TEAM_BILLING, feature_area: "Team & Billing", label: "Manage billing & subscriptions", allowed_roles: &["admin", "billing"] },
+    Capability { key: CAP_TEAM_MANAGE_MEMBERS, feature_area: "Team", label: "Invite & remove members", allowed_roles: &["admin"] },
+    Capability { key: CAP_TEAM_MANAGE_ROLES, feature_area: "Team", label: "Assign & change member roles", allowed_roles: &["admin"] },
     Capability { key: CAP_INTEGRATIONS_MANAGE, feature_area: "Integrations", label: "Connect, view & remove org-wide integration credentials", allowed_roles: &["admin"] },
     Capability { key: CAP_MCP_MANAGE_ACCESS_MODE, feature_area: "MCP", label: "Change MCP access mode (Advisor/Full)", allowed_roles: &["admin"] },
 ];
@@ -240,11 +266,11 @@ pub struct InvitePreview {
     pub role: String,
 }
 
-/// A tenant-scoped custom role: clone one of the 4 fixed `ROLES` and give
+/// A tenant-scoped custom role: clone one of the 3 fixed `ROLES` and give
 /// it its own label + capability set. `role_key` is always `custom:{id}`
 /// -- the `custom:` prefix is what lets every existing bare-string
 /// `ROLES.contains`/`role == "admin"` check keep working unmodified for
-/// the 4 fixed roles, since a custom role's `role` column value never
+/// the fixed roles, since a custom role's `role` column value never
 /// collides with one of those literals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomRole {
@@ -276,6 +302,7 @@ impl TeamStore {
         conn.execute_batch(SCHEMA).context("initializing teams schema")?;
         migrate_add_owner_column(&conn).context("migrating organizations.owner_user_id")?;
         migrate_add_mcp_access_mode_column(&conn).context("migrating organizations.mcp_access_mode")?;
+        migrate_drop_billing_role(&conn).context("removing the billing role")?;
         Ok(Self { conn })
     }
 
@@ -284,6 +311,7 @@ impl TeamStore {
         conn.execute_batch(SCHEMA).context("initializing teams schema")?;
         migrate_add_owner_column(&conn).context("migrating organizations.owner_user_id")?;
         migrate_add_mcp_access_mode_column(&conn).context("migrating organizations.mcp_access_mode")?;
+        migrate_drop_billing_role(&conn).context("removing the billing role")?;
         Ok(Self { conn })
     }
 
@@ -389,7 +417,7 @@ impl TeamStore {
         Ok(())
     }
 
-    /// A role string is valid for `tenant` if it's one of the 4 fixed
+    /// A role string is valid for `tenant` if it's one of the 3 fixed
     /// `ROLES`, or an existing `custom_roles` row for that tenant --
     /// replaces every bare `ROLES.contains(&role)` validation check
     /// (`add_member`/`update_member`/`create_invite` here, plus one in
@@ -566,7 +594,7 @@ impl TeamStore {
     }
 
     /// All per-user repo-access overrides for `tenant` -- the HTTP layer
-    /// combines these with role defaults (admin/billing aren't
+    /// combines these with role defaults (admin isn't
     /// override-editable at all; member/viewer default to allowed unless
     /// overridden) to build the full grid, since "default access" is a
     /// role-based UI/business-logic concern this crate doesn't need to
@@ -758,6 +786,30 @@ impl TeamStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_billing_role_migration_moves_billing_rows_to_viewer_and_strips_removed_capabilities() {
+        let store = TeamStore::open_in_memory().unwrap();
+        // Rows written before the billing role was removed.
+        store.conn.execute("INSERT INTO memberships (tenant, user_id, role) VALUES ('t', 1, 'billing')", []).unwrap();
+        store.conn.execute("INSERT INTO invites (tenant, email, role, token_hash, invited_by_user_id, expires_at) VALUES ('t', 'b@example.com', 'billing', 'h', 1, '2999-01-01')", []).unwrap();
+        store
+            .conn
+            .execute("INSERT INTO custom_roles (tenant, role_key, label, cloned_from, capabilities, created_by_user_id) VALUES ('t', 'custom:1', 'Finance', 'billing', 'team.billing,gotchas.view,gotchas.resolve', 1)", [])
+            .unwrap();
+
+        for _ in 0..2 {
+            migrate_drop_billing_role(&store.conn).unwrap();
+        }
+
+        let role: String = store.conn.query_row("SELECT role FROM memberships WHERE user_id = 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(role, "viewer");
+        let invite_role: String = store.conn.query_row("SELECT role FROM invites WHERE email = 'b@example.com'", [], |r| r.get(0)).unwrap();
+        assert_eq!(invite_role, "viewer");
+        let (cloned_from, caps): (String, String) = store.conn.query_row("SELECT cloned_from, capabilities FROM custom_roles WHERE role_key = 'custom:1'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(cloned_from, "viewer");
+        assert_eq!(caps, "gotchas.view");
+    }
 
     #[test]
     fn add_then_list_members_round_trips() {

@@ -47,7 +47,7 @@ pub fn build_doc_page(store: &dyn GraphStore, repo_name: &str, ranked_paths: &[P
     sections.extend(knowledge_sections(store, repo_name, &all_gotchas, "Known Gotchas", "known-gotchas")?);
     sections.extend(knowledge_sections(store, repo_name, &all_decisions, "Architectural Decisions", "architectural-decisions")?);
 
-    Ok(DocPage { repo: repo_name.to_string(), generated_at, node_count: all_nodes.len() as i64, sections })
+    Ok(DocPage { repo: repo_name.to_string(), generated_at, node_count: all_nodes.len() as i64, sections, module_set_hash: None, module_labels: Vec::new() })
 }
 
 fn overview_section(repo_name: &str, file_count: usize, symbol_count: usize, gotcha_count: usize, decision_count: usize, note_count: usize) -> DocSection {

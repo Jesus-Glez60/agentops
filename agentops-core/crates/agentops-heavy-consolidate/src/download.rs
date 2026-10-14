@@ -1,9 +1,8 @@
 //! Fetches the frozen base model's weights/tokenizer/config from the Hub
 //! (Initiative 6, CLS-inspired retrieval plan). A one-time, explicit
-//! network operation triggered by `consolidate_model`/`agentops consolidate
-//! --model` -- never automatic, matching this codebase's existing
-//! "opt-in, real cost, never run on a scan" convention for `explain_symbol`
-//! and `with_embeddings`.
+//! network operation triggered by a LoRA consolidation run -- never
+//! automatic, matching the "opt-in, real cost" convention of
+//! `explain_symbol` and `with_embeddings`.
 
 use std::path::PathBuf;
 

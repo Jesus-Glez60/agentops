@@ -28,7 +28,7 @@ export function renameOrg(name: string): Promise<{ name: string }> {
 
 export const TEAM_MEMBERS_SWR_KEY = "/team/members";
 
-export type MemberRole = "admin" | "member" | "viewer" | "billing";
+export type MemberRole = "admin" | "member" | "viewer";
 export type MemberStatus = "active" | "suspended";
 
 export interface TeamMember {
@@ -127,7 +127,7 @@ export interface CustomRole {
   capabilities: string[];
 }
 
-export const FIXED_ROLE_LABELS: Record<MemberRole, string> = { admin: "Admin", member: "Member", viewer: "Viewer", billing: "Billing" };
+export const FIXED_ROLE_LABELS: Record<MemberRole, string> = { admin: "Admin", member: "Member", viewer: "Viewer" };
 
 /** A member/invite's `role` field is either a fixed `MemberRole` or a custom role's `role_key` (`"custom:{id}"`) -- this resolves either to a display label, shared by the Members tab's role dropdown/badge and pending-invite rows. */
 export function roleLabel(role: string, customRoles: CustomRole[]): string {

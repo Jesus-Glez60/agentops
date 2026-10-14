@@ -107,7 +107,7 @@ pub fn consolidate(store: &dyn GraphStore, repo: &str, scope: Option<&[i64]>) ->
     // promoting.
     projection_store.save_anchor(&next_anchor)?;
 
-    let promoted = candidate_recall >= baseline_recall;
+    let promoted = should_promote(candidate_recall, baseline_recall);
     if promoted {
         projection_store.promote(version)?;
     }
@@ -120,16 +120,30 @@ pub fn consolidate(store: &dyn GraphStore, repo: &str, scope: Option<&[i64]>) ->
         baseline_recall,
         promoted_version: promoted.then_some(version),
         reason: if promoted {
-            format!("promoted v{version}: recall@{RECALL_K} {candidate_recall:.3} >= baseline {baseline_recall:.3}")
+            format!("promoted v{version}: recall@{RECALL_K} {candidate_recall:.3} > baseline {baseline_recall:.3}")
         } else {
-            format!("kept previous version: candidate recall@{RECALL_K} {candidate_recall:.3} regressed vs. baseline {baseline_recall:.3}")
+            format!("kept previous version: candidate recall@{RECALL_K} {candidate_recall:.3} did not improve on baseline {baseline_recall:.3}")
         },
     })
+}
+
+/// A candidate replaces the active head only when it is strictly better on
+/// the held-out split: a tie means no measured gain, so the active head
+/// stays (author decision, 2026-10-13).
+fn should_promote(candidate: f64, baseline: f64) -> bool {
+    candidate > baseline
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tie_does_not_promote_only_a_strict_improvement_does() {
+        assert!(!should_promote(0.5, 0.5));
+        assert!(!should_promote(0.4, 0.5));
+        assert!(should_promote(0.51, 0.5));
+    }
     use agentops_graph::{upsert_node, EdgeRelation, NewNode, NodeKind, SqliteGraphStore};
 
     fn symbol(store: &dyn GraphStore, repo: &str, name: &str) -> i64 {
@@ -157,8 +171,8 @@ mod tests {
 
     /// The real end-to-end path: enough plasticity-bearing, embedded pairs
     /// to actually train and evaluate a candidate, and since nothing is
-    /// active yet, the baseline is the raw embedding space -- any
-    /// candidate that isn't actively worse should promote on a first run.
+    /// active yet, the baseline is the raw embedding space -- a candidate
+    /// promotes on a first run only if it beats that.
     #[test]
     fn consolidate_trains_and_promotes_on_a_first_real_run() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
@@ -182,17 +196,13 @@ mod tests {
         if report.promoted {
             assert!(projection_store.active_version().unwrap().is_some());
         }
-        // Clean up this test's real ~/.agentops/models/{repo} directory
-        // rather than leaving throwaway test artifacts on disk.
-        let _ = std::fs::remove_dir_all(dirs_home_for_test().join(".agentops").join("models").join(&repo));
+        // Clean up this test's real models/{repo} directory rather than
+        // leaving throwaway test artifacts on disk.
+        let _ = std::fs::remove_dir_all(agentops_manifest::agentops_data_dir().join("models").join(&repo));
     }
 
     fn uuid_like() -> String {
         use std::time::{SystemTime, UNIX_EPOCH};
         format!("{}", SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos())
-    }
-
-    fn dirs_home_for_test() -> std::path::PathBuf {
-        std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
     }
 }

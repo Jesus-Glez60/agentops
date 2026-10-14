@@ -11,7 +11,10 @@
 //! `ToolDefinition` even has an access field) and are available regardless
 //! of mode; retrofitting a shared capability system into two more crates is
 //! out of scope for this merge, whose goal is removing tiering, not adding
-//! a new cross-cutting one.
+//! a new cross-cutting one. Hosted `/mcp` (`agentops-heavy-api::mcp_http`)
+//! does make `scrape_library` and `sync_changelogs` Full-only; this local
+//! server deliberately does not, since its user owns the machine (author
+//! decision, 2026-10-14).
 //!
 //! **Tool-name collisions, resolved before this crate existed** (see each
 //! source tool's own doc comment for the rationale): `agentops-mcp`'s
@@ -33,7 +36,7 @@ use agentops_mcp::AccessMode;
 use docbrain_graph::SqliteDocbrainStore;
 use serde_json::{json, Value};
 
-use protocol::{JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS, MCP_PROTOCOL_VERSION, METHOD_NOT_FOUND};
+use protocol::{JsonRpcRequest, JsonRpcResponse, INVALID_PARAMS, PARSE_ERROR, MCP_PROTOCOL_VERSION, METHOD_NOT_FOUND};
 
 pub struct Dispatch {
     pub mode: AccessMode,
@@ -87,7 +90,7 @@ async fn handle_message(dispatch: &mut Dispatch, raw: &str) -> Option<String> {
     let request: JsonRpcRequest = match serde_json::from_str(raw) {
         Ok(r) => r,
         Err(e) => {
-            let resp = JsonRpcResponse::err(Value::Null, INTERNAL_ERROR, format!("parse error: {e}"));
+            let resp = JsonRpcResponse::err(Value::Null, PARSE_ERROR, format!("parse error: {e}"));
             return Some(serde_json::to_string(&resp).unwrap());
         }
     };

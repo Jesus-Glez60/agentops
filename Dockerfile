@@ -76,6 +76,8 @@ COPY --from=web-builder /build/apps/web/public ./apps/web/.next/standalone/publi
 COPY ecosystem.config.js ./
 
 ENV NODE_ENV=production
+# Tells ecosystem.config.js not to generate keys into the container filesystem.
+ENV AGENTOPS_CONTAINER=1
 ENV HOSTNAME=0.0.0.0
 ENV PORT=3000
 ENV AGENTOPS_ADDR=0.0.0.0:8420

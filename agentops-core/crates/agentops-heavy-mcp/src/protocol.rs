@@ -50,7 +50,21 @@ impl JsonRpcResponse {
 
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
-pub const INTERNAL_ERROR: i64 = -32603;
+/// JSON-RPC 2.0: invalid JSON was received.
+pub const PARSE_ERROR: i64 = -32700;
+
+/// MCP tool annotations, the same shape `agentops-mcp` publishes (finding F7).
+#[derive(Debug, Serialize, Clone, Copy)]
+pub struct ToolAnnotations {
+    #[serde(rename = "readOnlyHint")]
+    pub read_only_hint: bool,
+    #[serde(rename = "destructiveHint")]
+    pub destructive_hint: bool,
+    #[serde(rename = "idempotentHint")]
+    pub idempotent_hint: bool,
+    #[serde(rename = "openWorldHint")]
+    pub open_world_hint: bool,
+}
 
 #[derive(Debug, Serialize, Clone)]
 pub struct ToolDefinition {
@@ -58,6 +72,7 @@ pub struct ToolDefinition {
     pub description: &'static str,
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    pub annotations: ToolAnnotations,
 }
 
 #[derive(Debug, Serialize)]

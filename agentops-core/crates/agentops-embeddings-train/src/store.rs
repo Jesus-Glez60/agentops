@@ -6,7 +6,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use candle_core::{DType, Device};
 use candle_nn::{VarBuilder, VarMap};
 
@@ -18,14 +18,15 @@ pub struct ProjectionStore {
 }
 
 impl ProjectionStore {
-    /// `~/.agentops/models/{repo}` -- `repo` is already a filesystem-safe
+    /// `$AGENTOPS_DATA_DIR/models/{repo}` (default `~/.agentops/models`,
+    /// via `agentops_manifest::agentops_data_dir` like every other store) --
+    /// `repo` is already a filesystem-safe
     /// canonicalized directory name by the time it reaches here (the same
     /// `agentops_mcp::scan::repo_name()` convention every other per-repo
     /// path in this codebase already relies on), so no further sanitizing
     /// is done here.
     pub fn open(repo: &str) -> Result<Self> {
-        let base = dirs_home().context("resolving home directory for ~/.agentops/models")?;
-        let dir = base.join(".agentops").join("models").join(repo);
+        let dir = agentops_manifest::agentops_data_dir().join("models").join(repo);
         fs::create_dir_all(&dir)?;
         Ok(Self { dir })
     }
@@ -129,10 +130,6 @@ impl ProjectionStore {
         fs::write(self.anchor_path(), serde_json::to_string(pairs)?)?;
         Ok(())
     }
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
 }
 
 #[cfg(test)]

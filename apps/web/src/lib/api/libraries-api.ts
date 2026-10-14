@@ -109,8 +109,19 @@ export async function getLibraryChangelog(slug: string): Promise<string> {
 
 /** `background: true` returns immediately with a job id (used by the detail page's "Re-index" action -- the user's already looking at the library, no need to block on it). `background: false` waits for the real scrape result, so the "Add library" flow can show genuine success/failure and the list can refresh with real doc counts, not just a registered-but-empty row. */
 export async function scrapeLibrary(slug: string, version: string, background: boolean): Promise<{ isError: boolean; text: string }> {
-  return callTool("scrape_library", { slug, version, background, max_pages: 6 });
+  try {
+    return await callTool("scrape_library", { slug, version, background, max_pages: 6 });
+  } catch (e) {
+    // Scraping needs the `libraries.manage` capability (admin and member by
+    // default); the server's 403 names the capability, not what to do.
+    if (e instanceof Error && e.message.includes("libraries.manage")) {
+      return { isError: true, text: MISSING_MANAGE_MESSAGE };
+    }
+    throw e;
+  }
 }
+
+export const MISSING_MANAGE_MESSAGE = "Your role can't scrape or sync library docs. Ask an org admin.";
 
 export async function rescrapeLibrary(slug: string, version: string): Promise<{ isError: boolean; text: string }> {
   return scrapeLibrary(slug, version, true);

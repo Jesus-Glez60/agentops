@@ -4,8 +4,7 @@
 //! this boilerplate instead of independently re-copying and re-diverging on
 //! it a third time — `agentops-graph` had a shared `upsert_node()` helper on
 //! `main`, but `docbrain-graph` didn't and relied on a `UNIQUE` constraint
-//! plus a manual check-then-act race in its caller instead. See
-//! hexagonal-architecture-guide.md's noted layering gap for the history.
+//! plus a manual check-then-act race in its caller instead.
 
 use std::path::Path;
 

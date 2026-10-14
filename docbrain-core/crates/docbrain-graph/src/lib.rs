@@ -8,8 +8,7 @@
 //! (synapse) is a typed relation between two nodes (`Sequence`,
 //! `ParentSection`, `CrossReference`) that lets retrieval walk to
 //! directly-connected context instead of returning a flat top-k of isolated
-//! chunks. See ~/.claude/plans/let-s-start-module-1-robust-hummingbird.md
-//! for the full design rationale.
+//! chunks.
 //!
 //! Single-tenant for this pass — `main`'s `TenantContext`/`Visibility`
 //! multi-org isolation is real, useful behavior but out of scope for "build

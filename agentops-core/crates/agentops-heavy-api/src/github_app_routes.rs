@@ -504,6 +504,9 @@ async fn github_webhook_handler(State(state): State<Arc<GithubWebhookState>>, he
                 }
             };
             match connection {
+                Ok(Some(c)) if c.method == ConnectionMethod::GitHubApp && !pushes_tracked_ref(&payload, &c) => {
+                    (StatusCode::OK, Json(json!({ "dispatched": false, "reason": "push to untracked ref" }))).into_response()
+                }
                 Ok(Some(c)) if c.method == ConnectionMethod::GitHubApp => match crate::indexing::create_and_spawn_job(&state.deps, tenant, c, JobKind::Reindex) {
                     Ok(job_id) => (StatusCode::OK, Json(json!({ "dispatched": true, "job_id": job_id }))).into_response(),
                     Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response(),
@@ -513,6 +516,21 @@ async fn github_webhook_handler(State(state): State<Arc<GithubWebhookState>>, he
             }
         }
         other => (StatusCode::OK, Json(json!({ "dispatched": false, "reason": format!("unhandled event type {other:?}") }))).into_response(),
+    }
+}
+
+/// Whether a push event touches the branch this connection indexes: its
+/// `tracked_branch`, or the repo's default branch when none is set. A push
+/// to any other branch or a tag would reindex unchanged content, since every
+/// job checks out the tracked branch. Fails open (returns true) when the
+/// payload lacks `ref` or the default branch, so a payload shape we did not
+/// expect still reindexes as before.
+fn pushes_tracked_ref(payload: &serde_json::Value, connection: &agentops_repo_access::store::RepoConnection) -> bool {
+    let Some(pushed) = payload.pointer("/ref").and_then(|v| v.as_str()) else { return true };
+    let wanted = connection.tracked_branch.clone().or_else(|| payload.pointer("/repository/default_branch").and_then(|v| v.as_str()).map(str::to_string));
+    match wanted {
+        Some(branch) => pushed == format!("refs/heads/{branch}"),
+        None => true,
     }
 }
 
@@ -667,6 +685,65 @@ mod tests {
         let job = { deps.indexing.lock().unwrap().latest_job_for_connection("acme", "acme-corp--widgets").unwrap() };
         assert!(job.is_some());
         assert_eq!(job.unwrap().kind, agentops_repo_access::indexing_store::JobKind::Reindex);
+    }
+
+    /// Sends one signed push with the given `ref` for `acme-corp/widgets`
+    /// (default branch `main`) and returns the response JSON.
+    async fn push_with_ref(deps: &IndexingDeps, tracked_branch: Option<&str>, git_ref: &str) -> serde_json::Value {
+        let secret = "wh-secret";
+        {
+            let indexing = deps.indexing.lock().unwrap();
+            indexing.create_installation("acme", "555", "acme-corp", None).unwrap();
+        }
+        {
+            let connections = deps.connections.lock().unwrap();
+            connections.create_github_app_connection("acme", "acme-corp--widgets", "https://github.com/acme-corp/widgets.git", "555").unwrap();
+            connections.set_tracked_branch("acme", "acme-corp--widgets", tracked_branch).unwrap();
+        }
+        let config = GitHubAppConfig { app_id: 1, private_key_pem: String::new(), webhook_secret: secret.to_string() };
+        let router = merge_github_webhook_route(Router::new(), deps.clone(), Some(config));
+        let body = serde_json::json!({
+            "ref": git_ref,
+            "installation": { "id": 555 },
+            "repository": { "full_name": "acme-corp/widgets", "default_branch": "main" },
+        })
+        .to_string();
+        let signature = sign(secret, body.as_bytes());
+        let resp = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/webhooks/github")
+                    .header(SIGNATURE_HEADER, signature)
+                    .header("x-github-event", "push")
+                    .header(DELIVERY_HEADER, format!("delivery-{git_ref}"))
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        body_json(resp).await
+    }
+
+    #[tokio::test]
+    async fn a_push_to_a_feature_branch_or_a_tag_does_not_reindex() {
+        let deps = test_deps();
+        let json = push_with_ref(&deps, None, "refs/heads/feature/x").await;
+        assert_eq!(json["dispatched"], false, "a feature-branch push must not reindex: {json:?}");
+        let json = push_with_ref(&test_deps(), None, "refs/tags/v1.0.0").await;
+        assert_eq!(json["dispatched"], false, "a tag push must not reindex: {json:?}");
+        assert!(deps.indexing.lock().unwrap().latest_job_for_connection("acme", "acme-corp--widgets").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_push_to_the_default_or_tracked_branch_reindexes() {
+        let json = push_with_ref(&test_deps(), None, "refs/heads/main").await;
+        assert_eq!(json["dispatched"], true, "a push to the default branch must reindex: {json:?}");
+        let json = push_with_ref(&test_deps(), Some("release"), "refs/heads/release").await;
+        assert_eq!(json["dispatched"], true, "a push to the tracked branch must reindex: {json:?}");
+        let json = push_with_ref(&test_deps(), Some("release"), "refs/heads/main").await;
+        assert_eq!(json["dispatched"], false, "with a tracked branch set, a default-branch push must not reindex: {json:?}");
     }
 
     #[tokio::test]

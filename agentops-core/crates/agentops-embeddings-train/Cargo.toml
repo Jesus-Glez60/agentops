@@ -8,6 +8,7 @@ license.workspace = true
 name = "agentops_embeddings_train"
 
 [dependencies]
+agentops-manifest = { path = "../agentops-manifest" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

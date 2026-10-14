@@ -30,7 +30,7 @@ async fn main() -> anyhow::Result<()> {
             Some(index)
         }
         Err(_) => {
-            eprintln!("AGENTOPS_QDRANT_URL not set — semantic_search/semantic_index/search_docs_indexed/index_docs_indexed/consolidate_model unavailable.");
+            eprintln!("AGENTOPS_QDRANT_URL not set — semantic_search/semantic_index/search_docs_indexed/index_docs_indexed unavailable.");
             None
         }
     };

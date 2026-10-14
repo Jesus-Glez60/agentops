@@ -30,7 +30,7 @@
 use std::path::PathBuf;
 
 use agentops_accounts::User;
-use agentops_embeddings::{Embedder, LocalEmbedder};
+use agentops_embeddings::LocalEmbedder;
 use agentops_graph::{NodeKind, NodeProminence};
 use agentops_manifest::ManifestEntry;
 use axum::extract::{Path as AxumPath, Query, State};
@@ -121,9 +121,11 @@ pub(crate) struct LocalSearchQuery {
     top_k: Option<usize>,
 }
 
-/// `GET /local-search` -- tenant-scoped semantic/embedding search, reusing
-/// `LocalEmbedder`/`GraphStore::search_similar` exactly the way
-/// `agentops-api`'s `search_json` does.
+/// `GET /local-search` -- tenant-scoped hybrid search (dense + lexical +
+/// exact name, `agentops_retrieval::search_hybrid`, the same ranking MCP
+/// `local_semantic_search` uses). Dense-only search found nothing on repos
+/// indexed the normal hosted way, since that path stores no embeddings.
+/// `similarity` carries `HybridHit::relevance`.
 pub(crate) async fn local_search_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, Query(q): Query<LocalSearchQuery>) -> (StatusCode, Json<Value>) {
     let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
         Ok(t) => t,
@@ -141,7 +143,6 @@ pub(crate) async fn local_search_json(State(state): State<AppState>, user: Optio
     let query_text = q.q.clone();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<agentops_api::search::SearchResult>> {
-        let embedding = LocalEmbedder.embed(&query_text)?;
         let mut repos = tenant_repo_paths(&state, &tenant)?;
         if let Some(names) = &repo_filter {
             // Filter by either the resolved repo name or the raw connection
@@ -157,11 +158,16 @@ pub(crate) async fn local_search_json(State(state): State<AppState>, user: Optio
         for (name, path) in &repos {
             let Ok(store) = agentops_mcp::resolve_store(state.pg_store.as_ref(), path) else { continue };
             for kind in &kind_passes {
-                for (node, distance) in store.search_similar(name, &embedding, top_k, *kind)? {
-                    hits.push(agentops_api::search::node_to_result(name, node, distance));
+                for hit in agentops_retrieval::search_hybrid(store.as_ref(), &LocalEmbedder, name, &query_text, top_k, *kind, false, None)? {
+                    let relevance = hit.relevance();
+                    let mut result = agentops_api::search::node_to_result(name, hit.node, 0.0);
+                    result.similarity = relevance;
+                    hits.push(result);
                 }
             }
         }
+        // Merges the per-repo lists, keeping the same curation demotion
+        // `search_hybrid` applies within one repo.
         hits.sort_by(|a, b| {
             let rank_a = a.similarity * agentops_graph::prominence_rank_multiplier(a.prominence) as f32;
             let rank_b = b.similarity * agentops_graph::prominence_rank_multiplier(b.prominence) as f32;
@@ -663,6 +669,30 @@ mod tests {
         assert_eq!(connections[0]["counts"]["files"], 1, "{body:?}");
         assert_eq!(connections[0]["counts"]["symbols"], 1, "{body:?}");
         assert_eq!(connections[0]["path_missing"], false);
+    }
+
+    // Hosted indexing persists without embeddings, so the old dense-only
+    // search returned nothing for a symbol the graph plainly has.
+    #[tokio::test]
+    async fn local_search_finds_a_symbol_by_name_in_a_repo_indexed_without_embeddings() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, token) = signup(&accounts, "dev@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&user.tenant, user.id, "admin").unwrap();
+
+        seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &user.tenant, "widgets");
+
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+
+        let resp = app.oneshot(Request::builder().uri("/local-search?q=greet").header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = body_json(resp).await;
+        let results = body["results"].as_array().unwrap();
+        assert!(results.iter().any(|r| r["name"] == "greet"), "{body:?}");
+        let similarity = results[0]["similarity"].as_f64().unwrap();
+        assert!(similarity > 0.0 && similarity <= 1.0, "similarity must stay a 0..1 relevance: {body:?}");
     }
 
     #[tokio::test]

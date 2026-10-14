@@ -64,18 +64,45 @@ pub fn generate_docs(repo_path: &Path) -> Result<PathBuf> {
 pub fn persist_doc_page(store: &dyn GraphStore, repo_path: &Path, repo: &str, files: &[ScannedFile], with_embeddings: bool) -> Result<()> {
     let ranked: Vec<PathBuf> = agentops_scanner::rank_files(repo_path, files).into_iter().map(|(p, _)| p).collect();
 
+    let previous: Option<agentops_docgen::DocPage> = match store.get_doc_page(repo) {
+        Ok(Some((_, previous_json))) => match serde_json::from_str(&previous_json) {
+            Ok(page) => Some(page),
+            Err(err) => {
+                eprintln!("warning: previous doc page for {repo:?} failed to deserialize ({err:#}) -- discarding it rather than blocking this scan's fresh page from saving");
+                None
+            }
+        },
+        _ => None,
+    };
+
     // Default tier, not cheap: these labels are read directly by users in the
     // Documentation Viewer's Core Modules nav, closer to `explain_symbol`
     // (interactive, quality matters) than to a background best-effort call.
     // Revised after a wrap-skill council audit flagged the original cheap-
-    // tier choice as mis-scoped (2026-09-28).
-    let recorder = agentops_llm::UsageRecorder::default();
-    let module_labels = agentops_llm::AnthropicConfig::from_env()
-        .and_then(|config| agentops_llm::group_core_modules(&config.with_usage_sink(recorder.clone()), repo, &ranked))
-        .unwrap_or_default();
-    recorder.persist(store, repo);
+    // tier choice as mis-scoped (2026-09-28). The labels depend only on the
+    // ranked file list, so they are reused while that list is unchanged:
+    // `agentops watch`, webhook reindexes and repeat scans of the same tree
+    // no longer pay for a fresh call each time (author decision, 2026-10-13).
+    let module_set_hash = module_set_hash(&ranked);
+    let module_labels = match previous.as_ref().filter(|p| p.module_set_hash.as_deref() == Some(module_set_hash.as_str())) {
+        Some(previous) => previous.module_labels.clone(),
+        None => {
+            let recorder = agentops_llm::UsageRecorder::default();
+            let labels = agentops_llm::AnthropicConfig::from_env()
+                .and_then(|config| agentops_llm::group_core_modules(&config.with_usage_sink(recorder.clone()), repo, &ranked))
+                .unwrap_or_default();
+            recorder.persist(store, repo);
+            labels
+        }
+    };
 
     let mut doc_page = agentops_docgen::build_doc_page(store, repo, &ranked, &module_labels)?;
+    // Only cache labels that came from a real call: with no key, or after a
+    // failed call, the list is empty and the next scan should try again.
+    if !module_labels.is_empty() {
+        doc_page.module_set_hash = Some(module_set_hash);
+        doc_page.module_labels = module_labels;
+    }
 
     // Preserve agent-authored `Blueprint` sections (persisted by
     // `persist_blueprint_doc`/`upsert_blueprint_section`) across every
@@ -84,35 +111,41 @@ pub fn persist_doc_page(store: &dyn GraphStore, repo_path: &Path, repo: &str, fi
     // runs. A corrupted/unparseable previous page can't contribute anything
     // here regardless, so that case just logs and falls through to the
     // freshly-built page -- it must never panic or block this scan.
-    if let Ok(Some((_, previous_json))) = store.get_doc_page(repo) {
-        match serde_json::from_str::<agentops_docgen::DocPage>(&previous_json) {
-            Ok(previous) => {
-                let mut blueprint_sections: Vec<agentops_docgen::DocSection> =
-                    previous.sections.into_iter().filter(|s| s.group == agentops_docgen::DocGroup::Blueprint).collect();
-                // Dedupe by id, keeping the last occurrence -- only matters
-                // if a corrupted previous page somehow had duplicate
-                // Blueprint ids; a fresh build never emits this group at
-                // all, so there's no cross-group collision to resolve here.
-                let mut seen = std::collections::HashSet::new();
-                let mut deduped = Vec::with_capacity(blueprint_sections.len());
-                while let Some(section) = blueprint_sections.pop() {
-                    if seen.insert(section.id.clone()) {
-                        deduped.push(section);
-                    }
-                }
-                deduped.reverse();
-                doc_page.sections.extend(deduped);
-            }
-            Err(err) => {
-                eprintln!("warning: previous doc page for {repo:?} failed to deserialize ({err:#}) -- discarding it rather than blocking this scan's fresh page from saving");
+    if let Some(previous) = previous {
+        let mut blueprint_sections: Vec<agentops_docgen::DocSection> = previous.sections.into_iter().filter(|s| s.group == agentops_docgen::DocGroup::Blueprint).collect();
+        // Dedupe by id, keeping the last occurrence -- only matters
+        // if a corrupted previous page somehow had duplicate
+        // Blueprint ids; a fresh build never emits this group at
+        // all, so there's no cross-group collision to resolve here.
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::with_capacity(blueprint_sections.len());
+        while let Some(section) = blueprint_sections.pop() {
+            if seen.insert(section.id.clone()) {
+                deduped.push(section);
             }
         }
+        deduped.reverse();
+        doc_page.sections.extend(deduped);
     }
 
     index_doc_sections(store, repo, &doc_page, with_embeddings)?;
     let content_json = serde_json::to_string(&doc_page).context("serializing the generated doc page")?;
     store.save_doc_page(repo, &doc_page.generated_at, &content_json)?;
     Ok(())
+}
+
+/// SHA-256 (hex) of the sorted ranked paths, the only input to the module
+/// labels besides the repo name.
+fn module_set_hash(ranked: &[PathBuf]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut paths: Vec<String> = ranked.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    paths.sort();
+    let mut hasher = Sha256::new();
+    for path in &paths {
+        hasher.update(path.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Merges one agent-authored `Blueprint` section (one of the 8
@@ -387,6 +420,38 @@ mod tests {
         let (_generated_at, content_json) = store.get_doc_page(&repo).unwrap().unwrap();
         let doc_page: agentops_docgen::DocPage = serde_json::from_str(&content_json).unwrap();
         assert!(doc_page.sections.iter().any(|s| s.id == "blueprint-prd"), "the blueprint-prd section must survive a rescan: sections={:?}", doc_page.sections.iter().map(|s| &s.id).collect::<Vec<_>>());
+    }
+
+    /// F24: module labels cost an LLM call, so a rescan of an unchanged
+    /// file set reuses the stored ones. Tests have no API key, so labels
+    /// that show up after the rescan can only have come from the cache.
+    #[test]
+    fn a_rescan_with_an_unchanged_file_set_reuses_the_stored_module_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let report = agentops_scanner::scan_repo(dir.path()).unwrap();
+        let ranked: Vec<PathBuf> = agentops_scanner::rank_files(dir.path(), &report.files).into_iter().map(|(p, _)| p).collect();
+        let (generated_at, content_json) = store.get_doc_page(&repo).unwrap().unwrap();
+        let mut page: agentops_docgen::DocPage = serde_json::from_str(&content_json).unwrap();
+        assert!(page.module_labels.is_empty(), "with no API key nothing is cached");
+        page.module_set_hash = Some(module_set_hash(&ranked));
+        page.module_labels = vec![agentops_graph::ModuleLabel { label: "Cached module".into(), file_paths: ranked.iter().map(|p| p.to_string_lossy().into_owned()).collect() }];
+        store.save_doc_page(&repo, &generated_at, &serde_json::to_string(&page).unwrap()).unwrap();
+
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        let page: agentops_docgen::DocPage = serde_json::from_str(&store.get_doc_page(&repo).unwrap().unwrap().1).unwrap();
+        assert_eq!(page.module_labels.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(), ["Cached module"], "unchanged files must reuse the cached labels");
+
+        // A new file changes the set, so the cache no longer applies.
+        std::fs::write(dir.path().join("src/other.py"), "def other():\n    return 1\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        let page: agentops_docgen::DocPage = serde_json::from_str(&store.get_doc_page(&repo).unwrap().unwrap().1).unwrap();
+        assert!(page.module_labels.is_empty(), "a changed file set must not reuse stale labels");
     }
 
     #[test]

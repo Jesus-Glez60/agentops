@@ -5,7 +5,7 @@ import type { SessionUser } from "@/lib/auth/types";
 import { TEAM_SWR_KEY, getTeam } from "@/lib/api/team-api";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 
-const ROLE_LABELS: Record<string, string> = { admin: "Admin", member: "Member", viewer: "Viewer", billing: "Billing" };
+const ROLE_LABELS: Record<string, string> = { admin: "Admin", member: "Member", viewer: "Viewer" };
 
 // Hero sizing per redesign plan Phase 8 -- 64px avatar -> 72px, name
 // text-lg (18px) -> 36px (roughly a 2x jump, so the surrounding spacing is

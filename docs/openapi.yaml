@@ -1481,33 +1481,6 @@ paths:
                         text: { type: string }
         "503": { description: Search not configured for this deployment }
 
-  /consolidate/model:
-    post:
-      tags: [Search & Graph]
-      summary: Locally consolidate/fine-tune a small model on a repo's curated notes
-      security: [{ sessionOrApiKey: [] }]
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required: [path]
-              properties: { path: { type: string } }
-      responses:
-        "200":
-          description: Consolidation result
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  attempted: { type: boolean }
-                  promoted: { type: boolean }
-                  examples_used: { type: integer }
-                  candidate_score: { type: number }
-                  baseline_score: { type: number }
-
   /nodes:
     get:
       tags: [Search & Graph]

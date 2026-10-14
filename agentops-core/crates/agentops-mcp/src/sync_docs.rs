@@ -23,12 +23,13 @@ pub struct SyncDocsSummary {
     pub versions_recorded: u32,
 }
 
-/// `~/.agentops/docbrain.db` — duplicated (not depended-on) from
-/// `docbrain_mcp::default_db_path`: pulling in `docbrain-mcp` here just for
-/// one path constant would be a heavier cross-crate wire than this one-line
-/// join warrants.
+/// Same resolution as `docbrain_mcp::default_db_path` (copied, not
+/// depended on, to avoid pulling in `docbrain-mcp` for one path):
+/// `AGENTOPS_DOCBRAIN_DB`, else `docbrain.db` in the AgentOps data dir.
+/// A hardcoded `~/.agentops` here used to send `agentops sync-docs` to a
+/// different file than the rest of the CLI whenever `AGENTOPS_DATA_DIR` was set.
 fn default_docbrain_db_path() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".agentops").join("docbrain.db")
+    std::env::var_os("AGENTOPS_DOCBRAIN_DB").map(PathBuf::from).unwrap_or_else(|| agentops_manifest::agentops_data_dir().join("docbrain.db"))
 }
 
 /// Scans `repo_path` for third-party dependencies and registers whichever

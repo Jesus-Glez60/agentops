@@ -16,11 +16,10 @@ use docbrain_graph::SqliteDocbrainStore;
 
 /// The docbrain store location — `AGENTOPS_DOCBRAIN_DB` if set, else
 /// `$AGENTOPS_DATA_DIR/docbrain.db` (default `~/.agentops/docbrain.db`). One
-/// canonical definition, called by this crate's own binary, `docbrain-api`,
-/// `agentops-mcp-server`/`agentops-server`, and `agentops-cli`'s
-/// `docbrain-serve`/`docbrain-serve-api` passthrough commands, rather than
-/// each of them keeping its own private copy (two of which already existed
-/// independently before this one was added). This is the single-tenant,
+/// canonical definition, called by `agentops-mcp-server`, `agentops-server`
+/// and `agentops-cli` (`docbrain-serve`, `serve-api`), rather than each of
+/// them keeping its own private copy (`agentops-mcp::sync_docs` copies the
+/// same resolution to avoid depending on this crate). This is the single-tenant,
 /// CLI-facing store — distinct from `agentops-heavy-api`'s per-tenant
 /// `docbrain-tenants/` directory (`DOCBRAIN_DB_DIR`), which has its own
 /// default under the same `AGENTOPS_DATA_DIR`.
