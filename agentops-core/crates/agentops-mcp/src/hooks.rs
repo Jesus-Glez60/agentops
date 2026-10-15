@@ -72,6 +72,7 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     match event {
         "posttooluse" => classify_post_tool_use(tool_name, &tool_input).is_some() || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
         "pretooluse" => tool_name == "ExitPlanMode" || is_memory_write(tool_name, &tool_input) || detect_secret_exposure(tool_name, &tool_input).is_some(),
+        "userpromptsubmit" => payload.get("prompt").and_then(|v| v.as_str()).is_some_and(|p| !p.trim().is_empty() && !is_task_notification(p)),
         "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
         _ => true,
     }
@@ -282,10 +283,13 @@ fn plan_flow_directive() -> String {
 const PLAN_FLOW_REMINDER: &str = "AgentOps task-start flow: you're mid-flow. Carry on from the step you're on (recall, library-docs, pointed questions, audit-plan, then present with \"Research performed\" and \"Council verdict\"). Don't restart it.";
 
 /// Claude Code delivers a finished background task as a `UserPromptSubmit`
-/// whose prompt is the notification XML (spike, 2026-10-14). It isn't the
-/// user speaking, so it's never recorded or used for recall.
+/// whose prompt is the notification XML (spike, 2026-10-14), and a
+/// subagent's hand-back as one starting with the agent-message preamble
+/// (seen in a transcript, 2026-10-15). Neither is the user speaking, so
+/// neither is recorded or used for recall.
 fn is_task_notification(prompt: &str) -> bool {
-    prompt.trim_start().starts_with("<task-notification>")
+    let prompt = prompt.trim_start();
+    prompt.starts_with("<task-notification>") || prompt.starts_with("Another Claude session sent a message:\n<agent-message")
 }
 
 /// The session's most recent real user prompt, from either mode. Feeds the
@@ -598,6 +602,8 @@ mod tests {
         assert!(!is_relevant("pretooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "src/main.rs"} })));
         assert!(is_relevant("pretooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": ".env"} })));
         assert!(is_relevant("userpromptsubmit", &json!({ "prompt": "hi" })));
+        assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<task-notification>x" })));
+        assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "Another Claude session sent a message:\n<agent-message from=\"a1\">\nreport" })));
     }
 
     #[test]
@@ -798,6 +804,9 @@ mod tests {
         gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hooks");
         let out = handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": "<task-notification>\n<summary>hooks agent finished</summary>", "session_id": "s", "permission_mode": "plan" })).unwrap();
         assert!(out.is_none());
+        assert!(store.session_events(&repo, "s").unwrap().is_empty());
+        let hand_back = "Another Claude session sent a message:\n<agent-message from=\"a1\">\n[Subagent hand-back] the hooks report";
+        assert!(handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": hand_back, "session_id": "s", "permission_mode": "plan" })).unwrap().is_none());
         assert!(store.session_events(&repo, "s").unwrap().is_empty());
         assert!(prompt(store.as_ref(), &repo, "plan the hooks work", "plan").contains("task-start flow"), "a notification never counts as the episode's first prompt");
     }
