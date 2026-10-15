@@ -35,3 +35,17 @@ Once confirmed, deliver the statement of intent, offer to hand off to
 `idea-refine` (if it still needs variations) or `spec-driven-development`
 (if it's concrete enough to specify), and stop your turn — do not start
 downstream work in the same turn the user just confirmed.
+
+**Plan-flow mode.** When you're called from the `plan` skill (the
+task-start flow), the plan is the next step, not a separate turn. Use the
+same trigger and the same one-question-with-a-guess style, but:
+
+- Ask at most 3 questions (`MAX_PLAN_QUESTIONS`), only about the outcome,
+  the scope boundary, or a constraint the plan depends on, and only what
+  recall and the code didn't answer.
+- Skip the closing statement of intent and the explicit-yes gate. Don't
+  stop the turn: hand the answers back to `plan` and keep planning in the
+  same turn.
+- Anything still unanswered when you stop becomes an "Open assumptions"
+  entry at the top of the plan. Approving the plan is the user's chance to
+  correct it.

@@ -28,6 +28,16 @@ relevant gotcha is easiest to miss. Name what was found, or state in one
 line that nothing relevant exists. A plan that skipped this check is
 incomplete.
 
+**Pointed questions.** After recall, if the task is still missing its
+outcome, its scope boundary, or a constraint the plan depends on, and
+neither recall nor the code answers it, ask before planning. Use the
+`interview-me` skill in its plan-flow mode: one question at a time with
+`AskUserQuestion`, each with your guess attached, and at most 3 questions
+(`MAX_PLAN_QUESTIONS`). Don't ask about anything you can verify yourself
+or that has a conventional default. Past the cap, plan anyway: list every
+open assumption under an "Open assumptions" heading at the top of the
+plan, so the user can correct them before approving.
+
 Only propose genuinely new code for whatever's left after that check.
 Present the plan naming the specific existing code and dependencies it
 reuses, not just a list of new files to create.

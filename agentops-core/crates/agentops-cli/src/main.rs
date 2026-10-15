@@ -2641,5 +2641,18 @@ mod tests {
         }
     }
 
+
+    /// The question cap is a constant (`MAX_PLAN_QUESTIONS`) but the skills
+    /// state it as prose; this keeps the two from drifting.
+    #[test]
+    fn plan_and_interview_me_state_the_same_question_cap_as_the_constant() {
+        let dir = tempfile::tempdir().unwrap();
+        agentops_ruler_bridge::build_ruler_dir(dir.path(), "# AGENTS").unwrap();
+        let cap = format!("at most {} questions", agentops_mcp::budget::MAX_PLAN_QUESTIONS);
+        for skill in ["plan", "interview-me"] {
+            let rendered = std::fs::read_to_string(dir.path().join(format!(".ruler/skills/{skill}/SKILL.md"))).unwrap();
+            assert!(rendered.contains(&cap) && rendered.contains("Open assumptions"), "{skill} must say \"{cap}\" and name the Open assumptions section");
+        }
+    }
 }
 
