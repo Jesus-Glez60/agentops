@@ -113,7 +113,7 @@ Read tools also write, in a small way. Calls such as `get_symbol` and `list_gotc
 | Tool | Access | R/W | Inputs | Returns |
 | --- | --- | --- | --- | --- |
 | `status` | Advisor | R | `path*` | Last scan's counts plus the repo-state summary, or "no scans recorded yet". |
-| `list_gotchas` | Advisor | R | `path*`, `session_id` | One line per gotcha, title and node id; `Reduced` last with its reason. |
+| `list_gotchas` | Advisor | R | `path*`, `session_id`, `query`, `tag` | One line per gotcha, title and node id; `Reduced` last with its reason. `query` keeps gotchas whose title or body contains every word (case-insensitive); `tag` keeps those carrying that exact tag ([06-notes-and-consolidation.md](06-notes-and-consolidation.md), "Tags"); both combine with AND. Filtering happens in Rust, so both stores behave the same. With neither, the output is unchanged; with no match, `No gotchas match.` |
 | `get_symbol` | Advisor | R | `path*`, `name*`, `file`, `session_id`, `max_chars` | Symbol source, then the gotchas and decisions that affect it, with staleness and curation markers. |
 | `list_scans` | Advisor | R | `path*`, `limit` (default 10) | One line per scan with file and symbol deltas. |
 | `related_context` | Advisor | R | `path*`, `symbol_id*`, `top_k`, `session_id`, `max_chars`, `compact` | Pattern-completed related symbols and their notes. |

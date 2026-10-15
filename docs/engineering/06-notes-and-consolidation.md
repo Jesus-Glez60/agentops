@@ -60,6 +60,10 @@ There is one implementation behind every write path: `add_note` and `ingest_note
 4. Re-read the folder with `walk_vault`, find the note by title, and ingest it with `ingest_vault(.., bump_confirmed_at: true)`.
 5. If `with_embeddings` is set, embed the body with `LocalEmbedder` and store it (`set_embedding`).
 
+### Tags
+
+Frontmatter `tags` reach the graph as the last line of the node's content: `<!-- agentops:tags a, b -->`, appended by `ingest_vault` (`content_with_tags`) and read back by `tags_of` (`agentops-core/crates/agentops-notes/src/vault.rs`). Only a final line in that form counts, so a body that mentions the marker inline isn't read as tags. Until milestone 1 the tags were dropped at ingest: they lived only in the note file, so nothing graph-side could filter on them. A marker line was chosen over a `tags` column because a column needs a migration in both stores (gotchas 54053, 54216, 54241). Existing notes pick up their tags on the next re-ingest, because the hosted reindex re-reads `.notes/` (ADR 0045) and local ingest re-reads the vault. The dashboard renders content with `react-markdown` without `rehype-raw`, which drops HTML comments, so the marker isn't shown. `list_gotchas` filters on it with `tag`.
+
 `ingest_notes_dir` walks the folder, ingests every note with `bump_confirmed_at: true`, and with `with_embeddings` re-embeds every `Gotcha`, `Decision` and `Note` node in the repo. The re-embedding is deliberate: `IngestSummary` carries counts, not node ids (doc comment).
 
 `agentops ingest-notes --dry-run` still makes and records paid LLM calls when `--llm-classify` or `--llm-match` is set. Only the notes are not written (inline comment in `agentops-core/crates/agentops-cli/src/main.rs`).

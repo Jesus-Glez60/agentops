@@ -320,6 +320,31 @@ pub struct IngestSummary {
     pub edges_reinforced: usize,
 }
 
+/// Starts the line `ingest_vault` appends to a note's node content to carry
+/// its frontmatter tags into the graph (`Node` has no tags field, and a
+/// column would need a migration in both stores). An HTML comment, so a
+/// Markdown render hides it, and a hand-written body can't produce one by
+/// accident. Lexical search sees the tag words too, which is intended.
+pub const TAGS_MARKER: &str = "<!-- agentops:tags ";
+
+/// `body` plus, when there are tags, a final `<!-- agentops:tags a, b -->`
+/// line.
+pub fn content_with_tags(body: &str, tags: &[String]) -> String {
+    let tags: Vec<&str> = tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    if tags.is_empty() {
+        return body.to_string();
+    }
+    format!("{body}\n\n{TAGS_MARKER}{} -->", tags.join(", "))
+}
+
+/// The tags `content_with_tags` stored in a node's content: only its last
+/// line is read, and only if it is a tags marker.
+pub fn tags_of(content: &str) -> Vec<String> {
+    let Some(last) = content.trim_end().lines().last() else { return Vec::new() };
+    let Some(list) = last.trim().strip_prefix(TAGS_MARKER).and_then(|rest| rest.strip_suffix("-->")) else { return Vec::new() };
+    list.split(',').map(|t| t.trim().to_string()).filter(|t| !t.is_empty()).collect()
+}
+
 /// Ingests `notes` into `repo`'s graph: one node per `VaultNote`
 /// (`Gotcha`/`Decision`/`Note` per its inferred type), matched to symbols
 /// via `matcher` and connected via `Affects` edges (note → symbol,
@@ -349,7 +374,7 @@ pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], mat
                 container: None,
                 start_line: None,
                 end_line: None,
-                content: Some(note.body.clone()),
+                content: Some(content_with_tags(&note.body, &note.tags)),
             },
         )?;
         summary.notes_written += 1;
@@ -376,6 +401,27 @@ mod tests {
 
     fn node(repo: &str, path: &str, name: &str) -> NewNode {
         NewNode { kind: NodeKind::Symbol, repo: repo.to_string(), path: Some(path.to_string()), name: Some(name.to_string()), container: None, start_line: Some(1), end_line: Some(2), content: Some("..".to_string()) }
+    }
+
+    #[test]
+    fn tags_round_trip_through_node_content_and_only_the_final_marker_counts() {
+        let content = content_with_tags("Body mentioning <!-- agentops:tags fake --> inline.", &["zoho".into(), " crm ".into(), "".into()]);
+        assert!(content.ends_with("<!-- agentops:tags zoho, crm -->"), "{content}");
+        assert_eq!(tags_of(&content), vec!["zoho", "crm"]);
+        assert_eq!(content_with_tags("no tags", &[]), "no tags");
+        assert!(tags_of("Body\n<!-- agentops:tags x -->\nmore text after").is_empty(), "a marker that isn't the last line is body text");
+    }
+
+    #[test]
+    fn ingest_vault_stores_frontmatter_tags_in_the_node_content() {
+        let dir = tempfile::tempdir().unwrap();
+        write_note(dir.path(), "gotchas/zoho.md", "---\ntitle: \"Zoho duplicate contact\"\ntype: gotcha\ntags: [zoho, crm]\n---\n\nBody text here.\n");
+        let notes = walk_vault(dir.path(), &HeuristicClassifier).unwrap();
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        ingest_vault(&store, "demo", &notes, &WordBoundaryMatcher::default(), false).unwrap();
+        let node = store.nodes_by_kind("demo", agentops_graph::NodeKind::Gotcha).unwrap().remove(0);
+        assert_eq!(tags_of(node.content.as_deref().unwrap()), vec!["zoho", "crm"]);
+        assert!(node.content.unwrap().starts_with("Body text here."));
     }
 
     #[test]

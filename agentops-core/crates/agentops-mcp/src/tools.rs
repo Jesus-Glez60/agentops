@@ -52,10 +52,10 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_gotchas",
-            description: "Lists every Gotcha node recorded for a repo. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
+            description: "Lists the Gotcha nodes recorded for a repo. With no filter, every gotcha. `query` keeps gotchas whose title or body contains every word of it (case-insensitive); `tag` keeps gotchas carrying that exact tag (from the note's frontmatter or add_note's tags, e.g. a library slug). Both together combine with AND. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" } }, "required": ["path"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" }, "query": { "type": "string", "description": "Words that must all appear in the title or body" }, "tag": { "type": "string", "description": "Exact tag, e.g. a library slug" } }, "required": ["path"] }),
             handler: tool_list_gotchas,
         },
         ToolSpec {
@@ -480,6 +480,22 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
     if gotchas.is_empty() {
         let hint = never_scanned_hint(store.as_ref(), &repo)?.unwrap_or_default();
         return Ok(format!("No gotchas recorded.{hint}"));
+    }
+    // Filtered in Rust over the already-loaded list rather than through
+    // `search_lexical`, so both stores behave the same: SQLite FTS ORs a
+    // multi-word query while Postgres ANDs it.
+    let query = get_str(args, "query").map(str::trim).filter(|q| !q.is_empty());
+    let tag = get_str(args, "tag").map(str::trim).filter(|t| !t.is_empty());
+    if query.is_some() || tag.is_some() {
+        let words: Vec<String> = query.map(|q| q.split_whitespace().map(str::to_lowercase).collect()).unwrap_or_default();
+        gotchas.retain(|n| {
+            let content = n.content.as_deref().unwrap_or("");
+            let haystack = format!("{} {}", n.name.as_deref().unwrap_or(""), content).to_lowercase();
+            words.iter().all(|w| haystack.contains(w.as_str())) && tag.is_none_or(|t| agentops_notes::tags_of(content).iter().any(|have| have.eq_ignore_ascii_case(t)))
+        });
+        if gotchas.is_empty() {
+            return Ok("No gotchas match.".to_string());
+        }
     }
     // Full-prominence first -- every gotcha is still listed (this is
     // permanent knowledge, never hidden), just ranked so a curated-down
@@ -1488,6 +1504,38 @@ mod tests {
         let full_pos = text.find("Full prominence gotcha").unwrap();
         let niche_pos = text.find("Niche gotcha").unwrap();
         assert!(full_pos < niche_pos, "a Reduced-prominence gotcha must sort after Full ones, not before: {text}");
+    }
+
+    #[test]
+    fn list_gotchas_filters_by_query_by_tag_by_both_and_is_unchanged_with_neither() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "note_type": "gotcha", "title": "Axum Query rejects absent options", "body": "Option fields need serde default.", "tags": ["axum"] })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "note_type": "gotcha", "title": "Axum merge panics on duplicate routes", "body": "Router::merge panics.", "tags": ["axum", "routing"] })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "note_type": "gotcha", "title": "SQLite default timestamps", "body": "ALTER TABLE rejects CURRENT_TIMESTAMP. Not about axum routing.", "tags": ["sqlite"] })).unwrap();
+        let list = |extra: Value| {
+            let mut args = json!({ "path": path });
+            args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            call_tool(AccessMode::Full, "list_gotchas", &args).unwrap().content[0].text.clone()
+        };
+
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let mut nodes = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap();
+        nodes.sort_by_key(|n| n.prominence == agentops_graph::NodeProminence::Reduced);
+        let today = nodes.iter().map(|n| format!("- {} (node {})", n.name.as_deref().unwrap(), n.id)).collect::<Vec<_>>().join("\n");
+        assert_eq!(list(json!({})), today, "no filter: byte-identical to the unfiltered listing");
+        assert_eq!(list(json!({ "query": "  ", "tag": "" })), today, "blank filters count as no filter");
+
+        let by_tag = list(json!({ "tag": "AXUM" }));
+        assert!(by_tag.contains("Query rejects") && by_tag.contains("merge panics") && !by_tag.contains("SQLite"), "tag is exact but case-insensitive, and body text never counts as a tag: {by_tag}");
+        let by_query = list(json!({ "query": "axum routing" }));
+        assert!(by_query.contains("SQLite") && !by_query.contains("Query rejects"), "every query word must appear in title or body: {by_query}");
+        let both = list(json!({ "query": "panics", "tag": "routing" }));
+        assert!(both.contains("merge panics") && both.lines().count() == 1, "{both}");
+        assert_eq!(list(json!({ "tag": "nope" })), "No gotchas match.");
     }
 
     #[test]

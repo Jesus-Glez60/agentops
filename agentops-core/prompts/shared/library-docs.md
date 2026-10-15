@@ -3,7 +3,7 @@ back to a third-party documentation tool or training knowledge as the first
 move, and don't skip a step just because a later one might also work.
 
 1. Call `get_docs`/`search_docs` for the library. If either returns real
-   results, use them and stop here.
+   results, use them and skip to the gotchas step below.
 
 2. If it's empty, or the library isn't registered at all: call
    `discover_library` (resolves ecosystem/registry metadata from its name).
@@ -31,6 +31,13 @@ move, and don't skip a step just because a later one might also work.
 4. If neither step 2 nor step 3 resolves it, say so explicitly rather than
    silently guessing, and only then fall back to training knowledge — flag
    it clearly as unverified, never presented as confirmed fact.
+
+**Then load the library's recorded gotchas**, whichever step found the docs
+(or none did): call `list_gotchas` with `tag` set to the library's slug,
+then again with `query` set to its name. Docs say how a library is meant to
+work; gotchas say how it actually bit this project. Report what came back,
+or say in one line that nothing did. Never skip this because the docs looked
+complete.
 
 Do this even when not explicitly asked to fetch documentation — a doc gap
 found mid-task is a reason to fill it through this sequence, not a reason
