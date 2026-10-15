@@ -389,6 +389,35 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 - The server has `AGENTOPS_GITHUB_WEBHOOK_SECRET` set, so the GitHub App's webhook secret no longer matches it. Pushes therefore never reindex, and nothing reports it.
 - **Resolved** (2026-10-14, configuration only, author-approved): the App's webhook secret was set to the server's value through `PATCH /app/hook/config`; the next delivery returned 200. Recorded as a gotcha on the hosted graph.
 
+### F50. Hooks never ran in this repo
+
+- Status: found 2026-10-14 during the milestone 1 spike.
+- `connect --with-hooks` was opt-in, and this repo was connected without it, so neither `.claude/settings.json` nor the user settings had the agentops hooks. Pinned-note re-injection, session capture and the session guide had never run in its sessions.
+- **Resolved** in milestone 1 (`25c4591`): hooks are installed by default (`--no-hooks` opts out). Installed here on 2026-10-14 with `agentops connect --remote`.
+
+### F51. Hooks wrote to an orphaned local graph on server-connected repos
+
+- Status: found 2026-10-14 (cue-driven memory requirement, verification findings).
+- `hook-capture` always opened the local store, so on a `connect --remote` repo its session events and pins went to `.context/graph.db`, not the server.
+- **Resolved** in `25c4591`: hooks forward to `POST /repos/{id}/hooks/{event}` when `.context/agentops-remote.json` exists. Verified live: this session's events reached the server.
+
+### F52. Note tags were dropped at ingest
+
+- Status: found 2026-10-14 while planning milestone 1; recorded as a gotcha on the hosted graph.
+- `add_note` wrote `tags` into the note's frontmatter, but `ingest_vault` stored only the body, so nothing graph-side could filter on them.
+- **Resolved** in `6f9a95f`: a final `<!-- agentops:tags ... -->` line carries them into node content.
+
+### F53. Recall seeds from a whole prompt were mostly noise
+
+- Status: found 2026-10-14 measuring milestone 1 against this repo's graph.
+- The first seed for "add a --json flag to agentops status" matched only the repo's own name and single weak words, and digest doc sections matched every prompt.
+- **Partly resolved** in `a998c7e` and `591bbed` (repo name excluded, two-keyword floor, digest sections down-weighted, cue-count ranking). Still open: one large note ("agentops-teams: Organizations, memberships...") matches many prompts on one or two words. IDF-style weighting is milestone 3 material.
+
+### F54. `connect` with a subset of agents shrinks Ruler's .gitignore block
+
+- Status: seen 2026-10-14; recorded as a gotcha on the hosted graph.
+- `connect --agents claude` rewrote the Ruler block to the claude paths only and un-ignored `.cursor/`, `.gemini/skills` and `AGENTS.md`. Restored by hand with `git checkout .gitignore`. Not fixed.
+
 ### Observation: a scratch docbrain library on the hosted server
 
 - The 2026-10-13 SSRF check registered `zz-ssrf-check` in the author's org docbrain store. No tool deletes a library; it is hidden from the Libraries list because it has no content. Not a defect.
