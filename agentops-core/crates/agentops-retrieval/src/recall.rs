@@ -124,9 +124,13 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
             c.score *= DOC_SECTION_WEIGHT;
         }
     }
-    // Score first; id as a stable tiebreak so the same prompt always
-    // yields the same seed.
-    ranked.sort_by(|a, b| b.1.score.total_cmp(&a.1.score).then(a.0.cmp(&b.0)));
+    // How many distinct cues a node matched comes first: rank fusion runs
+    // per kind, so every kind's top hit scores alike, and a gotcha matching
+    // three keywords must beat a decision matching two (seen live on the
+    // server graph). A named symbol's note counts as one cue more. Then the
+    // fused score, then id as a stable tiebreak.
+    let cues = |c: &Candidate| c.reasons.len() + usize::from(c.reasons.iter().any(|r| r.starts_with("affects")));
+    ranked.sort_by(|a, b| cues(&b.1).cmp(&cues(&a.1)).then(b.1.score.total_cmp(&a.1.score)).then(a.0.cmp(&b.0)));
     Ok(ranked
         .into_iter()
         .take(limit)
@@ -248,6 +252,15 @@ mod tests {
         let specific = note(&store, NodeKind::Gotcha, "Webhook signature mismatch", "every webhook gets 401");
         let seed = recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap();
         assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![specific, digest], "{seed:?}");
+    }
+
+    #[test]
+    fn a_note_matching_more_keywords_beats_the_top_hit_of_another_kind() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let decision = note(&store, NodeKind::Decision, "Webhook auto-kickoff", "github webhook");
+        let gotcha = note(&store, NodeKind::Gotcha, "Webhook signature 401", "github webhook signature invalid");
+        let seed = recall_seed(&store, "r", "github webhook signature", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![gotcha, decision], "{seed:?}");
     }
 
     #[test]
