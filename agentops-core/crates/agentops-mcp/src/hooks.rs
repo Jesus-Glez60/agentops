@@ -253,25 +253,119 @@ fn post_tool_use_failure(store: &dyn GraphStore, repo: &str, payload: &Value) ->
 // UserPromptSubmit
 // ---------------------------------------------------------------------
 
+/// `tool_name` of the `user_intent` event a prompt is recorded as. The
+/// plan-mode variant is how the next prompt tells whether a planning
+/// episode is already under way; always compare it exactly.
+pub const PROMPT_TOOL: &str = "user_prompt";
+pub const PLAN_PROMPT_TOOL: &str = "user_prompt:plan";
+/// `event_kind` recording which node ids a hook already showed this
+/// session, so recall never repeats itself (description: `ids 1,2,3`).
+pub const RECALL_INJECTED: &str = "recall_injected";
+
+/// The task-start flow directive (`prompts/shared/plan-flow.md`), compiled in.
+fn plan_flow_directive() -> String {
+    include_str!("../../../prompts/shared/plan-flow.md").replace("{MAX_PLAN_QUESTIONS}", &crate::budget::MAX_PLAN_QUESTIONS.to_string())
+}
+
+/// Sent on every later prompt of a planning episode instead of the full
+/// directive: never restart the flow mid-episode.
+const PLAN_FLOW_REMINDER: &str = "AgentOps task-start flow: you're mid-flow. Carry on from the step you're on (recall, library-docs, pointed questions, audit-plan, then present with \"Research performed\" and \"Council verdict\"). Don't restart it.";
+
+/// Claude Code delivers a finished background task as a `UserPromptSubmit`
+/// whose prompt is the notification XML (spike, 2026-10-14). It isn't the
+/// user speaking, so it's never recorded or used for recall.
+fn is_task_notification(prompt: &str) -> bool {
+    prompt.trim_start().starts_with("<task-notification>")
+}
+
+/// The session's most recent real user prompt, from either mode. Feeds the
+/// subagent seed, which has no prompt of its own.
+pub fn last_prompt(store: &dyn GraphStore, repo: &str, session_id: &str) -> Result<Option<String>> {
+    Ok(store.session_events(repo, session_id)?.into_iter().rev().find(|e| e.event_kind == "user_intent" && (e.tool_name == PROMPT_TOOL || e.tool_name == PLAN_PROMPT_TOOL)).map(|e| e.description))
+}
+
+/// Node ids a hook already injected in this session.
+fn injected_ids(events: &[agentops_graph::SessionEvent]) -> std::collections::HashSet<i64> {
+    events.iter().filter(|e| e.event_kind == RECALL_INJECTED).flat_map(|e| e.description.trim_start_matches("ids ").split(',').filter_map(|id| id.trim().parse().ok()).collect::<Vec<i64>>()).collect()
+}
+
+/// Appends a recall section to `parts` with as many pointers as fit in
+/// `budget` (counting everything already in `parts`), and records which
+/// ones went out. Returns nothing; an empty seed adds nothing.
+fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, parts: &mut Vec<String>, seed: &[agentops_retrieval::RecallPointer], budget: usize) -> Result<()> {
+    const HEADER: &str = "Recalled from AgentOps for this task (pointers; `fetch_content` with the id returns the full text):";
+    let used: usize = parts.iter().map(|p| p.chars().count() + 2).sum::<usize>() + HEADER.chars().count();
+    let mut lines = Vec::new();
+    let mut size = used;
+    for pointer in seed {
+        let line = pointer.render();
+        size += line.chars().count() + 1;
+        if size > budget {
+            break;
+        }
+        lines.push((pointer.node_id, line));
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let ids = lines.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
+    store.record_session_event(repo, session_id, "recall", &format!("ids {ids}"), None, RECALL_INJECTED)?;
+    parts.push(format!("{HEADER}\n{}", lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")));
+    Ok(())
+}
+
+/// Records the prompt, then injects context:
+/// - always: pinned notes (sticky pins re-injected on every turn, the
+///   "combat context drift" mechanism -- a pin is a standing directive);
+/// - plan mode, first prompt of a planning episode (the previous prompt
+///   wasn't in plan mode, or there was none): the task-start flow directive
+///   and a recall seed of up to `PLAN_SEED_MAX_ITEMS` pointers;
+/// - plan mode, later prompts (answers, refinements): a one-line reminder;
+/// - any other mode: up to `DEFAULT_SEED_MAX_ITEMS` pointers not already
+///   shown this session, so a new topic gets fresh recall and a follow-up
+///   on the same topic gets nothing extra.
+///
+/// Everything fits in `PLAN_FLOW_BUDGET`; recall pointers are dropped first.
 fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
+    use crate::budget::{DEFAULT_SEED_MAX_ITEMS, PLAN_FLOW_BUDGET, PLAN_SEED_MAX_ITEMS};
+
     let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
-    if prompt.trim().is_empty() {
+    if prompt.trim().is_empty() || is_task_notification(prompt) {
         return Ok(None);
     }
+    let session_id = session_id(payload);
+    let plan_mode = payload.get("permission_mode").and_then(|v| v.as_str()) == Some("plan");
+    let events = store.session_events(repo, session_id)?;
+    let continuing_episode = events.iter().rev().find(|e| e.event_kind == "user_intent").is_some_and(|e| e.tool_name == PLAN_PROMPT_TOOL);
+
     let capped = cap(prompt, DEFAULT_CHAR_BUDGET, 0);
     let redacted = agentops_security::redact(&capped.text);
-    store.record_session_event(repo, session_id(payload), "user_prompt", &redacted.text, None, "user_intent")?;
+    store.record_session_event(repo, session_id, if plan_mode { PLAN_PROMPT_TOOL } else { PROMPT_TOOL }, &redacted.text, None, "user_intent")?;
 
-    // Sticky pins re-injected on every turn, not just at SessionStart -- the
-    // actual "combat context drift" mechanism: a long, multi-compact session
-    // can scroll a SessionStart-only injection out of view, but a pin is
-    // meant to be a standing directive the agent never loses sight of.
-    // Claude Code caps `additionalContext` at 10,000 chars;
-    // `GUIDE_CHAR_BUDGET`'s 2000 stays comfortably under that.
+    let mut parts = Vec::new();
     let pinned = crate::session_guide::build_pinned_context(store, repo)?;
-    Ok((!pinned.is_empty()).then(|| hook_output("UserPromptSubmit", Some(&pinned), None)))
+    if !pinned.is_empty() {
+        parts.push(pinned);
+    }
+    if plan_mode && continuing_episode {
+        parts.push(PLAN_FLOW_REMINDER.to_string());
+    } else if plan_mode {
+        parts.push(plan_flow_directive());
+        // The whole seed, even pointers shown earlier in the session: the
+        // plan is built from this, and earlier context may be compacted.
+        let seed = agentops_retrieval::recall_seed(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default())?;
+        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET)?;
+    } else {
+        let seed = agentops_retrieval::recall_seed(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &injected_ids(&events))?;
+        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET)?;
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let context = cap(&parts.join("\n\n"), PLAN_FLOW_BUDGET, 0).text;
+    Ok(Some(hook_output("UserPromptSubmit", Some(&context), None)))
 }
 
 // ---------------------------------------------------------------------
@@ -529,6 +623,77 @@ mod tests {
         store.record_scan(&repo, &[]).unwrap();
         let out = handle(store.as_ref(), &repo, "sessionstart", &json!({ "source": "startup", "session_id": "sess-13" })).unwrap().expect("a scanned repo primes a fresh session");
         assert_eq!(out["hookSpecificOutput"]["hookEventName"], "SessionStart");
+    }
+
+    fn gotcha(store: &dyn GraphStore, repo: &str, name: &str, content: &str) -> i64 {
+        agentops_graph::upsert_node(store, NewNode { kind: NodeKind::Gotcha, repo: repo.into(), path: Some(format!("vault:{name}")), name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some(content.into()) }).unwrap()
+    }
+
+    fn context(out: Option<Value>) -> String {
+        out.map(|o| o["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string()).unwrap_or_default()
+    }
+
+    fn prompt(store: &dyn GraphStore, repo: &str, text: &str, mode: &str) -> String {
+        context(handle(store, repo, "userpromptsubmit", &json!({ "prompt": text, "session_id": "s", "permission_mode": mode })).unwrap())
+    }
+
+    #[test]
+    fn the_first_plan_mode_prompt_gets_the_flow_and_a_seed_within_budget_and_later_ones_only_a_reminder() {
+        let (_dir, store, repo) = store();
+        let id = gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hook capture opens the local store");
+        let first = prompt(store.as_ref(), &repo, "make the hooks follow the remote server", "plan");
+        assert!(first.contains("AgentOps task-start flow") && first.contains("at most 3"), "{first}");
+        assert!(first.contains(&format!("(id {id})")), "the seed points at the matching gotcha: {first}");
+        assert!(first.chars().count() <= crate::budget::PLAN_FLOW_BUDGET);
+
+        let second = prompt(store.as_ref(), &repo, "yes, the server one", "plan");
+        assert_eq!(second, PLAN_FLOW_REMINDER, "a later prompt in the same episode never restarts the flow");
+
+        // Leaving plan mode and coming back starts a new episode.
+        prompt(store.as_ref(), &repo, "ok go", "default");
+        assert!(prompt(store.as_ref(), &repo, "plan the hooks server work again", "plan").contains("AgentOps task-start flow"));
+    }
+
+    #[test]
+    fn a_default_mode_prompt_gets_only_pointers_it_hasnt_seen_this_session() {
+        let (_dir, store, repo) = store();
+        let hooks_id = gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hook capture opens the local store");
+        let tags_id = gotcha(store.as_ref(), &repo, "Tags dropped at ingest", "ingest keeps only the body");
+
+        let first = prompt(store.as_ref(), &repo, "why do hooks ignore the server", "default");
+        assert!(first.contains(&format!("(id {hooks_id})")) && !first.contains("task-start flow"), "{first}");
+        assert!(prompt(store.as_ref(), &repo, "why do hooks ignore the server", "default").is_empty(), "the same topic again adds nothing new");
+        let other = prompt(store.as_ref(), &repo, "now the ingest tags problem", "default");
+        assert!(other.contains(&format!("(id {tags_id})")) && !other.contains(&format!("(id {hooks_id})")), "{other}");
+    }
+
+    #[test]
+    fn pinned_notes_still_come_first_in_every_mode() {
+        let (_dir, store, repo) = store();
+        let pin = gotcha(store.as_ref(), &repo, "Always run tests on the server", "rule");
+        store.set_curation(&repo, pin, agentops_graph::NodeProminence::Pinned, None).unwrap();
+        for mode in ["default", "plan"] {
+            assert!(prompt(store.as_ref(), &repo, "anything at all", mode).starts_with("## Pinned"), "{mode}");
+        }
+    }
+
+    #[test]
+    fn a_task_notification_is_neither_recorded_nor_answered() {
+        let (_dir, store, repo) = store();
+        gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hooks");
+        let out = handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": "<task-notification>\n<summary>hooks agent finished</summary>", "session_id": "s", "permission_mode": "plan" })).unwrap();
+        assert!(out.is_none());
+        assert!(store.session_events(&repo, "s").unwrap().is_empty());
+        assert!(prompt(store.as_ref(), &repo, "plan the hooks work", "plan").contains("task-start flow"), "a notification never counts as the episode's first prompt");
+    }
+
+    #[test]
+    fn last_prompt_reads_both_modes_and_ignores_notifications() {
+        let (_dir, store, repo) = store();
+        prompt(store.as_ref(), &repo, "first", "default");
+        prompt(store.as_ref(), &repo, "second, planned", "plan");
+        handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": "<task-notification>x", "session_id": "s" })).unwrap();
+        assert_eq!(last_prompt(store.as_ref(), &repo, "s").unwrap().as_deref(), Some("second, planned"));
     }
 
     #[test]

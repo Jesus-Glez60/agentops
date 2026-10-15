@@ -1225,21 +1225,24 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
         return Ok(());
     }
     let settings_path = path.join(".claude").join("settings.json");
-    const HOOKS: &[(&str, &str)] = &[
-        ("PostToolUse", "posttooluse"),
-        ("PostToolUseFailure", "posttoolusefailure"),
-        ("UserPromptSubmit", "userpromptsubmit"),
-        ("SessionStart", "sessionstart"),
-        ("PreToolUse", "pretooluse"),
-        ("SessionEnd", "sessionend"),
+    // (event, --event flag, timeout in seconds). The prompt hook gets 10 s,
+    // below Claude Code's 30 s default: recall must never make a prompt
+    // feel stuck, and on timeout the prompt still goes through.
+    const HOOKS: &[(&str, &str, Option<u64>)] = &[
+        ("PostToolUse", "posttooluse", None),
+        ("PostToolUseFailure", "posttoolusefailure", None),
+        ("UserPromptSubmit", "userpromptsubmit", Some(10)),
+        ("SessionStart", "sessionstart", None),
+        ("PreToolUse", "pretooluse", None),
+        ("SessionEnd", "sessionend", None),
     ];
-    for (event_name, event_flag) in HOOKS {
+    for (event_name, event_flag, timeout) in HOOKS {
         // `--compress` is only meaningful for `--event pretooluse` (see
         // `hook_capture::process_pre_tool_use`), but baking it only into
         // that one command line is simplest and keeps every other event's
         // command exactly as before -- no shared flag/env var needed.
         let extra_flag = if compress_commands && *event_name == "PreToolUse" { " --compress" } else { "" };
-        write_claude_hook(&settings_path, event_name, &format!("agentops hook-capture --event {event_flag}{extra_flag}"))?;
+        write_claude_hook(&settings_path, event_name, &format!("agentops hook-capture --event {event_flag}{extra_flag}"), *timeout)?;
     }
     let compress_note = if compress_commands { ", command-output compression enabled" } else { "" };
     println!(
@@ -1259,7 +1262,7 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
 /// (`maybe_install_claude_hooks` loops it) — each call only ever touches
 /// its own `event_name` key, leaving every other hook (ours or a user's own)
 /// untouched.
-fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str) -> Result<()> {
+fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str, timeout_secs: Option<u64>) -> Result<()> {
     let mut root: serde_json::Value = if settings_path.exists() {
         serde_json::from_str(&std::fs::read_to_string(settings_path).with_context(|| format!("reading {}", settings_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
     } else {
@@ -1291,7 +1294,11 @@ fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str) -> R
         }
     }
     groups.retain(|g| g.get("hooks").and_then(|h| h.as_array()).is_none_or(|h| !h.is_empty()));
-    groups.push(serde_json::json!({ "hooks": [{ "type": "command", "command": command }] }));
+    let mut handler = serde_json::json!({ "type": "command", "command": command });
+    if let Some(secs) = timeout_secs {
+        handler["timeout"] = serde_json::json!(secs);
+    }
+    groups.push(serde_json::json!({ "hooks": [handler] }));
     *event = serde_json::Value::Array(groups);
 
     if let Some(parent) = settings_path.parent() {
@@ -2498,8 +2505,8 @@ mod tests {
         std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
         std::fs::write(&settings_path, r#"{"hooks":{"SessionEnd":{"command":"agentops hook-capture --event sessionend"}}}"#).unwrap();
 
-        write_claude_hook(&settings_path, "SessionEnd", "agentops hook-capture --event sessionend").unwrap();
-        write_claude_hook(&settings_path, "SessionEnd", "agentops hook-capture --event sessionend").unwrap();
+        write_claude_hook(&settings_path, "SessionEnd", "agentops hook-capture --event sessionend", None).unwrap();
+        write_claude_hook(&settings_path, "SessionEnd", "agentops hook-capture --event sessionend", None).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(parsed["hooks"]["SessionEnd"], serde_json::json!([{ "hooks": [{ "type": "command", "command": "agentops hook-capture --event sessionend" }] }]));
@@ -2510,7 +2517,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");
 
-        write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse").unwrap();
+        write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse", None).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(last_hook_command(&parsed, "PostToolUse"), "agentops hook-capture --event posttooluse");
@@ -2527,7 +2534,7 @@ mod tests {
         )
         .unwrap();
 
-        write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse").unwrap();
+        write_claude_hook(&settings_path, "PostToolUse", "agentops hook-capture --event posttooluse", None).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(last_hook_command(&parsed, "SessionStart"), "some-other-tool", "a pre-existing, unrelated hook must survive: {parsed}");
@@ -2547,6 +2554,7 @@ mod tests {
         for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse"), ("SessionEnd", "sessionend")] {
             assert_eq!(last_hook_command(&parsed, event), format!("agentops hook-capture --event {flag}"), "{event}: {parsed}");
         }
+        assert_eq!(parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"], 10, "the prompt hook must time out well before Claude Code's 30 s default: {parsed}");
     }
 
     #[test]

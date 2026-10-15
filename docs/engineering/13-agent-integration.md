@@ -128,12 +128,28 @@ The store logic for every event lives in one place, `agentops_mcp::hooks::handle
 | --- | --- |
 | `PostToolUse` | Categorizes the call (edit, git, web) into `session_events`. If output is too large to inline, redacts it and stores it as a `ToolOutput` node, findable by search and `fetch_content`. |
 | `PostToolUseFailure` | Records an `error` event. `PostToolUse` never fires on failure (gotcha 53971). |
-| `UserPromptSubmit` | Records `user_intent`; injects pinned nodes. |
+| `UserPromptSubmit` | Records `user_intent` and injects pinned nodes, plus the task-start flow in plan mode or a recall seed otherwise (see "Task-start flow and recall seed" below). Skips the `<task-notification>` prompts Claude Code sends when a background task finishes. Installed with a 10 s timeout. |
 | `SessionStart` | On startup, resume or compact, injects the session guide (`session_guide::build`) and pinned nodes. |
 | `PreToolUse` | Warns about likely secret exposure, never blocks. Warning without blocking needs `hookSpecificOutput` JSON, not stderr (gotcha 53971). |
 | `SessionEnd` | Starts a detached `agentops usage sync --transcript` for the ending session. |
 
 `write_claude_hook` merges into existing settings: other tools' hooks and the user's own groups on the same event survive. An earlier version wrote the wrong schema, and no installed hook ever fired (gotcha 54240). Claude Code's `PostToolUse` `tool_response` is an object with `type` and `text`, not a bare string (gotcha 53972).
+
+### Task-start flow and recall seed
+
+Milestone 1 makes the prompt hook do recall itself, because plan mode never calls AgentOps tools on its own (`agentops_mcp::hooks`, `user_prompt_submit`). Each prompt is recorded as a `user_intent` event whose `tool_name` is `user_prompt`, or `user_prompt:plan` when Claude Code reports `permission_mode: "plan"`. The next prompt reads that to tell whether a planning episode has already started.
+
+| Prompt | Injected (pins always first) |
+| --- | --- |
+| Plan mode, first prompt of an episode (the previous prompt wasn't in plan mode) | The task-start flow directive (`agentops-core/prompts/shared/plan-flow.md`, compiled in), then a recall seed of up to `PLAN_SEED_MAX_ITEMS` pointers |
+| Plan mode, later prompts | One-line reminder; the flow never restarts mid-episode |
+| Any other mode | Up to `DEFAULT_SEED_MAX_ITEMS` recall pointers not already shown this session, or nothing if there are none |
+
+The directive tells the agent, in order: use the `plan` skill; recall first; run `library-docs` for every library touched; ask at most `MAX_PLAN_QUESTIONS` pointed questions if the task is ambiguous; run `audit-plan`; present with "Research performed" and "Council verdict".
+
+The seed comes from `agentops_retrieval::recall_seed` (`agentops-core/crates/agentops-retrieval/src/recall.rs`). It is lexical and graph only: no embedding model runs inside a hook. The prompt is cut into keywords, and each keyword goes to `GraphStore::search_lexical` per note kind (Gotcha, Decision, Note, DocSection). They go separately because SQLite's FTS5 query ORs terms while Postgres's `plainto_tsquery` ANDs them. Identifier-shaped words are matched exactly against symbol names and followed one hop over `Affects` edges to their notes. Results are fused by reciprocal rank, reduced-prominence nodes rank lower, and pinned nodes are left out because the pin block already shows them. Each pointer is one line: kind, title, node id, and why it matched.
+
+Every pointer sent is recorded as a `recall_injected` event (`ids 1,2,3`), so ordinary prompts never repeat a pointer within a session. Everything injected fits in `PLAN_FLOW_BUDGET` (4,000 characters), and pointers are dropped first. All of these limits are constants in `agentops-mcp/src/budget.rs`.
 
 ### Command compression
 

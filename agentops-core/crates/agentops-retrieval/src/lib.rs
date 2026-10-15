@@ -20,6 +20,9 @@
 
 use std::collections::HashMap;
 
+pub mod recall;
+pub use recall::{recall_seed, RecallPointer, RECALL_KINDS};
+
 use agentops_embeddings::Embedder;
 use agentops_graph::{age_days, bounded_neighborhood, effective_edge_weight, effective_weight, EdgeRelation, GraphStore, Node, NodeKind, NeighborhoodQuery, TraversalDirection};
 use anyhow::Result;

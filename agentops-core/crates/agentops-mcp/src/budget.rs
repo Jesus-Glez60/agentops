@@ -9,6 +9,25 @@
 /// `max_chars` override.
 pub const DEFAULT_CHAR_BUDGET: usize = 4000;
 
+// Milestone 1 (task-start flow) parameters. Starting values from the spec;
+// change them here only.
+
+/// Everything a plan-mode prompt hook injects (pins, flow directive, recall
+/// seed). Well under Claude Code's 10,000-character cap per hook field.
+pub const PLAN_FLOW_BUDGET: usize = 4000;
+/// Recall pointers on the first prompt of a planning episode.
+pub const PLAN_SEED_MAX_ITEMS: usize = 8;
+/// New recall pointers on an ordinary (non-plan) prompt.
+pub const DEFAULT_SEED_MAX_ITEMS: usize = 5;
+/// Everything a `SubagentStart` hook injects; same as the session guide.
+pub const SUBAGENT_SEED_BUDGET: usize = 2000;
+/// Pointed questions the plan flow may ask before planning with stated
+/// assumptions.
+pub const MAX_PLAN_QUESTIONS: usize = 3;
+/// Times per planning episode a plan missing its required sections is sent
+/// back before it is let through with a warning.
+pub const ENFORCE_MAX_NUDGES: usize = 1;
+
 pub struct Capped {
     pub text: String,
     pub truncated: bool,
