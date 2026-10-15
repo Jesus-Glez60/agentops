@@ -394,6 +394,7 @@ dependencies = [
  "agentops-notes",
  "agentops-retrieval",
  "agentops-scanner",
+ "agentops-security",
  "agentops-store-open",
  "anyhow",
  "candle-core",

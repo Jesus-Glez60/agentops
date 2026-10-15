@@ -26,7 +26,7 @@ Self-hosting needs exactly one required value (`AGENTOPS_SECRETS_MASTER_KEY`) an
 ## CLI
 
 - `agentops install|status|repos|forget|docgen|changelog|note|ingest-notes|search|explain|watch` — scan a repo into the graph and work with it.
-- `agentops connect [--remote <server-url>] [--global] [--with-hooks [--compress-commands]]` — connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, or any other Ruler-supported agent) by registering the MCP server and distributing AGENTS.md/skills. Without `--remote`: local stdio server against a locally scanned repo. With `--remote`: the hosted server's `/mcp` endpoint, authenticated via browser device login (default) or a personal API key.
+- `agentops connect [--remote <server-url>] [--global] [--no-hooks] [--compress-commands]` — connect a coding tool (Claude Code, Cursor, Codex CLI, Gemini CLI, or any other Ruler-supported agent) by registering the MCP server and distributing AGENTS.md/skills. Without `--remote`: local stdio server against a locally scanned repo. With `--remote`: the hosted server's `/mcp` endpoint, authenticated via browser device login (default) or a personal API key.
 - `agentops usage sync|report` — Claude Code session token/cost tracking, and offline replay of where context went.
 - `agentops librarian export-labels|dry-run` — evaluate cheap models (Anthropic or OpenAI-compatible) at cataloguing gotchas.
 - `agentops task ...` — native task management with Linear sync.

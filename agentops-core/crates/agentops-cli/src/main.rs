@@ -11,6 +11,7 @@
 mod hook_capture;
 mod compress_output;
 mod librarian;
+mod remote_marker;
 mod usage;
 mod usage_report;
 
@@ -20,6 +21,7 @@ use agentops_graph::{GraphStore, NodeKind};
 use agentops_repo_access::normalize_repo_path;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use remote_marker::{read_remote_marker, remote_marker_path, write_remote_marker_file, RemoteMcpMarker};
 
 #[derive(Parser)]
 #[command(name = "agentops", version, about = "AgentOps codebrain/docbrain CLI")]
@@ -304,26 +306,31 @@ enum Command {
         /// default choice.
         #[arg(long, conflicts_with = "api_key")]
         device_login: bool,
-        /// Also install a Claude Code `PostToolUse` hook that captures any
-        /// tool output too large to be worth inlining into context (redacted,
-        /// stored as a searchable node — see `hook-capture`). Claude Code only
-        /// in this first pass; ignored for other --agents.
-        #[arg(long)]
+        /// Accepted for backward compatibility; hooks are installed by
+        /// default now (see `--no-hooks`).
+        #[arg(long, hide = true, conflicts_with = "no_hooks")]
         with_hooks: bool,
+        /// Skip installing the Claude Code hook suite (see `hook-capture`).
+        /// Hooks are on by default because recall, the session guide and the
+        /// plan-mode flow all depend on them: subagents never see AGENTS.md,
+        /// and plan mode never calls MCP tools on its own. Claude Code only;
+        /// ignored for other --agents.
+        #[arg(long)]
+        no_hooks: bool,
         /// Also rewrite known-noisy Bash commands (test runners, `git diff`/
         /// `log`, `grep`/`rg`) via `PreToolUse`'s `updatedInput` so their
         /// output is compressed *before* it reaches context, instead of only
         /// being captured after the fact once it's already oversized. A
-        /// separate opt-in from `--with-hooks`: every hook `--with-hooks`
+        /// separate opt-in from the default hook suite: every hook it
         /// installs only ever *observes* (captures, warns, redacts) — this
         /// one changes the literal command that executes, a materially
         /// bigger trust boundary, so it's never bundled into the default
-        /// hook suite. Requires --with-hooks; Claude Code only.
-        #[arg(long, requires = "with_hooks")]
+        /// hook suite. Claude Code only; conflicts with --no-hooks.
+        #[arg(long, conflicts_with = "no_hooks")]
         compress_commands: bool,
     },
     /// Internal: invoked by a Claude Code hook (installed via
-    /// `connect --with-hooks`), not meant to be run by hand. Reads the
+    /// `connect`), not meant to be run by hand. Reads the
     /// hook's JSON payload from stdin; --event selects which hook fired.
     #[command(hide = true)]
     HookCapture {
@@ -710,11 +717,11 @@ fn main() -> Result<()> {
             }
         },
         Command::Init { yes, path } => init(yes, &path),
-        Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands } => {
+        Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks: _, no_hooks, compress_commands } => {
             if global {
                 connect_global(agents, access_mode, yes, remote, api_key, device_login)
             } else {
-                connect(&path, agents, access_mode, yes, remote, api_key, device_login, with_hooks, compress_commands)
+                connect(&path, agents, access_mode, yes, remote, api_key, device_login, !no_hooks, compress_commands)
             }
         }
         Command::HookCapture { event, compress } => hook_capture::run(&event, compress),
@@ -1201,9 +1208,9 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
     Ok(())
 }
 
-/// `--with-hooks` support, Claude Code only in this first pass (see
+/// The hook suite `connect` installs by default (`--no-hooks` skips it), Claude Code only (see
 /// `hook_capture`'s module doc comment for why). No-ops quietly for any
-/// other agent id — `--with-hooks` describes intent ("capture large tool
+/// other agent id — hooks describe intent ("capture large tool
 /// output for whichever selected agent supports it"), not a hard requirement
 /// that every agent in `--agents` has hook support.
 /// Installs the full AgentOps hook suite for Claude Code: `PostToolUse`
@@ -1291,50 +1298,6 @@ fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str) -> R
         std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
     std::fs::write(settings_path, serde_json::to_string_pretty(&root)?).with_context(|| format!("writing {}", settings_path.display()))
-}
-
-/// `.context/agentops-remote.json` -- persists a repo's "coding tools here
-/// point at this remote server" choice across future `agentops install`/
-/// `connect` runs that don't pass `--remote` again (e.g. re-scanning, or
-/// adding another agent later). Lives in `.context/` alongside
-/// `graph.db` -- a per-repo, not-meant-for-git-history directory this
-/// codebase already uses for exactly this kind of local machine state,
-/// deliberately not `.ruler/` (whose own files are Ruler-managed/
-/// overwritten-on-every-`apply`, the opposite of what a marker needs).
-#[derive(serde::Serialize, serde::Deserialize)]
-struct RemoteMcpMarker {
-    server_url: String,
-    connection_id: String,
-    // Embedded literally into 3 of 4 tools' MCP config (see
-    // `json_remote_entry`) so re-running `agentops install`/`connect` here
-    // later can re-embed the same key without re-prompting or re-doing
-    // device-login. Written with `0600` perms below — this file carries a
-    // real credential, unlike the rest of `.context/`.
-    api_key: String,
-}
-
-fn remote_marker_path(path: &Path) -> PathBuf {
-    path.join(".context").join("agentops-remote.json")
-}
-
-fn read_remote_marker(path: &Path) -> Option<RemoteMcpMarker> {
-    let content = std::fs::read_to_string(remote_marker_path(path)).ok()?;
-    serde_json::from_str(&content).ok()
-}
-
-/// `0600` on Unix, matching the precedent for the only other secret-bearing
-/// file this codebase writes (`agentops-repo-access`'s `write_private_key_file`)
-/// — a no-op permission-wise on Windows, where there's no equivalent bit.
-#[cfg(unix)]
-fn write_remote_marker_file(marker_path: &Path, contents: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(marker_path).with_context(|| format!("writing {}", marker_path.display()))?;
-    std::io::Write::write_all(&mut file, contents.as_bytes()).with_context(|| format!("writing {}", marker_path.display()))
-}
-
-#[cfg(not(unix))]
-fn write_remote_marker_file(marker_path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(marker_path, contents).with_context(|| format!("writing {}", marker_path.display()))
 }
 
 fn write_remote_marker(path: &Path, server_url: &str, connection_id: &str, api_key: &str) -> Result<()> {

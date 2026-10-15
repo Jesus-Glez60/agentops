@@ -26,6 +26,7 @@ agentops-retrieval = { path = "../agentops-retrieval" }
 agentops-embeddings-train = { path = "../agentops-embeddings-train" }
 agentops-lsp-client = { path = "../agentops-lsp-client" }
 agentops-manifest = { path = "../agentops-manifest" }
+agentops-security = { path = "../agentops-security" }
 sha2.workspace = true
 candle-core = "0.8"
 notify-debouncer-full.workspace = true

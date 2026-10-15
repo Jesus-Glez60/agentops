@@ -4,6 +4,7 @@
 //! identically by the CLI and the MCP `scan_repo` tool.
 
 pub mod budget;
+pub mod hooks;
 mod consolidate;
 mod docgen;
 mod init;

@@ -478,6 +478,42 @@ pub(crate) async fn usage_sync_json(State(state): State<AppState>, user: Option<
     }
 }
 
+/// `POST /repos/{id}/hooks/{event}` -- the hosted half of `agentops
+/// hook-capture`. A repo connected via `agentops connect --remote` forwards
+/// each Claude Code hook payload here instead of opening a local graph, and
+/// this runs the exact function the local path runs
+/// (`agentops_mcp::hooks::handle`) against the connection's store, so the
+/// two can't drift. The repo comes from the resolved connection, never from
+/// the payload. Replies `{"output": <hook stdout JSON or null>}`. Same
+/// personal-API-key auth as `usage_sync_json`.
+pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath((id, event)): AxumPath<(String, String)>, Query(q): Query<TenantQuery>, Json(payload): Json<Value>) -> (StatusCode, Json<Value>) {
+    if !agentops_mcp::hooks::STORE_EVENTS.contains(&event.as_str()) {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": format!("unknown hook event '{event}'") })));
+    }
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Option<Value>>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        Ok(Some(agentops_mcp::hooks::handle(store.as_ref(), &repo, &event, &payload)?))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(output))) => (StatusCode::OK, Json(json!({ "output": output }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// `GET /repos/{id}/docs` -- mirrors `agentops-api`'s `docs_json` cache-hit/
 /// miss logic exactly (persisted `doc_pages` row if present, else a
 /// heuristic-only page built on the fly, never persisted from here).
@@ -794,6 +830,44 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let resp = app.oneshot(post(&other_token)).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never resolve the owner's store name");
+    }
+
+    #[tokio::test]
+    async fn hook_events_round_trip_through_the_connections_store_and_never_cross_tenants() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&other.tenant, other.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let post = |event: &str, token: &str, payload: Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/repos/{connection_id}/hooks/{event}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap()
+        };
+
+        // A prompt is recorded in the connection's store...
+        let resp = app.clone().oneshot(post("userpromptsubmit", &owner_token, json!({ "session_id": "s1", "prompt": "fix the login bug" }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        // ...and the resume guide built from that same store shows it.
+        let resp = app.clone().oneshot(post("sessionstart", &owner_token, json!({ "session_id": "s1", "source": "resume" }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let body = body_json(resp).await;
+        let context = body["output"]["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default().to_string();
+        assert!(context.contains("fix the login bug"), "{body:?}");
+
+        let resp = app.clone().oneshot(post("nosuchevent", &owner_token, json!({}))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
+        let resp = app.oneshot(post("userpromptsubmit", &other_token, json!({ "session_id": "s1", "prompt": "x" }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
     }
 
     #[tokio::test]

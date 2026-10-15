@@ -1614,6 +1614,32 @@ paths:
       responses:
         "200": { description: Upserted }
 
+  /repos/{id}/hooks/{event}:
+    post:
+      tags: [Search & Graph]
+      summary: Run a Claude Code hook against the connection's store
+      description: Hosted half of `agentops hook-capture`. A repo connected via `agentops connect --remote` forwards each hook payload here (minus its local `cwd`/`transcript_path`) instead of opening a local graph; the server runs the same `agentops_mcp::hooks::handle` the local path runs. The repo comes from the connection, never the payload. Returns the JSON the hook prints, or null.
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: event, in: path, required: true, schema: { type: string, enum: [posttooluse, posttoolusefailure, userpromptsubmit, sessionstart, pretooluse] } }
+        - { name: tenant, in: query, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, description: The Claude Code hook payload as received on stdin }
+      responses:
+        "200":
+          description: Handled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  output: { type: object, nullable: true, description: "The hook's stdout JSON (hookSpecificOutput), or null when it has nothing to inject" }
+        "404": { description: Unknown event, or no such connection for this tenant }
+
   /activity:
     get:
       tags: [Search & Graph]

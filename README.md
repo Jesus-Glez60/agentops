@@ -107,7 +107,7 @@ npx agentops-cli connect   # register the local stdio MCP server + distribute AG
 
 - `--agents claude,cursor,codex,gemini-cli` skips the picker. `connect` uses [Ruler](https://github.com/intellectronica/ruler), so any agent Ruler supports (Copilot, Windsurf, Aider, Zed, …) works via `--agents <id>`.
 - `--global` installs skills and the MCP server at user level (e.g. `~/.claude/skills/`) instead of into one repo. An agent can then register and scan individual repos itself with the `register_repo` / `scan_repo` tools.
-- `--with-hooks` (Claude Code) installs hooks that capture oversized tool output as searchable, redacted nodes. `--compress-commands` additionally rewrites known-noisy commands (test runners, `git diff`/`log`, `grep`/`rg`) so their output is compressed before it reaches context. It changes the command that actually runs, so it's a separate opt-in.
+- Claude Code hooks are installed by default (`--no-hooks` skips them). They capture oversized tool output as searchable, redacted nodes. `--compress-commands` additionally rewrites known-noisy commands (test runners, `git diff`/`log`, `grep`/`rg`) so their output is compressed before it reaches context. It changes the command that actually runs, so it's a separate opt-in.
 - `--access-mode full` exposes write tools to the agent (default `advisor`, read-only).
 
 Re-run `connect` any time to add another tool.

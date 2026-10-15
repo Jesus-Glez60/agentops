@@ -46,7 +46,8 @@ Other flags:
 - `--access-mode advisor|full`: local mode only.
 - `--yes`: no prompts; needs `--agents`.
 - `--api-key` or `--device-login`: remote mode.
-- `--with-hooks`, `--compress-commands`: Claude Code hooks.
+- `--no-hooks`: skip the Claude Code hooks, which are installed by default. `--with-hooks` is still accepted and does nothing.
+- `--compress-commands`: command compression on the `PreToolUse` hook.
 
 ### Local mode
 
@@ -54,7 +55,7 @@ Other flags:
 2. If the repo is not in the scan manifest, offer to scan it (`install` without Ruler).
 3. Read `AGENTS.md`, or generate it with `init_agents_md` if missing.
 4. Distribute instructions, skills, agents and the MCP entry through Ruler (`distribute_via_ruler`).
-5. With `--with-hooks`, install the Claude Code hooks.
+5. Install the Claude Code hooks, unless `--no-hooks` is passed.
 6. Print where each tool's MCP config was written and remind the user to restart the tool.
 
 ### Remote mode
@@ -114,7 +115,14 @@ Ruler needs Node, because it runs through `npx`. Bump `RULER_VERSION` deliberate
 
 ## Claude Code hooks
 
-`agentops connect --with-hooks` adds hooks to Claude Code's settings for six events. Each runs `agentops hook-capture --event <name>` (`agentops-core/crates/agentops-cli/src/hook_capture.rs`):
+`agentops connect` adds hooks to Claude Code's settings for six events, unless `--no-hooks` is passed. They were opt-in (`--with-hooks`) until milestone 1. They're on by default now because subagents never load `AGENTS.md`/`CLAUDE.md` and plan mode never calls MCP tools on its own, so hooks are the only reliable way memory reaches the agent (`docs/engineering/spikes/m1-hooks.md`). Each runs `agentops hook-capture --event <name>` (`agentops-core/crates/agentops-cli/src/hook_capture.rs`).
+
+The store logic for every event lives in one place, `agentops_mcp::hooks::handle` (`agentops-core/crates/agentops-mcp/src/hooks.rs`). `hook_capture` only decides where it runs:
+
+- **Local** (no `.context/agentops-remote.json`): it opens the repo's store and calls `handle` directly.
+- **Remote** (marker present): it posts the payload, minus `cwd` and `transcript_path`, to the server's `POST /repos/{id}/hooks/{event}` with the marker's API key. The server runs the same `handle` against the connection's store, and `.context/graph.db` is never opened. A network error, a timeout (`REMOTE_HOOK_TIMEOUT`, 3 s) or a non-2xx reply logs one stderr line and exits 0 with no context, so a session never stalls.
+
+`hooks::is_relevant` filters on the client first, so an ordinary tool call (a `Read` with small output, a `PreToolUse` with nothing to warn about) costs no store open and no HTTP call. Before milestone 1, hooks always opened the local store, even in a remote-connected repo, so their events and pins went to an orphaned local graph.
 
 | Event | What it does |
 | --- | --- |
@@ -129,7 +137,7 @@ Ruler needs Node, because it runs through `npx`. Bump `RULER_VERSION` deliberate
 
 ### Command compression
 
-`--compress-commands` (requires `--with-hooks`) adds `--compress` to the `PreToolUse` hook. It rewrites known-noisy Bash commands, such as test runners, `git diff`/`git log` and `grep`/`rg`, through `updatedInput`, so output is compressed before it reaches context (`agentops-core/crates/agentops-cli/src/compress_output.rs`). It is opt-in because it changes the command that runs, a bigger trust step than observing.
+`--compress-commands` adds `--compress` to the `PreToolUse` hook. It rewrites known-noisy Bash commands, such as test runners, `git diff`/`git log` and `grep`/`rg`, through `updatedInput`, so output is compressed before it reaches context (`agentops-core/crates/agentops-cli/src/compress_output.rs`). It is opt-in because it changes the command that runs, a bigger trust step than observing.
 
 The rewrite pipes through the compressor and preserves the original exit status through bash's `PIPESTATUS`; a plain pipe would report the compressor's status (gotcha 53900).
 

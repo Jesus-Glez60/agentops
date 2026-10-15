@@ -48,7 +48,7 @@ Against a hosted server, from inside the repo: `curl -fsSL https://<server>/conn
 
 Solo, fully local: `npx agentops-cli install` (scan + AGENTS.md), then `npx agentops-cli connect` (local stdio MCP server + AGENTS.md/skills via Ruler).
 
-Connect options: `--agents <ids>` (any Ruler-supported agent), `--global` (user-level skills/MCP; agents register repos themselves via `register_repo`/`scan_repo`), `--with-hooks` and `--compress-commands` (Claude Code hooks), `--access-mode full` (expose write tools).
+Connect options: `--agents <ids>` (any Ruler-supported agent), `--global` (user-level skills/MCP; agents register repos themselves via `register_repo`/`scan_repo`), `--no-hooks` (Claude Code hooks are on by default) and `--compress-commands`, `--access-mode full` (expose write tools).
 
 ### CLI reference
 

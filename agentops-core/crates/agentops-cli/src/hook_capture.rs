@@ -1,34 +1,40 @@
 //! `agentops hook-capture --event <name>` — the handler behind every Claude
-//! Code hook `connect --with-hooks` installs (see `write_claude_hook` in
+//! Code hook `connect` installs (see `maybe_install_claude_hooks` in
 //! `main.rs`). One binary, dispatched by `--event` rather than by sniffing
-//! payload shape (more robust — Claude Code's hook config can pass whatever
-//! flag each event needs).
+//! payload shape.
 //!
-//! - `posttooluse`: if a tool's own output is large enough that inlining it
-//!   into context would be wasteful, redacts it and persists it in full as
-//!   both a `session_events` row and a `NodeKind::ToolOutput` node (searchable
-//!   via `nodes_fts`/`search_hybrid`, fetchable via `fetch_content`). Also
-//!   cheaply categorizes every call (file edits, git commands, web
-//!   references) into `session_events` regardless of output size, feeding
-//!   `get_session_guide`.
-//! - `posttoolusefailure`, `userpromptsubmit`: record narrower categories
-//!   (`"error"`, `"user_intent"`) the same way.
-//! - `pretooluse`: a proactive secret-exposure warning — never blocks (see
-//!   `process_pre_tool_use`'s doc comment for why it's especially careful
-//!   about this).
-//! - `sessionend`: spawns a detached `usage sync --transcript` for the
-//!   ending session (see `process_session_end`).
-//! - `sessionstart`: renders the session-resume guide on compact/resume,
-//!   via `agentops_mcp::session_guide::build` (shared with the
-//!   `get_session_guide` MCP tool — one implementation, two callers).
+//! The store-touching logic for each event lives in `agentops_mcp::hooks`,
+//! which documents what each event does. This module only decides *where*
+//! it runs:
+//!
+//! - **Local** (no `.context/agentops-remote.json`): open the repo's store
+//!   and call `agentops_mcp::hooks::handle` directly. Errors propagate as
+//!   before, except on `pretooluse`, which must never fail.
+//! - **Remote** (marker present): forward the payload to the server's
+//!   `POST /repos/{id}/hooks/{event}` with the marker's API key, which runs
+//!   the same function against the server's store. The local graph is never
+//!   opened. A network error, timeout or non-2xx response never fails the
+//!   hook: it logs one stderr line and exits 0 with no context, so a session
+//!   never stalls on recall.
+//!
+//! Client-only concerns stay here: reading stdin, `--compress` command
+//! rewriting on `pretooluse`, and `sessionend`'s detached usage sync.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use agentops_graph::{NewNode, NodeKind};
-use agentops_mcp::budget::{cap, DEFAULT_CHAR_BUDGET};
+use agentops_mcp::hooks;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
+
+use crate::remote_marker::{read_remote_marker, RemoteMcpMarker};
+
+/// Per-HTTP-call timeout when forwarding a hook to the server. A prompt
+/// hook must never feel slow; Claude Code's own hook timeout (10 s for the
+/// prompt and subagent hooks `connect` installs) is the outer bound.
+pub(crate) const REMOTE_HOOK_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Entry point for the `hook-capture` subcommand. `compress` is only ever
 /// read by the `pretooluse` branch (see `Connect`'s `--compress-commands`
@@ -37,269 +43,91 @@ use serde::Deserialize;
 pub fn run(event: &str, compress: bool) -> Result<()> {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).context("reading hook payload from stdin")?;
+    if let Some(output) = process(event, compress, &input)? {
+        println!("{output}");
+    }
+    Ok(())
+}
+
+/// Everything `run` does except the stdin read and the stdout write, so
+/// tests can drive it with fixture payloads.
+fn process(event: &str, compress: bool, input: &str) -> Result<Option<Value>> {
     match event {
-        "posttooluse" => process_post_tool_use(&input),
-        "posttoolusefailure" => process_post_tool_use_failure(&input),
-        "userpromptsubmit" => process_user_prompt_submit(&input),
-        "sessionstart" => process_session_start(&input),
-        // Like `pretooluse`, never fails the hook: a usage sync is
-        // bookkeeping, and must not surface as an error on exit.
+        // Never fails the hook: a usage sync is bookkeeping.
         "sessionend" => {
-            if let Err(e) = process_session_end(&input) {
+            if let Err(e) = process_session_end(input) {
                 eprintln!("agentops hook-capture --event sessionend: {e:#} (non-fatal)");
             }
-            Ok(())
+            Ok(None)
         }
         // `PreToolUse` is the one event whose nonzero exit can actually
         // block the tool call it's reacting to (confirmed against Claude
-        // Code's real hook docs — unlike every other event here). This
-        // handler must never surface an `Err` up to `main()`'s exit code,
-        // so it's wrapped separately rather than trusting the same
-        // `Result`-propagation-is-safe posture the other events use.
-        "pretooluse" => {
-            if let Err(e) = process_pre_tool_use(&input, compress) {
+        // Code's real hook docs). This handler must never surface an `Err`.
+        "pretooluse" => match process_pre_tool_use(input, compress) {
+            Ok(output) => Ok(output),
+            Err(e) => {
                 eprintln!("agentops hook-capture --event pretooluse: {e:#} (non-fatal, continuing)");
+                Ok(None)
             }
-            Ok(())
+        },
+        event if hooks::STORE_EVENTS.contains(&event) => {
+            let payload: Value = serde_json::from_str(input).with_context(|| format!("parsing {event} payload"))?;
+            dispatch(event, &payload)
         }
         other => anyhow::bail!("unknown hook event '{other}'"),
     }
 }
 
-// ---------------------------------------------------------------------
-// PostToolUse
-// ---------------------------------------------------------------------
-
-/// Claude Code's `PostToolUse` hook payload — only the fields this hook
-/// actually uses; every other field Claude Code sends is ignored via serde's
-/// default "unknown fields are fine" behavior (no `deny_unknown_fields`).
-#[derive(Debug, Deserialize)]
-struct PostToolUsePayload {
-    tool_name: String,
-    #[serde(default)]
-    tool_input: serde_json::Value,
-    #[serde(default)]
-    tool_response: serde_json::Value,
-    session_id: Option<String>,
-    cwd: Option<String>,
-}
-
-fn process_post_tool_use(input: &str) -> Result<()> {
-    let payload: PostToolUsePayload = serde_json::from_str(input).context("parsing PostToolUse payload")?;
-    let Some(cwd) = payload.cwd.as_deref() else {
-        return Ok(());
+/// Runs `event`'s store logic locally or on the server (see the module doc
+/// comment). Returns the hook's stdout JSON, if any.
+fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
+    let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) else {
+        return Ok(None);
     };
+    if !hooks::is_relevant(event, payload) {
+        return Ok(None);
+    }
     let repo_path = Path::new(cwd);
-    let store = agentops_mcp::open_store(repo_path)?;
-    let repo = agentops_mcp::repo_name(repo_path);
-    let session_id = payload.session_id.as_deref().unwrap_or("unknown-session");
-
-    // Cheap, always-on categorization -- independent of whether this call's
-    // own output is large enough to warrant the full-capture path below.
-    // Most calls match nothing here, and that's fine: unlike the MCP tools'
-    // own event recording, there's no catch-all "activity" fallback: not
-    // every tool call is guide-worthy.
-    if let Some((event_kind, description)) = classify_post_tool_use(&payload.tool_name, &payload.tool_input) {
-        store.record_session_event(&repo, session_id, &payload.tool_name, &description, None, event_kind)?;
-    }
-
-    let text = render_tool_response(&payload.tool_response);
-    if text.chars().count() <= DEFAULT_CHAR_BUDGET {
-        // Small enough to not be worth capturing — the whole point is only
-        // ever intervening on the outputs that would otherwise bloat context.
-        return Ok(());
-    }
-
-    // Stored in full (redacted, not truncated) — the whole point of a
-    // Node-backed capture is that `fetch_content`/lexical search can reach
-    // *all* of it later; only the inline tool responses in `agentops-mcp`
-    // (get_symbol, related_context, explain_symbol) cap what they return.
-    let redaction = agentops_security::redact(&text);
-
-    let node_id = store.add_node(NewNode {
-        kind: NodeKind::ToolOutput,
-        repo: repo.clone(),
-        path: Some(format!("tool_output:{session_id}:{}", now_nanos())),
-        name: Some(payload.tool_name.clone()),
-        container: None,
-        start_line: None,
-        end_line: None,
-        content: Some(redaction.text),
-    })?;
-
-    store.record_session_event(&repo, session_id, &payload.tool_name, &format!("captured {} chars of tool output ({} secret(s) redacted)", text.chars().count(), redaction.redacted_count), Some(node_id), "tool_output")?;
-
-    // CacheAligner-equivalent (Headroom-inspired, see the project's own
-    // notes on this): this captured `ToolOutput` node is exactly the kind
-    // of content a later session might reuse/re-embed verbatim -- flag it
-    // if it carries volatile content (a fresh timestamp, session UUID/JWT,
-    // or hash) that would look stale or misleading by the time it's reused.
-    // Detector-only, same as `detect_cache_unsafe` itself: never mutates
-    // the captured content, only warns. Best-effort, same as the warning
-    // above it -- a failure to record this must never fail the hook.
-    let hazards = agentops_mcp::budget::detect_cache_unsafe(&text);
-    if !hazards.is_empty() {
-        let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-        for hazard in &hazards {
-            let kind = match hazard.kind {
-                agentops_mcp::budget::CacheHazardKind::Uuid => "UUID",
-                agentops_mcp::budget::CacheHazardKind::Jwt => "JWT",
-                agentops_mcp::budget::CacheHazardKind::HexHash => "hex hash",
-                agentops_mcp::budget::CacheHazardKind::Timestamp => "timestamp",
-            };
-            *counts.entry(kind).or_default() += 1;
-        }
-        let summary = counts.into_iter().map(|(kind, n)| format!("{n} {kind}")).collect::<Vec<_>>().join(", ");
-        let _ = store.record_session_event(&repo, session_id, &payload.tool_name, &format!("captured tool output contains volatile content ({summary}) — may look stale if reused verbatim in a later session"), Some(node_id), "cache_hazard_warning");
-    }
-
-    Ok(())
-}
-
-/// Feeds `get_session_guide`'s "Files Modified"/"Git Ops"/"External
-/// References" sections. Deliberately narrow, pattern-based, no LLM call --
-/// "Rejected Approaches"/"Constraints"/"Blockers" need actual semantic
-/// judgment and are out of scope here (see the plan this was built from).
-fn classify_post_tool_use(tool_name: &str, tool_input: &serde_json::Value) -> Option<(&'static str, String)> {
-    match tool_name {
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
-            let path = tool_input.get("file_path").or_else(|| tool_input.get("notebook_path")).and_then(|v| v.as_str())?;
-            Some(("file_modified", path.to_string()))
-        }
-        "Bash" => {
-            let command = tool_input.get("command").and_then(|v| v.as_str())?;
-            is_git_op(command).then(|| ("git_op", agentops_security::redact(command).text))
-        }
-        "WebFetch" | "WebSearch" => {
-            let reference = tool_input.get("url").or_else(|| tool_input.get("query")).and_then(|v| v.as_str())?;
-            Some(("external_reference", reference.to_string()))
-        }
-        _ => None,
-    }
-}
-
-/// A plain substring check, not a regex — no new dependency needed for
-/// something this simple (`agentops-cli` doesn't otherwise depend on the
-/// `regex` crate directly).
-fn is_git_op(command: &str) -> bool {
-    let trimmed = command.trim_start();
-    if !trimmed.starts_with("git ") {
-        return false;
-    }
-    const VERBS: &[&str] = &["commit", "push", "merge", "rebase", "checkout", "reset"];
-    VERBS.iter().any(|v| trimmed.contains(v))
-}
-
-/// `tool_response` is whatever shape the underlying tool returned. Claude
-/// Code's real shape for most tools is `{"type": "text", "text": "..."}` —
-/// an object, not a bare string (confirmed against the real hook docs,
-/// correcting an earlier assumption in this same function that stringified
-/// the whole wrapper object, polluting captured content with JSON-escaping
-/// noise and inflating what got measured against `DEFAULT_CHAR_BUDGET`).
-/// Extracts `.text`/`.content` when present; falls back to stringifying the
-/// whole value only if neither key holds a string, so an unrecognized shape
-/// still degrades gracefully instead of panicking or losing data outright.
-fn render_tool_response(value: &serde_json::Value) -> String {
-    match value {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Null => String::new(),
-        serde_json::Value::Object(map) => match map.get("text").or_else(|| map.get("content")).and_then(|v| v.as_str()) {
-            Some(s) => s.to_string(),
-            None => value.to_string(),
+    match read_remote_marker(repo_path) {
+        Some(marker) => match call_remote(&marker, event, payload) {
+            Ok(output) => Ok(output),
+            Err(e) => {
+                eprintln!("agentops hook-capture --event {event}: {e:#} (remote, non-fatal)");
+                Ok(None)
+            }
         },
-        other => other.to_string(),
+        None => {
+            let store = agentops_mcp::open_store(repo_path)?;
+            let repo = agentops_mcp::repo_name(repo_path);
+            hooks::handle(store.as_ref(), &repo, event, payload)
+        }
     }
 }
 
-// ---------------------------------------------------------------------
-// PostToolUseFailure
-// ---------------------------------------------------------------------
-
-/// Claude Code's docs (as fetched) confirm `tool_name`/`tool_input` but
-/// don't spell out the exact failure-details field name for this event --
-/// `error` is a best-effort guess, same "not independently confirmed"
-/// posture as the Gemini CLI header-substitution gotcha this project
-/// already carries. Defaults to `Value::Null` if the real field is named
-/// something else, which `render_tool_response` degrades to an empty
-/// description for -- a silently-thin event, never a parse failure.
-#[derive(Debug, Deserialize)]
-struct PostToolUseFailurePayload {
-    tool_name: String,
-    #[serde(default)]
-    error: serde_json::Value,
-    session_id: Option<String>,
-    cwd: Option<String>,
-}
-
-fn process_post_tool_use_failure(input: &str) -> Result<()> {
-    let payload: PostToolUseFailurePayload = serde_json::from_str(input).context("parsing PostToolUseFailure payload")?;
-    let Some(cwd) = payload.cwd.as_deref() else {
-        return Ok(());
-    };
-    let repo_path = Path::new(cwd);
-    let store = agentops_mcp::open_store(repo_path)?;
-    let repo = agentops_mcp::repo_name(repo_path);
-    let session_id = payload.session_id.as_deref().unwrap_or("unknown-session");
-
-    let description = render_tool_response(&payload.error);
-    let capped = cap(&description, DEFAULT_CHAR_BUDGET, 0);
-    let redacted = agentops_security::redact(&capped.text);
-    store.record_session_event(&repo, session_id, &payload.tool_name, &redacted.text, None, "error")?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------
-// UserPromptSubmit
-// ---------------------------------------------------------------------
-
-/// `prompt` is a best-effort field-name guess (not spelled out in the
-/// fetched docs excerpt) -- same "not independently confirmed" posture as
-/// `PostToolUseFailurePayload::error` above.
-#[derive(Debug, Deserialize)]
-struct UserPromptSubmitPayload {
-    prompt: Option<String>,
-    session_id: Option<String>,
-    cwd: Option<String>,
-}
-
-fn process_user_prompt_submit(input: &str) -> Result<()> {
-    let payload: UserPromptSubmitPayload = serde_json::from_str(input).context("parsing UserPromptSubmit payload")?;
-    let (Some(cwd), Some(prompt)) = (payload.cwd.as_deref(), payload.prompt.as_deref()) else {
-        return Ok(());
-    };
-    if prompt.trim().is_empty() {
-        return Ok(());
+/// `POST {server_url}/repos/{connection_id}/hooks/{event}`, the same Bearer
+/// auth `usage::push_usage_remote` uses. The payload goes up without its
+/// local paths (`cwd`, `transcript_path`): the server resolves the repo
+/// from the connection and never reads them.
+fn call_remote(marker: &RemoteMcpMarker, event: &str, payload: &Value) -> Result<Option<Value>> {
+    let url = format!("{}/repos/{}/hooks/{event}", marker.server_url.trim_end_matches('/'), marker.connection_id);
+    let mut body = payload.clone();
+    if let Some(map) = body.as_object_mut() {
+        map.remove("cwd");
+        map.remove("transcript_path");
     }
-    let repo_path = Path::new(cwd);
-    let store = agentops_mcp::open_store(repo_path)?;
-    let repo = agentops_mcp::repo_name(repo_path);
-    let session_id = payload.session_id.as_deref().unwrap_or("unknown-session");
-
-    let capped = cap(prompt, DEFAULT_CHAR_BUDGET, 0);
-    let redacted = agentops_security::redact(&capped.text);
-    store.record_session_event(&repo, session_id, "user_prompt", &redacted.text, None, "user_intent")?;
-
-    // Sticky pins re-injected on every turn, not just at SessionStart -- the
-    // actual "combat context drift" mechanism: a long, multi-compact session
-    // can scroll a SessionStart-only injection out of view, but a pin is
-    // meant to be a standing directive the agent never loses sight of.
-    // Confirmed against Claude Code's real hooks docs: `UserPromptSubmit`
-    // nests `additionalContext` under `hookSpecificOutput` exactly like
-    // `SessionStart`/`PreToolUse` (capped at 10,000 chars by Claude Code
-    // itself -- `GUIDE_CHAR_BUDGET`'s 2000 stays comfortably under that).
-    let pinned = agentops_mcp::session_guide::build_pinned_context(store.as_ref(), &repo)?;
-    if !pinned.is_empty() {
-        println!(
-            "{}",
-            serde_json::json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": pinned,
-                }
-            })
-        );
+    let mut response = ureq::post(&url)
+        .header("Authorization", &format!("Bearer {}", marker.api_key))
+        .config()
+        .http_status_as_error(false)
+        .timeout_global(Some(REMOTE_HOOK_TIMEOUT))
+        .build()
+        .send_json(&body)
+        .with_context(|| format!("calling POST {url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!("POST {url} returned {}", response.status());
     }
-    Ok(())
+    let reply: Value = response.body_mut().read_json().with_context(|| format!("parsing POST {url} response"))?;
+    Ok(reply.get("output").cloned().filter(|v| !v.is_null()))
 }
 
 // ---------------------------------------------------------------------
@@ -310,70 +138,35 @@ fn process_user_prompt_submit(input: &str) -> Result<()> {
 struct PreToolUsePayload {
     tool_name: String,
     #[serde(default)]
-    tool_input: serde_json::Value,
-    session_id: Option<String>,
-    cwd: Option<String>,
+    tool_input: Value,
 }
 
 /// Two fully independent concerns, either/both/neither of which can fire on
-/// the same call: a proactive secret-exposure warning (reuses the existing
-/// redaction/filename-classification code directly, invents no new
-/// pattern-matching; deliberately narrow -- full command blocking/denial, a
-/// competitor's `curl`/`wget` policy, is explicitly out of scope, there's no
-/// sandboxed-exec tool to redirect to and it's not core to what AgentOps
-/// does) and, when `compress` is set, a command-output-compression rewrite
-/// (RTK-inspired -- see `classify_for_compression`). **Never sets
-/// `permissionDecision`** for the warning path (the tool call always
-/// proceeds through Claude Code's normal permission flow untouched); the
-/// compression path sets `updatedInput` only, never `permissionDecision`
-/// either, so it changes *what* runs, never *whether* it runs.
-fn process_pre_tool_use(input: &str, compress: bool) -> Result<()> {
-    let payload: PreToolUsePayload = serde_json::from_str(input).context("parsing PreToolUse payload")?;
-    let warning = detect_secret_exposure(&payload.tool_name, &payload.tool_input);
+/// the same call: the secret-exposure warning (store-side, via `dispatch`,
+/// see `agentops_mcp::hooks`) and, when `compress` is set, a
+/// command-output-compression rewrite (RTK-inspired -- see
+/// `classify_for_compression`). The compression path sets `updatedInput`
+/// only, never `permissionDecision`, so it changes *what* runs, never
+/// *whether* it runs. A failure to reach the store never drops the rewrite.
+fn process_pre_tool_use(input: &str, compress: bool) -> Result<Option<Value>> {
+    let value: Value = serde_json::from_str(input).context("parsing PreToolUse payload")?;
+    let payload: PreToolUsePayload = serde_json::from_value(value.clone()).context("parsing PreToolUse payload")?;
     let rewrite = if compress { detect_command_rewrite(&payload.tool_name, &payload.tool_input) } else { None };
-
-    if warning.is_none() && rewrite.is_none() {
-        return Ok(());
-    }
-
-    if let (Some(w), Some(cwd)) = (&warning, payload.cwd.as_deref()) {
-        let repo_path = Path::new(cwd);
-        if let Ok(store) = agentops_mcp::open_store(repo_path) {
-            let repo = agentops_mcp::repo_name(repo_path);
-            let session_id = payload.session_id.as_deref().unwrap_or("unknown-session");
-            // Best-effort: a failure to record must never block the tool
-            // call or fail this hook -- the warning has already been decided;
-            // recording it is a nice-to-have for the session guide, not
-            // a precondition for warning Claude.
-            let _ = store.record_session_event(&repo, session_id, &payload.tool_name, w, None, "secret_exposure_warning");
+    let warning = match dispatch("pretooluse", &value) {
+        Ok(output) => output,
+        Err(e) => {
+            eprintln!("agentops hook-capture --event pretooluse: {e:#} (non-fatal, continuing)");
+            None
         }
+    };
+    if warning.is_none() && rewrite.is_none() {
+        return Ok(None);
     }
-
-    let mut output = serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse" } });
-    if let Some(w) = &warning {
-        output["hookSpecificOutput"]["additionalContext"] = serde_json::Value::String(w.clone());
-        output["hookSpecificOutput"]["systemMessage"] = serde_json::Value::String(format!("agentops: {w}"));
-    }
+    let mut output = warning.unwrap_or_else(|| hooks::hook_output("PreToolUse", None, None));
     if let Some(new_command) = &rewrite {
         output["hookSpecificOutput"]["updatedInput"] = serde_json::json!({ "command": new_command });
     }
-    println!("{output}");
-    Ok(())
-}
-
-fn detect_secret_exposure(tool_name: &str, tool_input: &serde_json::Value) -> Option<String> {
-    match tool_name {
-        "Bash" => {
-            let command = tool_input.get("command").and_then(|v| v.as_str())?;
-            let redaction = agentops_security::redact(command);
-            (redaction.redacted_count > 0).then(|| "this command appears to contain a credential-shaped string — double-check before running it".to_string())
-        }
-        "Read" | "Edit" | "Write" | "NotebookEdit" => {
-            let path = tool_input.get("file_path").and_then(|v| v.as_str())?;
-            agentops_security::is_secret_bearing_filename(Path::new(path)).then(|| format!("{path} looks like a secret-bearing file"))
-        }
-        _ => None,
-    }
+    Ok(Some(output))
 }
 
 // ---------------------------------------------------------------------
@@ -501,304 +294,111 @@ fn process_session_end(input: &str) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------
-// SessionStart
-// ---------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-struct SessionStartPayload {
-    source: Option<String>,
-    session_id: Option<String>,
-    cwd: Option<String>,
-}
-
-fn process_session_start(input: &str) -> Result<()> {
-    let payload: SessionStartPayload = serde_json::from_str(input).context("parsing SessionStart payload")?;
-    // Confirmed exactly against Claude Code's real docs: `source` is one of
-    // startup/resume/clear/compact/fork. AgentOps never needs a `PreCompact`
-    // hook (unlike a competitor's design) because `session_events` already
-    // persists durably and incrementally throughout the session -- gating
-    // here is the only "checkpoint" logic needed. `startup` is included
-    // (unlike this hook's first version) so a brand-new session also gets
-    // primed -- there's nothing yet to resume, but `build_repo_briefing`'s
-    // fallback below still has real repo-level context to offer.
-    if !matches!(payload.source.as_deref(), Some("compact") | Some("resume") | Some("startup")) {
-        return Ok(());
-    }
-    let (Some(cwd), Some(session_id)) = (payload.cwd.as_deref(), payload.session_id.as_deref()) else {
-        return Ok(());
-    };
-
-    let repo_path = Path::new(cwd);
-    let store = agentops_mcp::open_store(repo_path)?;
-    let repo = agentops_mcp::repo_name(repo_path);
-    let guide = agentops_mcp::session_guide::build(store.as_ref(), &repo, session_id)?;
-    let guide = if guide.is_empty() { agentops_mcp::session_guide::build_repo_briefing(store.as_ref(), &repo)? } else { guide };
-    // Sticky pins are a standing directive, prepended ahead of the
-    // session-resume guide/briefing -- and checked for emptiness only after
-    // this concatenation, so a session with pins but no other activity yet
-    // still emits output.
-    let pinned = agentops_mcp::session_guide::build_pinned_context(store.as_ref(), &repo)?;
-    let guide = if pinned.is_empty() { guide } else if guide.is_empty() { pinned } else { format!("{pinned}\n\n{guide}") };
-    if guide.is_empty() {
-        return Ok(());
-    }
-
-    println!(
-        "{}",
-        serde_json::json!({
-            "hookSpecificOutput": {
-                "hookEventName": "SessionStart",
-                "additionalContext": guide,
-            }
-        })
-    );
-    Ok(())
-}
-
-/// Nanosecond timestamp used only to keep each captured event's `path`
-/// unique (see `upsert_node`'s natural-key doc comment — `add_node` is used
-/// directly here instead, since each hook-capture event is a distinct
-/// occurrence to record, never one to update in place).
-fn now_nanos() -> u128 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    #[test]
-    fn render_tool_response_passes_through_a_plain_string() {
-        assert_eq!(render_tool_response(&serde_json::json!("hello")), "hello");
+    fn payload(dir: &Path, extra: Value) -> String {
+        let mut p = json!({ "session_id": "sess-1", "cwd": dir.to_string_lossy() });
+        p.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        p.to_string()
+    }
+
+    fn write_marker(dir: &Path, server_url: &str) {
+        std::fs::create_dir_all(dir.join(".context")).unwrap();
+        std::fs::write(crate::remote_marker::remote_marker_path(dir), json!({ "server_url": server_url, "connection_id": "conn-1", "api_key": "k" }).to_string()).unwrap();
     }
 
     #[test]
-    fn render_tool_response_extracts_text_from_the_real_claude_code_shape() {
-        assert_eq!(render_tool_response(&serde_json::json!({"type": "text", "text": "hello world"})), "hello world");
-    }
-
-    #[test]
-    fn render_tool_response_falls_back_to_stringifying_an_unrecognized_shape() {
-        assert_eq!(render_tool_response(&serde_json::json!({"a": 1})), r#"{"a":1}"#);
-    }
-
-    #[test]
-    fn is_git_op_recognizes_common_verbs_but_not_plain_git_status() {
-        assert!(is_git_op("git commit -m 'wip'"));
-        assert!(is_git_op("git push origin main"));
-        assert!(!is_git_op("git status"));
-        assert!(!is_git_op("echo git commit"));
-    }
-
-    #[test]
-    fn small_tool_output_is_not_captured() {
+    fn a_local_repo_records_through_the_shared_hooks_module() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "tool_name": "Bash", "tool_response": "short output", "session_id": "sess-1", "cwd": path }).to_string();
-
-        process_post_tool_use(&payload).unwrap();
-
+        process("userpromptsubmit", false, &payload(dir.path(), json!({ "prompt": "fix the login bug" }))).unwrap();
         let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        assert!(store.nodes_by_kind(&repo, NodeKind::ToolOutput).unwrap().is_empty(), "small output should not be captured as a node");
-    }
-
-    #[test]
-    fn large_tool_output_is_captured_redacted_and_recorded() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let big_output = format!("{}\nAWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLE", "line of shell output\n".repeat(300));
-        let payload = serde_json::json!({ "tool_name": "Bash", "tool_response": big_output, "session_id": "sess-2", "cwd": path }).to_string();
-
-        process_post_tool_use(&payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let nodes = store.nodes_by_kind(&repo, NodeKind::ToolOutput).unwrap();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].name.as_deref(), Some("Bash"));
-        let content = nodes[0].content.as_deref().unwrap();
-        assert!(content.contains("[REDACTED:unquoted-env-credential-assignment]"), "{content}");
-        assert!(!content.contains("wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLE"));
-        assert!(content.contains("line of shell output"), "content should be stored in full, not truncated");
-
-        let events = store.session_events(&repo, "sess-2").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].tool_name, "Bash");
-    }
-
-    #[test]
-    fn large_tool_output_containing_a_uuid_also_records_a_cache_hazard_warning() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let big_output = format!("{}\nsession_id: 123e4567-e89b-12d3-a456-426614174000 done", "line of shell output\n".repeat(300));
-        let payload = serde_json::json!({ "tool_name": "Bash", "tool_response": big_output, "session_id": "sess-hazard", "cwd": path }).to_string();
-
-        process_post_tool_use(&payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-hazard").unwrap();
-        assert_eq!(events.len(), 2, "both the tool_output capture and the cache_hazard_warning must be recorded: {events:?}");
-        assert!(events.iter().any(|e| e.event_kind == "cache_hazard_warning" && e.description.contains("UUID")), "{events:?}");
-    }
-
-    #[test]
-    fn large_tool_output_with_no_volatile_content_records_no_cache_hazard_warning() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let big_output = "line of shell output\n".repeat(300);
-        let payload = serde_json::json!({ "tool_name": "Bash", "tool_response": big_output, "session_id": "sess-no-hazard", "cwd": path }).to_string();
-
-        process_post_tool_use(&payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-no-hazard").unwrap();
-        assert!(!events.iter().any(|e| e.event_kind == "cache_hazard_warning"), "{events:?}");
-    }
-
-    #[test]
-    fn a_real_claude_code_shaped_response_is_captured_as_plain_text_not_json_wrapped() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let big_text = "line of shell output\n".repeat(300);
-        let payload = serde_json::json!({ "tool_name": "Bash", "tool_response": {"type": "text", "text": big_text}, "session_id": "sess-3", "cwd": path }).to_string();
-
-        process_post_tool_use(&payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let nodes = store.nodes_by_kind(&repo, NodeKind::ToolOutput).unwrap();
-        assert_eq!(nodes.len(), 1);
-        let content = nodes[0].content.as_deref().unwrap();
-        assert!(!content.contains(r#""type":"text""#), "must not capture the JSON wrapper: {content}");
-        assert!(content.starts_with("line of shell output"));
-    }
-
-    #[test]
-    fn editing_a_file_records_a_file_modified_event_regardless_of_output_size() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "tool_name": "Edit", "tool_input": {"file_path": "src/main.rs"}, "tool_response": "ok", "session_id": "sess-4", "cwd": path }).to_string();
-
-        process_post_tool_use(&payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-4").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_kind, "file_modified");
-        assert_eq!(events[0].description, "src/main.rs");
-    }
-
-    #[test]
-    fn a_git_commit_is_recorded_as_a_git_op_but_git_status_is_not() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let commit_payload = serde_json::json!({ "tool_name": "Bash", "tool_input": {"command": "git commit -m 'wip'"}, "tool_response": "ok", "session_id": "sess-5", "cwd": path.clone() }).to_string();
-        let status_payload = serde_json::json!({ "tool_name": "Bash", "tool_input": {"command": "git status"}, "tool_response": "ok", "session_id": "sess-5", "cwd": path }).to_string();
-
-        process_post_tool_use(&commit_payload).unwrap();
-        process_post_tool_use(&status_payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-5").unwrap();
-        assert_eq!(events.len(), 1, "only the commit should be recorded, not plain status: {events:?}");
-        assert_eq!(events[0].event_kind, "git_op");
-    }
-
-    #[test]
-    fn post_tool_use_failure_records_an_error_event() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "tool_name": "Bash", "error": "command not found", "session_id": "sess-6", "cwd": path }).to_string();
-
-        process_post_tool_use_failure(&payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-6").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_kind, "error");
-    }
-
-    #[test]
-    fn user_prompt_submit_records_user_intent() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "prompt": "fix the login bug", "session_id": "sess-7", "cwd": path }).to_string();
-
-        process_user_prompt_submit(&payload).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-7").unwrap();
+        let events = store.session_events(&agentops_mcp::repo_name(dir.path()), "sess-1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, "user_intent");
-        assert_eq!(events[0].description, "fix the login bug");
     }
 
     #[test]
-    fn user_prompt_submit_ignores_an_empty_prompt() {
+    fn an_irrelevant_tool_call_never_opens_the_store() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "prompt": "   ", "session_id": "sess-8", "cwd": path }).to_string();
+        process("posttooluse", false, &payload(dir.path(), json!({ "tool_name": "Read", "tool_input": {"file_path": "a.rs"}, "tool_response": "ok" }))).unwrap();
+        assert!(!dir.path().join(".context").join("graph.db").exists());
+    }
 
-        user_prompt_submit_is_a_noop(&payload, dir.path());
-
-        fn user_prompt_submit_is_a_noop(payload: &str, dir: &std::path::Path) {
-            process_user_prompt_submit(payload).unwrap();
-            let store = agentops_mcp::open_store(dir).unwrap();
-            let repo = agentops_mcp::repo_name(dir);
-            assert!(store.session_events(&repo, "sess-8").unwrap().is_empty());
+    /// The spec's "unreachable server" check, for both failure shapes: a
+    /// refused connection, and a server that accepts but never answers
+    /// (which must hit `REMOTE_HOOK_TIMEOUT`, not hang).
+    #[test]
+    fn a_remote_repo_with_an_unreachable_server_exits_cleanly_in_time_and_never_creates_a_local_graph() {
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let silent_url = format!("http://{}", silent.local_addr().unwrap());
+        let refused_url = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        for url in [refused_url, silent_url] {
+            let dir = tempfile::tempdir().unwrap();
+            write_marker(dir.path(), &url);
+            let events: [(&str, Value); 5] = [
+                ("userpromptsubmit", json!({ "prompt": "hi" })),
+                ("sessionstart", json!({ "source": "startup" })),
+                ("posttooluse", json!({ "tool_name": "Edit", "tool_input": {"file_path": "a.rs"}, "tool_response": "ok" })),
+                ("posttoolusefailure", json!({ "tool_name": "Bash", "error": "boom" })),
+                ("pretooluse", json!({ "tool_name": "Read", "tool_input": {"file_path": ".env"} })),
+            ];
+            for (event, extra) in events {
+                let started = std::time::Instant::now();
+                let output = process(event, false, &payload(dir.path(), extra)).unwrap();
+                assert!(output.is_none(), "{event} against {url} must emit no context");
+                assert!(started.elapsed() < REMOTE_HOOK_TIMEOUT + Duration::from_secs(1), "{event} against {url} took {:?}", started.elapsed());
+            }
+            assert!(!dir.path().join(".context").join("graph.db").exists(), "a remote-connected repo must never open the local graph");
         }
     }
 
     #[test]
-    fn pre_tool_use_warns_on_a_bash_command_with_a_credential_but_never_blocks() {
+    fn a_remote_repo_forwards_the_payload_without_local_paths_and_returns_the_servers_output() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let mut received = String::new();
+            // Read until the JSON body's closing brace has arrived.
+            while !received.contains("\r\n\r\n") || !received.trim_end().ends_with('}') {
+                let n = std::io::Read::read(&mut stream, &mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                received.push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+            let body = json!({ "output": { "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": "from the server" } } }).to_string();
+            write!(stream, "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+            received
+        });
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "tool_name": "Bash", "tool_input": {"command": r#"export API_KEY="sk_live_abcdef1234567890ABCDEF""#}, "session_id": "sess-9", "cwd": path }).to_string();
-
-        // Must never return an Err (would surface as a nonzero exit).
-        process_pre_tool_use(&payload, false).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-9").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_kind, "secret_exposure_warning");
+        write_marker(dir.path(), &url);
+        let output = process("userpromptsubmit", false, &payload(dir.path(), json!({ "prompt": "hi", "transcript_path": "/home/me/t.jsonl" }))).unwrap().unwrap();
+        assert_eq!(output["hookSpecificOutput"]["additionalContext"], "from the server");
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /repos/conn-1/hooks/userpromptsubmit "), "{request}");
+        assert!(request.contains("Bearer k"), "{request}");
+        assert!(!request.contains("transcript_path") && !request.contains("\"cwd\""), "local paths must not be sent: {request}");
+        assert!(!dir.path().join(".context").join("graph.db").exists());
     }
 
     #[test]
-    fn pre_tool_use_warns_on_reading_a_dotenv_file() {
+    fn pre_tool_use_never_fails_and_keeps_the_rewrite_when_the_server_is_unreachable() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "tool_name": "Read", "tool_input": {"file_path": ".env"}, "session_id": "sess-10", "cwd": path }).to_string();
-
-        process_pre_tool_use(&payload, false).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        let events = store.session_events(&repo, "sess-10").unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].event_kind, "secret_exposure_warning");
-    }
-
-    #[test]
-    fn pre_tool_use_is_silent_for_an_ordinary_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "tool_name": "Read", "tool_input": {"file_path": "src/main.rs"}, "session_id": "sess-11", "cwd": path }).to_string();
-
-        process_pre_tool_use(&payload, false).unwrap();
-
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        assert!(store.session_events(&repo, "sess-11").unwrap().is_empty());
+        let refused_url = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", l.local_addr().unwrap())
+        };
+        write_marker(dir.path(), &refused_url);
+        let output = process("pretooluse", true, &payload(dir.path(), json!({ "tool_name": "Bash", "tool_input": {"command": "cargo test"} }))).unwrap().unwrap();
+        assert!(output["hookSpecificOutput"]["updatedInput"]["command"].as_str().unwrap().contains("compress-output"));
     }
 
     #[test]
@@ -878,31 +478,4 @@ mod tests {
         assert_eq!(status.code(), Some(1), "the rewritten line's exit code must be `false`'s real code (1), not `cat`'s (0): {rewritten}");
     }
 
-    #[test]
-    fn session_start_is_a_noop_on_plain_startup() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let payload = serde_json::json!({ "source": "startup", "session_id": "sess-12", "cwd": path }).to_string();
-
-        // Must not error even though nothing has been scanned/recorded yet.
-        process_session_start(&payload).unwrap();
-    }
-
-    #[test]
-    fn session_start_on_startup_primes_a_scanned_repo_via_the_fallback_briefing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().to_string_lossy().to_string();
-        let store = agentops_mcp::open_store(dir.path()).unwrap();
-        let repo = agentops_mcp::repo_name(dir.path());
-        store.add_node(NewNode { kind: NodeKind::Gotcha, repo: repo.clone(), path: None, name: Some("Watch out".into()), container: None, start_line: None, end_line: None, content: Some("A real gotcha.".into()) }).unwrap();
-        store.record_scan(&repo, &[]).unwrap();
-
-        let payload = serde_json::json!({ "source": "startup", "session_id": "sess-13", "cwd": path }).to_string();
-
-        // Doesn't error, and (unlike the never-scanned case above) actually
-        // has something to prime the fresh session with -- can't easily
-        // assert on stdout here without capturing it, so this just confirms
-        // the fallback path executes cleanly against a real scanned repo.
-        process_session_start(&payload).unwrap();
-    }
 }

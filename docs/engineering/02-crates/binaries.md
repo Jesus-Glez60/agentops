@@ -45,7 +45,7 @@ Index and field definitions: [02-crate-reference.md](../02-crate-reference.md).
 
   | Module | Command | Job |
   | --- | --- | --- |
-  | `hook_capture.rs` | `hook-capture --event <name>` | The handler behind every Claude Code hook `connect --with-hooks` installs. |
+  | `hook_capture.rs` | `hook-capture --event <name>` | The handler behind every Claude Code hook `connect` installs (default on; `--no-hooks` skips them). |
   | `compress_output.rs` | `compress-output --kind <kind>` | Compresses a command's output, as one stage of a `PreToolUse`-rewritten pipeline. |
   | `usage.rs` | `usage sync` | Parses a Claude Code JSONL transcript and syncs per-session token usage. |
   | `usage_report.rs` | `usage report` | Replays where a session's tokens went. |
