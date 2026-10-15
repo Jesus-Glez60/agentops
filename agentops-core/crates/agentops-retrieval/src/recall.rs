@@ -10,7 +10,9 @@
 //!   queries rather than one, because the two adapters disagree on how a
 //!   multi-word query combines: SQLite's FTS5 query ORs the terms, Postgres's
 //!   `plainto_tsquery` ANDs them, so a whole prompt sent to Postgres would
-//!   almost never match. A node matching more keywords ranks higher.
+//!   almost never match. A node matching more keywords ranks higher. With
+//!   three or more keywords a node must match at least two, and the repo's
+//!   own name never counts as a keyword.
 //! - **Named symbols.** Identifier-shaped words in the prompt
 //!   (`snake_case`, `CamelCase`, `a::b`, backticked) are matched exactly
 //!   against symbol names with `search_exact`, then followed one hop over
@@ -32,6 +34,8 @@ pub const RECALL_KINDS: &[NodeKind] = &[NodeKind::Gotcha, NodeKind::Decision, No
 const MAX_KEYWORDS: usize = 8;
 /// Candidates fetched per keyword and kind before fusion.
 const PER_QUERY: usize = 10;
+/// Score multiplier for generated doc sections (see `recall_seed`).
+const DOC_SECTION_WEIGHT: f64 = 0.25;
 
 /// One recalled node, as a pointer the agent can follow.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,9 +76,17 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
         }
     };
 
-    for keyword in keywords(query) {
+    // The repo's own name appears in half its notes, so it never counts as
+    // a keyword (hosted repos are named `<owner>--<repo>--<tenant>`).
+    let repo_lower = repo.to_lowercase();
+    let keywords: Vec<String> = keywords(query).into_iter().filter(|k| !repo_lower.contains(k.as_str())).collect();
+    // With several keywords, one weak word in common isn't a cue: a note
+    // must match at least two. An empty seed beats a noisy one, which only
+    // teaches the agent to skip seeds.
+    let min_keyword_matches = if keywords.len() >= 3 { 2 } else { 1 };
+    for keyword in &keywords {
         for &kind in RECALL_KINDS {
-            for (rank, (node, _)) in store.search_lexical(repo, &keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
+            for (rank, (node, _)) in store.search_lexical(repo, keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
                 add(node.id, node.kind, node.name.as_deref(), node.prominence, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""));
             }
         }
@@ -99,10 +111,17 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
         }
     }
 
-    let mut ranked: Vec<(i64, Candidate)> = candidates.into_iter().filter(|(id, c)| !exclude.contains(id) && c.prominence != NodeProminence::Pinned).collect();
+    let enough = |c: &Candidate| c.reasons.iter().any(|r| r.starts_with("affects")) || c.reasons.len() >= min_keyword_matches;
+    let mut ranked: Vec<(i64, Candidate)> = candidates.into_iter().filter(|(id, c)| !exclude.contains(id) && c.prominence != NodeProminence::Pinned && enough(c)).collect();
     for (_, c) in &mut ranked {
         if c.prominence == NodeProminence::Reduced {
             c.score *= 0.5;
+        }
+        // Generated doc sections such as "Known Gotchas" digest many notes
+        // at once, so they match almost any prompt. They rank below the
+        // specific notes they summarize.
+        if c.kind == NodeKind::DocSection {
+            c.score *= DOC_SECTION_WEIGHT;
         }
     }
     // Score first; id as a stable tiebreak so the same prompt always
@@ -120,7 +139,7 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
 
 /// Common English and instruction words that would match half the graph.
 const STOPWORDS: &[&str] = &[
-    "the", "and", "for", "with", "that", "this", "from", "into", "onto", "are", "was", "were", "been", "being", "have", "has", "had", "not", "but", "can", "could", "should", "would", "will", "shall", "may", "might", "must", "you", "your", "our", "its", "their", "them", "they", "what", "when", "where", "which", "while", "who", "why", "how", "all", "any", "each", "some", "more", "most", "other", "such", "only", "own", "same", "than", "too", "very", "just", "also", "then", "there", "here", "about", "above", "after", "again", "before", "below", "between", "both", "during", "further", "once", "out", "over", "under", "until", "make", "made", "want", "need", "like", "use", "using", "add", "get", "let", "please", "lets", "now", "new", "way", "does", "did", "doing", "done", "one", "two", "it's", "i'm", "don't", "can't", "sure", "plan", "task", "fix", "change", "update", "better", "work", "thing", "things",
+    "the", "and", "for", "with", "that", "this", "from", "into", "onto", "are", "was", "were", "been", "being", "have", "has", "had", "not", "but", "can", "could", "should", "would", "will", "shall", "may", "might", "must", "you", "your", "our", "its", "their", "them", "they", "what", "when", "where", "which", "while", "who", "why", "how", "all", "any", "each", "some", "more", "most", "other", "such", "only", "own", "same", "than", "too", "very", "just", "also", "then", "there", "here", "about", "above", "after", "again", "before", "below", "between", "both", "during", "further", "once", "out", "over", "under", "until", "make", "made", "want", "need", "like", "use", "using", "add", "get", "let", "please", "lets", "now", "new", "way", "does", "did", "doing", "done", "one", "two", "it's", "i'm", "don't", "can't", "sure", "plan", "task", "fix", "change", "update", "better", "work", "works", "working", "thing", "things", "fail", "fails", "failed", "failing", "check", "checks", "ignore", "ignores", "broken", "break", "breaks", "issue", "problem", "wrong", "doesn't", "isn't", "look", "see", "try",
 ];
 
 /// Distinct keywords from `query`, in order of first appearance: words of
@@ -185,7 +204,9 @@ mod tests {
         let one = note(&store, NodeKind::Decision, "Hooks are opt-in", "hooks are installed only with a flag");
         note(&store, NodeKind::Symbol, "remote_hooks", "fn remote_hooks() {}");
         let seed = recall_seed(&store, "r", "make remote hooks reliable", 8, &HashSet::new()).unwrap();
-        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![both, one], "symbols never appear; more matched keywords rank higher: {seed:?}");
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![both], "with 3 keywords, one shared word isn't enough; symbols never appear: {seed:?}");
+        let seed = recall_seed(&store, "r", "remote hooks", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![both, one], "more matched keywords rank higher: {seed:?}");
         assert!(seed[0].render().contains("matched \"remote\", \"hooks\""), "{}", seed[0].render());
     }
 
@@ -211,6 +232,22 @@ mod tests {
         assert_eq!(seed.len(), 1, "{seed:?}");
         assert_eq!(seed[0].node_id, gotcha);
         assert!(seed[0].reason.contains("affects `ingest_vault`"), "{seed:?}");
+    }
+
+    #[test]
+    fn the_repos_own_name_is_never_a_keyword() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        upsert_node(&store, NewNode { kind: NodeKind::Gotcha, repo: "owner--agentops--t1".into(), path: Some("vault:a".into()), name: Some("agentops naming".into()), container: None, start_line: None, end_line: None, content: Some("agentops agentops".into()) }).unwrap();
+        assert!(recall_seed(&store, "owner--agentops--t1", "agentops status json", 8, &HashSet::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_specific_note_outranks_a_doc_section_digest_matching_the_same_words() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let digest = note(&store, NodeKind::DocSection, "Known Gotchas", "webhook signature deadlock pool postgres everything");
+        let specific = note(&store, NodeKind::Gotcha, "Webhook signature mismatch", "every webhook gets 401");
+        let seed = recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![specific, digest], "{seed:?}");
     }
 
     #[test]
