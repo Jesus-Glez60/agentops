@@ -875,6 +875,25 @@ mod tests {
         assert_eq!(store.session_events(&repo, "s").unwrap().iter().filter(|e| e.event_kind == MEMORY_WRITE_REDIRECTED).count(), 3);
     }
 
+    /// The server runs these hooks against Postgres, whose lexical search
+    /// ANDs a multi-word query where SQLite ORs it. Skips when no Postgres
+    /// is reachable; the server's CI sets AGENTOPS_TEST_DATABASE_URL.
+    #[test]
+    fn the_prompt_hook_records_and_recalls_against_postgres() {
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let Ok(pg) = agentops_graph_pg::PostgresGraphStore::connect(&url) else {
+            eprintln!("skipping the_prompt_hook_records_and_recalls_against_postgres: no Postgres reachable at {url}");
+            return;
+        };
+        let repo = format!("hooks-pg-test-{}", now_nanos());
+        let id = gotcha(&pg, &repo, "Hooks ignore the remote server", "hook capture opens the local store");
+        let first = prompt(&pg, &repo, "make the hooks follow the remote server reliably", "plan");
+        let events = pg.session_events(&repo, "s").unwrap();
+        pg.wipe_repo(&repo).unwrap();
+        assert!(first.contains("task-start flow") && first.contains(&format!("(id {id})")), "a multi-word prompt must still recall on Postgres: {first}");
+        assert!(events.iter().any(|e| e.event_kind == "user_intent" && e.tool_name == PLAN_PROMPT_TOOL), "{events:?}");
+    }
+
     #[test]
     fn hook_output_omits_absent_fields() {
         let out = hook_output("UserPromptSubmit", Some("ctx"), None);
