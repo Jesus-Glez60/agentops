@@ -178,7 +178,7 @@ Other debt:
 
 - **Recall noise.** One large note matches many prompts on one or two words (F53). Per-keyword IDF weighting is the next step; it belongs with milestone 3's cued recall.
 - **Version dependence.** Item 6 depends on `tool_input.plan` and the `ExitPlanMode` deny behaving as on Claude Code 2.1.286. It fails open if the field disappears. Re-check on upgrade.
-- **Hooks aren't committed.** This repo's `.claude/settings.json` now carries the hooks, but that change isn't committed. The file is tracked and the repo is public, so committing it would run `agentops hook-capture` for anyone who clones with the CLI installed. The author decides.
+- **Hooks are committed.** The author chose to commit this repo's `.claude/settings.json` with the hooks (`d2f18b6`). The repo is public, so anyone who clones it with the CLI installed runs `agentops hook-capture`.
 - **MEMORY.md is still loaded.** Claude Code still loads it, and the redirect only blocks writes in repos with hooks installed. `autoMemoryEnabled: false` / `CLAUDE_CODE_DISABLE_AUTO_MEMORY` exist in the 2.1.286 binary (**unverified**, not in the docs) and are the switch for after the import.
 - **Unmeasured cost.** The council member runs on `model: haiku` with 19 named MCP tools. The cost of the five-member council (gotcha 53946) isn't measured.
 
