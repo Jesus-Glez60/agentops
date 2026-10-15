@@ -71,7 +71,7 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     match event {
         "posttooluse" => classify_post_tool_use(tool_name, &tool_input).is_some() || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
-        "pretooluse" => tool_name == "ExitPlanMode" || detect_secret_exposure(tool_name, &tool_input).is_some(),
+        "pretooluse" => tool_name == "ExitPlanMode" || is_memory_write(tool_name, &tool_input) || detect_secret_exposure(tool_name, &tool_input).is_some(),
         "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
         _ => true,
     }
@@ -393,11 +393,35 @@ fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<O
     if tool_name == "ExitPlanMode" {
         return check_presented_plan(store, repo, session_id(payload), &tool_input);
     }
+    if is_memory_write(tool_name, &tool_input) {
+        let path = tool_input.get("file_path").and_then(|v| v.as_str()).unwrap_or_default();
+        let _ = store.record_session_event(repo, session_id(payload), tool_name, path, None, MEMORY_WRITE_REDIRECTED);
+        return Ok(Some(serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": MEMORY_REDIRECT_REASON } })));
+    }
     let Some(warning) = detect_secret_exposure(tool_name, &tool_input) else {
         return Ok(None);
     };
     let _ = store.record_session_event(repo, session_id(payload), tool_name, &warning, None, "secret_exposure_warning");
     Ok(Some(hook_output("PreToolUse", Some(&warning), Some(&format!("agentops: {warning}")))))
+}
+
+/// `event_kind` of a write to Claude Code's local memory that was sent to
+/// `add_note` instead.
+pub const MEMORY_WRITE_REDIRECTED: &str = "memory_write_redirected";
+
+const MEMORY_REDIRECT_REASON: &str = "AgentOps is this repo's memory: Claude Code's local memory files (MEMORY.md and the files beside it) aren't written here. Record this with the add_note MCP tool instead (it reaches the remote server when the repo is connected to one). Set note_type to gotcha, decision or knowledge, and add one tag saying what kind of memory it is: memory-kind:semantic (a fact and the reason behind it), memory-kind:episodic (what happened in a session), or memory-kind:procedural (a rule that must always hold). If it updates something already recorded, say so in the body.";
+
+/// A `Write`/`Edit`/`MultiEdit` into Claude Code's per-project memory
+/// directory (`~/.claude/projects/<project>/memory/`). Reads aren't
+/// touched: existing MEMORY.md files stay readable until they're imported
+/// (milestone 2). Backslashes are normalized so a Windows path matches too.
+fn is_memory_write(tool_name: &str, tool_input: &Value) -> bool {
+    if !matches!(tool_name, "Write" | "Edit" | "MultiEdit") {
+        return false;
+    }
+    let Some(path) = tool_input.get("file_path").and_then(|v| v.as_str()) else { return false };
+    let path = path.replace('\\', "/");
+    path.split_once("/.claude/projects/").is_some_and(|(_, rest)| rest.split('/').nth(1) == Some("memory"))
 }
 
 /// `event_kind` of a plan sent back for a missing section, and of one let
@@ -833,6 +857,22 @@ mod tests {
         assert!(present(store.as_ref(), &repo, Some("# P\n## Research performed\nx\n### council VERDICT\nclear")).is_none());
         assert!(present(store.as_ref(), &repo, None).is_none(), "fail open when the plan text isn't in the payload");
         assert!(present(store.as_ref(), &repo, Some("Research performed and Council verdict mentioned only in prose")).is_some(), "only headings count");
+    }
+
+    #[test]
+    fn a_write_into_claude_codes_memory_directory_is_redirected_to_add_note_and_nothing_else_is() {
+        let (_dir, store, repo) = store();
+        let pre = |tool: &str, path: &str| handle(store.as_ref(), &repo, "pretooluse", &json!({ "session_id": "s", "tool_name": tool, "tool_input": { "file_path": path } })).unwrap();
+        for (tool, path) in [("Write", "/Users/me/.claude/projects/-Users-me-repo/memory/MEMORY.md"), ("Edit", "/Users/me/.claude/projects/-Users-me-repo/memory/feedback_x.md"), ("Write", r"C:\Users\me\.claude\projects\C--repo\memory\MEMORY.md")] {
+            let out = pre(tool, path).unwrap_or_else(|| panic!("{tool} {path} must be denied"));
+            assert_eq!(out["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(out["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().contains("add_note"));
+        }
+        assert!(pre("Read", "/Users/me/.claude/projects/-Users-me-repo/memory/MEMORY.md").is_none(), "reads stay allowed");
+        assert!(pre("Write", "/Users/me/repo/src/memory/mod.rs").is_none());
+        assert!(pre("Write", "/Users/me/.claude/projects/-Users-me-repo/notes.md").is_none());
+        assert!(pre("Write", "/Users/me/.claude/plans/plan.md").is_none());
+        assert_eq!(store.session_events(&repo, "s").unwrap().iter().filter(|e| e.event_kind == MEMORY_WRITE_REDIRECTED).count(), 3);
     }
 
     #[test]
