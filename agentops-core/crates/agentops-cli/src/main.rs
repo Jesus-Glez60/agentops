@@ -2500,6 +2500,20 @@ mod tests {
     }
 
     #[test]
+    fn installing_the_hook_suite_twice_leaves_one_agentops_entry_per_event() {
+        let dir = tempfile::tempdir().unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], true).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap()).unwrap();
+        let hooks = parsed["hooks"].as_object().unwrap();
+        assert_eq!(hooks.len(), 7, "{parsed}");
+        for (event, groups) in hooks {
+            let ours = groups.as_array().unwrap().iter().flat_map(|g| g["hooks"].as_array().unwrap()).filter(|h| h["command"].as_str().unwrap().starts_with("agentops hook-capture")).count();
+            assert_eq!(ours, 1, "{event}: {parsed}");
+        }
+    }
+
+    #[test]
     fn write_claude_hook_replaces_a_legacy_bare_object_entry_and_never_duplicates_ours() {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");

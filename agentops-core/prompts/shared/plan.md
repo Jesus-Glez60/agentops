@@ -58,3 +58,8 @@ lists the files/symbols that finding depends on. This is the same schema
 review pass trusts an item here **only if none of its `files` have changed
 since this plan was written**; anything stale, or anything this section
 doesn't cover, gets re-derived live instead of trusted from cache.
+
+Before presenting the plan, run the `audit-plan` skill on it and keep its
+verdict in a "Council verdict" section next to "Research performed". Both
+are required headings: in plan mode, a plan presented without either is
+sent back once with the missing step named.

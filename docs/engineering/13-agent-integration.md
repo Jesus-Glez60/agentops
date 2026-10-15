@@ -130,7 +130,7 @@ The store logic for every event lives in one place, `agentops_mcp::hooks::handle
 | `PostToolUseFailure` | Records an `error` event. `PostToolUse` never fires on failure (gotcha 53971). |
 | `UserPromptSubmit` | Records `user_intent` and injects pinned nodes, plus the task-start flow in plan mode or a recall seed otherwise (see "Task-start flow and recall seed" below). Skips the `<task-notification>` prompts Claude Code sends when a background task finishes. Installed with a 10 s timeout. |
 | `SessionStart` | On startup, resume or compact, injects the session guide (`session_guide::build`) and pinned nodes. |
-| `PreToolUse` | Warns about likely secret exposure, never blocks. Warning without blocking needs `hookSpecificOutput` JSON, not stderr (gotcha 53971). |
+| `PreToolUse` | Warns about likely secret exposure. Warning without blocking needs `hookSpecificOutput` JSON, not stderr (gotcha 53971). On `ExitPlanMode`, checks the plan's required sections (see below). Never blocks anything else (ADR 0049). |
 | `SessionEnd` | Starts a detached `agentops usage sync --transcript` for the ending session. |
 | `SubagentStart` | For `Explore`, `Plan` and the `plan-council-*` agents (`hooks::SEEDED_AGENTS`), injects pinned nodes and a recall seed built from the session's latest user prompt, within `SUBAGENT_SEED_BUDGET` (2,000 characters). Subagents load no `CLAUDE.md`/`AGENTS.md`, so this is their only memory channel. The seed isn't recorded as shown, because the main session hasn't seen it. Installed with a 10 s timeout. |
 
@@ -151,6 +151,10 @@ The directive tells the agent, in order: use the `plan` skill; recall first; run
 The seed comes from `agentops_retrieval::recall_seed` (`agentops-core/crates/agentops-retrieval/src/recall.rs`). It is lexical and graph only: no embedding model runs inside a hook. The prompt is cut into keywords, and each keyword goes to `GraphStore::search_lexical` per note kind (Gotcha, Decision, Note, DocSection). They go separately because SQLite's FTS5 query ORs terms while Postgres's `plainto_tsquery` ANDs them. Identifier-shaped words are matched exactly against symbol names and followed one hop over `Affects` edges to their notes. Results are fused by reciprocal rank, reduced-prominence nodes rank lower, and pinned nodes are left out because the pin block already shows them. Each pointer is one line: kind, title, node id, and why it matched.
 
 Every pointer sent is recorded as a `recall_injected` event (`ids 1,2,3`), so ordinary prompts never repeat a pointer within a session. Everything injected fits in `PLAN_FLOW_BUDGET` (4,000 characters), and pointers are dropped first. All of these limits are constants in `agentops-mcp/src/budget.rs`.
+
+### Plan enforcement
+
+A plan presented in plan mode must have a "Research performed" heading and a "Council verdict" heading (`check_presented_plan` in `agentops_mcp::hooks`). The spike showed that Claude Code 2.1.286 passes the full plan to `PreToolUse` on `ExitPlanMode` as `tool_input.plan`, and obeys a deny. The first plan in a planning episode that lacks a section is denied with a reason naming the missing step: recall, or run `audit-plan`. That is recorded as a `plan_nudge` event. The next attempt goes through with a top-level `systemMessage` warning to the user (`plan_presented_incomplete`), so it never loops (`ENFORCE_MAX_NUDGES`). A planning episode starts after the last ordinary-mode prompt. Only headings count, not prose. If `tool_input.plan` is missing, the plan goes through untouched. The existing `PreToolUse` hook already runs for every tool, so this needs no new hook entry. ADR 0049 records why `PreToolUse` may block here.
 
 ### Council agents
 

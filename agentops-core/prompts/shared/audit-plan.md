@@ -43,3 +43,9 @@ solo playbook's report, or the council's consensus verdict — clear, or the
 consolidated required changes). Do not evaluate anything outside the
 ladder, recorded knowledge, and what the review itself surfaced (no
 unprompted general design review).
+
+Write the verdict into the plan itself, under a "Council verdict" heading:
+the verdict (clear, clear with changes, or blocked), who reviewed it (solo
+playbook or the five-persona council and chair), and what changed because
+of it. A plan presented without that heading is sent back once by the
+task-start flow's hook.

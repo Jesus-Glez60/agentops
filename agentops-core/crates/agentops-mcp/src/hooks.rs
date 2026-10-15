@@ -71,23 +71,26 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     match event {
         "posttooluse" => classify_post_tool_use(tool_name, &tool_input).is_some() || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
-        "pretooluse" => detect_secret_exposure(tool_name, &tool_input).is_some(),
+        "pretooluse" => tool_name == "ExitPlanMode" || detect_secret_exposure(tool_name, &tool_input).is_some(),
         "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
         _ => true,
     }
 }
 
-/// The `hookSpecificOutput` object every context-injecting hook prints.
-/// `additional_context`/`system_message` are omitted when `None`.
+/// The JSON every context-injecting hook prints. `additionalContext` goes
+/// inside `hookSpecificOutput`; `systemMessage` (a warning shown to the
+/// user) is one of Claude Code's top-level output fields, a sibling of
+/// `hookSpecificOutput`. Each is omitted when `None`.
 pub fn hook_output(event_name: &str, additional_context: Option<&str>, system_message: Option<&str>) -> Value {
     let mut specific = serde_json::json!({ "hookEventName": event_name });
     if let Some(context) = additional_context {
         specific["additionalContext"] = Value::String(context.to_string());
     }
+    let mut output = serde_json::json!({ "hookSpecificOutput": specific });
     if let Some(message) = system_message {
-        specific["systemMessage"] = Value::String(message.to_string());
+        output["systemMessage"] = Value::String(message.to_string());
     }
-    serde_json::json!({ "hookSpecificOutput": specific })
+    output
 }
 
 fn session_id(payload: &Value) -> &str {
@@ -387,11 +390,56 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value) -> Re
 fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
+    if tool_name == "ExitPlanMode" {
+        return check_presented_plan(store, repo, session_id(payload), &tool_input);
+    }
     let Some(warning) = detect_secret_exposure(tool_name, &tool_input) else {
         return Ok(None);
     };
     let _ = store.record_session_event(repo, session_id(payload), tool_name, &warning, None, "secret_exposure_warning");
     Ok(Some(hook_output("PreToolUse", Some(&warning), Some(&format!("agentops: {warning}")))))
+}
+
+/// `event_kind` of a plan sent back for a missing section, and of one let
+/// through anyway with a warning.
+pub const PLAN_NUDGE: &str = "plan_nudge";
+pub const PLAN_PRESENTED_INCOMPLETE: &str = "plan_presented_incomplete";
+
+/// Sections every presented plan must carry (headings, matched
+/// case-insensitively), with what to do when one is missing.
+const REQUIRED_PLAN_SECTIONS: &[(&str, &str)] = &[
+    ("Research performed", "recall first (the plan skill's gotcha/decision check) and record it under a \"Research performed\" heading"),
+    ("Council verdict", "run the audit-plan skill and put its verdict under a \"Council verdict\" heading"),
+];
+
+/// Soft enforcement of the task-start flow (milestone 1, item 6). On
+/// Claude Code 2.1.286 a `PreToolUse` deny on `ExitPlanMode` is obeyed: the
+/// plan isn't shown and the agent gets the reason (spike, 2026-10-14). The
+/// first plan in a planning episode that lacks a required section is
+/// denied with a reason naming the missing step. After
+/// `ENFORCE_MAX_NUDGES` nudges it goes through with a warning shown to the
+/// user, so this can never loop. An episode starts after the last
+/// ordinary-mode prompt. If `tool_input.plan` is missing (another Claude
+/// Code version), the plan goes through untouched.
+fn check_presented_plan(store: &dyn GraphStore, repo: &str, session_id: &str, tool_input: &Value) -> Result<Option<Value>> {
+    let Some(plan) = tool_input.get("plan").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let headings: Vec<String> = plan.lines().filter(|l| l.trim_start().starts_with('#')).map(|l| l.to_lowercase()).collect();
+    let missing: Vec<&(&str, &str)> = REQUIRED_PLAN_SECTIONS.iter().filter(|(name, _)| !headings.iter().any(|h| h.contains(&name.to_lowercase()))).collect();
+    if missing.is_empty() {
+        return Ok(None);
+    }
+    let names = missing.iter().map(|(name, _)| format!("\"{name}\"")).collect::<Vec<_>>().join(" and ");
+    let nudges_this_episode = store.session_events(repo, session_id)?.iter().fold(0, |n, e| if e.event_kind == "user_intent" && e.tool_name == PROMPT_TOOL { 0 } else if e.event_kind == PLAN_NUDGE { n + 1 } else { n });
+    if nudges_this_episode < crate::budget::ENFORCE_MAX_NUDGES {
+        store.record_session_event(repo, session_id, "ExitPlanMode", &format!("plan sent back: missing {names}"), None, PLAN_NUDGE)?;
+        let steps = missing.iter().map(|(_, step)| *step).collect::<Vec<_>>().join("; then ");
+        let reason = format!("AgentOps task-start flow: this plan has no {names} section. Before presenting it, {steps}. Then call ExitPlanMode again.");
+        return Ok(Some(serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })));
+    }
+    store.record_session_event(repo, session_id, "ExitPlanMode", &format!("plan presented without {names}"), None, PLAN_PRESENTED_INCOMPLETE)?;
+    Ok(Some(hook_output("PreToolUse", None, Some(&format!("agentops: this plan skipped part of the task-start flow (no {names} section). Review it with that in mind.")))))
 }
 
 fn detect_secret_exposure(tool_name: &str, tool_input: &Value) -> Option<String> {
@@ -751,6 +799,40 @@ mod tests {
         assert!(explore.chars().count() <= crate::budget::SUBAGENT_SEED_BUDGET);
         assert!(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "statusline-setup" })).unwrap().is_none());
         assert_eq!(recorded(), before, "a subagent's seed never counts as shown to the main session");
+    }
+
+    fn present(store: &dyn GraphStore, repo: &str, plan: Option<&str>) -> Option<Value> {
+        let input = plan.map(|p| json!({ "plan": p })).unwrap_or(json!({}));
+        handle(store, repo, "pretooluse", &json!({ "session_id": "s", "tool_name": "ExitPlanMode", "tool_input": input })).unwrap()
+    }
+
+    #[test]
+    fn a_plan_missing_a_section_is_sent_back_once_then_let_through_with_a_warning() {
+        let (_dir, store, repo) = store();
+        prompt(store.as_ref(), &repo, "plan something", "plan");
+        let incomplete = "# Plan\n\n## Research performed\n- checked\n";
+
+        let first = present(store.as_ref(), &repo, Some(incomplete)).unwrap();
+        assert_eq!(first["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = first["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("\"Council verdict\"") && reason.contains("audit-plan") && !reason.contains("\"Research performed\""), "{reason}");
+
+        let second = present(store.as_ref(), &repo, Some(incomplete)).unwrap();
+        assert!(second["hookSpecificOutput"].get("permissionDecision").is_none(), "never more than ENFORCE_MAX_NUDGES nudges: {second}");
+        assert!(second["systemMessage"].as_str().unwrap().contains("Council verdict"), "{second}");
+
+        // A new planning episode gets its own nudge.
+        prompt(store.as_ref(), &repo, "go", "default");
+        prompt(store.as_ref(), &repo, "plan the next thing", "plan");
+        assert_eq!(present(store.as_ref(), &repo, Some(incomplete)).unwrap()["hookSpecificOutput"]["permissionDecision"], "deny");
+    }
+
+    #[test]
+    fn a_complete_plan_or_one_with_no_plan_text_goes_through_untouched() {
+        let (_dir, store, repo) = store();
+        assert!(present(store.as_ref(), &repo, Some("# P\n## Research performed\nx\n### council VERDICT\nclear")).is_none());
+        assert!(present(store.as_ref(), &repo, None).is_none(), "fail open when the plan text isn't in the payload");
+        assert!(present(store.as_ref(), &repo, Some("Research performed and Council verdict mentioned only in prose")).is_some(), "only headings count");
     }
 
     #[test]
