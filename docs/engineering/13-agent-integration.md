@@ -115,7 +115,7 @@ Ruler needs Node, because it runs through `npx`. Bump `RULER_VERSION` deliberate
 
 ## Claude Code hooks
 
-`agentops connect` adds hooks to Claude Code's settings for six events, unless `--no-hooks` is passed. They were opt-in (`--with-hooks`) until milestone 1. They're on by default now because subagents never load `AGENTS.md`/`CLAUDE.md` and plan mode never calls MCP tools on its own, so hooks are the only reliable way memory reaches the agent (`docs/engineering/spikes/m1-hooks.md`). Each runs `agentops hook-capture --event <name>` (`agentops-core/crates/agentops-cli/src/hook_capture.rs`).
+`agentops connect` adds hooks to Claude Code's settings for seven events, unless `--no-hooks` is passed. They were opt-in (`--with-hooks`) until milestone 1. They're on by default now because subagents never load `AGENTS.md`/`CLAUDE.md` and plan mode never calls MCP tools on its own, so hooks are the only reliable way memory reaches the agent (`docs/engineering/spikes/m1-hooks.md`). Each runs `agentops hook-capture --event <name>` (`agentops-core/crates/agentops-cli/src/hook_capture.rs`).
 
 The store logic for every event lives in one place, `agentops_mcp::hooks::handle` (`agentops-core/crates/agentops-mcp/src/hooks.rs`). `hook_capture` only decides where it runs:
 
@@ -132,6 +132,7 @@ The store logic for every event lives in one place, `agentops_mcp::hooks::handle
 | `SessionStart` | On startup, resume or compact, injects the session guide (`session_guide::build`) and pinned nodes. |
 | `PreToolUse` | Warns about likely secret exposure, never blocks. Warning without blocking needs `hookSpecificOutput` JSON, not stderr (gotcha 53971). |
 | `SessionEnd` | Starts a detached `agentops usage sync --transcript` for the ending session. |
+| `SubagentStart` | For `Explore`, `Plan` and the `plan-council-*` agents (`hooks::SEEDED_AGENTS`), injects pinned nodes and a recall seed built from the session's latest user prompt, within `SUBAGENT_SEED_BUDGET` (2,000 characters). Subagents load no `CLAUDE.md`/`AGENTS.md`, so this is their only memory channel. The seed isn't recorded as shown, because the main session hasn't seen it. Installed with a 10 s timeout. |
 
 `write_claude_hook` merges into existing settings: other tools' hooks and the user's own groups on the same event survive. An earlier version wrote the wrong schema, and no installed hook ever fired (gotcha 54240). Claude Code's `PostToolUse` `tool_response` is an object with `type` and `text`, not a bare string (gotcha 53972).
 
@@ -150,6 +151,10 @@ The directive tells the agent, in order: use the `plan` skill; recall first; run
 The seed comes from `agentops_retrieval::recall_seed` (`agentops-core/crates/agentops-retrieval/src/recall.rs`). It is lexical and graph only: no embedding model runs inside a hook. The prompt is cut into keywords, and each keyword goes to `GraphStore::search_lexical` per note kind (Gotcha, Decision, Note, DocSection). They go separately because SQLite's FTS5 query ORs terms while Postgres's `plainto_tsquery` ANDs them. Identifier-shaped words are matched exactly against symbol names and followed one hop over `Affects` edges to their notes. Results are fused by reciprocal rank, reduced-prominence nodes rank lower, and pinned nodes are left out because the pin block already shows them. Each pointer is one line: kind, title, node id, and why it matched.
 
 Every pointer sent is recorded as a `recall_injected` event (`ids 1,2,3`), so ordinary prompts never repeat a pointer within a session. Everything injected fits in `PLAN_FLOW_BUDGET` (4,000 characters), and pointers are dropped first. All of these limits are constants in `agentops-mcp/src/budget.rs`.
+
+### Council agents
+
+`plan-council-member` and `plan-council-chair` (`agentops-core/prompts/agents/`) list every read-only AgentOps tool by full name (`mcp__agentops__<tool>`) in their `tools:` frontmatter, next to `Read`/`Grep`/`Bash`. In Claude Code, an explicit `tools:` list excludes any MCP tool it doesn't name, so before milestone 1 the Completeness-checker couldn't call the `list_gotchas`/`related_context` its persona asks for. The member prompt tells it to query the graph per file and symbol before grepping. A test in `agentops-cli` renders the prompt pack through `agentops-ruler-bridge` and checks the list against both tool registries' `read_only_hint`: every read-only tool is listed and no write tool is (`council_agents_list_every_read_only_agentops_tool_and_no_write_tool`).
 
 ### Command compression
 

@@ -1,7 +1,7 @@
 ---
 name: plan-council-member
 description: "Reviews a plan or diff either solo (single-agent review playbook — the default for small/medium changes) or as one voice in the full five-persona critique council (Skeptic, Simplifier, Completeness-checker, Outsider, Opportunity-hunter — spawned for large/high-risk changes; a live test found shrinking this council for risky changes removed exactly the scrutiny that should scale up with risk). The caller's prompt says which mode and, in council mode, which persona. Read-only, independent — in council mode, never told what the other members found. Spawned by audit-plan and wrap."
-tools: Read, Grep, Bash
+tools: Read, Grep, Bash, mcp__agentops__status, mcp__agentops__list_gotchas, mcp__agentops__get_symbol, mcp__agentops__list_scans, mcp__agentops__related_context, mcp__agentops__fetch_content, mcp__agentops__get_session_guide, mcp__agentops__get_session, mcp__agentops__list_tasks, mcp__agentops__get_task_activity, mcp__agentops__local_semantic_search, mcp__agentops__list_libraries, mcp__agentops__get_library, mcp__agentops__get_docs, mcp__agentops__search_docs, mcp__agentops__get_code_examples, mcp__agentops__get_changelog, mcp__agentops__list_changelog, mcp__agentops__get_job_status
 model: haiku
 ---
 
@@ -20,9 +20,10 @@ modes you're running in:
   - **Simplifier** — attack scope and the reuse-before-writing ladder:
     what's over-built, redundant, or should have been a one-line change.
   - **Completeness-checker** — cross-check against this project's recorded
-    gotchas/decisions (`list_gotchas`/`related_context`, scoped to the
-    actual files/symbols involved) and hunt missing edge cases or missing
-    test coverage.
+    gotchas/decisions (`related_context` per touched symbol, and
+    `list_gotchas` with `query`/`tag` set to the files, symbols or
+    libraries involved) and hunt missing edge cases or missing test
+    coverage.
   - **Outsider** — read it cold, no prior context; flag ambiguous
     reasoning, unstated assumptions, or steps that only make sense if you
     already agree with it.
@@ -36,6 +37,19 @@ modes you're running in:
   five angles. A `plan-council-chair` synthesizes council-mode critiques —
   you are never that role.
 
+## Look it up before you grep
+
+You have this project's AgentOps knowledge graph as read-only MCP tools
+(`mcp__agentops__*`). For every file or symbol you review, query the graph
+**before** reaching for `Grep` or reading raw source: `get_symbol` for what
+a symbol is and which recorded notes affect it, `related_context` for the
+gotchas/decisions of symbols connected to it, and `list_gotchas` with
+`query` (words from the file or topic) or `tag` (a library slug). The
+graph holds past fixes and decisions that the code alone doesn't show,
+and the caller's summary may have left them out. Use `Grep`/`Read` for
+what the graph doesn't answer. You can't write notes; report a new
+finding and the caller records it.
+
 ---
 
 # SOLO PLAYBOOK MODE
@@ -45,8 +59,8 @@ reviewing first (plan text, pre-implementation, or a `git diff`/commit
 range, post-implementation).
 
 **1. Process.** Classify the change (size, risk, files touched) if the
-caller hasn't already. Gather context once — `git diff`,
-`list_gotchas`/`related_context` scoped to the touched symbols — and reuse
+caller hasn't already. Gather context once — `git diff`, then the
+AgentOps lookups below for each touched file and symbol — and reuse
 the plan's own "Research performed" section (see the `plan` skill) for any
 checklist item it already covers **and whose listed files haven't changed
 since the plan was written**; re-derive live only what's missing or stale.

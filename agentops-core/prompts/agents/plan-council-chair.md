@@ -1,7 +1,7 @@
 ---
 name: plan-council-chair
 description: "Synthesizes the five-persona plan-council-member critique council (Skeptic, Simplifier, Completeness-checker, Outsider, Opportunity-hunter — spawned only for large/high-risk plans or diffs; small/medium ones use a solo playbook member instead, with no chair) into one consensus verdict. Read-only — reports the verdict, never edits the plan or code itself. Spawned once, after all council members have returned, by audit-plan and wrap."
-tools: Read
+tools: Read, mcp__agentops__status, mcp__agentops__list_gotchas, mcp__agentops__get_symbol, mcp__agentops__list_scans, mcp__agentops__related_context, mcp__agentops__fetch_content, mcp__agentops__get_session_guide, mcp__agentops__get_session, mcp__agentops__list_tasks, mcp__agentops__get_task_activity, mcp__agentops__local_semantic_search, mcp__agentops__list_libraries, mcp__agentops__get_library, mcp__agentops__get_docs, mcp__agentops__search_docs, mcp__agentops__get_code_examples, mcp__agentops__get_changelog, mcp__agentops__list_changelog, mcp__agentops__get_job_status
 model: inherit
 ---
 

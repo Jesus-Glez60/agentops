@@ -1622,7 +1622,7 @@ paths:
       security: [{ sessionOrApiKey: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
-        - { name: event, in: path, required: true, schema: { type: string, enum: [posttooluse, posttoolusefailure, userpromptsubmit, sessionstart, pretooluse] } }
+        - { name: event, in: path, required: true, schema: { type: string, enum: [posttooluse, posttoolusefailure, userpromptsubmit, sessionstart, pretooluse, subagentstart] } }
         - { name: tenant, in: query, schema: { type: string } }
       requestBody:
         required: true

@@ -1235,6 +1235,7 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
         ("SessionStart", "sessionstart", None),
         ("PreToolUse", "pretooluse", None),
         ("SessionEnd", "sessionend", None),
+        ("SubagentStart", "subagentstart", Some(10)),
     ];
     for (event_name, event_flag, timeout) in HOOKS {
         // `--compress` is only meaningful for `--event pretooluse` (see
@@ -1246,7 +1247,7 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
     }
     let compress_note = if compress_commands { ", command-output compression enabled" } else { "" };
     println!(
-        "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse/SessionEnd{compress_note} — see the get_session_guide/fetch_content/semantic_search MCP tools).",
+        "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse/SessionEnd/SubagentStart{compress_note} — see the get_session_guide/fetch_content/semantic_search MCP tools).",
         settings_path.display()
     );
     Ok(())
@@ -2551,7 +2552,7 @@ mod tests {
         maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
-        for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse"), ("SessionEnd", "sessionend")] {
+        for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse"), ("SessionEnd", "sessionend"), ("SubagentStart", "subagentstart")] {
             assert_eq!(last_hook_command(&parsed, event), format!("agentops hook-capture --event {flag}"), "{event}: {parsed}");
         }
         assert_eq!(parsed["hooks"]["UserPromptSubmit"][0]["hooks"][0]["timeout"], 10, "the prompt hook must time out well before Claude Code's 30 s default: {parsed}");
@@ -2612,5 +2613,33 @@ mod tests {
         assert_eq!(entry["url"].as_str().unwrap(), "https://agentops.example.com/mcp");
         assert_eq!(entry["bearer_token_env_var"].as_str().unwrap(), "AGENTOPS_API_KEY");
     }
+
+    /// Milestone 1, item 3: council members review code directly, so they
+    /// need the same graph lookups the planner has. Renders the prompt pack
+    /// the way `connect` ships it (via `agentops-ruler-bridge`) and checks
+    /// that both council agents list every read-only AgentOps tool and no
+    /// write tool, with the tool registries' own `read_only_hint` as the
+    /// source of truth, so a new tool can't silently go missing.
+    #[test]
+    fn council_agents_list_every_read_only_agentops_tool_and_no_write_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        agentops_ruler_bridge::build_ruler_dir(dir.path(), "# AGENTS").unwrap();
+
+        let core = agentops_mcp::list_tools(agentops_mcp::AccessMode::Full).into_iter().map(|t| (t.name, t.annotations.read_only_hint));
+        let docbrain = docbrain_mcp::list_tools().into_iter().map(|t| (t.name, t.annotations.read_only_hint));
+        let all: Vec<(&str, bool)> = core.chain(docbrain).collect();
+        assert!(all.iter().any(|(_, ro)| *ro) && all.iter().any(|(_, ro)| !*ro));
+
+        for agent in ["plan-council-member", "plan-council-chair"] {
+            let rendered = std::fs::read_to_string(dir.path().join(format!(".ruler/agents/{agent}.md"))).unwrap();
+            let tools_line = rendered.lines().find(|l| l.starts_with("tools:")).unwrap_or_else(|| panic!("{agent} has no tools: line"));
+            let listed: std::collections::HashSet<&str> = tools_line.trim_start_matches("tools:").split(',').map(str::trim).collect();
+            for (name, read_only) in &all {
+                let full = format!("mcp__agentops__{name}");
+                assert_eq!(listed.contains(full.as_str()), *read_only, "{agent}: {full} must be listed iff it is read-only ({tools_line})");
+            }
+        }
+    }
+
 }
 

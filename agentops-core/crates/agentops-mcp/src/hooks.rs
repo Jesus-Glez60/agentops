@@ -38,7 +38,12 @@ use crate::budget::{cap, DEFAULT_CHAR_BUDGET};
 
 /// The `--event` names whose handling needs a store. Anything else is
 /// client-only or unknown.
-pub const STORE_EVENTS: &[&str] = &["posttooluse", "posttoolusefailure", "userpromptsubmit", "sessionstart", "pretooluse"];
+pub const STORE_EVENTS: &[&str] = &["posttooluse", "posttoolusefailure", "userpromptsubmit", "sessionstart", "pretooluse", "subagentstart"];
+
+/// Subagent types `subagentstart` seeds. Planning and review agents: the
+/// ones that read code before anything is decided. Matched exactly on the
+/// payload's `agent_type`.
+pub const SEEDED_AGENTS: &[&str] = &["Explore", "Plan", "plan-council-member", "plan-council-chair"];
 
 /// Runs `event`'s store-touching logic for a raw hook `payload` against
 /// `repo` in `store`. The payload's `cwd` is never used to pick the repo:
@@ -51,6 +56,7 @@ pub fn handle(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value) 
         "userpromptsubmit" => user_prompt_submit(store, repo, payload),
         "sessionstart" => session_start(store, repo, payload),
         "pretooluse" => pre_tool_use(store, repo, payload),
+        "subagentstart" => subagent_start(store, repo, payload),
         other => anyhow::bail!("unknown hook event '{other}'"),
     }
 }
@@ -66,6 +72,7 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     match event {
         "posttooluse" => classify_post_tool_use(tool_name, &tool_input).is_some() || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
         "pretooluse" => detect_secret_exposure(tool_name, &tool_input).is_some(),
+        "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
         _ => true,
     }
 }
@@ -403,6 +410,42 @@ fn detect_secret_exposure(tool_name: &str, tool_input: &Value) -> Option<String>
 }
 
 // ---------------------------------------------------------------------
+// SubagentStart
+// ---------------------------------------------------------------------
+
+/// Subagents load no CLAUDE.md or AGENTS.md (spike, 2026-10-14), so this
+/// hook is the only way project memory reaches them. For a planning or
+/// review agent (`SEEDED_AGENTS`), injects the pinned notes and a recall
+/// seed built from the session's latest user prompt (the payload carries no
+/// task of its own), within `SUBAGENT_SEED_BUDGET`. Nothing is recorded as
+/// injected: a subagent's context isn't the main session's, so the main
+/// session must still be able to see these pointers itself.
+fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
+    use crate::budget::{PLAN_SEED_MAX_ITEMS, SUBAGENT_SEED_BUDGET};
+
+    if !is_relevant("subagentstart", payload) {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    let pinned = crate::session_guide::build_pinned_context(store, repo)?;
+    if !pinned.is_empty() {
+        parts.push(pinned);
+    }
+    if let Some(prompt) = last_prompt(store, repo, session_id(payload))? {
+        let seed = agentops_retrieval::recall_seed(store, repo, &prompt, PLAN_SEED_MAX_ITEMS, &Default::default())?;
+        if !seed.is_empty() {
+            const HEADER: &str = "Recalled from AgentOps for the task you were spawned for (pointers; query `get_symbol`/`related_context`/`list_gotchas` or `fetch_content` with the id before grepping):";
+            parts.push(format!("{HEADER}\n{}", seed.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n")));
+        }
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    let context = cap(&parts.join("\n\n"), SUBAGENT_SEED_BUDGET, 0).text;
+    Ok(Some(hook_output("SubagentStart", Some(&context), None)))
+}
+
+// ---------------------------------------------------------------------
 // SessionStart
 // ---------------------------------------------------------------------
 
@@ -694,6 +737,20 @@ mod tests {
         prompt(store.as_ref(), &repo, "second, planned", "plan");
         handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": "<task-notification>x", "session_id": "s" })).unwrap();
         assert_eq!(last_prompt(store.as_ref(), &repo, "s").unwrap().as_deref(), Some("second, planned"));
+    }
+
+    #[test]
+    fn a_planning_subagent_gets_pins_and_a_seed_from_the_last_prompt_and_others_get_nothing() {
+        let (_dir, store, repo) = store();
+        let id = gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hook capture opens the local store");
+        prompt(store.as_ref(), &repo, "make the hooks follow the remote server", "plan");
+        let recorded = || store.session_events(&repo, "s").unwrap().into_iter().filter(|e| e.event_kind == RECALL_INJECTED).count();
+        let before = recorded();
+        let explore = context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a1" })).unwrap());
+        assert!(explore.contains(&format!("(id {id})")), "{explore}");
+        assert!(explore.chars().count() <= crate::budget::SUBAGENT_SEED_BUDGET);
+        assert!(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "statusline-setup" })).unwrap().is_none());
+        assert_eq!(recorded(), before, "a subagent's seed never counts as shown to the main session");
     }
 
     #[test]
