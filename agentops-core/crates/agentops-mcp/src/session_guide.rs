@@ -43,30 +43,54 @@ fn prominence_sort_rank(p: NodeProminence) -> u8 {
 /// (`agentops-cli::hook_capture`). Returns an empty string when there are
 /// no pins -- same "nothing to show is the normal case" contract as `build`.
 pub fn build_pinned_context(store: &dyn GraphStore, repo: &str) -> anyhow::Result<String> {
+    Ok(pinned_block(store, repo)?.0)
+}
+
+/// One pin's line. A procedural memory (a rule, tagged
+/// `memory-kind:procedural`) is its rule line alone; any other pin shows
+/// kind, name and its first line. Only the first line, never full content:
+/// `fetch_content` with the id has the rest (the reasoning, for a rule).
+pub fn render_pin(kind: NodeKind, name: Option<&str>, content: Option<&str>, id: i64) -> String {
+    let content = content.unwrap_or("");
+    let first = content.lines().next().unwrap_or("");
+    if agentops_notes::tags_of(content).iter().any(|t| t == "memory-kind:procedural") {
+        format!("- {first} (id {id})")
+    } else {
+        format!("- [{}] {}: {first} (id {id})", kind.as_db_str(), name.unwrap_or("(untitled)"))
+    }
+}
+
+/// The `## Pinned` block within `PIN_BUDGET`, whole lines only, plus the
+/// ids of pins that didn't fit. A pin is never dropped silently: the block
+/// ends with a line naming the ones cut, and the importer's report lists
+/// them. Stable id order, so the block doesn't reshuffle every turn.
+pub fn pinned_block(store: &dyn GraphStore, repo: &str) -> anyhow::Result<(String, Vec<i64>)> {
     let mut pinned = store.nodes_pinned(repo)?;
     if pinned.is_empty() {
-        return Ok(String::new());
+        return Ok((String::new(), Vec::new()));
     }
-    // Stable order across calls regardless of underlying query order, so
-    // the injected block doesn't reshuffle every turn.
     pinned.sort_by_key(|n| n.id);
-
-    let body = pinned
-        .iter()
-        .map(|n| {
-            let name = n.name.as_deref().unwrap_or("(untitled)");
-            let excerpt = n.content.as_deref().unwrap_or("").lines().next().unwrap_or("");
-            format!("- [{}] {name}: {excerpt} (id {})", n.kind.as_db_str(), n.id)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    // Name+excerpt only, not full content -- a caller wanting the full body
-    // already has `fetch_content` by node id (same excerpt-only pattern as
-    // `build_repo_briefing`'s `excerpt_section`, not `process_post_tool_use`'s
-    // full-capture pattern).
-    let sections: [(&str, String); 1] = [("Pinned", body)];
-    Ok(cap_sections(&sections, GUIDE_CHAR_BUDGET))
+    const HEADER: &str = "## Pinned\n";
+    // Room kept for the closing "didn't fit" line.
+    const CUT_NOTE_ROOM: usize = 160;
+    let mut out = HEADER.to_string();
+    let mut cut = Vec::new();
+    for n in &pinned {
+        let line = render_pin(n.kind, n.name.as_deref(), n.content.as_deref(), n.id);
+        if cut.is_empty() && out.chars().count() + line.chars().count() + 1 + CUT_NOTE_ROOM <= crate::budget::PIN_BUDGET {
+            out.push_str(&line);
+            out.push('\n');
+        } else {
+            cut.push(n.id);
+        }
+    }
+    if !cut.is_empty() {
+        let ids = cut.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
+        let note = format!("- ({} more pinned didn't fit; fetch_content ids {ids})", cut.len());
+        out.push_str(&note.chars().take(CUT_NOTE_ROOM - 1).collect::<String>());
+        out.push('\n');
+    }
+    Ok((out.trim_end().to_string() + "\n\n", cut))
 }
 
 /// Builds the guide for `session_id` in `repo`. Returns an empty string if
@@ -226,6 +250,28 @@ mod tests {
         assert!(ctx.contains("Always remember"), "{ctx}");
         assert!(ctx.contains("Never bypass the redaction gate."), "{ctx}");
         assert!(!ctx.contains("Unrelated"), "{ctx}");
+    }
+
+    #[test]
+    fn a_procedural_pin_is_its_rule_line_and_pins_that_do_not_fit_are_named_not_dropped() {
+        use agentops_graph::NewNode;
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let rule = store.add_node(NewNode { kind: NodeKind::Note, repo: "demo".into(), path: None, name: Some("feedback_tests".into()), container: None, start_line: None, end_line: None, content: Some(agentops_notes::content_with_tags("Run the test suites on the server.\n\nThe laptop build takes 38 minutes.", &["memory-kind:procedural".into()])) }).unwrap();
+        store.set_curation("demo", rule, NodeProminence::Pinned, None).unwrap();
+        let (block, cut) = pinned_block(&store, "demo").unwrap();
+        assert!(block.contains(&format!("- Run the test suites on the server. (id {rule})")) && !block.contains("feedback_tests") && !block.contains("38 minutes"), "{block}");
+        assert!(cut.is_empty());
+
+        let long = "x".repeat(150);
+        let many: Vec<i64> = (0..20).map(|i| {
+            let id = store.add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some(format!("g{i}")), container: None, start_line: None, end_line: None, content: Some(long.clone()) }).unwrap();
+            store.set_curation("demo", id, NodeProminence::Pinned, None).unwrap();
+            id
+        }).collect();
+        let (block, cut) = pinned_block(&store, "demo").unwrap();
+        assert!(block.chars().count() <= crate::budget::PIN_BUDGET, "{}", block.chars().count());
+        assert!(!cut.is_empty() && cut.iter().all(|id| many.contains(id)));
+        assert!(block.contains(&format!("{} more pinned didn't fit", cut.len())) && block.contains(&cut[0].to_string()), "{block}");
     }
 
     #[test]

@@ -373,7 +373,8 @@ fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, parts: &mut V
 ///   shown this session, so a new topic gets fresh recall and a follow-up
 ///   on the same topic gets nothing extra.
 ///
-/// Everything fits in `PLAN_FLOW_BUDGET`; recall pointers are dropped first.
+/// Everything fits in `PLAN_FLOW_BUDGET` plus `PIN_BUDGET` for the pins;
+/// recall pointers are dropped first.
 fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
     use crate::budget::{DEFAULT_SEED_MAX_ITEMS, PLAN_FLOW_BUDGET, PLAN_SEED_MAX_ITEMS};
 
@@ -404,15 +405,15 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value) -> Re
         // The whole seed, even pointers shown earlier in the session: the
         // plan is built from this, and earlier context may be compacted.
         let seed = agentops_retrieval::recall_seed(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default())?;
-        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET)?;
+        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     } else {
         let seed = agentops_retrieval::recall_seed(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &injected_ids(&events))?;
-        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET)?;
+        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     }
     if parts.is_empty() {
         return Ok(None);
     }
-    let context = cap(&parts.join("\n\n"), PLAN_FLOW_BUDGET, 0).text;
+    let context = cap(&parts.join("\n\n"), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET, 0).text;
     Ok(Some(hook_output("UserPromptSubmit", Some(&context), None)))
 }
 
@@ -583,7 +584,7 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result
             parts.push(format!("{HEADER}\n{}", seed.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n")));
         }
     }
-    let context = cap(&parts.join("\n\n"), SUBAGENT_SEED_BUDGET, 0).text;
+    let context = cap(&parts.join("\n\n"), SUBAGENT_SEED_BUDGET + crate::budget::PIN_BUDGET, 0).text;
     Ok(Some(hook_output("SubagentStart", Some(&context), None)))
 }
 

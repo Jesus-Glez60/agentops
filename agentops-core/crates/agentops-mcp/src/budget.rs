@@ -21,6 +21,15 @@ pub const PLAN_SEED_MAX_ITEMS: usize = 8;
 pub const DEFAULT_SEED_MAX_ITEMS: usize = 5;
 /// Everything a `SubagentStart` hook injects; same as the session guide.
 pub const SUBAGENT_SEED_BUDGET: usize = 2000;
+/// The pinned block (milestone 2): its own budget, added on top of
+/// `PLAN_FLOW_BUDGET` and `SUBAGENT_SEED_BUDGET` rather than taken from
+/// them, so pinned rules never crowd out the flow directive or the seed.
+/// Pins resend on every prompt, so their size is a cost on every turn: the
+/// milestone 2 pilot raises this only as far as the imported rules need.
+pub const PIN_BUDGET: usize = 2000;
+/// Claude Code's cap on one hook output field.
+pub const HOOK_FIELD_MAX: usize = 10_000;
+const _: () = assert!(PIN_BUDGET + PLAN_FLOW_BUDGET <= HOOK_FIELD_MAX && PIN_BUDGET + SUBAGENT_SEED_BUDGET <= HOOK_FIELD_MAX);
 /// Pointed questions the plan flow may ask before planning with stated
 /// assumptions.
 pub const MAX_PLAN_QUESTIONS: usize = 3;

@@ -31,6 +31,8 @@ use crate::remote_marker::{read_remote_marker, RemoteMcpMarker};
 
 /// Below this classifier confidence, a person decides (`NeedsReview`).
 pub(crate) const CLASSIFY_MIN_CONFIDENCE: f32 = 0.7;
+/// A rule's first line: what the pin block shows, so it must read as one line.
+pub(crate) const RULE_LINE_MAX: usize = 160;
 /// Tag every imported node carries, beside `memory-kind:<kind>`.
 pub(crate) const IMPORTED_TAG: &str = "imported:memory-md";
 const UNCLASSIFIED_REASON: &str = "unclassified on import";
@@ -290,12 +292,30 @@ pub(crate) struct Record {
     pub(crate) pinned: bool,
     pub(crate) similar_to: Vec<i64>,
     pub(crate) warnings: Vec<String>,
+    /// For a pinned rule: the line its pin shows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) rule_line: Option<String>,
 }
 
-/// The note text for an entry: its one-line description first (unless the
-/// body already starts with it), then the body. An episodic entry keeps
-/// its date.
+/// The rule a procedural entry pins: its one-line description, else its
+/// body's first line, cut to `RULE_LINE_MAX` characters.
+fn rule_line(entry: &Entry) -> String {
+    let source = entry.description.clone().unwrap_or_else(|| entry.body.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string());
+    if source.chars().count() <= RULE_LINE_MAX {
+        source
+    } else {
+        format!("{}…", source.chars().take(RULE_LINE_MAX - 1).collect::<String>().trim_end())
+    }
+}
+
+/// The note text for an entry. A procedural entry is its rule line, then
+/// the reasoning (pins show only the first line). Otherwise its one-line
+/// description first (unless the body already starts with it), then the
+/// body; an episodic entry keeps its date.
 fn note_body(entry: &Entry, kind: Option<MemoryKind>, mtime_date: &str) -> String {
+    if kind == Some(MemoryKind::Procedural) {
+        return format!("{}\n\n{}", rule_line(entry), entry.body).trim().to_string();
+    }
     let mut body = match &entry.description {
         Some(d) if !entry.body.starts_with(d.as_str()) => format!("{d}\n\n{}", entry.body),
         _ => entry.body.clone(),
@@ -339,6 +359,7 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             continue;
         }
         let classified = classify(&entry, llm)?;
+        let entry_for_rule = Entry { description: entry.description.clone(), body: entry.body.clone(), ..Default::default() };
         let mtime_date = std::fs::metadata(&path).and_then(|m| m.modified()).map(utc_date).unwrap_or_default();
         let body = note_body(&entry, classified.memory_kind, &mtime_date);
         let note_type = match classified.memory_kind {
@@ -365,6 +386,7 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             pinned: false,
             similar_to: preview.similar_to.clone(),
             warnings: entry.warnings,
+            rule_line: None,
         };
         if preview.already_exists {
             record.action = "skip";
@@ -378,6 +400,9 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             record.warnings.push(format!("needs review: {reason}"));
         }
 
+        // A rule is pinned: always present, never left to recall.
+        let pin = classified.memory_kind == Some(MemoryKind::Procedural) && classified.needs_review.is_none();
+        record.pinned = pin && record.action == "create";
         if apply && matches!(record.action, "create" | "needs_review") {
             let written = sink.add_note(&title, &body, note_type, &tags, AddMode::WriteUnlessDuplicate)?;
             record.node_id = written.node_id;
@@ -385,20 +410,26 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             if !written.written {
                 record.action = "duplicate";
                 record.duplicate_of = written.duplicate_of;
+                record.pinned = false;
             } else if let (Some(reason), Some(id)) = (classified.needs_review, written.node_id) {
                 sink.set_curation(id, "needs_review", Some(reason))?;
+            } else if let (true, Some(id)) = (pin, written.node_id) {
+                sink.set_curation(id, "pinned", None)?;
             }
         }
+        record.rule_line = pin.then(|| rule_line(&entry_for_rule));
         records.push(record);
     }
     Ok(records)
 }
 
 fn skipped(file: &str, source_line: Option<usize>, title: &str, warnings: Vec<String>) -> Record {
-    Record { source_file: file.into(), source_line, title: title.into(), signal: "none", memory_kind: None, node_kind: None, confidence: None, action: "skip", node_id: None, duplicate_of: None, pinned: false, similar_to: Vec::new(), warnings }
+    Record { source_file: file.into(), source_line, title: title.into(), signal: "none", memory_kind: None, node_kind: None, confidence: None, action: "skip", node_id: None, duplicate_of: None, pinned: false, similar_to: Vec::new(), warnings, rule_line: None }
 }
 
-/// Counts and warnings only: no entry text, so it can be quoted safely.
+/// Counts and warnings, plus the pin block the imported rules add (their
+/// rule lines, which the spec asks to see with its size). No other entry
+/// text, so everything but the pin block can be quoted safely.
 pub(crate) fn summary_markdown(records: &[Record], apply: bool) -> String {
     let by = |f: &dyn Fn(&Record) -> String| -> BTreeMap<String, usize> {
         let mut m = BTreeMap::new();
@@ -413,6 +444,22 @@ pub(crate) fn summary_markdown(records: &[Record], apply: bool) -> String {
     out.push_str(&table("By memory kind", by(&|r| r.memory_kind.map_or("unclassified".into(), |k| k.as_str().to_string()))));
     out.push_str(&table("By signal", by(&|r| r.signal.to_string())));
     out.push_str(&table("By node kind", by(&|r| r.node_kind.clone().unwrap_or_else(|| "none".into()))));
+    // The pin block these rules add (the spec's "rendered pin block with its
+    // size"), in the hook's own format and budget. Pins already on the
+    // server count against the same budget; the pilot measures the real one.
+    let pins: Vec<String> = records.iter().filter(|r| r.pinned).filter_map(|r| r.rule_line.as_ref().map(|line| format!("- {line} (id {})", r.node_id.map_or("new".into(), |id| id.to_string())))).collect();
+    let block = format!("## Pinned\n{}\n", pins.join("\n"));
+    let size = block.chars().count();
+    let budget = agentops_mcp::budget::PIN_BUDGET;
+    let mut used = "## Pinned\n".chars().count() + 160;
+    let cut: Vec<&str> = records.iter().filter(|r| r.pinned).filter(|r| {
+        used += r.rule_line.as_ref().map_or(0, |l| l.chars().count() + 12);
+        used > budget
+    }).map(|r| r.source_file.as_str()).collect();
+    out.push_str(&format!("\n## Pinned rules ({} rules, {size} characters, budget {budget})\n\n```\n{block}```\n", pins.len()));
+    if !cut.is_empty() {
+        out.push_str(&format!("\n**Over the pin budget: these would be cut** (named in the pin block, never dropped silently): {}\n", cut.join(", ")));
+    }
     let warnings: Vec<String> = records.iter().flat_map(|r| r.warnings.iter().map(move |w| format!("- `{}`: {w}", r.source_file))).collect();
     out.push_str(&format!("\n## Warnings ({})\n\n{}\n", warnings.len(), if warnings.is_empty() { "None.".to_string() } else { warnings.join("\n") }));
     out
@@ -582,6 +629,16 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_line_is_the_description_or_first_line_cut_to_the_max() {
+        let with_description = Entry { description: Some("never push without asking".into()), body: "Because a push deploys.".into(), ..Default::default() };
+        assert_eq!(rule_line(&with_description), "never push without asking");
+        let long = Entry { body: format!("{}\nreasoning", "y".repeat(400)), ..Default::default() };
+        let line = rule_line(&long);
+        assert!(line.chars().count() <= RULE_LINE_MAX && line.ends_with('…'));
+        assert_eq!(note_body(&with_description, Some(MemoryKind::Procedural), "2026-10-16"), "never push without asking\n\nBecause a push deploys.");
+    }
+
+    #[test]
     fn utc_date_formats_known_days() {
         assert_eq!(utc_date(std::time::UNIX_EPOCH), "1970-01-01");
         assert_eq!(utc_date(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_760_572_800)), "2025-10-16");
@@ -644,6 +701,14 @@ mod tests {
         assert_eq!((copy.action, copy.duplicate_of), ("duplicate", original.node_id), "{first:#?}");
         let created = memories();
         assert_eq!(created, files.len() - 1, "every entry but the duplicate becomes a node");
+        let rule = by_file(&first, "feedback_tests.md");
+        assert!(rule.pinned && rule.rule_line.as_deref() == Some("always run the suites on the server"), "{rule:?}");
+        let rule_node = store.get_node(&name, rule.node_id.unwrap()).unwrap().unwrap();
+        assert_eq!(rule_node.prominence, agentops_graph::NodeProminence::Pinned);
+        assert_eq!(rule_node.content.as_deref().unwrap().lines().next(), Some("always run the suites on the server"), "the rule is the first line");
+        let (block, cut) = agentops_mcp::session_guide::pinned_block(store.as_ref(), &name).unwrap();
+        assert!(block.contains(&format!("- always run the suites on the server (id {})", rule_node.id)) && cut.is_empty(), "{block}");
+        assert!(!by_file(&first, "project_deploy.md").pinned, "only rules are pinned");
         let review = store.get_node(&name, by_file(&first, "notes_misc.md").node_id.unwrap()).unwrap().unwrap();
         assert_eq!(review.prominence, agentops_graph::NodeProminence::NeedsReview);
         assert!(agentops_notes::tags_of(review.content.as_deref().unwrap()).contains(&IMPORTED_TAG.to_string()));
@@ -665,5 +730,8 @@ mod tests {
         assert_eq!(records.len(), files.len());
         let summary = std::fs::read_to_string(report_dir.join("summary.md")).unwrap();
         assert!(summary.contains("8 entries") && !summary.contains("Lunch with the team"), "counts, never entry text: {summary}");
+        assert!(summary.contains("## Pinned rules (0 rules"), "a re-run pins nothing new: {summary}");
+        let first_summary = summary_markdown(&first, true);
+        assert!(first_summary.contains("## Pinned rules (1 rules") && first_summary.contains("- always run the suites on the server (id "), "{first_summary}");
     }
 }
