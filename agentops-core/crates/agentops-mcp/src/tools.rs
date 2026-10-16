@@ -92,7 +92,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "add_note",
-            description: "Writes a new note (gotcha/decision/knowledge) to the repo's notes folder and ingests it into the graph in one step — the write-back tool for an agent that just learned something worth remembering. Omit note_type to let it be classified automatically. Set with_embeddings to make it findable via semantic_search. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
+            description: "Writes a new note (gotcha/decision/knowledge) to the repo's notes folder and ingests it into the graph in one step — the write-back tool for an agent that just learned something worth remembering. Omit note_type to let it be classified automatically. Set with_embeddings to make it findable via semantic_search (and linked to similar memories). dry_run classifies and compares the note against existing memories without writing anything; skip_duplicates writes it unless it nearly copies an existing memory. Either one adds a final `result: {json}` line with node_id, written, already_exists, duplicate_of and similar_to. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
             // `Advisor`, not `Full` -- deliberately available in both access
             // modes, unlike every other write tool. Advisor mode exists to
             // block destructive/costly actions (bulk rescans, paid LLM
@@ -113,6 +113,8 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "note_type": { "type": "string", "enum": ["gotcha", "decision", "knowledge"] },
                         "tags": { "type": "array", "items": { "type": "string" } },
                         "with_embeddings": { "type": "boolean" },
+                        "dry_run": { "type": "boolean", "description": "Classify and compare only; write nothing." },
+                        "skip_duplicates": { "type": "boolean", "description": "Don't write a near-copy of an existing memory; reinforce that memory instead." },
                         "session_id": { "type": "string" },
                         "notes_path": { "type": "string", "description": "Override the notes folder (local servers only; refused on a hosted server)." },
                     },
@@ -750,7 +752,14 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
         Some(other) => anyhow::bail!("invalid note_type '{other}', expected gotcha, decision, or knowledge"),
     };
 
-    let result = crate::notes::add_note(Path::new(path_str), title, body, note_type, &tags, explicit_notes_path.as_deref(), get_bool(args, "with_embeddings"))?;
+    let mode = if get_bool(args, "dry_run") {
+        crate::notes::AddMode::DryRun
+    } else if get_bool(args, "skip_duplicates") {
+        crate::notes::AddMode::WriteUnlessDuplicate
+    } else {
+        crate::notes::AddMode::Write
+    };
+    let result = crate::notes::add_note_with(Path::new(path_str), title, body, note_type, &tags, explicit_notes_path.as_deref(), get_bool(args, "with_embeddings"), mode)?;
     let type_str = match result.note_type {
         agentops_notes::NoteType::Gotcha => "gotcha",
         agentops_notes::NoteType::Decision => "decision",
@@ -761,8 +770,28 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
     // "Decisions" section) — everything else stays the generic "activity"
     // this call already recorded before that guide existed.
     let event_kind = if result.note_type == agentops_notes::NoteType::Decision { "decision" } else { "activity" };
-    maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"), None, event_kind)?;
-    Ok(format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols, {} reinforced).", result.file_path.display(), result.edges_written, result.edges_reinforced))
+    if result.written {
+        maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"), None, event_kind)?;
+    }
+    let text = if result.written {
+        format!("Wrote {} ({type_str}) and ingested it ({} edge(s) to related symbols, {} reinforced).", result.file_path.display(), result.edges_written, result.edges_reinforced)
+    } else if let Some((id, score)) = result.duplicate_of.filter(|_| mode != crate::notes::AddMode::DryRun) {
+        format!("Not written: it nearly copies node {id} (cosine {score:.3}), whose similarity edges were reinforced instead.")
+    } else {
+        format!("Dry run: would write {} ({type_str}). Nothing was written.", result.file_path.display())
+    };
+    if mode == crate::notes::AddMode::Write {
+        return Ok(text);
+    }
+    let structured = json!({
+        "note_type": type_str,
+        "node_id": result.node_id,
+        "written": result.written,
+        "already_exists": result.already_exists,
+        "duplicate_of": result.duplicate_of.map(|(id, score)| json!({ "node_id": id, "score": score })),
+        "similar_to": result.similar_to.iter().map(|(id, score)| json!({ "node_id": id, "score": score })).collect::<Vec<_>>(),
+    });
+    Ok(format!("{text}\nresult: {structured}"))
 }
 
 fn tool_ingest_notes(args: &Value) -> anyhow::Result<String> {

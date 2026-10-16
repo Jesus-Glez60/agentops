@@ -17,6 +17,32 @@ pub struct AddNoteResult {
     pub note_type: agentops_notes::NoteType,
     pub edges_written: usize,
     pub edges_reinforced: usize,
+    /// The note's node: `None` on a dry run, or when the note was a
+    /// near-copy of an existing memory and `AddMode::WriteUnlessDuplicate`
+    /// left it unwritten.
+    pub node_id: Option<i64>,
+    /// Whether a file was written and ingested.
+    pub written: bool,
+    /// A node with this note's natural key (kind, file, title) existed
+    /// before the call: writing it again updates that node in place.
+    pub already_exists: bool,
+    /// The existing memory this one nearly copies (cosine at least
+    /// `DUPLICATE_MIN_SCORE`), with its score. Not the note's own node.
+    pub duplicate_of: Option<(i64, f32)>,
+    /// The memories it is (or would be) linked to by `SimilarTo`.
+    pub similar_to: Vec<(i64, f32)>,
+}
+
+/// How `add_note_with` treats the note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddMode {
+    /// Write and ingest, as `add_note` always has.
+    Write,
+    /// Write unless it nearly copies an existing memory; then reinforce
+    /// that memory's similarity edges instead (the MEMORY.md importer).
+    WriteUnlessDuplicate,
+    /// Classify and compare only: no file, node, edge or reinforcement.
+    DryRun,
 }
 
 /// Writes a new note to the repo's resolved notes folder and ingests it
@@ -33,6 +59,16 @@ pub struct AddNoteResult {
 /// `ingest_notes_dir`'s bulk path below, so there's always exactly one id to
 /// attach an embedding to).
 pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<agentops_notes::NoteType>, tags: &[String], notes_path_override: Option<&Path>, with_embeddings: bool) -> Result<AddNoteResult> {
+    add_note_with(repo_path, title, body, note_type, tags, notes_path_override, with_embeddings, AddMode::Write)
+}
+
+/// `add_note` with a mode (milestone 2). `DryRun` and
+/// `WriteUnlessDuplicate` both need the body's embedding, so they compute
+/// it even without `with_embeddings`, and every check runs before the
+/// first write.
+#[allow(clippy::too_many_arguments)]
+pub fn add_note_with(repo_path: &Path, title: &str, body: &str, note_type: Option<agentops_notes::NoteType>, tags: &[String], notes_path_override: Option<&Path>, with_embeddings: bool, mode: AddMode) -> Result<AddNoteResult> {
+    use agentops_graph::similarity::{similar_memories, DUPLICATE_MIN_SCORE, SIMILAR_K, SIMILAR_MIN_SCORE};
     let store = crate::store::open_store(repo_path)?;
     let repo = repo_name(repo_path);
     let classifier = agentops_notes::HeuristicClassifier;
@@ -47,10 +83,32 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
     };
 
     let notes_dir = agentops_notes::resolve_notes_path(repo_path, notes_path_override);
-    std::fs::create_dir_all(&notes_dir)?;
     let slug = title.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect::<String>();
     let slug = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
     let file_path = notes_dir.join(format!("{slug}.md"));
+
+    // Everything below up to the first write only reads. The note's own
+    // node (same kind, file and title) is never its own duplicate: writing
+    // it again is an update, which is what makes a re-import idempotent.
+    let existing = store.find_node(&repo, note_type.node_kind(), Some(&format!("vault:{slug}.md")), Some(title), None)?.map(|n| n.id);
+    let embedding = if with_embeddings || mode != AddMode::Write { Some(agentops_embeddings::LocalEmbedder.embed(body)?) } else { None };
+    let (duplicate_of, similar_to) = match &embedding {
+        Some(embedding) if mode != AddMode::Write => {
+            let near: Vec<(i64, f32)> = similar_memories(store.as_ref(), &repo, embedding, existing, SIMILAR_K)?.into_iter().map(|(n, score)| (n.id, score)).collect();
+            (near.first().copied().filter(|(_, score)| *score >= DUPLICATE_MIN_SCORE), near.into_iter().filter(|(_, score)| *score >= SIMILAR_MIN_SCORE).collect())
+        }
+        _ => (None, Vec::new()),
+    };
+    let unwritten = |similar_to: Vec<(i64, f32)>| AddNoteResult { file_path: file_path.clone(), note_type, edges_written: 0, edges_reinforced: 0, node_id: existing, written: false, already_exists: existing.is_some(), duplicate_of, similar_to };
+    if mode == AddMode::DryRun {
+        return Ok(unwritten(similar_to));
+    }
+    if let (AddMode::WriteUnlessDuplicate, Some((duplicate, _))) = (mode, duplicate_of) {
+        agentops_graph::similarity::link_similar(store.as_ref(), &repo, duplicate)?;
+        return Ok(AddNoteResult { node_id: None, ..unwritten(similar_to) });
+    }
+
+    std::fs::create_dir_all(&notes_dir)?;
 
     let type_str = match note_type {
         agentops_notes::NoteType::Gotcha => "gotcha",
@@ -76,17 +134,15 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
     let this_note = notes.into_iter().find(|n| n.title == title).ok_or_else(|| anyhow::anyhow!("wrote note but failed to re-parse it"))?;
     let summary = agentops_notes::ingest_vault(store.as_ref(), &repo, std::slice::from_ref(&this_note), &matcher, true)?;
 
-    if with_embeddings {
-        let node_kind = note_type.node_kind();
-        let vault_path = format!("vault:{}", this_note.source_path.to_string_lossy());
-        if let Some(node) = store.find_node(&repo, node_kind, Some(&vault_path), Some(title), None)? {
-            let embedding = agentops_embeddings::LocalEmbedder.embed(body)?;
-            store.set_embedding(&repo, node.id, &embedding)?;
-            agentops_graph::similarity::link_similar(store.as_ref(), &repo, node.id)?;
-        }
+    let vault_path = format!("vault:{}", this_note.source_path.to_string_lossy());
+    let node_id = store.find_node(&repo, note_type.node_kind(), Some(&vault_path), Some(title), None)?.map(|n| n.id);
+    let mut similar_to = similar_to;
+    if let (Some(embedding), Some(id)) = (&embedding, node_id) {
+        store.set_embedding(&repo, id, embedding)?;
+        similar_to = agentops_graph::similarity::link_similar(store.as_ref(), &repo, id)?.linked;
     }
 
-    Ok(AddNoteResult { file_path, note_type, edges_written: summary.edges_written, edges_reinforced: summary.edges_reinforced })
+    Ok(AddNoteResult { file_path, note_type, edges_written: summary.edges_written, edges_reinforced: summary.edges_reinforced, node_id, written: true, already_exists: existing.is_some(), duplicate_of, similar_to })
 }
 
 /// Walks the repo's resolved notes folder and ingests every note found —
@@ -203,5 +259,43 @@ mod tests {
         let query = agentops_embeddings::LocalEmbedder.embed("comparison is not constant-time, timing side channel").unwrap();
         let hits = store.search_similar(&repo, &query, 5, Some(NodeKind::Gotcha)).unwrap();
         assert!(hits.iter().any(|(n, _)| n.name.as_deref() == Some("Timing attack risk")), "found: {hits:?}");
+    }
+
+    /// Milestone 2: a dry run writes nothing, a near-copy is skipped (the
+    /// existing memory is reinforced), and writing the same note again
+    /// updates it in place, which is what makes the importer idempotent.
+    #[test]
+    fn add_note_modes_dry_run_skip_a_near_copy_and_update_in_place() {
+        use super::{add_note_with, AddMode};
+        use agentops_notes::NoteType;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token(t):\n    return t == SECRET\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let count = || store.nodes_by_kind(&repo, agentops_graph::NodeKind::Gotcha).unwrap().len();
+        let body = "verify_token compares secrets with plain equality, which leaks timing; use a constant-time compare.";
+
+        let first = add_note_with(dir.path(), "Timing attack in verify_token", body, Some(NoteType::Gotcha), &[], None, true, AddMode::Write).unwrap();
+        let first_id = first.node_id.unwrap();
+        assert!(first.written && !first.already_exists);
+
+        let dry = add_note_with(dir.path(), "Same thing, other words", body, Some(NoteType::Gotcha), &[], None, true, AddMode::DryRun).unwrap();
+        assert!(!dry.written && dry.node_id.is_none());
+        assert_eq!(dry.duplicate_of.map(|(id, _)| id), Some(first_id));
+        assert!(!dry.file_path.exists(), "a dry run writes no file");
+        assert_eq!(count(), 1);
+
+        let skipped = add_note_with(dir.path(), "Same thing, other words", body, Some(NoteType::Gotcha), &[], None, true, AddMode::WriteUnlessDuplicate).unwrap();
+        assert!(!skipped.written && skipped.node_id.is_none() && !skipped.file_path.exists());
+        assert_eq!(count(), 1);
+
+        let again = add_note_with(dir.path(), "Timing attack in verify_token", body, Some(NoteType::Gotcha), &[], None, true, AddMode::WriteUnlessDuplicate).unwrap();
+        assert!(again.written && again.already_exists && again.duplicate_of.is_none(), "its own node is never its duplicate");
+        assert_eq!((again.node_id, count()), (Some(first_id), 1));
+
+        let other = add_note_with(dir.path(), "Unrelated decision", "We deploy on push to main through a CI gate on the server.", Some(NoteType::Gotcha), &[], None, true, AddMode::WriteUnlessDuplicate).unwrap();
+        assert!(other.written && other.duplicate_of.is_none());
+        assert_eq!(count(), 2);
     }
 }

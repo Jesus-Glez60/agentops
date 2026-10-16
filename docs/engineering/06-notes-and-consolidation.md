@@ -103,6 +103,20 @@ sequenceDiagram
   T-->>A: file path and edge counts
 ```
 
+## Importing Claude Code's MEMORY.md
+
+`agentops import-memory --project <repo> [--memory-dir <dir>] [--apply] [--report <file>] [--llm-classify]` (`agentops-core/crates/agentops-cli/src/import_memory.rs`) imports a Claude Code auto-memory directory (MEMORY.md and one file per entry; default `~/.claude/projects/<encoded repo path>/memory/`). Milestone 2 of the cue-driven memory work; the spike is `docs/engineering/spikes/m2-memory.md`.
+
+| Step | Rule |
+| --- | --- |
+| Input | Every `*.md` but `MEMORY.md`. The files are the source of truth; MEMORY.md only supplies each record's `source_line`, and an unlinked file gets a warning. |
+| Memory kind, first match wins | Frontmatter `type` (top level or under `metadata`), then the file-name prefix: `feedback` → procedural, `project` → episodic, `reference`/`user` → semantic. Then the heuristic classifier, or `--llm-classify`, at `CLASSIFY_MIN_CONFIDENCE = 0.7`. Else `NeedsReview` with "unclassified on import". |
+| Stale | An entry saying stale, superseded, no longer, obsolete or outdated goes to `NeedsReview` ("says it is stale or superseded"). |
+| Destination | Semantic: the kind `add_note`'s classifier picks. Episodic: a knowledge note ending "Recorded <date>". Procedural: a knowledge note. `NeedsReview`: a knowledge note, then curated to `needs_review`. Every note is tagged `imported:memory-md` and `memory-kind:<kind>`, written with embeddings, titled by the frontmatter `name`. |
+| Duplicates | `add_note` with `dry_run`, then `skip_duplicates`: a near-copy (cosine ≥ 0.92) isn't written. A re-run finds each note's own node (same natural key) and skips it, so `--apply` twice creates nodes once. |
+| Transport | With `.context/agentops-remote.json`: `add_note` over `/mcp` and `POST /repos/{id}/nodes/{node_id}/curation`, both with the marker's API key (the audit log names the key's owner). Without: the local store. |
+| Safety | The memory directory is only read. `--apply` first copies it to `.context/memory-backup/<date>/`. The report (`report.json`, one record per entry) and `summary.md` (counts and warnings, no entry text) go to `.context/memory-import/<date>/`, never `docs/`. |
+
 ## Notes on a hosted server
 
 When a repo is connected to a hosted server, notes go through hosted `/mcp` or `POST /tools/add_note`. The hosted `path` argument is a connection id or URL, never a literal path. `resolve_connection_path` maps it to the tenant's checkout directory, `<repo_checkouts_dir>/<connection_id>--<tenant>` (`checkout_path`, `agentops-core/crates/agentops-heavy-api/src/indexing.rs`; gotcha 54242).

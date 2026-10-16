@@ -11,6 +11,8 @@
 mod hook_capture;
 mod compress_output;
 mod librarian;
+mod import_memory;
+mod mcp_client;
 mod remote_marker;
 mod usage;
 mod usage_report;
@@ -141,6 +143,30 @@ enum Command {
         /// Embed every ingested note so it's findable via `search`.
         #[arg(long)]
         with_embeddings: bool,
+    },
+    /// Imports a Claude Code auto-memory directory (MEMORY.md and one file
+    /// per entry) into AgentOps: into this repo's server connection when it
+    /// has a remote marker, else its local graph. Dry run by default: writes
+    /// only the report under `.context/memory-import/<date>/`. `--apply`
+    /// first backs the directory up to `.context/memory-backup/<date>/`;
+    /// the memory files themselves are never changed.
+    ImportMemory {
+        /// The repo whose memories these are (and whose connection they go to).
+        #[arg(long, default_value = ".")]
+        project: PathBuf,
+        /// The memory directory; defaults to Claude Code's for `--project`.
+        #[arg(long)]
+        memory_dir: Option<PathBuf>,
+        /// Write the notes. Without it, nothing changes.
+        #[arg(long)]
+        apply: bool,
+        /// Where to write the JSON report (summary.md goes beside it).
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// Classify entries with no type or prefix via the Anthropic API
+        /// (requires AGENTOPS_ANTHROPIC_API_KEY).
+        #[arg(long)]
+        llm_classify: bool,
     },
     /// Links every gotcha, decision and note to the memories it reads most
     /// like (`SimilarTo` edges, ADR 0051), embedding any that has no vector
@@ -666,6 +692,7 @@ fn main() -> Result<()> {
         Command::Changelog { path, since, limit } => changelog(&path, since, limit),
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
         Command::LinkSimilar { path } => link_similar(&path),
+        Command::ImportMemory { project, memory_dir, apply, report, llm_classify } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
         }
@@ -1372,37 +1399,12 @@ fn git_remote_url(path: &Path) -> Option<String> {
 fn register_local_repo(path: &Path, server_url: &str, api_key: &str) -> Result<String> {
     let local_id = agentops_repo_access::store::new_local_repo_id();
     let name = path.file_name().and_then(|n| n.to_str());
-    let mut response = ureq::post(format!("{server_url}/mcp"))
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .config()
-        .http_status_as_error(false)
-        .build()
-        .send_json(serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": { "name": "register_repo", "arguments": { "local_id": local_id, "name": name } },
-        }))
-        .context("calling POST /mcp to register this local repo")?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.body_mut().read_to_string().unwrap_or_default();
-        anyhow::bail!("POST /mcp returned {status}: {body}");
-    }
-    let body: serde_json::Value = response.body_mut().read_json().context("parsing /mcp response")?;
-    if let Some(error) = body.get("error") {
-        anyhow::bail!("register_repo failed: {error}");
-    }
-    let message = body.pointer("/result/content/0/text").and_then(|v| v.as_str()).unwrap_or("(no message returned)");
-    // `isError` is currently always `false` for this tool server-side --
-    // register_repo reports failure only through the message text (e.g.
-    // "failed to register local repo '...': ..." on a store error), never
-    // via the JSON-RPC error path checked above -- so this is the only
-    // signal available that the id this fn is about to return, and the
-    // caller is about to persist to .context/agentops-remote.json, was
-    // never actually created. Checking `isError` too costs nothing if the
-    // server's behavior changes later to set it correctly.
-    if body.pointer("/result/isError").and_then(|v| v.as_bool()).unwrap_or(false) || message.starts_with("failed to register") {
+    let message = mcp_client::call_tool(server_url, api_key, "register_repo", serde_json::json!({ "local_id": local_id, "name": name }))?;
+    // register_repo reports a store failure only through its message text
+    // (e.g. "failed to register local repo '...': ..."), never `isError`,
+    // and the id returned here is about to be persisted to
+    // .context/agentops-remote.json, so the text is checked too.
+    if message.starts_with("failed to register") {
         anyhow::bail!("register_repo failed: {message}");
     }
     println!("{message}");

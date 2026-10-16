@@ -152,6 +152,10 @@ The seed comes from `agentops_retrieval::recall_seed` (`agentops-core/crates/age
 
 Every pointer sent is recorded as a `recall_injected` event (`ids 1,2,3`), so ordinary prompts never repeat a pointer within a session. Everything injected fits in `PLAN_FLOW_BUDGET` (4,000 characters), and pointers are dropped first. All of these limits are constants in `agentops-mcp/src/budget.rs`.
 
+### Importing MEMORY.md
+
+Claude Code's own auto-memory (MEMORY.md) is imported once with `agentops import-memory` ([06-notes-and-consolidation.md](06-notes-and-consolidation.md), "Importing Claude Code's MEMORY.md"), then turned off per project with `autoMemoryEnabled: false` in `.claude/settings.local.json` (verified in the milestone 2 spike: the session's system prompt loses its memory section). Milestone 1's redirect of memory writes to `add_note` stays on as a backstop.
+
 ### Plan enforcement
 
 A plan presented in plan mode must have a "Research performed" heading and a "Council verdict" heading (`check_presented_plan` in `agentops_mcp::hooks`). The spike showed that Claude Code 2.1.286 passes the full plan to `PreToolUse` on `ExitPlanMode` as `tool_input.plan`, and obeys a deny. The first plan in a planning episode that lacks a section is denied with a reason naming the missing step: recall, or run `audit-plan`. That is recorded as a `plan_nudge` event. The next attempt goes through with a top-level `systemMessage` warning to the user (`plan_presented_incomplete`), so it never loops (`ENFORCE_MAX_NUDGES`). A planning episode starts after the last ordinary-mode prompt. Only headings count, not prose. If `tool_input.plan` is missing, the plan goes through untouched. The existing `PreToolUse` hook already runs for every tool, so this needs no new hook entry. ADR 0049 records why `PreToolUse` may block here.
