@@ -101,6 +101,12 @@ A first remote default-mode run measured p50 174 ms / p95 340 ms, probably with 
 | 4. Plan without "Council verdict": one nudge, then a warning | **Half verified** (session `fdfd8325`, 2026-10-16). The first ExitPlanMode was denied by the hook with the "no Council verdict section" reason. The second submission was never made, so the let-through-with-warning half is **not run**. Anomaly, **unexplained**: the next plan-mode prompt in the same episode got the full flow directive instead of `PLAN_FLOW_REMINDER`, and `get_session_guide` doesn't show that prompt as the session intent. |
 | 5. Evidence-session replay | **Not run.** The requirement's evidence transcripts were never attached. |
 
+**Re-run after the fixes (2026-10-16, session `eb8806fa`, server on `36a2733`).** The first prompt ran in `auto` mode, not plan mode, so only the second, plan-mode prompt ("also make it work for --remote") is a check run.
+- **Check 1: pass, after one false deny.** The `plan` skill ran first, then `get_symbol`/`list_gotchas` with `path: "Jesus-Glez60--agentops"`, before any code search. There were no path errors (fix `30f2361`). Then 2 questions, `library-docs` and `audit-plan` (five members plus chair), and a plan with both sections. The new evidence gate (`2ecbf3c`) still sent it back with "no sign you ran recall…". **Root cause:** hooks routed by the shell's `cwd`, so after a `cd` the events went to stray local graphs under subdirectories, never the server. Fixed in `3ebe5a1` (hooks resolve `CLAUDE_PROJECT_DIR`, then the nearest ancestor with `.git`). Verified by piping payloads with a subdirectory `cwd` through the rebuilt CLI: the server gate saw the evidence and let the plan through. **A full plan-mode session on `3ebe5a1` hasn't run yet.**
+- **Check 3: pass.** All five members and the chair called an agentops tool right after reading the plan file, before any code Read/Grep/Bash. The first run had 12 calls before its first agentops call. Fix: `36a2733`, the seed's look-it-up-first line.
+- **Check 4: pass on the let-through half.** The second ExitPlanMode went through after one nudge, and the user saw the plan. Whether the warning `systemMessage` was displayed isn't recorded in the transcript: **unverified**.
+- **The check 4 anomaly: explained.** The second prompt of `fdfd8325` was recorded in `agentops-cli/src/.context/graph.db`, the same `cwd` bug. That store had no earlier plan prompt, so the hook gave the full directive.
+
 **Evidence-session replay.** Not done, for the reason above.
 
 ## 4. Current state of memory writing
