@@ -112,6 +112,8 @@
   --relevance-supporting: var(--ink-500);
 
   --curation-needs-curation: var(--peach);
+
+  --curation-needs-review: var(--yellow);
   --curation-kept: var(--green-400);
   --curation-reduced: var(--ink-500);
   --curation-pinned: var(--blue-500);
@@ -187,6 +189,7 @@
   --color-relevance-supporting: var(--relevance-supporting);
 
   --color-curation-needs-curation: var(--curation-needs-curation);
+  --color-curation-needs-review: var(--curation-needs-review);
   --color-curation-kept: var(--curation-kept);
   --color-curation-reduced: var(--curation-reduced);
   --color-curation-pinned: var(--curation-pinned);

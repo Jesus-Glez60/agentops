@@ -46,6 +46,15 @@ export function NodeDetailSections({
           </div>
         </div>
       )}
+      {detail.prominence === "NeedsReview" && (
+        <div className="flex items-start gap-2 rounded-md border border-curation-needs-review/40 bg-curation-needs-review/10 p-3 text-body text-ink-300">
+          <TriangleAlert className="mt-0.5 size-4 shrink-0 text-curation-needs-review" />
+          <div>
+            <p className="font-medium text-ink-100">Needs review</p>
+            <p>{detail.curation_reason ?? "No reason recorded."}</p>
+          </div>
+        </div>
+      )}
 
       {detail.content && (
         <div className="flex flex-col gap-2">

@@ -165,6 +165,7 @@ Notes are permanent knowledge. They are never deleted or resolved; their promine
 | `Full` | Default. |
 | `Reduced` | Ranked ×0.1 everywhere it is ranked. Requires a non-empty reason, which is shown next to the note. |
 | `Pinned` | Normal ranking, plus included in the sticky context `get_session_guide` returns (`nodes_pinned`). |
+| `NeedsReview` | Waiting for a person: an imported memory that couldn't be classified, or one that says it's stale. Ranked ×0.1 and marked; never recalled. Requires a reason. The Gotchas screen's "Needs review" tab lists every memory kind in this state, with "Set kind", "Accept" (→ `Full`) and "Reduce" ([ADR 0050](adr/0050-needs-review-curation-state.md)). |
 
 Curation is set only through REST:
 
@@ -172,14 +173,15 @@ Curation is set only through REST:
 | --- | --- | --- |
 | Single-operator `agentops-api` | `POST /repos/{name}/nodes/{id}/curation` | `set_curation_json` (`agentops-core/crates/agentops-api/src/search.rs`) |
 | Hosted `agentops-heavy-api` | `POST /repos/{id}/nodes/{node_id}/curation` | `set_curation_json` (`agentops-core/crates/agentops-heavy-api/src/dashboard.rs`) |
+| Hosted `agentops-heavy-api` | `POST /repos/{id}/nodes/{node_id}/kind` | `set_node_kind_json` (same file); gotcha, decision or knowledge |
 
-Both reject `reduced` without a reason (HTTP 400). The web Gotchas screen drives them (`apps/web/src/app/(app)/gotchas/page.tsx`). No MCP tool changes curation. An agent can record a note, but only a person in the dashboard, or a REST client, can demote or pin one.
+Both reject `reduced` or `needs_review` without a reason (HTTP 400). On the hosted server every curation and kind change is written to the tenant's audit log (`node_curated`, `node_kind_set`) with the acting user, the session's or personal API key's owner; the instance-wide key logs a NULL actor with `"via": "instance_api_key"`. The web Gotchas screen drives them (`apps/web/src/app/(app)/gotchas/page.tsx`). No MCP tool changes curation. An agent can record a note, but only a person in the dashboard, or a REST client, can demote or pin one.
 
 Curation survives rescans because `upsert_node` never writes the curation columns. `agentops migrate-graph` copies them explicitly (`set_curation` in `agentops-core/crates/agentops-cli/src/main.rs`).
 
 How each surface shows a `Reduced` note:
 
-- `list_gotchas` lists every gotcha, `Reduced` last, with "⚠ reduced prominence — <reason>".
+- `list_gotchas` lists every gotcha, `Reduced` and `NeedsReview` last, with "⚠ reduced prominence — <reason>" or "⚠ needs review — <reason>". Its `prominence` argument keeps one state.
 - `get_symbol` shows the same marker and sorts by damped weight.
 - Hybrid search and the hosted `/local-search` multiply the rank by `prominence_rank_multiplier` ([05-retrieval.md](05-retrieval.md), "Prominence dampening").
 - LoRA training examples are weighted by it (`TrainingExample.weight`).

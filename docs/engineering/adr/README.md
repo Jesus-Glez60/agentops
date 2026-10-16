@@ -55,6 +55,7 @@ Decisions with a recorded reason, one file each. A record exists only when its "
 | [0047](0047-bge-m3-and-qdrant.md) | BGE-M3 and Qdrant for the semantic index | R1 |
 | [0048](0048-optional-rust-analyzer-pass.md) | The rust-analyzer pass is opt-in | R7 |
 | [0049](0049-hooks-may-block-two-narrow-cases.md) | The PreToolUse hook blocks in two narrow cases | Milestone 1 |
+| [0050](0050-needs-review-curation-state.md) | "Needs review" is a curation state | Milestone 2 |
 
 ## Pending: rationale not recorded
 

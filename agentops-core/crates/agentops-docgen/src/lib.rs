@@ -90,10 +90,10 @@ fn render_notes(out: &mut String, store: &dyn GraphStore, repo_name: &str, notes
     for note in notes {
         let name = note.name.as_deref().unwrap_or("(untitled)");
         let text = note.content.as_deref().unwrap_or("");
-        let reduced = if note.prominence == agentops_graph::NodeProminence::Reduced {
-            format!("\n\n⚠ **Reduced prominence** — {}", note.curation_reason.as_deref().unwrap_or("no reason recorded"))
-        } else {
-            String::new()
+        let reduced = match note.prominence {
+            agentops_graph::NodeProminence::Reduced => format!("\n\n⚠ **Reduced prominence** — {}", note.curation_reason.as_deref().unwrap_or("no reason recorded")),
+            agentops_graph::NodeProminence::NeedsReview => format!("\n\n⚠ **Needs review** — {}", note.curation_reason.as_deref().unwrap_or("no reason recorded")),
+            agentops_graph::NodeProminence::Full | agentops_graph::NodeProminence::Pinned => String::new(),
         };
         out.push_str(&format!("**{name}**\n\n{text}{reduced}\n\n"));
 

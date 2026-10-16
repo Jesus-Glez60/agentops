@@ -30,6 +30,7 @@ fn prominence_sort_rank(p: NodeProminence) -> u8 {
         NodeProminence::Pinned => 0,
         NodeProminence::Full => 1,
         NodeProminence::Reduced => 2,
+        NodeProminence::NeedsReview => 3,
     }
 }
 
@@ -127,6 +128,7 @@ pub fn build_repo_briefing(store: &dyn GraphStore, repo: &str) -> anyhow::Result
 
     let excerpt_section = |kind: NodeKind| -> anyhow::Result<String> {
         let mut nodes = store.nodes_by_kind(repo, kind)?;
+        nodes.retain(|n| n.prominence.recallable());
         nodes.sort_by_key(|n| prominence_sort_rank(n.prominence));
         Ok(nodes
             .iter()

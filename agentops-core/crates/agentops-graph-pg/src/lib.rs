@@ -404,7 +404,15 @@ impl GraphStore for PostgresGraphStore {
     fn set_curation(&self, repo: &str, node_id: i64, prominence: NodeProminence, reason: Option<&str>) -> Result<()> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
-            client.execute("UPDATE nodes SET curated = true, prominence = $1, curation_reason = $2 WHERE repo = $3 AND id = $4", &[&prominence.as_db_str(), &reason, &repo, &node_id]).await?;
+            client.execute("UPDATE nodes SET curated = $5, prominence = $1, curation_reason = $2 WHERE repo = $3 AND id = $4", &[&prominence.as_db_str(), &reason, &repo, &node_id, &(prominence != NodeProminence::NeedsReview)]).await?;
+            Ok(())
+        })
+    }
+
+    fn set_node_kind(&self, repo: &str, node_id: i64, kind: NodeKind) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("UPDATE nodes SET kind = $1 WHERE repo = $2 AND id = $3", &[&kind.as_db_str(), &repo, &node_id]).await?;
             Ok(())
         })
     }
@@ -1637,6 +1645,22 @@ mod tests {
         assert_eq!(hits[0].0.id, id);
 
         store.delete_nodes("pg-repo-h", &[id]).unwrap();
+    }
+
+    #[test]
+    fn needs_review_round_trips_uncurated_and_a_kind_change_keeps_the_node() {
+        let store = require_store!();
+        let id = upsert_node(&store, node("pg-repo-needs-review", NodeKind::Note, Some("vault:m.md"), Some("m"))).unwrap();
+        store.set_curation("pg-repo-needs-review", id, NodeProminence::NeedsReview, Some("unclassified on import")).unwrap();
+        let n = store.get_node("pg-repo-needs-review", id).unwrap().unwrap();
+        assert_eq!(n.prominence, NodeProminence::NeedsReview);
+        assert_eq!(n.curation_reason.as_deref(), Some("unclassified on import"));
+        assert!(!n.curated);
+
+        store.set_node_kind("pg-repo-needs-review", id, NodeKind::Decision).unwrap();
+        let moved = store.get_node("pg-repo-needs-review", id).unwrap().unwrap();
+        assert_eq!((moved.id, moved.kind), (id, NodeKind::Decision));
+        store.delete_nodes("pg-repo-needs-review", &[id]).unwrap();
     }
 
     #[test]

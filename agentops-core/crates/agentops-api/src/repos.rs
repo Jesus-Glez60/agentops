@@ -299,6 +299,19 @@ pub struct GotchaSummary {
     pub curated: bool,
     pub prominence: NodeProminence,
     pub curation_reason: Option<String>,
+    /// `Gotcha` except in the `needs_review` bucket, which also holds
+    /// decisions and notes waiting for a person to settle their kind.
+    pub kind: NodeKind,
+}
+
+/// The node kinds a `GET /gotchas` bucket lists: gotchas only, except
+/// `needs_review`, which covers every memory kind (milestone 2, ADR 0050).
+pub fn bucket_kinds(bucket: Option<&str>) -> &'static [NodeKind] {
+    if bucket == Some("needs_review") {
+        &[NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note]
+    } else {
+        &[NodeKind::Gotcha]
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,7 +322,7 @@ pub struct GotchasQuery {
     repos: Option<String>,
 }
 
-pub const GOTCHA_BUCKETS: [&str; 4] = ["needs_curation", "kept", "reduced", "pinned"];
+pub const GOTCHA_BUCKETS: [&str; 5] = ["needs_curation", "kept", "reduced", "pinned", "needs_review"];
 
 /// The four real curation states a gotcha can be in -- never a fifth
 /// "closed" one. Caller must validate `bucket` against `GOTCHA_BUCKETS`
@@ -321,7 +334,8 @@ pub const GOTCHA_BUCKETS: [&str; 4] = ["needs_curation", "kept", "reduced", "pin
 /// call, so there's no ordering/precedence concern between arms here.
 pub fn matches_bucket(node: &Node, bucket: &str) -> bool {
     match bucket {
-        "needs_curation" => !node.curated,
+        "needs_curation" => !node.curated && node.prominence != NodeProminence::NeedsReview,
+        "needs_review" => node.prominence == NodeProminence::NeedsReview,
         "pinned" => node.prominence == NodeProminence::Pinned,
         "kept" => node.curated && node.prominence == NodeProminence::Full,
         "reduced" => node.prominence == NodeProminence::Reduced,
@@ -354,7 +368,7 @@ pub(crate) async fn gotchas_json(State(state): State<AppState>, Query(q): Query<
 
         let mut gotchas = Vec::new();
         for (name, store) in &repos {
-            for node in store.nodes_by_kind(name, NodeKind::Gotcha)? {
+            for node in bucket_kinds(bucket.as_deref()).iter().map(|&kind| store.nodes_by_kind(name, kind)).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flatten() {
                 if let Some(b) = &bucket {
                     if !matches_bucket(&node, b) {
                         continue;
@@ -372,6 +386,7 @@ pub(crate) async fn gotchas_json(State(state): State<AppState>, Query(q): Query<
                     curated: node.curated,
                     prominence: node.prominence,
                     curation_reason: node.curation_reason,
+                    kind: node.kind,
                 });
             }
         }

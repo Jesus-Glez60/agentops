@@ -1535,6 +1535,7 @@ paths:
     post:
       tags: [Search & Graph]
       summary: Set a Gotcha/Decision node's curation state (bucket, reason, prominence)
+      description: Audit-logged (node_curated). `reason` is required for reduced and needs_review.
       security: [{ sessionOrApiKey: [] }]
       parameters:
         - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
@@ -1543,9 +1544,38 @@ paths:
       requestBody:
         content:
           application/json:
-            schema: { type: object }
+            schema:
+              type: object
+              required: [prominence]
+              properties:
+                prominence: { type: string, enum: [full, reduced, pinned, needs_review] }
+                reason: { type: string, nullable: true }
       responses:
         "200": { description: Updated }
+        "400": { description: Invalid prominence, or no reason for reduced/needs_review }
+
+  /repos/{id}/nodes/{node_id}/kind:
+    post:
+      tags: [Search & Graph]
+      summary: Change a memory node's kind (gotcha, decision, knowledge) and its note file's type
+      description: Audit-logged (node_kind_set). Only gotcha, decision and note nodes.
+      security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string }, description: Connection id }
+        - { name: node_id, in: path, required: true, schema: { type: string } }
+        - { name: tenant, in: query, schema: { type: string } }
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [kind]
+              properties:
+                kind: { type: string, enum: [gotcha, decision, knowledge] }
+      responses:
+        "200": { description: Updated }
+        "400": { description: Invalid kind, or not a memory node }
+        "404": { description: No such node }
 
   /repos/{id}/nodes/{node_id}/graph:
     get:
@@ -1663,7 +1693,12 @@ paths:
     get:
       tags: [Search & Graph]
       summary: List Gotcha nodes across repos, for the curation dashboard
+      description: The needs_review bucket also lists decisions and notes waiting for review; each entry carries its kind.
       security: [{ sessionOrApiKey: [] }]
+      parameters:
+        - { name: bucket, in: query, schema: { type: string, enum: [needs_curation, kept, reduced, pinned, needs_review] } }
+        - { name: repos, in: query, schema: { type: string }, description: Comma-separated connection ids }
+        - { name: tenant, in: query, schema: { type: string } }
       responses:
         "200": { description: OK }
 

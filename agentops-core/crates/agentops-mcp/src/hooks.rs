@@ -916,6 +916,19 @@ mod tests {
         assert_eq!(recorded(), before, "a subagent's seed never counts as shown to the main session");
     }
 
+    #[test]
+    fn a_needs_review_memory_never_reaches_a_prompt_seed_a_subagent_seed_or_the_pins() {
+        let (_dir, store, repo) = store();
+        let id = gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hook capture opens the local store");
+        store.set_curation(&repo, id, agentops_graph::NodeProminence::NeedsReview, Some("unclassified on import")).unwrap();
+        let plan = prompt(store.as_ref(), &repo, "make the hooks follow the remote server", "plan");
+        let explore = context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a1" })).unwrap());
+        let later = prompt(store.as_ref(), &repo, "hooks remote server again", "default");
+        for text in [&plan, &explore, &later] {
+            assert!(!text.contains(&format!("(id {id})")), "{text}");
+        }
+    }
+
     fn present(store: &dyn GraphStore, repo: &str, plan: Option<&str>) -> Option<Value> {
         let input = plan.map(|p| json!({ "plan": p })).unwrap_or(json!({}));
         handle(store, repo, "pretooluse", &json!({ "session_id": "s", "tool_name": "ExitPlanMode", "tool_input": input })).unwrap()

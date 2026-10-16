@@ -112,7 +112,7 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
     }
 
     let enough = |c: &Candidate| c.reasons.iter().any(|r| r.starts_with("affects")) || c.reasons.len() >= min_keyword_matches;
-    let mut ranked: Vec<(i64, Candidate)> = candidates.into_iter().filter(|(id, c)| !exclude.contains(id) && c.prominence != NodeProminence::Pinned && enough(c)).collect();
+    let mut ranked: Vec<(i64, Candidate)> = candidates.into_iter().filter(|(id, c)| !exclude.contains(id) && c.prominence != NodeProminence::Pinned && c.prominence.recallable() && enough(c)).collect();
     for (_, c) in &mut ranked {
         if c.prominence == NodeProminence::Reduced {
             c.score *= 0.5;
@@ -224,6 +224,20 @@ mod tests {
         let seed = recall_seed(&store, "r", "ingest", 8, &HashSet::from([a])).unwrap();
         assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![b]);
         assert!(recall_seed(&store, "r", "ingest", 0, &HashSet::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_needs_review_node_never_reaches_the_seed_by_keyword_or_by_symbol() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let kept = note(&store, NodeKind::Gotcha, "ingest drops tags", "ingest_vault");
+        let unsettled = note(&store, NodeKind::Note, "ingest maybe slow", "ingest_vault");
+        store.set_curation("r", unsettled, NodeProminence::NeedsReview, Some("unclassified on import")).unwrap();
+        let symbol = note(&store, NodeKind::Symbol, "ingest_vault", "fn ingest_vault() {}");
+        store.add_edge("r", unsettled, symbol, EdgeRelation::Affects).unwrap();
+        let by_keyword = recall_seed(&store, "r", "ingest", 8, &HashSet::new()).unwrap();
+        let by_symbol = recall_seed(&store, "r", "why is ingest_vault slow", 8, &HashSet::new()).unwrap();
+        assert_eq!(by_keyword.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![kept]);
+        assert!(by_symbol.iter().all(|p| p.node_id != unsettled), "{by_symbol:?}");
     }
 
     #[test]

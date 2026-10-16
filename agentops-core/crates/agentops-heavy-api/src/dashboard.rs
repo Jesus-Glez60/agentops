@@ -228,6 +228,93 @@ pub(crate) async fn node_detail_json(State(state): State<AppState>, user: Option
     }
 }
 
+/// Writes one curation action to the tenant's audit log (milestone 2, ADR
+/// 0050: every curation is logged, not only team actions). The actor is
+/// the session's or personal API key's user; the instance-wide key has
+/// none, so the row's actor is NULL and `via` says so. Best effort: no
+/// teams store, or a failed write, never fails the curation itself.
+fn audit_curation(state: &AppState, tenant: &str, user: &Option<axum::Extension<User>>, action: &str, target: &str, mut metadata: Value) {
+    let Some(teams) = &state.teams else {
+        eprintln!("agentops: no teams store, so {action} on {target} isn't audit-logged");
+        return;
+    };
+    let actor = user.as_ref().map(|axum::Extension(u)| u.id);
+    if actor.is_none() {
+        metadata["via"] = json!("instance_api_key");
+    }
+    if let Err(e) = teams.lock().unwrap().record_audit_event(tenant, actor, action, Some(target), None, &metadata.to_string()) {
+        eprintln!("agentops: audit log write for {action} on {target} failed: {e:#}");
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SetNodeKindBody {
+    /// `gotcha`, `decision` or `knowledge` (a `Note`).
+    kind: String,
+}
+
+/// `POST /repos/{id}/nodes/{node_id}/kind` -- the Gotchas workspace's "set
+/// kind" on a memory, typically a `NeedsReview` one the importer couldn't
+/// classify. Changes the node's kind in place and rewrites its note file's
+/// frontmatter `type:` in the connection's notes folder (ADR 0045), or the
+/// next reindex would ingest the file as a second node of the old kind.
+/// Only memory nodes (gotcha, decision, note) can change kind.
+pub(crate) async fn set_node_kind_json(
+    State(state): State<AppState>,
+    user: Option<axum::Extension<User>>,
+    AxumPath((id, node_id)): AxumPath<(String, i64)>,
+    Query(q): Query<TenantQuery>,
+    Json(body): Json<SetNodeKindBody>,
+) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let (kind, note_type) = match body.kind.as_str() {
+        "gotcha" => (NodeKind::Gotcha, "gotcha"),
+        "decision" => (NodeKind::Decision, "decision"),
+        "knowledge" => (NodeKind::Note, "knowledge"),
+        other => return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("invalid 'kind': {other:?} (expected gotcha, decision or knowledge)") }))),
+    };
+
+    let audit_state = state.clone();
+    let audit_tenant = tenant.clone();
+    let audit_target = format!("{id}/nodes/{node_id}");
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(), (StatusCode, String)>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(Err((StatusCode::NOT_FOUND, "no such node".into()))),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        let Some(node) = store.get_node(&repo, node_id)? else {
+            return Ok(Err((StatusCode::NOT_FOUND, "no such node".into())));
+        };
+        if !matches!(node.kind, NodeKind::Gotcha | NodeKind::Decision | NodeKind::Note) {
+            return Ok(Err((StatusCode::BAD_REQUEST, format!("only gotchas, decisions and notes change kind, not a {}", node.kind.as_db_str()))));
+        }
+        if let Some(rel) = node.path.as_deref().and_then(|p| p.strip_prefix("vault:")) {
+            let file = crate::indexing::notes_dir_for_checkout(&path).join(rel);
+            if let Ok(content) = std::fs::read_to_string(&file) {
+                std::fs::write(&file, agentops_notes::with_frontmatter_type(&content, note_type))?;
+            }
+        }
+        store.set_node_kind(&repo, node_id, kind)?;
+        Ok(Ok(()))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Ok(()))) => {
+            audit_curation(&audit_state, &audit_tenant, &user, "node_kind_set", &audit_target, json!({ "kind": note_type }));
+            (StatusCode::OK, Json(json!({ "id": node_id, "kind": note_type })))
+        }
+        Ok(Ok(Err((status, error)))) => (status, Json(json!({ "error": error }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct SetCurationBody {
     prominence: String,
@@ -239,6 +326,7 @@ fn parse_prominence(s: &str) -> Option<NodeProminence> {
         "full" => Some(NodeProminence::Full),
         "reduced" => Some(NodeProminence::Reduced),
         "pinned" => Some(NodeProminence::Pinned),
+        "needs_review" => Some(NodeProminence::NeedsReview),
         _ => None,
     }
 }
@@ -263,11 +351,15 @@ pub(crate) async fn set_curation_json(
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("invalid 'prominence': {:?}", body.prominence) })));
     };
     let reason = body.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
-    if prominence == NodeProminence::Reduced && reason.is_none() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "'reason' is required (non-empty) when prominence is 'reduced'" })));
+    if prominence.requires_reason() && reason.is_none() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "'reason' is required (non-empty) when prominence is 'reduced' or 'needs_review'" })));
     }
     let reason = reason.map(str::to_string);
 
+    let audit_state = state.clone();
+    let audit_tenant = tenant.clone();
+    let audit_target = format!("{id}/nodes/{node_id}");
+    let audit_metadata = json!({ "prominence": prominence.as_db_str(), "reason": reason });
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<()>> {
         let path = match resolve_connection_path(&state, &tenant, &id) {
             Ok(p) => p,
@@ -283,6 +375,9 @@ pub(crate) async fn set_curation_json(
     })
     .await;
 
+    if matches!(result, Ok(Ok(Some(())))) {
+        audit_curation(&audit_state, &audit_tenant, &user, "node_curated", &audit_target, audit_metadata);
+    }
     match result {
         Ok(Ok(Some(()))) => (StatusCode::OK, Json(json!({ "id": node_id, "prominence": prominence }))),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such node" }))),
@@ -589,7 +684,7 @@ pub(crate) async fn gotchas_json(State(state): State<AppState>, user: Option<axu
         let mut gotchas = Vec::new();
         for (name, path) in &repos {
             let Ok(store) = agentops_mcp::resolve_store(state.pg_store.as_ref(), path) else { continue };
-            for node in store.nodes_by_kind(name, NodeKind::Gotcha)? {
+            for node in agentops_api::repos::bucket_kinds(bucket.as_deref()).iter().map(|&kind| store.nodes_by_kind(name, kind)).collect::<anyhow::Result<Vec<_>>>()?.into_iter().flatten() {
                 if let Some(b) = &bucket {
                     if !agentops_api::repos::matches_bucket(&node, b) {
                         continue;
@@ -607,6 +702,7 @@ pub(crate) async fn gotchas_json(State(state): State<AppState>, user: Option<axu
                     curated: node.curated,
                     prominence: node.prominence,
                     curation_reason: node.curation_reason,
+                    kind: node.kind,
                 });
             }
         }
@@ -830,6 +926,60 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
         let resp = app.oneshot(post(&other_token)).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never resolve the owner's store name");
+    }
+
+    /// Milestone 2 item 1 end to end: a memory goes to `needs_review` (a
+    /// reason is required), shows up in that bucket whatever its kind, gets
+    /// its kind set (node and note file both), and every step is in the
+    /// tenant's audit log with the acting user.
+    #[tokio::test]
+    async fn needs_review_is_listed_across_kinds_its_kind_can_be_set_and_every_curation_is_audited() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let teams_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let teams = agentops_teams::TeamStore::open(&teams_dir.path().join("teams.db")).unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+        let path = crate::indexing::checkout_path(checkouts_dir.path(), &owner.tenant, &connection_id);
+        let repo = agentops_mcp::repo_name(&path);
+        let notes_dir = crate::indexing::notes_dir_for_checkout(&path);
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("m.md"), "---\ntitle: \"m\"\ntype: knowledge\n---\n\nbody\n").unwrap();
+        let node_id = agentops_mcp::open_store(&path)
+            .unwrap()
+            .add_node(agentops_graph::NewNode { kind: agentops_graph::NodeKind::Note, repo: repo.clone(), path: Some("vault:m.md".into()), name: Some("m".into()), container: None, start_line: None, end_line: None, content: Some("body".into()) })
+            .unwrap();
+
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let post = |uri: String, body: Value| Request::builder().method("POST").uri(uri).header("authorization", format!("Bearer {owner_token}")).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let curation = format!("/repos/{repo}/nodes/{node_id}/curation");
+
+        let no_reason = app.clone().oneshot(post(curation.clone(), json!({ "prominence": "needs_review", "reason": " " }))).await.unwrap();
+        assert_eq!(no_reason.status(), axum::http::StatusCode::BAD_REQUEST);
+        let ok = app.clone().oneshot(post(curation.clone(), json!({ "prominence": "needs_review", "reason": "unclassified on import" }))).await.unwrap();
+        assert_eq!(ok.status(), axum::http::StatusCode::OK);
+
+        let listed = app.clone().oneshot(Request::builder().uri("/gotchas?bucket=needs_review").header("authorization", format!("Bearer {owner_token}")).body(Body::empty()).unwrap()).await.unwrap();
+        let listed = body_json(listed).await;
+        let entry = listed["gotchas"].as_array().unwrap().iter().find(|g| g["id"] == node_id).unwrap_or_else(|| panic!("{listed}")).clone();
+        assert_eq!((entry["kind"].clone(), entry["prominence"].clone(), entry["curated"].clone()), (json!("Note"), json!("NeedsReview"), json!(false)));
+
+        let bad_kind = app.clone().oneshot(post(format!("/repos/{repo}/nodes/{node_id}/kind"), json!({ "kind": "symbol" }))).await.unwrap();
+        assert_eq!(bad_kind.status(), axum::http::StatusCode::BAD_REQUEST);
+        let set_kind = app.clone().oneshot(post(format!("/repos/{repo}/nodes/{node_id}/kind"), json!({ "kind": "gotcha" }))).await.unwrap();
+        assert_eq!(set_kind.status(), axum::http::StatusCode::OK);
+        assert_eq!(agentops_mcp::open_store(&path).unwrap().get_node(&repo, node_id).unwrap().unwrap().kind, agentops_graph::NodeKind::Gotcha);
+        assert!(std::fs::read_to_string(notes_dir.join("m.md")).unwrap().contains("type: gotcha"));
+        let accepted = app.oneshot(post(curation, json!({ "prominence": "full", "reason": null }))).await.unwrap();
+        assert_eq!(accepted.status(), axum::http::StatusCode::OK);
+
+        let audit = agentops_teams::TeamStore::open(&teams_dir.path().join("teams.db")).unwrap().list_audit_log(&owner.tenant, None, None, None).unwrap();
+        let mut actions: Vec<(String, Option<i64>)> = audit.iter().map(|e| (e.action.clone(), e.actor_user_id)).collect();
+        actions.sort();
+        assert_eq!(actions, vec![("node_curated".to_string(), Some(owner.id)), ("node_curated".to_string(), Some(owner.id)), ("node_kind_set".to_string(), Some(owner.id))]);
+        assert!(audit.iter().any(|e| e.metadata.contains("needs_review") && e.metadata.contains("unclassified on import")), "{audit:?}");
     }
 
     #[tokio::test]

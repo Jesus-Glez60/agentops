@@ -2,17 +2,19 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SWRConfig } from "swr";
 
-const { getGotchas, getRepos, setCuration, getNodeDetail, toastError } = vi.hoisted(() => ({
+const { getGotchas, getRepos, setCuration, setNodeKind, getNodeDetail, toastError } = vi.hoisted(() => ({
   getGotchas: vi.fn(),
   getRepos: vi.fn(),
   setCuration: vi.fn(),
+  setNodeKind: vi.fn(),
   getNodeDetail: vi.fn(),
   toastError: vi.fn(),
 }));
 
 vi.mock("@/lib/api/repos-api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api/repos-api")>("@/lib/api/repos-api");
-  return { ...actual, getGotchas, getRepos, setCuration, getNodeDetail };
+  // The page loads `getCurationQueue`; here it is just the mocked list.
+  return { ...actual, getGotchas, getCurationQueue: () => getGotchas(), getRepos, setCuration, setNodeKind, getNodeDetail };
 });
 
 vi.mock("sonner", () => ({
@@ -41,6 +43,7 @@ const needsCurationGotcha = {
   curated: false,
   prominence: "Full" as const,
   curation_reason: null,
+  kind: "Gotcha" as const,
 };
 
 const reducedGotcha = {
@@ -52,10 +55,21 @@ const reducedGotcha = {
   curation_reason: "only affects old Linux envs",
 };
 
-function nodeDetailFor(gotcha: typeof needsCurationGotcha | typeof reducedGotcha) {
+// An imported memory nobody could classify: a note, waiting in Needs review.
+const needsReviewNote = {
+  ...needsCurationGotcha,
+  id: 3,
+  name: "Imported deploy memory",
+  path: "vault:deploy.md",
+  prominence: "NeedsReview" as const,
+  curation_reason: "unclassified on import",
+  kind: "Note" as const,
+};
+
+function nodeDetailFor(gotcha: { id: number; repo: string; path: string | null; name: string | null; snippet: string | null; curated: boolean; prominence: string; curation_reason: string | null; kind: string }) {
   return {
     id: gotcha.id,
-    kind: "Gotcha",
+    kind: gotcha.kind,
     repo: gotcha.repo,
     path: gotcha.path,
     name: gotcha.name,
@@ -75,6 +89,7 @@ describe("GotchasPage", () => {
     getGotchas.mockReset();
     getRepos.mockReset();
     setCuration.mockReset();
+    setNodeKind.mockReset();
     getNodeDetail.mockReset();
     toastError.mockClear();
     getRepos.mockResolvedValue({ connections: [], can_connect: true });
@@ -96,6 +111,36 @@ describe("GotchasPage", () => {
     fireEvent.click(screen.getByRole("button", { name: "Reduced" }));
     expect(screen.getByText("Niche old-Linux workaround")).toBeInTheDocument();
     expect(screen.queryByText("Unbounded retry loop")).not.toBeInTheDocument();
+  });
+
+  it("a needs-review memory gets its own tab, badge and count, not Needs curation", async () => {
+    getGotchas.mockResolvedValue([needsCurationGotcha, needsReviewNote]);
+    renderPage();
+    await screen.findByText("Imported deploy memory");
+
+    fireEvent.click(screen.getByRole("button", { name: "Needs review" }));
+    expect(screen.getByText("Imported deploy memory")).toBeInTheDocument();
+    expect(screen.queryByText("Unbounded retry loop")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Needs curation" }));
+    expect(screen.queryByText("Imported deploy memory")).not.toBeInTheDocument();
+  });
+
+  it("a needs-review memory shows its reason and can have its kind set and be accepted", async () => {
+    getGotchas.mockResolvedValue([needsReviewNote]);
+    getNodeDetail.mockResolvedValue(nodeDetailFor(needsReviewNote));
+    setNodeKind.mockResolvedValue({ id: 3, kind: "gotcha" });
+    setCuration.mockResolvedValue({ id: 3, prominence: "Full" });
+    renderPage();
+
+    fireEvent.click(await screen.findByText("Imported deploy memory"));
+    expect(await screen.findByText("unclassified on import")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Knowledge" })).toHaveAttribute("aria-pressed", "true");
+    fireEvent.click(screen.getByRole("button", { name: "Gotcha" }));
+    await waitFor(() => expect(setNodeKind).toHaveBeenCalledWith("agentops", 3, "gotcha"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Gotcha" })).toHaveAttribute("aria-pressed", "true"));
+
+    fireEvent.click(screen.getByRole("button", { name: /Accept/ }));
+    await waitFor(() => expect(setCuration).toHaveBeenCalledWith("agentops", 3, "Full", null));
   });
 
   it("shows an empty state when nothing matches", async () => {

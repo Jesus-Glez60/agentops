@@ -52,10 +52,10 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "list_gotchas",
-            description: "Lists the Gotcha nodes recorded for a repo. With no filter, every gotcha. `query` keeps gotchas whose title or body contains every word of it (case-insensitive); `tag` keeps gotchas carrying that exact tag (from the note's frontmatter or add_note's tags, e.g. a library slug). Both together combine with AND. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
+            description: "Lists the Gotcha nodes recorded for a repo. With no filter, every gotcha. `query` keeps gotchas whose title or body contains every word of it (case-insensitive); `tag` keeps gotchas carrying that exact tag (from the note's frontmatter or add_note's tags, e.g. a library slug). Both together combine with AND. `prominence` keeps only gotchas in that curation state (full, pinned, reduced or needs_review); without it every state is listed and reduced/needs-review ones are marked. Pass session_id to correlate this call into a cross-tool activity feed (see get_session) and count it toward the usage dashboard's knowledge-reuse tracking.",
             access: AccessMode::Advisor,
             annotations: READ_ONLY,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" }, "query": { "type": "string", "description": "Words that must all appear in the title or body" }, "tag": { "type": "string", "description": "Exact tag, e.g. a library slug" } }, "required": ["path"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "session_id": { "type": "string" }, "query": { "type": "string", "description": "Words that must all appear in the title or body" }, "tag": { "type": "string", "description": "Exact tag, e.g. a library slug" }, "prominence": { "type": "string", "enum": ["full", "pinned", "reduced", "needs_review"], "description": "Only gotchas in this curation state" } }, "required": ["path"] }),
             handler: tool_list_gotchas,
         },
         ToolSpec {
@@ -486,12 +486,16 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
     // multi-word query while Postgres ANDs it.
     let query = get_str(args, "query").map(str::trim).filter(|q| !q.is_empty());
     let tag = get_str(args, "tag").map(str::trim).filter(|t| !t.is_empty());
-    if query.is_some() || tag.is_some() {
+    let prominence = get_str(args, "prominence").map(str::trim).filter(|p| !p.is_empty());
+    if prominence.is_some_and(|p| !["full", "pinned", "reduced", "needs_review"].contains(&p)) {
+        anyhow::bail!("invalid prominence {prominence:?} (expected full, pinned, reduced or needs_review)");
+    }
+    if query.is_some() || tag.is_some() || prominence.is_some() {
         let words: Vec<String> = query.map(|q| q.split_whitespace().map(str::to_lowercase).collect()).unwrap_or_default();
         gotchas.retain(|n| {
             let content = n.content.as_deref().unwrap_or("");
             let haystack = format!("{} {}", n.name.as_deref().unwrap_or(""), content).to_lowercase();
-            words.iter().all(|w| haystack.contains(w.as_str())) && tag.is_none_or(|t| agentops_notes::tags_of(content).iter().any(|have| have.eq_ignore_ascii_case(t)))
+            words.iter().all(|w| haystack.contains(w.as_str())) && tag.is_none_or(|t| agentops_notes::tags_of(content).iter().any(|have| have.eq_ignore_ascii_case(t))) && prominence.is_none_or(|p| n.prominence.as_db_str() == p)
         });
         if gotchas.is_empty() {
             return Ok("No gotchas match.".to_string());
@@ -501,15 +505,11 @@ fn tool_list_gotchas(args: &Value) -> anyhow::Result<String> {
     // permanent knowledge, never hidden), just ranked so a curated-down
     // one doesn't dominate an agent's attention over ones nobody's
     // demoted.
-    gotchas.sort_by_key(|n| n.prominence == agentops_graph::NodeProminence::Reduced);
+    gotchas.sort_by_key(|n| agentops_graph::prominence_label(n.prominence).is_some());
     let rendered = gotchas
         .iter()
         .map(|n| {
-            let reduced = if n.prominence == agentops_graph::NodeProminence::Reduced {
-                format!(" ⚠ reduced prominence — {}", n.curation_reason.as_deref().unwrap_or("no reason recorded"))
-            } else {
-                String::new()
-            };
+            let reduced = agentops_graph::prominence_label(n.prominence).map(|label| format!(" ⚠ {label} — {}", n.curation_reason.as_deref().unwrap_or("no reason recorded"))).unwrap_or_default();
             format!("- {} (node {}){reduced}", n.name.as_deref().unwrap_or("(untitled)"), n.id)
         })
         .collect::<Vec<_>>()
@@ -590,11 +590,7 @@ fn tool_get_symbol(args: &Value) -> anyhow::Result<String> {
         for edge in &affecting {
             if let Some(note) = notes_by_src.get(&edge.src_id) {
                 let staleness = if is_possibly_stale(&edge.updated_at) { " ⚠ possibly stale — this symbol changed since this note was last confirmed relevant" } else { "" };
-                let reduced = if note.prominence == agentops_graph::NodeProminence::Reduced {
-                    format!(" ⚠ reduced prominence — {}", note.curation_reason.as_deref().unwrap_or("no reason recorded"))
-                } else {
-                    String::new()
-                };
+                let reduced = agentops_graph::prominence_label(note.prominence).map(|label| format!(" ⚠ {label} — {}", note.curation_reason.as_deref().unwrap_or("no reason recorded"))).unwrap_or_default();
                 let capped_note = crate::budget::cap(note.content.as_deref().unwrap_or(""), max_chars(args), edge.src_id);
                 let entry = format!("- {}: {}{}{}", note.name.as_deref().unwrap_or("(untitled)"), capped_note.text, staleness, reduced);
                 match note.kind {
@@ -895,11 +891,7 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
             .map(|h| {
                 let signals = [h.dense_rank.map(|_| "dense"), h.lexical_rank.map(|_| "lexical"), h.exact_rank.map(|_| "exact")].into_iter().flatten().collect::<Vec<_>>().join("+");
                 let graph = h.graph_score.filter(|s| *s > 0.0).map(|s| format!(", graph {s:.4}")).unwrap_or_default();
-                let reduced = if h.node.prominence == agentops_graph::NodeProminence::Reduced {
-                    format!(" ⚠ reduced prominence — {}", h.node.curation_reason.as_deref().unwrap_or("no reason recorded"))
-                } else {
-                    String::new()
-                };
+                let reduced = agentops_graph::prominence_label(h.node.prominence).map(|label| format!(" ⚠ {label} — {}", h.node.curation_reason.as_deref().unwrap_or("no reason recorded"))).unwrap_or_default();
                 // Graphify-style citation: the real edge chain `graph_score`
                 // came from, not just the opaque number -- so a caller can
                 // trust it without re-verifying via Grep. Only present when
@@ -947,11 +939,7 @@ fn tool_semantic_search(args: &Value) -> anyhow::Result<String> {
     let rendered = hits
         .iter()
         .map(|(n, distance)| {
-            let reduced = if n.prominence == agentops_graph::NodeProminence::Reduced {
-                format!(" ⚠ reduced prominence — {}", n.curation_reason.as_deref().unwrap_or("no reason recorded"))
-            } else {
-                String::new()
-            };
+            let reduced = agentops_graph::prominence_label(n.prominence).map(|label| format!(" ⚠ {label} — {}", n.curation_reason.as_deref().unwrap_or("no reason recorded"))).unwrap_or_default();
             format!("- #{} {:?} {} (distance {distance:.4}){}{reduced}", n.id, n.kind, n.name.as_deref().unwrap_or("(untitled)"), n.path.as_deref().map(|p| format!(" — {p}")).unwrap_or_default())
         })
         .collect::<Vec<_>>()
@@ -1504,6 +1492,27 @@ mod tests {
         let full_pos = text.find("Full prominence gotcha").unwrap();
         let niche_pos = text.find("Niche gotcha").unwrap();
         assert!(full_pos < niche_pos, "a Reduced-prominence gotcha must sort after Full ones, not before: {text}");
+    }
+
+    #[test]
+    fn list_gotchas_marks_needs_review_unfiltered_and_filters_by_prominence() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.py"), "def greet():\n    return 'hi'\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Settled gotcha", "note_type": "gotcha", "body": "greet has a known bug." })).unwrap();
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Unsettled gotcha", "note_type": "gotcha", "body": "greet might misbehave." })).unwrap();
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let unsettled = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().find(|n| n.name.as_deref() == Some("Unsettled gotcha")).unwrap();
+        store.set_curation(&repo, unsettled.id, agentops_graph::NodeProminence::NeedsReview, Some("unclassified on import")).unwrap();
+
+        let all = call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path })).unwrap().content[0].text.clone();
+        assert!(all.contains("Settled gotcha") && all.contains("Unsettled gotcha ") && all.contains("⚠ needs review — unclassified on import"), "{all}");
+        assert!(all.find("Settled gotcha").unwrap() < all.find("Unsettled gotcha").unwrap(), "{all}");
+        let only = call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path, "prominence": "needs_review" })).unwrap().content[0].text.clone();
+        assert!(only.contains("Unsettled gotcha") && !only.contains("Settled gotcha "), "{only}");
+        assert!(call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path, "prominence": "hidden" })).unwrap().is_error);
     }
 
     #[test]

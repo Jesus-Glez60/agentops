@@ -258,7 +258,8 @@ pub(crate) async fn node_detail_json(State(state): State<AppState>, AxumPath((re
 #[derive(Debug, Deserialize)]
 pub struct SetCurationBody {
     prominence: String,
-    /// Required (non-empty) when `prominence` is `"reduced"`, ignored when
+    /// Required (non-empty) when `prominence` is `"reduced"` or
+    /// `"needs_review"`, ignored when
     /// `"full"` -- a demotion without a reason would just be an unexplained
     /// downranking, which defeats the point of curation being visible.
     reason: Option<String>,
@@ -269,6 +270,7 @@ fn parse_prominence(s: &str) -> Option<NodeProminence> {
         "full" => Some(NodeProminence::Full),
         "reduced" => Some(NodeProminence::Reduced),
         "pinned" => Some(NodeProminence::Pinned),
+        "needs_review" => Some(NodeProminence::NeedsReview),
         _ => None,
     }
 }
@@ -281,8 +283,8 @@ pub(crate) async fn set_curation_json(State(state): State<AppState>, AxumPath((r
         return (StatusCode::BAD_REQUEST, Json(json!({ "error": format!("invalid 'prominence': {:?}", body.prominence) })));
     };
     let reason = body.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
-    if prominence == NodeProminence::Reduced && reason.is_none() {
-        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "'reason' is required (non-empty) when prominence is 'reduced'" })));
+    if prominence.requires_reason() && reason.is_none() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "'reason' is required (non-empty) when prominence is 'reduced' or 'needs_review'" })));
     }
     let reason = reason.map(str::to_string);
 

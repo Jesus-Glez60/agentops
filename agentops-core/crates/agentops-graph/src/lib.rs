@@ -109,11 +109,17 @@ impl NodeKind {
 /// match on this enum across the workspace (let `cargo build`'s
 /// non-exhaustive-match errors be the checklist; never add a wildcard arm
 /// here, since that's the whole safety net for not missing a call site).
+/// `NeedsReview` (milestone 2, ADR 0050) holds a memory nobody could
+/// classify with confidence, e.g. an unclassifiable MEMORY.md entry: it
+/// ranks like `Reduced` in search and is marked there, never reaches
+/// recall (seeds, pins, briefings), and waits in the Gotchas workspace for
+/// a person to set its kind and accept or reduce it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NodeProminence {
     Full,
     Reduced,
     Pinned,
+    NeedsReview,
 }
 
 impl NodeProminence {
@@ -122,6 +128,7 @@ impl NodeProminence {
             NodeProminence::Full => "full",
             NodeProminence::Reduced => "reduced",
             NodeProminence::Pinned => "pinned",
+            NodeProminence::NeedsReview => "needs_review",
         }
     }
 
@@ -129,8 +136,37 @@ impl NodeProminence {
         match s {
             "reduced" => NodeProminence::Reduced,
             "pinned" => NodeProminence::Pinned,
+            "needs_review" => NodeProminence::NeedsReview,
             _ => NodeProminence::Full,
         }
+    }
+
+    /// Whether this state must carry a non-empty `curation_reason`: a
+    /// lowered or unsettled memory always says why.
+    pub fn requires_reason(&self) -> bool {
+        match self {
+            NodeProminence::Reduced | NodeProminence::NeedsReview => true,
+            NodeProminence::Full | NodeProminence::Pinned => false,
+        }
+    }
+
+    /// Whether recall (prompt seeds, subagent seeds, pins, briefings) may
+    /// show this node. Search and `list_gotchas` still list it, marked.
+    pub fn recallable(&self) -> bool {
+        match self {
+            NodeProminence::NeedsReview => false,
+            NodeProminence::Full | NodeProminence::Reduced | NodeProminence::Pinned => true,
+        }
+    }
+}
+
+/// How a lowered or unsettled node is labelled wherever it's listed
+/// (`⚠ <label> — <reason>`), or `None` for `Full`/`Pinned`.
+pub fn prominence_label(prominence: NodeProminence) -> Option<&'static str> {
+    match prominence {
+        NodeProminence::Reduced => Some("reduced prominence"),
+        NodeProminence::NeedsReview => Some("needs review"),
+        NodeProminence::Full | NodeProminence::Pinned => None,
     }
 }
 
@@ -144,6 +180,7 @@ pub fn prominence_rank_multiplier(prominence: NodeProminence) -> f64 {
         NodeProminence::Full => 1.0,
         NodeProminence::Reduced => 0.1,
         NodeProminence::Pinned => 1.0,
+        NodeProminence::NeedsReview => 0.1,
     }
 }
 
@@ -250,7 +287,8 @@ pub struct Node {
     /// gotcha's prominence/reason survives every future scan.
     pub curated: bool,
     pub prominence: NodeProminence,
-    /// `Some` (non-empty) iff `prominence == Reduced` -- why this gotcha's
+    /// `Some` (non-empty) iff `prominence.requires_reason()` (`Reduced` or
+    /// `NeedsReview`) -- why this gotcha's
     /// prominence was lowered, shown alongside it everywhere it surfaces
     /// (dashboard, MCP tools, docgen, prompts) so the demotion is never a
     /// silent, unexplained downranking.
@@ -793,7 +831,14 @@ pub trait GraphStore {
     /// mutator, not a new `update_node` parameter, so `upsert_node`
     /// (called by every rescan/note-ingest) never touches it: a gotcha's
     /// curation survives every future rescan the same way an embedding does.
+    /// `NeedsReview` leaves `curated` false: no person has looked at the
+    /// node yet, which is the point of the state.
     fn set_curation(&self, repo: &str, node_id: i64, prominence: NodeProminence, reason: Option<&str>) -> Result<()>;
+    /// Changes a node's kind in place (id, edges, embedding and curation
+    /// kept): the Gotchas workspace's "set kind" on a `NeedsReview` memory.
+    /// A vault-backed note's file must be rewritten to the same kind by the
+    /// caller, or the next ingest recreates a node of the old kind.
+    fn set_node_kind(&self, repo: &str, node_id: i64, kind: NodeKind) -> Result<()>;
     fn delete_nodes(&self, repo: &str, ids: &[i64]) -> Result<()>;
 
     fn add_edge(&self, repo: &str, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64>;

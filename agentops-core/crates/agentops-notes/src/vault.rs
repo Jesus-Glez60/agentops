@@ -329,6 +329,24 @@ pub const TAGS_MARKER: &str = "<!-- agentops:tags ";
 
 /// `body` plus, when there are tags, a final `<!-- agentops:tags a, b -->`
 /// line.
+/// `content` (a note file) with its frontmatter `type:` set to `note_type`
+/// (`gotcha`, `decision` or `knowledge`), added after the opening `---`
+/// when the frontmatter has none. A file with no frontmatter gets one. Used
+/// when a person changes a note's kind, so the next ingest reads the new
+/// kind instead of recreating a node of the old one.
+pub fn with_frontmatter_type(content: &str, note_type: &str) -> String {
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return format!("---\ntype: {note_type}\n---\n\n{content}");
+    };
+    let Some(end) = rest.find("\n---") else {
+        return format!("---\ntype: {note_type}\n---\n\n{content}");
+    };
+    let (front, after) = rest.split_at(end);
+    let mut lines: Vec<String> = front.lines().filter(|l| !l.trim_start().starts_with("type:")).map(str::to_string).collect();
+    lines.push(format!("type: {note_type}"));
+    format!("---\n{}{after}", lines.join("\n"))
+}
+
 pub fn content_with_tags(body: &str, tags: &[String]) -> String {
     let tags: Vec<&str> = tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
     if tags.is_empty() {
@@ -613,5 +631,12 @@ mod tests {
         ingest_vault(&store, "demo", &notes, &matcher, true).unwrap();
 
         assert_eq!(store.nodes_by_kind("demo", NodeKind::Note).unwrap().len(), 1, "re-ingesting the same vault must not duplicate notes");
+    }
+
+    #[test]
+    fn a_kind_change_rewrites_or_adds_the_frontmatter_type() {
+        assert_eq!(with_frontmatter_type("---\ntitle: \"T\"\ntype: knowledge\ntags: [a]\n---\n\nBody\n", "gotcha"), "---\ntitle: \"T\"\ntags: [a]\ntype: gotcha\n---\n\nBody\n");
+        assert_eq!(with_frontmatter_type("---\ntitle: \"T\"\n---\n\nBody\n", "decision"), "---\ntitle: \"T\"\ntype: decision\n---\n\nBody\n");
+        assert_eq!(with_frontmatter_type("Body\n", "gotcha"), "---\ntype: gotcha\n---\n\nBody\n");
     }
 }

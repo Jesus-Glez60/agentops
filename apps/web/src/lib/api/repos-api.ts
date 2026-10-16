@@ -284,7 +284,10 @@ export type NodeKind = "Symbol" | "File" | "Gotcha" | "Decision" | "Definition" 
 
 // Same bare-variant-name convention as NodeKind. Curation only ever
 // reorders a gotcha's prominence -- there is no "closed"/hidden state.
-export type NodeProminence = "Full" | "Reduced" | "Pinned";
+// `NeedsReview` (milestone 2): a memory nobody could classify with
+// confidence. Never recalled to agents; waits here for a person to set its
+// kind and accept or reduce it.
+export type NodeProminence = "Full" | "Reduced" | "Pinned" | "NeedsReview";
 
 export interface SearchResult {
   repo: string;
@@ -364,21 +367,40 @@ export interface GotchaSummary {
   curated: boolean;
   prominence: NodeProminence;
   curation_reason: string | null;
+  /** `Gotcha`, except for `NeedsReview` memories, which can be any memory kind. */
+  kind: NodeKind;
 }
 
-/** `needs_curation` (nobody's looked at it), `kept` (curated, still Full prominence), or `reduced` (curated down, always paired with a reason). */
-export type GotchaBucket = "needs_curation" | "kept" | "reduced" | "pinned";
+/** `needs_curation` (nobody's looked at it), `kept` (curated, still Full prominence), `reduced` (curated down, always paired with a reason), `pinned`, or `needs_review` (any memory kind waiting for a person to classify it). */
+export type GotchaBucket = "needs_curation" | "kept" | "reduced" | "pinned" | "needs_review";
 
 export function getGotchas(bucket?: GotchaBucket): Promise<GotchaSummary[]> {
   const params = bucket ? `?bucket=${bucket}` : "";
   return heavyFetch<{ gotchas: GotchaSummary[] }>(`/gotchas${params}`).then((r) => r.gotchas);
 }
 
-/** `reason` is required (non-empty) when `prominence` is `"Reduced"`, ignored otherwise -- enforced server-side too. */
+/** The Gotchas workspace's whole list: every gotcha, plus the decisions and notes waiting in `needs_review` (the unfiltered list holds gotchas only). */
+export async function getCurationQueue(): Promise<GotchaSummary[]> {
+  const [gotchas, needsReview] = await Promise.all([getGotchas(), getGotchas("needs_review")]);
+  const seen = new Set(gotchas.map((g) => `${g.repo}:${g.id}`));
+  return [...gotchas, ...needsReview.filter((g) => !seen.has(`${g.repo}:${g.id}`))];
+}
+
+export type MemoryKindChoice = "gotcha" | "decision" | "knowledge";
+
+/** Changes a memory's kind in place (node and note file); the server only allows gotchas, decisions and notes. */
+export function setNodeKind(connectionId: string, id: number, kind: MemoryKindChoice): Promise<{ id: number; kind: MemoryKindChoice }> {
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/nodes/${id}/kind`, {
+    method: "POST",
+    body: JSON.stringify({ kind }),
+  });
+}
+
+/** `reason` is required (non-empty) when `prominence` is `"Reduced"` or `"NeedsReview"`, ignored otherwise -- enforced server-side too. */
 export function setCuration(connectionId: string, id: number, prominence: NodeProminence, reason: string | null): Promise<{ id: number; prominence: NodeProminence }> {
   return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/nodes/${id}/curation`, {
     method: "POST",
-    body: JSON.stringify({ prominence: prominence.toLowerCase(), reason }),
+    body: JSON.stringify({ prominence: prominence === "NeedsReview" ? "needs_review" : prominence.toLowerCase(), reason }),
   });
 }
 

@@ -85,13 +85,16 @@ The repo key for a local repo is the canonical directory's basename (`agentops_s
 
 Gotchas are permanent knowledge and are never resolved, dismissed or deleted (decision "Gotchas are curated, never resolved/dismissed -- don't reintroduce a bug-tracker model").
 
-`NodeProminence` has three values:
+`NodeProminence` has four values:
 
 | Value | Effect |
 | --- | --- |
 | `Full` (default) | Normal ranking. |
 | `Reduced` | Ranked ×0.1 (`prominence_rank_multiplier`); requires a non-empty `curation_reason`, shown wherever the node surfaces. |
 | `Pinned` | Normal ranking, plus injected into sticky session context (`nodes_pinned`, `idx_nodes_repo_prominence`). |
+| `NeedsReview` | A memory nobody could classify with confidence (milestone 2, [ADR 0050](adr/0050-needs-review-curation-state.md)). Ranked ×0.1 and marked in search and `list_gotchas`; never recalled (`recallable()` is false: no prompt or subagent seed, pin, or briefing). Requires a `curation_reason`. Leaves `curated` false. |
+
+`requires_reason()` and `recallable()` on `NodeProminence` hold those two rules in one place. `set_node_kind` changes a memory's kind in place (id, edges, embedding and curation kept); the hosted route also rewrites the note file's `type:` so the next ingest doesn't recreate the old kind.
 
 The multiplier changes a sort key only, never a displayed score (doc comment on `prominence_rank_multiplier`).
 

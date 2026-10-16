@@ -5,14 +5,17 @@ import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { ArrowDown, CheckCircle2, FileCode, GitBranch, Pencil, Pin, RotateCcw, SearchIcon, TriangleAlert } from "lucide-react";
 import {
-  getGotchas,
+  getCurationQueue,
   getNodeDetail,
   getRepos,
   GOTCHAS_SWR_KEY,
   REPOS_SWR_KEY,
   setCuration,
+  setNodeKind,
   type GotchaBucket,
   type GotchaSummary,
+  type MemoryKindChoice,
+  type NodeKind,
   type NodeProminence,
 } from "@/lib/api/repos-api";
 import { Button } from "@/components/ui/button";
@@ -29,6 +32,7 @@ import { cn } from "@/lib/utils";
 const BUCKET_TABS: { label: string; value: GotchaBucket | "all" }[] = [
   { label: "All", value: "all" },
   { label: "Needs curation", value: "needs_curation" },
+  { label: "Needs review", value: "needs_review" },
   { label: "Pinned", value: "pinned" },
   { label: "Kept", value: "kept" },
   { label: "Reduced", value: "reduced" },
@@ -39,7 +43,10 @@ const BUCKET_TABS: { label: string; value: GotchaBucket | "all" }[] = [
 // match "kept"'s condition. `Pinned` is the stronger signal and should own
 // the bucket exclusively, matching `agentops_api::repos::matches_bucket`'s
 // own arm ordering.
+// `NeedsReview` first of all: it's never `curated` (no person has looked at
+// it yet), so it would otherwise land in "needs curation".
 function bucketOf(gotcha: Pick<GotchaSummary, "curated" | "prominence">): GotchaBucket {
+  if (gotcha.prominence === "NeedsReview") return "needs_review";
   if (gotcha.prominence === "Pinned") return "pinned";
   if (!gotcha.curated) return "needs_curation";
   return gotcha.prominence === "Reduced" ? "reduced" : "kept";
@@ -47,10 +54,19 @@ function bucketOf(gotcha: Pick<GotchaSummary, "curated" | "prominence">): Gotcha
 
 const BUCKET_BADGE: Record<GotchaBucket, { label: string; className: string }> = {
   needs_curation: { label: "Needs curation", className: "border-curation-needs-curation/40 bg-curation-needs-curation/10 text-curation-needs-curation" },
+  needs_review: { label: "Needs review", className: "border-curation-needs-review/40 bg-curation-needs-review/10 text-curation-needs-review" },
   pinned: { label: "Pinned", className: "border-curation-pinned/40 bg-curation-pinned/10 text-curation-pinned" },
   kept: { label: "Kept", className: "border-curation-kept/40 bg-curation-kept/10 text-curation-kept" },
   reduced: { label: "Reduced", className: "border-curation-reduced/40 text-curation-reduced" },
 };
+
+// "Set kind" choices for a needs-review memory, and which one its current
+// node kind is. A `Note` is the "knowledge" kind.
+const KIND_CHOICES: { label: string; value: MemoryKindChoice; kind: NodeKind }[] = [
+  { label: "Gotcha", value: "gotcha", kind: "Gotcha" },
+  { label: "Decision", value: "decision", kind: "Decision" },
+  { label: "Knowledge", value: "knowledge", kind: "Note" },
+];
 
 function BucketBadge({ bucket }: { bucket: GotchaBucket }) {
   const { label, className } = BUCKET_BADGE[bucket];
@@ -83,11 +99,12 @@ export default function GotchasPage() {
   }
   const { mutate } = useSWRConfig();
 
-  const { data: gotchas, isLoading } = useSWR(GOTCHAS_SWR_KEY, () => getGotchas());
+  const { data: gotchas, isLoading } = useSWR(GOTCHAS_SWR_KEY, getCurationQueue);
   const { data: allRepos } = useSWR(REPOS_SWR_KEY, getRepos);
 
   const scoped = (gotchas ?? []).filter((g) => repoScope.length === 0 || repoScope.includes(g.repo));
   const needsCurationCount = scoped.filter((g) => bucketOf(g) === "needs_curation").length;
+  const needsReviewCount = scoped.filter((g) => bucketOf(g) === "needs_review").length;
   const pinnedCount = scoped.filter((g) => bucketOf(g) === "pinned").length;
   const keptCount = scoped.filter((g) => bucketOf(g) === "kept").length;
   const reducedCount = scoped.filter((g) => bucketOf(g) === "reduced").length;
@@ -119,6 +136,17 @@ export default function GotchasPage() {
       markReviewed(selected.repo, selected.id);
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Couldn't update curation. Please try again.");
+    }
+  }
+
+  async function applyKind(choice: (typeof KIND_CHOICES)[number]) {
+    if (!selected) return;
+    try {
+      await setNodeKind(selected.repo, selected.id, choice.value);
+      mutate(GOTCHAS_SWR_KEY, (current: GotchaSummary[] | undefined) => current?.map((g) => (g.repo === selected.repo && g.id === selected.id ? { ...g, kind: choice.kind } : g)), { revalidate: false });
+      mutate(detailKey, (current: typeof detail) => (current ? { ...current, kind: choice.kind } : current), { revalidate: false });
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't change the kind. Please try again.");
     }
   }
 
@@ -250,8 +278,9 @@ export default function GotchasPage() {
         )}
       </div>
 
-      <div className="grid grid-cols-4 gap-4">
+      <div className="grid grid-cols-5 gap-4">
         <StatBox label="Needs curation" value={needsCurationCount} valueClassName="text-curation-needs-curation" />
+        <StatBox label="Needs review" value={needsReviewCount} valueClassName="text-curation-needs-review" />
         <StatBox label="Pinned" value={pinnedCount} valueClassName="text-curation-pinned" />
         <StatBox label="Kept" value={keptCount} valueClassName="text-curation-kept" />
         <StatBox label="Reduced" value={reducedCount} valueClassName="text-curation-reduced" />
@@ -353,10 +382,19 @@ export default function GotchasPage() {
                   <div className="flex shrink-0 items-center gap-2">
                     {/* No dismiss/delete action anywhere -- gotchas are
                         permanent knowledge, curation only reorders them. */}
+                    {detail.prominence === "NeedsReview" && (
+                      <div className="flex items-center gap-1" role="group" aria-label="Set kind">
+                        {KIND_CHOICES.map((choice) => (
+                          <Button key={choice.value} size="sm" variant={detail.kind === choice.kind ? "secondary" : "outline"} aria-pressed={detail.kind === choice.kind} onClick={() => applyKind(choice)}>
+                            {choice.label}
+                          </Button>
+                        ))}
+                      </div>
+                    )}
                     {!(detail.curated && detail.prominence === "Full") && (
                       <Button size="sm" className="gap-1.5 bg-curation-kept/15 text-curation-kept hover:bg-curation-kept/25" variant="ghost" onClick={() => applyCuration("Full", null)}>
                         <CheckCircle2 className="size-3.5" />
-                        Keep as permanent knowledge
+                        {detail.prominence === "NeedsReview" ? "Accept" : "Keep as permanent knowledge"}
                       </Button>
                     )}
                     {/* No reason dialog for Pin/Unpin -- mirrors the Full

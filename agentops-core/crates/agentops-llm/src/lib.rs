@@ -463,10 +463,10 @@ fn build_prompt(
             // relevant), just flagged so the model weighs it as lower
             // confidence and understands why, instead of treating every
             // recorded note as equally authoritative.
-            let demoted = if *prominence == NodeProminence::Reduced {
-                format!(" [lower confidence -- prominence reduced: {}]", reason.as_deref().unwrap_or("no reason recorded"))
-            } else {
-                String::new()
+            let demoted = match prominence {
+                NodeProminence::Reduced => format!(" [lower confidence -- prominence reduced: {}]", reason.as_deref().unwrap_or("no reason recorded")),
+                NodeProminence::NeedsReview => format!(" [lower confidence -- needs review: {}]", reason.as_deref().unwrap_or("no reason recorded")),
+                NodeProminence::Full | NodeProminence::Pinned => String::new(),
             };
             notes_section.push_str(&format!("- [{kind:?}] {title}: {text}{demoted}\n"));
         }

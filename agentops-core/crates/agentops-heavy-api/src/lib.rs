@@ -283,6 +283,7 @@ fn build_router_with_tools_flag(
         .route("/gotchas", get(dashboard::gotchas_json))
         .route("/repos/{id}/nodes/{node_id}", get(dashboard::node_detail_json))
         .route("/repos/{id}/nodes/{node_id}/curation", post(dashboard::set_curation_json))
+        .route("/repos/{id}/nodes/{node_id}/kind", post(dashboard::set_node_kind_json))
         .route("/repos/{id}/nodes/{node_id}/graph", get(dashboard::subgraph_json))
         .route("/repos/{id}/graph", get(dashboard::repo_graph_json))
         .route("/repos/{id}/docs", get(dashboard::docs_json))

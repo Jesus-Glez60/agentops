@@ -621,9 +621,14 @@ impl GraphStore for SqliteGraphStore {
 
     fn set_curation(&self, repo: &str, node_id: i64, prominence: NodeProminence, reason: Option<&str>) -> Result<()> {
         self.conn.execute(
-            "UPDATE nodes SET curated = 1, prominence = ?1, curation_reason = ?2 WHERE repo = ?3 AND id = ?4",
-            rusqlite::params![prominence.as_db_str(), reason, repo, node_id],
+            "UPDATE nodes SET curated = ?5, prominence = ?1, curation_reason = ?2 WHERE repo = ?3 AND id = ?4",
+            rusqlite::params![prominence.as_db_str(), reason, repo, node_id, prominence != NodeProminence::NeedsReview],
         )?;
+        Ok(())
+    }
+
+    fn set_node_kind(&self, repo: &str, node_id: i64, kind: NodeKind) -> Result<()> {
+        self.conn.execute("UPDATE nodes SET kind = ?1 WHERE repo = ?2 AND id = ?3", rusqlite::params![kind.as_db_str(), repo, node_id])?;
         Ok(())
     }
 
@@ -1534,6 +1539,24 @@ mod tests {
         assert!(!n.curated);
         assert_eq!(n.prominence, NodeProminence::Full);
         assert_eq!(n.curation_reason, None);
+    }
+
+    #[test]
+    fn needs_review_round_trips_uncurated_and_a_kind_change_keeps_the_node() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let id = upsert_node(&store, node("repo-a", NodeKind::Note, Some("vault:m.md"), Some("m"))).unwrap();
+        store.set_curation("repo-a", id, NodeProminence::NeedsReview, Some("unclassified on import")).unwrap();
+        let n = store.get_node("repo-a", id).unwrap().unwrap();
+        assert_eq!(n.prominence, NodeProminence::NeedsReview);
+        assert_eq!(n.curation_reason.as_deref(), Some("unclassified on import"));
+        assert!(!n.curated, "no person has looked at it yet");
+        assert!(store.nodes_pinned("repo-a").unwrap().is_empty());
+
+        store.set_node_kind("repo-a", id, NodeKind::Gotcha).unwrap();
+        let moved = store.get_node("repo-a", id).unwrap().unwrap();
+        assert_eq!((moved.id, moved.kind, moved.prominence), (id, NodeKind::Gotcha, NodeProminence::NeedsReview));
+        store.set_curation("repo-a", id, NodeProminence::Full, None).unwrap();
+        assert!(store.get_node("repo-a", id).unwrap().unwrap().curated);
     }
 
     #[test]

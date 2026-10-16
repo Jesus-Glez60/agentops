@@ -757,7 +757,7 @@ fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result
             content: n.content.clone(),
         })?;
         node_id_map.insert(n.id, new_id);
-        if n.curated || matches!(n.prominence, agentops_graph::NodeProminence::Reduced) {
+        if n.curated || n.prominence != agentops_graph::NodeProminence::Full {
             dst.set_curation(repo, new_id, n.prominence, n.curation_reason.as_deref())?;
         }
         if let Some(embedding) = src.get_embedding(repo, n.id)? {
