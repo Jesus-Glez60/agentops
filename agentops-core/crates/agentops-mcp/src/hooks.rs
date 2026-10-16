@@ -70,7 +70,7 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     match event {
-        "posttooluse" => classify_post_tool_use(tool_name, &tool_input).is_some() || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
+        "posttooluse" => recorded_post_tool_event(payload, tool_name, &tool_input).is_some() || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
         "pretooluse" => tool_name == "ExitPlanMode" || is_memory_write(tool_name, &tool_input) || detect_secret_exposure(tool_name, &tool_input).is_some(),
         "userpromptsubmit" => payload.get("prompt").and_then(|v| v.as_str()).is_some_and(|p| !p.trim().is_empty() && !is_task_notification(p)),
         "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
@@ -116,6 +116,7 @@ struct PostToolUsePayload {
 
 fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<()> {
     let session_id = session_id(payload);
+    let raw = payload;
     let payload: PostToolUsePayload = serde_json::from_value(payload.clone()).context("parsing PostToolUse payload")?;
 
     // Cheap, always-on categorization -- independent of whether this call's
@@ -123,7 +124,7 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<
     // Most calls match nothing here, and that's fine: unlike the MCP tools'
     // own event recording, there's no catch-all "activity" fallback: not
     // every tool call is guide-worthy.
-    if let Some((event_kind, description)) = classify_post_tool_use(&payload.tool_name, &payload.tool_input) {
+    if let Some((event_kind, description)) = recorded_post_tool_event(raw, &payload.tool_name, &payload.tool_input) {
         store.record_session_event(repo, session_id, &payload.tool_name, &description, None, event_kind)?;
     }
 
@@ -198,9 +199,34 @@ fn classify_post_tool_use(tool_name: &str, tool_input: &Value) -> Option<(&'stat
             let reference = tool_input.get("url").or_else(|| tool_input.get("query")).and_then(|v| v.as_str())?;
             Some(("external_reference", reference.to_string()))
         }
+        "Skill" => {
+            let skill = tool_input.get("skill").and_then(|v| v.as_str())?;
+            FLOW_SKILLS.contains(&skill).then(|| (FLOW_SKILL, skill.to_string()))
+        }
+        name if RECALL_TOOLS.contains(&name) => Some((RECALL_CALL, name.to_string())),
         _ => None,
     }
 }
+
+/// `classify_post_tool_use`, minus task-start-flow evidence from a
+/// subagent: a council member's recall must not stand in for the
+/// planner's. Subagent payloads carry `agent_id` (logged live on Claude
+/// Code 2.1.286, 2026-10-16); the main thread's don't.
+fn recorded_post_tool_event(payload: &Value, tool_name: &str, tool_input: &Value) -> Option<(&'static str, String)> {
+    let event = classify_post_tool_use(tool_name, tool_input)?;
+    let from_subagent = payload.get("agent_id").is_some();
+    (!(from_subagent && matches!(event.0, RECALL_CALL | FLOW_SKILL))).then_some(event)
+}
+
+/// `event_kind`s recording that the task-start flow actually ran, read back
+/// by `check_presented_plan`.
+pub const RECALL_CALL: &str = "recall_call";
+pub const FLOW_SKILL: &str = "flow_skill";
+
+/// The agentops tools that count as recall, and the skills the flow
+/// requires in every planning episode.
+const RECALL_TOOLS: &[&str] = &["mcp__agentops__related_context", "mcp__agentops__get_symbol", "mcp__agentops__list_gotchas", "mcp__agentops__fetch_content", "mcp__agentops__get_session_guide"];
+const FLOW_SKILLS: &[&str] = &["plan", "library-docs", "audit-plan"];
 
 /// A plain substring check, not a regex — no new dependency needed for
 /// something this simple.
@@ -444,8 +470,10 @@ const REQUIRED_PLAN_SECTIONS: &[(&str, &str)] = &[
 /// Soft enforcement of the task-start flow (milestone 1, item 6). On
 /// Claude Code 2.1.286 a `PreToolUse` deny on `ExitPlanMode` is obeyed: the
 /// plan isn't shown and the agent gets the reason (spike, 2026-10-14). The
-/// first plan in a planning episode that lacks a required section is
-/// denied with a reason naming the missing step. After
+/// first plan in a planning episode that lacks a required section, or
+/// whose episode has no recorded recall call or flow skill run (see
+/// `recorded_post_tool_event`), is denied with a reason naming what's
+/// missing. After
 /// `ENFORCE_MAX_NUDGES` nudges it goes through with a warning shown to the
 /// user, so this can never loop. An episode starts after the last
 /// ordinary-mode prompt. If `tool_input.plan` is missing (another Claude
@@ -456,19 +484,43 @@ fn check_presented_plan(store: &dyn GraphStore, repo: &str, session_id: &str, to
     };
     let headings: Vec<String> = plan.lines().filter(|l| l.trim_start().starts_with('#')).map(|l| l.to_lowercase()).collect();
     let missing: Vec<&(&str, &str)> = REQUIRED_PLAN_SECTIONS.iter().filter(|(name, _)| !headings.iter().any(|h| h.contains(&name.to_lowercase()))).collect();
-    if missing.is_empty() {
+
+    // Evidence that the flow ran, from this episode only (after the last
+    // ordinary-mode prompt). Headings alone let a plan that skipped recall
+    // through (milestone 1 check 1, 2026-10-16).
+    let events = store.session_events(repo, session_id)?;
+    let episode = events.iter().rposition(|e| e.event_kind == "user_intent" && e.tool_name == PROMPT_TOOL).map_or(&events[..], |i| &events[i + 1..]);
+    let mut unrun = Vec::new();
+    if !episode.iter().any(|e| e.event_kind == RECALL_CALL) {
+        unrun.push("recall (related_context, get_symbol or list_gotchas)".to_string());
+    }
+    for skill in FLOW_SKILLS {
+        if !episode.iter().any(|e| e.event_kind == FLOW_SKILL && e.description == *skill) {
+            unrun.push(format!("the {skill} skill"));
+        }
+    }
+    if missing.is_empty() && unrun.is_empty() {
         return Ok(None);
     }
-    let names = missing.iter().map(|(name, _)| format!("\"{name}\"")).collect::<Vec<_>>().join(" and ");
-    let nudges_this_episode = store.session_events(repo, session_id)?.iter().fold(0, |n, e| if e.event_kind == "user_intent" && e.tool_name == PROMPT_TOOL { 0 } else if e.event_kind == PLAN_NUDGE { n + 1 } else { n });
+
+    let mut problems = Vec::new();
+    if !missing.is_empty() {
+        problems.push(format!("this plan has no {} section", missing.iter().map(|(name, _)| format!("\"{name}\"")).collect::<Vec<_>>().join(" and ")));
+    }
+    if !unrun.is_empty() {
+        problems.push(format!("there's no sign you ran {}", unrun.join(", ")));
+    }
+    let problems = problems.join("; ");
+    let nudges_this_episode = episode.iter().filter(|e| e.event_kind == PLAN_NUDGE).count();
     if nudges_this_episode < crate::budget::ENFORCE_MAX_NUDGES {
-        store.record_session_event(repo, session_id, "ExitPlanMode", &format!("plan sent back: missing {names}"), None, PLAN_NUDGE)?;
-        let steps = missing.iter().map(|(_, step)| *step).collect::<Vec<_>>().join("; then ");
-        let reason = format!("AgentOps task-start flow: this plan has no {names} section. Before presenting it, {steps}. Then call ExitPlanMode again.");
+        store.record_session_event(repo, session_id, "ExitPlanMode", &format!("plan sent back: {problems}"), None, PLAN_NUDGE)?;
+        let mut steps: Vec<String> = unrun.iter().map(|step| format!("run {step}")).collect();
+        steps.extend(missing.iter().map(|(_, step)| step.to_string()));
+        let reason = format!("AgentOps task-start flow: {problems}. Before presenting it, {}. Then call ExitPlanMode again.", steps.join("; then "));
         return Ok(Some(serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason } })));
     }
-    store.record_session_event(repo, session_id, "ExitPlanMode", &format!("plan presented without {names}"), None, PLAN_PRESENTED_INCOMPLETE)?;
-    Ok(Some(hook_output("PreToolUse", None, Some(&format!("agentops: this plan skipped part of the task-start flow (no {names} section). Review it with that in mind.")))))
+    store.record_session_event(repo, session_id, "ExitPlanMode", &format!("plan presented anyway: {problems}"), None, PLAN_PRESENTED_INCOMPLETE)?;
+    Ok(Some(hook_output("PreToolUse", None, Some(&format!("agentops: this plan skipped part of the task-start flow ({problems}). Review it with that in mind.")))))
 }
 
 fn detect_secret_exposure(tool_name: &str, tool_input: &Value) -> Option<String> {
@@ -602,6 +654,10 @@ mod tests {
         assert!(is_relevant("posttooluse", &json!({ "tool_name": "Read", "tool_response": "x".repeat(DEFAULT_CHAR_BUDGET + 1) })));
         assert!(!is_relevant("pretooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "src/main.rs"} })));
         assert!(is_relevant("pretooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": ".env"} })));
+        assert!(is_relevant("posttooluse", &json!({ "tool_name": "mcp__agentops__related_context", "tool_input": {} })));
+        assert!(is_relevant("posttooluse", &json!({ "tool_name": "Skill", "tool_input": {"skill": "audit-plan"} })));
+        assert!(!is_relevant("posttooluse", &json!({ "tool_name": "Skill", "tool_input": {"skill": "session"} })));
+        assert!(!is_relevant("posttooluse", &json!({ "tool_name": "mcp__agentops__list_gotchas", "tool_input": {}, "agent_id": "a1" })), "a subagent's recall is never sent");
         assert!(is_relevant("userpromptsubmit", &json!({ "prompt": "hi" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<task-notification>x" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<agent-message from=\"a1\">\n[Subagent hand-back] report\n</agent-message>" })));
@@ -840,10 +896,30 @@ mod tests {
         handle(store, repo, "pretooluse", &json!({ "session_id": "s", "tool_name": "ExitPlanMode", "tool_input": input })).unwrap()
     }
 
+    /// A main-thread (or, with `agent`, subagent) tool call as Claude Code
+    /// reports it to PostToolUse.
+    fn tool_call(store: &dyn GraphStore, repo: &str, tool_name: &str, tool_input: Value, agent: Option<&str>) {
+        let mut payload = json!({ "session_id": "s", "tool_name": tool_name, "tool_input": tool_input, "tool_response": "ok" });
+        if let Some(agent) = agent {
+            payload["agent_id"] = json!(agent);
+            payload["agent_type"] = json!("plan-council-member");
+        }
+        handle(store, repo, "posttooluse", &payload).unwrap();
+    }
+
+    /// Everything the task-start flow asks for, from the main thread.
+    fn run_flow(store: &dyn GraphStore, repo: &str) {
+        tool_call(store, repo, "mcp__agentops__get_symbol", json!({ "name": "x" }), None);
+        for skill in ["plan", "library-docs", "audit-plan"] {
+            tool_call(store, repo, "Skill", json!({ "skill": skill }), None);
+        }
+    }
+
     #[test]
     fn a_plan_missing_a_section_is_sent_back_once_then_let_through_with_a_warning() {
         let (_dir, store, repo) = store();
         prompt(store.as_ref(), &repo, "plan something", "plan");
+        run_flow(store.as_ref(), &repo);
         let incomplete = "# Plan\n\n## Research performed\n- checked\n";
 
         let first = present(store.as_ref(), &repo, Some(incomplete)).unwrap();
@@ -855,15 +931,54 @@ mod tests {
         assert!(second["hookSpecificOutput"].get("permissionDecision").is_none(), "never more than ENFORCE_MAX_NUDGES nudges: {second}");
         assert!(second["systemMessage"].as_str().unwrap().contains("Council verdict"), "{second}");
 
-        // A new planning episode gets its own nudge.
+        // A new planning episode gets its own nudge, and needs its own evidence.
         prompt(store.as_ref(), &repo, "go", "default");
         prompt(store.as_ref(), &repo, "plan the next thing", "plan");
         assert_eq!(present(store.as_ref(), &repo, Some(incomplete)).unwrap()["hookSpecificOutput"]["permissionDecision"], "deny");
     }
 
+    const COMPLETE: &str = "# P\n## Research performed\nx\n## Council verdict\nclear";
+
+    #[test]
+    fn a_plan_whose_episode_skipped_recall_or_a_flow_skill_is_sent_back_naming_what_is_missing() {
+        let (_dir, store, repo) = store();
+        prompt(store.as_ref(), &repo, "plan something", "plan");
+        tool_call(store.as_ref(), &repo, "Skill", json!({ "skill": "audit-plan" }), None);
+
+        let first = present(store.as_ref(), &repo, Some(COMPLETE)).unwrap();
+        assert_eq!(first["hookSpecificOutput"]["permissionDecision"], "deny");
+        let reason = first["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap();
+        assert!(reason.contains("recall") && reason.contains("the plan skill") && reason.contains("the library-docs skill") && !reason.contains("the audit-plan skill") && !reason.contains("section"), "{reason}");
+
+        let second = present(store.as_ref(), &repo, Some(COMPLETE)).unwrap();
+        assert!(second["hookSpecificOutput"].get("permissionDecision").is_none(), "{second}");
+        assert!(second["systemMessage"].as_str().unwrap().contains("library-docs"), "{second}");
+    }
+
+    #[test]
+    fn only_the_main_threads_recall_and_only_recall_tools_count_as_evidence() {
+        let (_dir, store, repo) = store();
+        prompt(store.as_ref(), &repo, "plan something", "plan");
+        for skill in ["plan", "library-docs", "audit-plan"] {
+            tool_call(store.as_ref(), &repo, "Skill", json!({ "skill": skill }), None);
+        }
+        // A council member's recall, and agentops tools that aren't recall.
+        tool_call(store.as_ref(), &repo, "mcp__agentops__list_gotchas", json!({ "path": "r" }), Some("a1"));
+        for tool in ["mcp__agentops__search_docs", "mcp__agentops__get_library", "mcp__agentops__get_docs"] {
+            tool_call(store.as_ref(), &repo, tool, json!({}), None);
+        }
+        tool_call(store.as_ref(), &repo, "Skill", json!({ "skill": "session" }), None);
+        let reason = present(store.as_ref(), &repo, Some(COMPLETE)).unwrap()["hookSpecificOutput"]["permissionDecisionReason"].as_str().unwrap().to_string();
+        assert!(reason.contains("recall"), "{reason}");
+        let kinds: Vec<String> = store.session_events(&repo, "s").unwrap().into_iter().map(|e| e.event_kind).collect();
+        assert_eq!(kinds.iter().filter(|k| *k == RECALL_CALL).count(), 0, "{kinds:?}");
+        assert_eq!(kinds.iter().filter(|k| *k == FLOW_SKILL).count(), 3, "{kinds:?}");
+    }
+
     #[test]
     fn a_complete_plan_or_one_with_no_plan_text_goes_through_untouched() {
         let (_dir, store, repo) = store();
+        run_flow(store.as_ref(), &repo);
         assert!(present(store.as_ref(), &repo, Some("# P\n## Research performed\nx\n### council VERDICT\nclear")).is_none());
         assert!(present(store.as_ref(), &repo, None).is_none(), "fail open when the plan text isn't in the payload");
         assert!(present(store.as_ref(), &repo, Some("Research performed and Council verdict mentioned only in prose")).is_some(), "only headings count");
