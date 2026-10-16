@@ -107,6 +107,13 @@ A first remote default-mode run measured p50 174 ms / p95 340 ms, probably with 
 - **Check 4: pass on the let-through half.** The second ExitPlanMode went through after one nudge, and the user saw the plan. Whether the warning `systemMessage` was displayed isn't recorded in the transcript: **unverified**.
 - **The check 4 anomaly: explained.** The second prompt of `fdfd8325` was recorded in `agentops-cli/src/.context/graph.db`, the same `cwd` bug. That store had no earlier plan prompt, so the hook gave the full directive.
 
+**Confirmation run (2026-10-16, session `a8a2c120`, CLI and server on `9709ea3`): pass.** In plan mode, prompt "add a --quiet flag to agentops hook-capture…":
+- The `plan` skill ran first. Then `list_gotchas`/`get_symbol` with `path: "Jesus-Glez60--agentops"`, before any code search.
+- One question, then `library-docs` (clap), then `audit-plan` (solo). The council member's first calls: read the plan, then `list_gotchas`, then `get_symbol`, then code.
+- The plan reached the user with **no** deny. The session `cd`'d into `agentops-core/crates/…`, and every event still reached the server: `get_session_guide` lists the intent and all three plan-file writes.
+- No stray `.context/graph.db` was created.
+- With this run, checks 1 to 4 pass. Check 5 (evidence replay) is still not run, since no transcripts were attached. The milestone 2 prerequisite is met.
+
 **Evidence-session replay.** Not done, for the reason above.
 
 ## 4. Current state of memory writing
