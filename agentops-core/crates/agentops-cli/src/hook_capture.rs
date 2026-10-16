@@ -87,13 +87,14 @@ fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
     if !hooks::is_relevant(event, payload) {
         return Ok(None);
     }
-    let repo_path = Path::new(cwd);
+    let root = hook_repo_root(Path::new(cwd), std::env::var("CLAUDE_PROJECT_DIR").ok().as_deref());
+    let repo_path = root.as_path();
     // The `path` the agent should pass to agentops tools, echoed into the
     // context the hook injects: the connection id for a remote repo (the
     // hosted `/mcp` never resolves a local checkout path), else this repo.
     let mut payload = payload.clone();
     let marker = read_remote_marker(repo_path);
-    payload["agentops_path"] = Value::String(marker.as_ref().map_or_else(|| cwd.to_string(), |m| m.connection_id.clone()));
+    payload["agentops_path"] = Value::String(marker.as_ref().map_or_else(|| repo_path.to_string_lossy().into_owned(), |m| m.connection_id.clone()));
     let payload = &payload;
     match marker {
         Some(marker) => match call_remote(&marker, event, payload) {
@@ -109,6 +110,19 @@ fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
             hooks::handle(store.as_ref(), &repo, event, payload)
         }
     }
+}
+
+/// The repo a hook belongs to. The payload's `cwd` follows the session's
+/// shell, so after a `cd` into a subdirectory it would miss the remote
+/// marker and open a stray local graph there (found 2026-10-16: five of
+/// them, holding the evidence the plan gate was looking for on the
+/// server). Claude Code sets `CLAUDE_PROJECT_DIR` to the root the session
+/// started in; without it, the nearest ancestor with a `.git`.
+fn hook_repo_root(cwd: &Path, project_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = project_dir.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dir);
+    }
+    cwd.ancestors().find(|p| p.join(".git").exists()).unwrap_or(cwd).to_path_buf()
 }
 
 /// `POST {server_url}/repos/{connection_id}/hooks/{event}`, the same Bearer
@@ -283,7 +297,7 @@ struct SessionEndPayload {
 fn process_session_end(input: &str) -> Result<()> {
     let payload: SessionEndPayload = serde_json::from_str(input).context("parsing SessionEnd payload")?;
     let transcript = payload.transcript_path.context("SessionEnd payload has no transcript_path")?;
-    let cwd = PathBuf::from(payload.cwd.unwrap_or_else(|| ".".into()));
+    let cwd = hook_repo_root(Path::new(payload.cwd.as_deref().unwrap_or(".")), std::env::var("CLAUDE_PROJECT_DIR").ok().as_deref());
     let context_dir = cwd.join(".context");
     std::fs::create_dir_all(&context_dir)?;
     let mut log = std::fs::OpenOptions::new().create(true).append(true).open(context_dir.join("usage-sync.log"))?;
@@ -325,6 +339,27 @@ mod tests {
         let events = store.session_events(&agentops_mcp::repo_name(dir.path()), "sess-1").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, "user_intent");
+    }
+
+    #[test]
+    fn a_hook_from_a_subdirectory_belongs_to_the_session_root_not_the_shells_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("crates").join("cli");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        assert_eq!(hook_repo_root(&sub, None), dir.path(), "nearest ancestor with .git");
+        assert_eq!(hook_repo_root(&sub, Some("/elsewhere/root")), Path::new("/elsewhere/root"), "CLAUDE_PROJECT_DIR wins");
+        assert_eq!(hook_repo_root(&sub, Some("")), dir.path());
+
+        // End to end: a prompt from the subdirectory lands in the root's store
+        // (skipped when the tests themselves run under a Claude Code hook env).
+        if std::env::var_os("CLAUDE_PROJECT_DIR").is_some() {
+            return;
+        }
+        process("userpromptsubmit", false, &payload(&sub, json!({ "prompt": "fix the login bug" }))).unwrap();
+        assert!(!sub.join(".context").exists(), "no stray graph in the subdirectory");
+        let store = agentops_mcp::open_store(dir.path()).unwrap();
+        assert_eq!(store.session_events(&agentops_mcp::repo_name(dir.path()), "sess-1").unwrap().len(), 1);
     }
 
     #[test]
