@@ -103,6 +103,10 @@ The damping and iteration values come from HippoRAG 2's query-time PageRank (con
 
 The fallback means this mode never returns fewer results than flat search would (doc comment). Doc sections exist only after a scan has generated the doc page. They are embedded only when the scan used `with_embeddings`.
 
+## Similarity hop in the recall seed
+
+`recall_seed` (`agentops-retrieval/src/recall.rs`), the hook seed, follows one `SimilarTo` hop from each memory that qualified on its own cues (keywords or a named symbol), never from a doc section. A neighbour reached this way scores half its source, counts as one cue so it ranks below direct matches, gives `similar to "<source title>"` as its reason, and is dropped if excluded, pinned or `NeedsReview`. Edges are only read here, so the hook loads no embedding model ([ADR 0051](adr/0051-similarity-edges-between-memories.md)). This is how a memory that names no symbol and shares no keyword with the prompt can still be recalled.
+
 ## Prominence dampening
 
 A `Reduced` gotcha ranks ×0.1 in `dense`, `hybrid` and `gist_then_detail`, and every result shows "⚠ reduced prominence — <reason>". The decision "Gotchas are curated, never resolved/dismissed -- don't reintroduce a bug-tracker model" lists the other surfaces it reaches: `list_gotchas`, `get_symbol`, `explain_symbol`'s prompt and docgen. Hosted `/local-search` applies it too (`dashboard.rs`); the single-operator `/local-search` in `agentops-api/src/search.rs` does not. In `dense` mode the distance is divided by the multiplier for sorting only; the printed distance is unchanged.
@@ -158,7 +162,8 @@ Compile-time constants (change in code):
 | `PPR_DAMPING`, `PPR_ITERATIONS` | 0.5, 20 | same |
 | `GIST_TOP_K`, `DETAIL_PASS_MAX_TOP_K` | 3, 1000 | same |
 | `PATTERN_COMPLETE_SIMILARITY_FLOOR`, `_PPR_FLOOR`, `_FETCH_MULTIPLE` | 0.5, 0.01, 3 | same |
-| `AFFECTS_EDGE_HALF_LIFE_DAYS`, `REFERENCES_EDGE_HALF_LIFE_DAYS` | 30, 90 | `agentops-graph/src/lib.rs` |
+| `AFFECTS_EDGE_HALF_LIFE_DAYS`, `REFERENCES_EDGE_HALF_LIFE_DAYS`, `SIMILAR_TO_EDGE_HALF_LIFE_DAYS` | 30, 90, 90 | `agentops-graph/src/lib.rs` |
+| `SIMILAR_K`, `SIMILAR_MIN_SCORE`, `SIMILAR_MAX_DEGREE`, `DUPLICATE_MIN_SCORE` | 5, 0.75, 12, 0.92 | `agentops-graph/src/similarity.rs` |
 | `prominence_rank_multiplier` (`Reduced`) | 0.1 | same |
 | `CANDIDATE_POOL_MULTIPLIER`, `MIN_CANDIDATE_POOL` | 4, 20 | `agentops-heavy-embeddings/src/lib.rs` |
 

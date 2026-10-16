@@ -112,7 +112,33 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
     }
 
     let enough = |c: &Candidate| c.reasons.iter().any(|r| r.starts_with("affects")) || c.reasons.len() >= min_keyword_matches;
-    let mut ranked: Vec<(i64, Candidate)> = candidates.into_iter().filter(|(id, c)| !exclude.contains(id) && c.prominence != NodeProminence::Pinned && c.prominence.recallable() && enough(c)).collect();
+    let shown = |id: &i64, prominence: NodeProminence| !exclude.contains(id) && prominence != NodeProminence::Pinned && prominence.recallable();
+    let mut ranked: Vec<(i64, Candidate)> = candidates.into_iter().filter(|(id, c)| shown(id, c.prominence) && enough(c)).collect();
+
+    // One `SimilarTo` hop from each memory that made it on its own cues
+    // (ADR 0051), so a memory that names no symbol and shares no keyword
+    // can still come up beside the one it resembles. Edges are only read
+    // here; they're computed at write time. A neighbour counts as one cue
+    // and scores half its source, so it ranks below what matched directly.
+    let mut seen: HashSet<i64> = ranked.iter().map(|(id, _)| *id).collect();
+    let mut neighbours = Vec::new();
+    for (source_id, source) in &ranked {
+        if source.kind == NodeKind::DocSection {
+            continue;
+        }
+        for edge in store.edges_from(repo, *source_id)? {
+            if edge.relation != EdgeRelation::SimilarTo || !seen.insert(edge.dst_id) {
+                continue;
+            }
+            let Some(neighbour) = store.get_node(repo, edge.dst_id)? else { continue };
+            if !RECALL_KINDS.contains(&neighbour.kind) || !shown(&neighbour.id, neighbour.prominence) {
+                continue;
+            }
+            let title = neighbour.name.clone().unwrap_or_else(|| "(untitled)".to_string());
+            neighbours.push((neighbour.id, Candidate { score: source.score * 0.5, kind: neighbour.kind, title, prominence: neighbour.prominence, reasons: vec![format!("similar to \"{}\"", source.title)] }));
+        }
+    }
+    ranked.extend(neighbours);
     for (_, c) in &mut ranked {
         if c.prominence == NodeProminence::Reduced {
             c.score *= 0.5;
@@ -224,6 +250,28 @@ mod tests {
         let seed = recall_seed(&store, "r", "ingest", 8, &HashSet::from([a])).unwrap();
         assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![b]);
         assert!(recall_seed(&store, "r", "ingest", 0, &HashSet::new()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_similar_to_hop_reaches_a_memory_with_no_keyword_and_no_symbol_and_says_why() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let matched = note(&store, NodeKind::Gotcha, "Webhook signature check fails", "webhook signature 401");
+        let associated = note(&store, NodeKind::Note, "Rotate the app secret after a deploy", "rotate secret deploy");
+        let unrelated = note(&store, NodeKind::Note, "Unrelated memory", "nothing in common");
+        let unsettled = note(&store, NodeKind::Decision, "Unsettled association", "pending");
+        store.set_curation("r", unsettled, NodeProminence::NeedsReview, Some("unclassified on import")).unwrap();
+        for (a, b) in [(matched, associated), (matched, unsettled)] {
+            store.add_edge("r", a, b, EdgeRelation::SimilarTo).unwrap();
+            store.add_edge("r", b, a, EdgeRelation::SimilarTo).unwrap();
+        }
+
+        let seed = recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![matched, associated], "{seed:?}");
+        assert_eq!(seed[1].reason, "similar to \"Webhook signature check fails\"");
+        assert!(seed.iter().all(|p| p.node_id != unrelated && p.node_id != unsettled));
+        // Excluded or already-shown neighbours stay out too.
+        let again = recall_seed(&store, "r", "webhook signature", 8, &HashSet::from([associated])).unwrap();
+        assert_eq!(again.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![matched]);
     }
 
     #[test]

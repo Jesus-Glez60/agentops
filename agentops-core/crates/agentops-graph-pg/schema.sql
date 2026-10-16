@@ -226,7 +226,7 @@ ALTER TABLE nodes DROP CONSTRAINT IF EXISTS nodes_kind_check;
 ALTER TABLE nodes ADD CONSTRAINT nodes_kind_check CHECK (kind IN ('symbol', 'file', 'gotcha', 'decision', 'definition', 'note', 'doc_section', 'tool_output'));
 
 ALTER TABLE edges DROP CONSTRAINT IF EXISTS edges_relation_check;
-ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depends_on', 'documents', 'affects', 'references', 'covers'));
+ALTER TABLE edges ADD CONSTRAINT edges_relation_check CHECK (relation IN ('depends_on', 'documents', 'affects', 'references', 'covers', 'similar_to'));
 
 -- Initiative 3 (CLS-inspired retrieval plan) added Node.last_touched_at on
 -- the SQLite backend only, deliberately not here: `nodes` queries in

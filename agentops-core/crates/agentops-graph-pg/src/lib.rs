@@ -1647,6 +1647,29 @@ mod tests {
         store.delete_nodes("pg-repo-h", &[id]).unwrap();
     }
 
+    /// The widened `edges_relation_check` accepts `similar_to`, and the
+    /// shared linker works against Postgres's cosine KNN too (ADR 0051).
+    #[test]
+    fn similar_to_edges_round_trip_and_link_similar_works_on_postgres() {
+        let store = require_store!();
+        let repo = "pg-repo-similar";
+        let mk = |name: &str, tilt: f32| {
+            let id = upsert_node(&store, node(repo, NodeKind::Note, Some(format!("vault:{name}.md").as_str()), Some(name))).unwrap();
+            let mut v = vec![0.0f32; 384];
+            v[0] = 1.0;
+            v[1] = tilt;
+            store.set_embedding(repo, id, &v).unwrap();
+            id
+        };
+        let a = mk("a", 0.0);
+        let b = mk("b", 0.1);
+        let summary = agentops_graph::similarity::link_similar(&store, repo, a).unwrap();
+        assert_eq!(summary.edges_created, 2, "{summary:?}");
+        let edge = store.edges_from(repo, b).unwrap().into_iter().find(|e| e.relation == EdgeRelation::SimilarTo).unwrap();
+        assert_eq!(edge.dst_id, a);
+        store.delete_nodes(repo, &[a, b]).unwrap();
+    }
+
     #[test]
     fn needs_review_round_trips_uncurated_and_a_kind_change_keeps_the_node() {
         let store = require_store!();

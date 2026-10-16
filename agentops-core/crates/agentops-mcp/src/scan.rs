@@ -571,6 +571,9 @@ fn persist_impl(path: &Path, report: &ScanReport, with_embeddings: bool, cross_f
                 }
             }
             store.set_embeddings_batch(&repo, &note_embeddings)?;
+            // Similarity edges between memories (ADR 0051). A rescan only
+            // fills in missing ones: re-reading a note isn't a re-write.
+            agentops_graph::similarity::link_all_similar(store.as_ref(), &repo, false)?;
         }
     }
 

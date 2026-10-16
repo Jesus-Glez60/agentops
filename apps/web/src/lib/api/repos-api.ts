@@ -429,8 +429,8 @@ export interface SubgraphEdge {
   id: number;
   src_id: number;
   dst_id: number;
-  relation: "DependsOn" | "Documents" | "Affects" | "References";
-  /** "depends on" / "documents" / "affects" / "references" -- see search.rs's relation_label. No "← " prefix: direction is conveyed structurally via src_id/dst_id. */
+  relation: "DependsOn" | "Documents" | "Affects" | "References" | "Covers" | "SimilarTo";
+  /** "depends on" / "documents" / "affects" / "references" / "covers" / "similar to" -- see search.rs's relation_label. No "← " prefix: direction is conveyed structurally via src_id/dst_id. */
   label: string;
 }
 

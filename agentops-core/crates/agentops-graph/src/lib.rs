@@ -16,6 +16,7 @@
 
 mod sqlite;
 pub mod community;
+pub mod similarity;
 
 pub use community::{detect_hotspots, node_degrees, Hotspot};
 pub use sqlite::SqliteGraphStore;
@@ -228,6 +229,13 @@ pub enum EdgeRelation {
     /// section's outgoing `Covers` edges to scope its second, detail-tier
     /// search pass.
     Covers,
+    /// Two memories (gotcha, decision or note) whose embeddings are close
+    /// (milestone 2, ADR 0051). Stored in both directions, so a hop works
+    /// from either end. **Plastic**: created and reinforced at write time
+    /// only (`similarity::link_similar`), decays with
+    /// `SIMILAR_TO_EDGE_HALF_LIFE_DAYS`, and is only followed, never
+    /// computed, in hooks (`agentops_retrieval::recall_seed`).
+    SimilarTo,
 }
 
 impl EdgeRelation {
@@ -238,6 +246,7 @@ impl EdgeRelation {
             EdgeRelation::Affects => "affects",
             EdgeRelation::References => "references",
             EdgeRelation::Covers => "covers",
+            EdgeRelation::SimilarTo => "similar_to",
         }
     }
 
@@ -247,6 +256,7 @@ impl EdgeRelation {
             "affects" => EdgeRelation::Affects,
             "references" => EdgeRelation::References,
             "covers" => EdgeRelation::Covers,
+            "similar_to" => EdgeRelation::SimilarTo,
             "depends_on" => EdgeRelation::DependsOn,
             other => {
                 // Kept as a fallback, since old rows may hold retired names,
@@ -363,6 +373,11 @@ pub const AFFECTS_EDGE_HALF_LIFE_DAYS: f64 = 30.0;
 /// shouldn't decay to irrelevance on the same timescale.
 pub const REFERENCES_EDGE_HALF_LIFE_DAYS: f64 = 90.0;
 
+/// Half-life, in days, of a `SimilarTo` edge (milestone 2): the same as
+/// `References`, since an association between two memories should outlast
+/// a single burst of work.
+pub const SIMILAR_TO_EDGE_HALF_LIFE_DAYS: f64 = REFERENCES_EDGE_HALF_LIFE_DAYS;
+
 /// Decay is a pure function applied at read time, not a stored/background
 /// value — sidesteps needing any scheduler/background-job infrastructure
 /// (none exists in this project) for something that only matters when an
@@ -390,6 +405,7 @@ pub fn effective_weight_with_half_life(weight: f64, age_days: f64, half_life_day
 pub fn effective_edge_weight(edge: &Edge) -> f64 {
     let half_life = match edge.relation {
         EdgeRelation::References => REFERENCES_EDGE_HALF_LIFE_DAYS,
+        EdgeRelation::SimilarTo => SIMILAR_TO_EDGE_HALF_LIFE_DAYS,
         // `Covers` edges are fully replaced on every doc regeneration (like
         // `DependsOn`), not reinforced -- there's no "repeat confirmation"
         // signal to decay, so the specific half-life picked here is moot in

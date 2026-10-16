@@ -57,6 +57,7 @@ Every kind, `DocSection` and `ToolOutput` included, can be selected by the `kind
 | `Affects` | `affects` | note → symbol | A gotcha or decision applies to a symbol. Reversing it silently breaks docgen badges. |
 | `References` | `references` | symbol → symbol, same file | Identifier reference found syntactically; not a call graph. `agentops install --with-lsp` also adds cross-file edges from rust-analyzer (fixed for `findings.md` F25). |
 | `Covers` | `covers` | `DocSection` → symbol/file | What a doc section documents; walked by `search_gist_then_detail`. |
+| `SimilarTo` | `similar_to` | memory ↔ memory (stored both ways) | Two gotchas, decisions or notes whose embeddings are close (cosine ≥ `SIMILAR_MIN_SCORE`). Created at write time by `similarity::link_similar`, followed one hop by `recall_seed`. Never touches a doc section ([ADR 0051](adr/0051-similarity-edges-between-memories.md)). |
 
 Source: doc comments on each variant. `EdgeRelation::from_db_str` maps an unknown string to `DependsOn` and logs a warning.
 
@@ -102,12 +103,15 @@ An earlier `review_status` column modelled gotchas as bugs to close. It was adde
 
 ### Edge weights and decay
 
-`Affects` and `References` edges are plastic. `weight` starts at 1.0 and grows when an edge is re-confirmed (`reinforce_edge`). Effective weight decays with age (`effective_edge_weight`, `age_days`), with a separate half-life per relation:
+`Affects`, `References` and `SimilarTo` edges are plastic. `weight` starts at 1.0 and grows when an edge is re-confirmed (`reinforce_edge`). Effective weight decays with age (`effective_edge_weight`, `age_days`), with a separate half-life per relation:
 
 | Relation | Half-life |
 | --- | --- |
 | `Affects` | `AFFECTS_EDGE_HALF_LIFE_DAYS = 30.0` |
 | `References` | `REFERENCES_EDGE_HALF_LIFE_DAYS = 90.0` |
+| `SimilarTo` | `SIMILAR_TO_EDGE_HALF_LIFE_DAYS = 90.0` (same as `References`) |
+
+`SimilarTo` edges (`agentops-graph/src/similarity.rs`): each write links the new memory to its `SIMILAR_K = 5` nearest memories with cosine ≥ `SIMILAR_MIN_SCORE = 0.75`, in both directions. Cosine is computed in Rust from the stored vectors, because SQLite's KNN distance is L2 and Postgres's is cosine. An existing pair is reinforced on an explicit write (`add_note`, `ingest_notes`, the importer) but only created, never reinforced, on a rescan (`link_all_similar(.., false)`). A memory keeps at most `SIMILAR_MAX_DEGREE = 12`; past that its weakest pair (both directions) is deleted. `DUPLICATE_MIN_SCORE = 0.92` marks a near-copy for the importer. `agentops link-similar` backfills a repo and prints the score distribution.
 
 A `References` edge whose target disappeared is deleted (`delete_edge`). The automatic every-scan re-match of notes must not bump `updated_at` (gotcha 53965, "Auto-rematch must not bump reinforce_edge's updated_at"). Decision "weighted decaying edges, auto note re-matching, and repo state added".
 
@@ -163,7 +167,7 @@ Differences from SQLite:
 | `last_touched_at` | Populated | Not populated |
 | Migrations | Tracked by `user_version` | Idempotent re-apply of `schema.sql` |
 
-Both CHECK constraints were widened for `doc_section`, `tool_output`, `references` and `covers` by dropping and re-adding them by name (`schema.sql` comments). Gotcha 54053: "Adding a NodeKind or EdgeRelation variant silently breaks PostgresGraphStore unless nodes_kind_check/edges_relation_check are also widened".
+Both CHECK constraints were widened for `doc_section`, `tool_output`, `references`, `covers` and `similar_to` by dropping and re-adding them by name (`schema.sql` comments). Gotcha 54053: "Adding a NodeKind or EdgeRelation variant silently breaks PostgresGraphStore unless nodes_kind_check/edges_relation_check are also widened".
 
 `wipe_repo` deletes one repo's rows from every per-repo table. Every new per-repo table must be added to it (gotcha 54241).
 

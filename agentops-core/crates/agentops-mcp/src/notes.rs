@@ -82,6 +82,7 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
         if let Some(node) = store.find_node(&repo, node_kind, Some(&vault_path), Some(title), None)? {
             let embedding = agentops_embeddings::LocalEmbedder.embed(body)?;
             store.set_embedding(&repo, node.id, &embedding)?;
+            agentops_graph::similarity::link_similar(store.as_ref(), &repo, node.id)?;
         }
     }
 
@@ -119,6 +120,7 @@ pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, cl
                 }
             }
         }
+        agentops_graph::similarity::link_all_similar(store.as_ref(), &repo, true)?;
     }
 
     Ok(summary)
