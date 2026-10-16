@@ -88,7 +88,14 @@ fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
         return Ok(None);
     }
     let repo_path = Path::new(cwd);
-    match read_remote_marker(repo_path) {
+    // The `path` the agent should pass to agentops tools, echoed into the
+    // context the hook injects: the connection id for a remote repo (the
+    // hosted `/mcp` never resolves a local checkout path), else this repo.
+    let mut payload = payload.clone();
+    let marker = read_remote_marker(repo_path);
+    payload["agentops_path"] = Value::String(marker.as_ref().map_or_else(|| cwd.to_string(), |m| m.connection_id.clone()));
+    let payload = &payload;
+    match marker {
         Some(marker) => match call_remote(&marker, event, payload) {
             Ok(output) => Ok(output),
             Err(e) => {
@@ -386,6 +393,8 @@ mod tests {
         assert!(request.starts_with("POST /repos/conn-1/hooks/userpromptsubmit "), "{request}");
         assert!(request.contains("Bearer k"), "{request}");
         assert!(!request.contains("transcript_path") && !request.contains("\"cwd\""), "local paths must not be sent: {request}");
+        let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["agentops_path"], "conn-1", "the agent is told the connection id");
         assert!(!dir.path().join(".context").join("graph.db").exists());
     }
 

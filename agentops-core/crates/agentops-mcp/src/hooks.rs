@@ -300,8 +300,15 @@ pub const PLAN_PROMPT_TOOL: &str = "user_prompt:plan";
 pub const RECALL_INJECTED: &str = "recall_injected";
 
 /// The task-start flow directive (`prompts/shared/plan-flow.md`), compiled in.
-fn plan_flow_directive() -> String {
-    include_str!("../../../prompts/shared/plan-flow.md").replace("{MAX_PLAN_QUESTIONS}", &crate::budget::MAX_PLAN_QUESTIONS.to_string())
+fn plan_flow_directive(agentops_path: &str) -> String {
+    include_str!("../../../prompts/shared/plan-flow.md").replace("{MAX_PLAN_QUESTIONS}", &crate::budget::MAX_PLAN_QUESTIONS.to_string()).replace("{AGENTOPS_PATH}", agentops_path)
+}
+
+/// The `path` agents should pass to agentops tools: what `agentops
+/// hook-capture` put in the payload (the connection id for a remote repo),
+/// else this store's repo name.
+fn agentops_path<'a>(payload: &'a Value, repo: &'a str) -> &'a str {
+    payload.get("agentops_path").and_then(|v| v.as_str()).filter(|p| !p.is_empty()).unwrap_or(repo)
 }
 
 /// Sent on every later prompt of a planning episode instead of the full
@@ -393,7 +400,7 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value) -> Re
     if plan_mode && continuing_episode {
         parts.push(PLAN_FLOW_REMINDER.to_string());
     } else if plan_mode {
-        parts.push(plan_flow_directive());
+        parts.push(plan_flow_directive(agentops_path(payload, repo)));
         // The whole seed, even pointers shown earlier in the session: the
         // plan is built from this, and earlier context may be compacted.
         let seed = agentops_retrieval::recall_seed(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default())?;
@@ -853,6 +860,15 @@ mod tests {
         for mode in ["default", "plan"] {
             assert!(prompt(store.as_ref(), &repo, "anything at all", mode).starts_with("## Pinned"), "{mode}");
         }
+    }
+
+    #[test]
+    fn the_flow_tells_the_agent_which_path_to_pass_to_agentops_tools() {
+        let (_dir, store, repo) = store();
+        let with_hint = context(handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": "plan it", "session_id": "a", "permission_mode": "plan", "agentops_path": "conn-1" })).unwrap());
+        assert!(with_hint.contains("Pass `path: \"conn-1\"`"), "{with_hint}");
+        let without = context(handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": "plan it", "session_id": "b", "permission_mode": "plan" })).unwrap());
+        assert!(without.contains(&format!("Pass `path: \"{repo}\"`")) && !without.contains("{AGENTOPS_PATH}"), "{without}");
     }
 
     #[test]
