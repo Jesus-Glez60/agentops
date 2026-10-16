@@ -562,7 +562,16 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result
     if !is_relevant("subagentstart", payload) {
         return Ok(None);
     }
-    let mut parts = Vec::new();
+    // Every seeded agent learns which `path` to pass. The council's own
+    // prompt already says to look things up before grepping and haiku
+    // ignored it (milestone 1 check 3), so it's repeated here, first, as
+    // an experiment the next check 3 run decides.
+    let path = agentops_path(payload, repo);
+    let mut parts = vec![if payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| t.starts_with("plan-council-")) {
+        format!("First, before any Read, Grep or Bash: call `get_symbol`, `related_context` or `list_gotchas` (`path: \"{path}\"`) for each file and symbol the plan names.")
+    } else {
+        format!("Pass `path: \"{path}\"` to every agentops tool.")
+    }];
     let pinned = crate::session_guide::build_pinned_context(store, repo)?;
     if !pinned.is_empty() {
         parts.push(pinned);
@@ -573,9 +582,6 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result
             const HEADER: &str = "Recalled from AgentOps for the task you were spawned for (pointers; query `get_symbol`/`related_context`/`list_gotchas` or `fetch_content` with the id before grepping):";
             parts.push(format!("{HEADER}\n{}", seed.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n")));
         }
-    }
-    if parts.is_empty() {
-        return Ok(None);
     }
     let context = cap(&parts.join("\n\n"), SUBAGENT_SEED_BUDGET, 0).text;
     Ok(Some(hook_output("SubagentStart", Some(&context), None)))
@@ -901,7 +907,10 @@ mod tests {
         let recorded = || store.session_events(&repo, "s").unwrap().into_iter().filter(|e| e.event_kind == RECALL_INJECTED).count();
         let before = recorded();
         let explore = context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a1" })).unwrap());
-        assert!(explore.contains(&format!("(id {id})")), "{explore}");
+        assert!(explore.contains(&format!("(id {id})")) && explore.starts_with(&format!("Pass `path: \"{repo}\"`")), "{explore}");
+        let council = context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "plan-council-member", "agent_id": "a2", "agentops_path": "conn-1" })).unwrap());
+        assert!(council.starts_with("First, before any Read, Grep or Bash") && council.contains("`path: \"conn-1\"`") && council.contains(&format!("(id {id})")), "{council}");
+        assert!(council.chars().count() <= crate::budget::SUBAGENT_SEED_BUDGET);
         assert!(explore.chars().count() <= crate::budget::SUBAGENT_SEED_BUDGET);
         assert!(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "statusline-setup" })).unwrap().is_none());
         assert_eq!(recorded(), before, "a subagent's seed never counts as shown to the main session");
