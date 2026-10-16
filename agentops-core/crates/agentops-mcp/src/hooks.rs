@@ -284,12 +284,13 @@ const PLAN_FLOW_REMINDER: &str = "AgentOps task-start flow: you're mid-flow. Car
 
 /// Claude Code delivers a finished background task as a `UserPromptSubmit`
 /// whose prompt is the notification XML (spike, 2026-10-14), and a
-/// subagent's hand-back as one starting with the agent-message preamble
-/// (seen in a transcript, 2026-10-15). Neither is the user speaking, so
-/// neither is recorded or used for recall.
+/// subagent's hand-back as one whose prompt is `<agent-message from=...>`
+/// (recorded hook payload, 2026-10-16; the transcript shows an extra
+/// "Another Claude session sent a message:" line the hook never sees).
+/// Neither is the user speaking, so neither is recorded or used for recall.
 fn is_task_notification(prompt: &str) -> bool {
     let prompt = prompt.trim_start();
-    prompt.starts_with("<task-notification>") || prompt.starts_with("Another Claude session sent a message:\n<agent-message")
+    prompt.starts_with("<task-notification>") || prompt.starts_with("<agent-message")
 }
 
 /// The session's most recent real user prompt, from either mode. Feeds the
@@ -603,7 +604,7 @@ mod tests {
         assert!(is_relevant("pretooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": ".env"} })));
         assert!(is_relevant("userpromptsubmit", &json!({ "prompt": "hi" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<task-notification>x" })));
-        assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "Another Claude session sent a message:\n<agent-message from=\"a1\">\nreport" })));
+        assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<agent-message from=\"a1\">\n[Subagent hand-back] report\n</agent-message>" })));
     }
 
     #[test]
@@ -805,7 +806,7 @@ mod tests {
         let out = handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": "<task-notification>\n<summary>hooks agent finished</summary>", "session_id": "s", "permission_mode": "plan" })).unwrap();
         assert!(out.is_none());
         assert!(store.session_events(&repo, "s").unwrap().is_empty());
-        let hand_back = "Another Claude session sent a message:\n<agent-message from=\"a1\">\n[Subagent hand-back] the hooks report";
+        let hand_back = "<agent-message from=\"a1\">\n[Subagent hand-back] the hooks report\n</agent-message>";
         assert!(handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "prompt": hand_back, "session_id": "s", "permission_mode": "plan" })).unwrap().is_none());
         assert!(store.session_events(&repo, "s").unwrap().is_empty());
         assert!(prompt(store.as_ref(), &repo, "plan the hooks work", "plan").contains("task-start flow"), "a notification never counts as the episode's first prompt");
