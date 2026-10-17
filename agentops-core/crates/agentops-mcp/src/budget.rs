@@ -29,6 +29,11 @@ pub const SUBAGENT_SEED_BUDGET: usize = 2000;
 /// rules at 1,976 characters before real ids, so 15 rules need ~2,500.
 /// 3,000 leaves room for a few more without a cut.
 pub const PIN_BUDGET: usize = 3000;
+/// Longest first line a pin shows, in characters. A pin is a standing
+/// reminder, and `fetch_content` with its id has the rest. The agentops
+/// pilot (2026-10-17) pinned an existing decision whose first line was a
+/// 690-character paragraph, which pushed a rule out of the block.
+pub const PIN_LINE_MAX: usize = 180;
 /// Claude Code's cap on one hook output field.
 pub const HOOK_FIELD_MAX: usize = 10_000;
 const _: () = assert!(PIN_BUDGET + PLAN_FLOW_BUDGET <= HOOK_FIELD_MAX && PIN_BUDGET + SUBAGENT_SEED_BUDGET <= HOOK_FIELD_MAX);

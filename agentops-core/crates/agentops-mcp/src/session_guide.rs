@@ -52,7 +52,9 @@ pub fn build_pinned_context(store: &dyn GraphStore, repo: &str) -> anyhow::Resul
 /// `fetch_content` with the id has the rest (the reasoning, for a rule).
 pub fn render_pin(kind: NodeKind, name: Option<&str>, content: Option<&str>, id: i64) -> String {
     let content = content.unwrap_or("");
-    let first = content.lines().next().unwrap_or("");
+    let line = content.lines().next().unwrap_or("");
+    let max = crate::budget::PIN_LINE_MAX;
+    let first = if line.chars().count() <= max { line.to_string() } else { format!("{}…", line.chars().take(max - 1).collect::<String>().trim_end()) };
     if agentops_notes::tags_of(content).iter().any(|t| t == "memory-kind:procedural") {
         format!("- {first} (id {id})")
     } else {
@@ -261,6 +263,14 @@ mod tests {
         let (block, cut) = pinned_block(&store, "demo").unwrap();
         assert!(block.contains(&format!("- Run the test suites on the server. (id {rule})")) && !block.contains("feedback_tests") && !block.contains("38 minutes"), "{block}");
         assert!(cut.is_empty());
+
+        // A pinned memory whose first line is a whole paragraph shows only
+        // its start, so it can't crowd other pins out.
+        let paragraph = store.add_node(NewNode { kind: NodeKind::Decision, repo: "demo".into(), path: None, name: Some("long decision".into()), container: None, start_line: None, end_line: None, content: Some("z".repeat(700)) }).unwrap();
+        store.set_curation("demo", paragraph, NodeProminence::Pinned, None).unwrap();
+        let line = render_pin(NodeKind::Decision, Some("long decision"), Some(&"z".repeat(700)), paragraph);
+        assert!(line.contains(&format!("{}…", "z".repeat(crate::budget::PIN_LINE_MAX - 1))) && !line.contains(&"z".repeat(crate::budget::PIN_LINE_MAX)), "{line}");
+        store.set_curation("demo", paragraph, NodeProminence::Full, None).unwrap();
 
         let long = "x".repeat(150);
         let many: Vec<i64> = (0..20).map(|i| {
