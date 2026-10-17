@@ -2285,43 +2285,8 @@ fn note(path: &Path, kind: Option<NoteKindArg>, tags: &[String], with_embeddings
 }
 
 fn link_similar(path: &Path) -> Result<()> {
-    use agentops_embeddings::Embedder;
-    use agentops_graph::similarity;
     let store = agentops_mcp::open_store(path)?;
-    let repo = agentops_mcp::repo_name(path);
-    let mut embedded = 0;
-    for &kind in similarity::MEMORY_KINDS {
-        for node in store.nodes_by_kind(&repo, kind)? {
-            if let (None, Some(content)) = (store.get_embedding(&repo, node.id)?, node.content.as_deref()) {
-                store.set_embedding(&repo, node.id, &agentops_embeddings::LocalEmbedder.embed(content)?)?;
-                embedded += 1;
-            }
-        }
-    }
-    let summary = similarity::link_all_similar(store.as_ref(), &repo, false)?;
-    println!("repo {repo}: embedded {embedded} memories, created {} SimilarTo edges, dropped {} over the degree cap", summary.edges_created, summary.edges_dropped);
-
-    let scores = similarity::candidate_pair_scores(store.as_ref(), &repo, 2 * similarity::SIMILAR_K)?;
-    println!("candidate pair cosine ({} pairs, {} per memory):", scores.len(), 2 * similarity::SIMILAR_K);
-    for bucket in (0..20).rev() {
-        let (lo, hi) = (bucket as f32 * 0.05, (bucket + 1) as f32 * 0.05);
-        let n = scores.iter().filter(|s| **s >= lo && (**s < hi || bucket == 19)).count();
-        if n > 0 {
-            let mark = if lo >= similarity::DUPLICATE_MIN_SCORE - 0.05 && lo < similarity::DUPLICATE_MIN_SCORE { "  <- duplicate threshold" } else if (similarity::SIMILAR_MIN_SCORE - lo).abs() < 1e-6 { "  <- link threshold" } else { "" };
-            println!("  {lo:.2}-{hi:.2}  {n:>5}{mark}");
-        }
-    }
-    let mut total = 0;
-    let mut unlinked = 0;
-    for &kind in similarity::MEMORY_KINDS {
-        for node in store.nodes_by_kind(&repo, kind)? {
-            total += 1;
-            if store.edges_from(&repo, node.id)?.is_empty() && store.edges_to(&repo, node.id)?.is_empty() {
-                unlinked += 1;
-            }
-        }
-    }
-    println!("memories with no edges of any kind: {unlinked} of {total}");
+    print!("{}", agentops_mcp::link_similar_backfill(store.as_ref(), &agentops_mcp::repo_name(path))?);
     Ok(())
 }
 

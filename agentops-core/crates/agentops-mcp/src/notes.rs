@@ -182,6 +182,59 @@ pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, cl
     Ok(summary)
 }
 
+/// The similarity backfill (milestone 2, ADR 0051): embeds every gotcha,
+/// decision and note that has no vector yet, creates the missing
+/// `SimilarTo` edges (never reinforcing existing ones), and returns a plain
+/// text report: the candidate-pair cosine histogram the thresholds are tuned
+/// from, and how many memories still have no edge of any kind. Shared by
+/// `agentops link-similar` and `agentops-server link-similar`, which runs it
+/// inside the hosted app with that deployment's own store settings.
+pub fn link_similar_backfill(store: &dyn agentops_graph::GraphStore, repo: &str) -> Result<String> {
+    use agentops_graph::similarity;
+    use std::fmt::Write as _;
+    let mut embedded = 0;
+    for &kind in similarity::MEMORY_KINDS {
+        for node in store.nodes_by_kind(repo, kind)? {
+            if let (None, Some(content)) = (store.get_embedding(repo, node.id)?, node.content.as_deref()) {
+                store.set_embedding(repo, node.id, &agentops_embeddings::LocalEmbedder.embed(content)?)?;
+                embedded += 1;
+            }
+        }
+    }
+    let summary = similarity::link_all_similar(store, repo, false)?;
+    let mut out = String::new();
+    writeln!(out, "repo {repo}: embedded {embedded} memories, created {} SimilarTo edges, dropped {} over the degree cap", summary.edges_created, summary.edges_dropped)?;
+
+    let per_node = 2 * similarity::SIMILAR_K;
+    let scores = similarity::candidate_pair_scores(store, repo, per_node)?;
+    writeln!(out, "candidate pair cosine ({} pairs, {per_node} nearest per memory):", scores.len())?;
+    for bucket in (0..20).rev() {
+        let (lo, hi) = (bucket as f32 * 0.05, (bucket + 1) as f32 * 0.05);
+        let n = scores.iter().filter(|s| **s >= lo && (**s < hi || bucket == 19)).count();
+        if n > 0 {
+            let mark = if (lo..hi).contains(&similarity::DUPLICATE_MIN_SCORE) {
+                "  <- duplicate threshold in this bucket"
+            } else if (lo..hi).contains(&similarity::SIMILAR_MIN_SCORE) {
+                "  <- link threshold in this bucket"
+            } else {
+                ""
+            };
+            writeln!(out, "  {lo:.2}-{hi:.2}  {n:>5}{mark}")?;
+        }
+    }
+    let (mut total, mut unlinked) = (0, 0);
+    for &kind in similarity::MEMORY_KINDS {
+        for node in store.nodes_by_kind(repo, kind)? {
+            total += 1;
+            if store.edges_from(repo, node.id)?.is_empty() && store.edges_to(repo, node.id)?.is_empty() {
+                unlinked += 1;
+            }
+        }
+    }
+    writeln!(out, "memories with no edges of any kind: {unlinked} of {total}")?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use agentops_graph::{GraphStore, SqliteGraphStore};
@@ -297,5 +350,23 @@ mod tests {
         let other = add_note_with(dir.path(), "Unrelated decision", "We deploy on push to main through a CI gate on the server.", Some(NoteType::Gotcha), &[], None, true, AddMode::WriteUnlessDuplicate).unwrap();
         assert!(other.written && other.duplicate_of.is_none());
         assert_eq!(count(), 2);
+    }
+
+    /// The backfill embeds memories that have no vector and links them,
+    /// creating edges only; a second run creates nothing.
+    #[test]
+    fn the_similarity_backfill_embeds_missing_vectors_links_once_and_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token(t):\n    return t == SECRET\n").unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        add_note(dir.path(), "Timing attack in verify_token", "verify_token compares secrets with plain equality, which leaks timing.", Some(agentops_notes::NoteType::Gotcha), &[], None, false).unwrap();
+        add_note(dir.path(), "verify_token leaks timing", "verify_token uses plain equality on secrets, leaking timing information.", Some(agentops_notes::NoteType::Gotcha), &[], None, false).unwrap();
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+
+        let first = super::link_similar_backfill(store.as_ref(), &repo).unwrap();
+        assert!(first.contains("embedded 2 memories") && first.contains("created 2 SimilarTo edges") && first.contains("memories with no edges of any kind: 0 of 2"), "{first}");
+        let second = super::link_similar_backfill(store.as_ref(), &repo).unwrap();
+        assert!(second.contains("embedded 0 memories") && second.contains("created 0 SimilarTo edges"), "{second}");
     }
 }
