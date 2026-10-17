@@ -7,8 +7,9 @@
 //! frontmatter `type` (top level or under `metadata`), then the file-name
 //! prefix, then the heuristic classifier or `--llm-classify` at
 //! `CLASSIFY_MIN_CONFIDENCE`, else `NeedsReview` ("unclassified on
-//! import"). An entry that says it's stale or superseded also goes to
-//! `NeedsReview`. Every entry gets one report record: entries in equals
+//! import"). An entry whose description or MEMORY.md index line says it's
+//! stale or superseded also goes to `NeedsReview`, except a rule: rules are
+//! always pinned, never left waiting. Every entry gets one report record: entries in equals
 //! records out.
 //!
 //! Writes go through `add_note` (over `/mcp` when the repo has a remote
@@ -76,6 +77,8 @@ struct Entry {
     claude_type: Option<String>,
     modified: Option<String>,
     body: String,
+    /// This file's line in MEMORY.md: the person's own one-line summary.
+    index_line: Option<String>,
     warnings: Vec<String>,
 }
 
@@ -115,15 +118,15 @@ fn parse_entry(file: &str, content: &str) -> Entry {
     entry
 }
 
-/// `MEMORY.md`'s `- [Title](file.md)` lines: file name → line number.
-fn index_lines(memory_md: &str) -> HashMap<String, usize> {
+/// `MEMORY.md`'s `- [Title](file.md)` lines: file name → (line number, line).
+fn index_lines(memory_md: &str) -> HashMap<String, (usize, String)> {
     memory_md
         .lines()
         .enumerate()
         .filter_map(|(i, line)| {
             let start = line.find("](")? + 2;
             let end = line[start..].find(')')? + start;
-            Some((line[start..end].to_string(), i + 1))
+            Some((line[start..end].to_string(), (i + 1, line.to_string())))
         })
         .collect()
 }
@@ -146,8 +149,12 @@ pub(crate) trait KindClassifier {
 }
 
 fn classify(entry: &Entry, llm: Option<&dyn KindClassifier>) -> Result<Classified> {
+    // Only the entry's own one-line summaries count: its description and its
+    // MEMORY.md line. Bodies use these words in other senses ("a stale
+    // browser tab", "possibly stale" notes): checking them sent a quarter
+    // of the agentops pilot's entries to review (2026-10-17 dry run).
     let stale = {
-        let text = format!("{} {}", entry.description.as_deref().unwrap_or(""), entry.body).to_lowercase();
+        let text = format!("{} {}", entry.description.as_deref().unwrap_or(""), entry.index_line.as_deref().unwrap_or("")).to_lowercase();
         STALE_WORDS.iter().any(|w| text.contains(w))
     };
     let prefix = ["feedback", "project", "reference", "user"].into_iter().find(|p| entry.file.starts_with(&format!("{p}_")));
@@ -169,7 +176,7 @@ fn classify(entry: &Entry, llm: Option<&dyn KindClassifier>) -> Result<Classifie
             (_, false) => Classified { signal: "none", memory_kind: None, note_type: None, confidence: Some(0.0), needs_review: Some(UNCLASSIFIED_REASON) },
         }
     };
-    if stale && classified.needs_review.is_none() {
+    if stale && classified.needs_review.is_none() && classified.memory_kind != Some(MemoryKind::Procedural) {
         classified.needs_review = Some(STALE_REASON);
     }
     Ok(classified)
@@ -341,7 +348,7 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
     let mut records = Vec::new();
     for path in files {
         let file = path.file_name().unwrap().to_string_lossy().to_string();
-        let source_line = index.get(&file).copied();
+        let source_line = index.get(&file).map(|(line, _)| *line);
         let content = match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
@@ -350,6 +357,7 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             }
         };
         let mut entry = parse_entry(&file, &content);
+        entry.index_line = index.get(&file).map(|(_, text)| text.clone());
         if source_line.is_none() {
             entry.warnings.push("not linked from MEMORY.md".into());
         }
@@ -400,9 +408,11 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             record.warnings.push(format!("needs review: {reason}"));
         }
 
-        // A rule is pinned: always present, never left to recall.
+        // A rule is pinned: always present, never left to recall. When it
+        // nearly copies a memory already recorded, that memory is pinned
+        // instead, so no rule is lost when MEMORY.md is turned off.
         let pin = classified.memory_kind == Some(MemoryKind::Procedural) && classified.needs_review.is_none();
-        record.pinned = pin && record.action == "create";
+        record.pinned = pin && matches!(record.action, "create" | "duplicate");
         if apply && matches!(record.action, "create" | "needs_review") {
             let written = sink.add_note(&title, &body, note_type, &tags, AddMode::WriteUnlessDuplicate)?;
             record.node_id = written.node_id;
@@ -410,11 +420,16 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             if !written.written {
                 record.action = "duplicate";
                 record.duplicate_of = written.duplicate_of;
-                record.pinned = false;
             } else if let (Some(reason), Some(id)) = (classified.needs_review, written.node_id) {
                 sink.set_curation(id, "needs_review", Some(reason))?;
             } else if let (true, Some(id)) = (pin, written.node_id) {
                 sink.set_curation(id, "pinned", None)?;
+            }
+        }
+        if apply && pin && record.action == "duplicate" {
+            if let Some(existing) = record.duplicate_of {
+                sink.set_curation(existing, "pinned", None)?;
+                record.warnings.push(format!("rule pinned on the memory it duplicates (node {existing})"));
             }
         }
         record.rule_line = pin.then(|| rule_line(&entry_for_rule));
@@ -447,7 +462,7 @@ pub(crate) fn summary_markdown(records: &[Record], apply: bool) -> String {
     // The pin block these rules add (the spec's "rendered pin block with its
     // size"), in the hook's own format and budget. Pins already on the
     // server count against the same budget; the pilot measures the real one.
-    let pins: Vec<String> = records.iter().filter(|r| r.pinned).filter_map(|r| r.rule_line.as_ref().map(|line| format!("- {line} (id {})", r.node_id.map_or("new".into(), |id| id.to_string())))).collect();
+    let pins: Vec<String> = records.iter().filter(|r| r.pinned).filter_map(|r| r.rule_line.as_ref().map(|line| format!("- {line} (id {})", r.node_id.or(r.duplicate_of).map_or("new".into(), |id| id.to_string())))).collect();
     let block = format!("## Pinned\n{}\n", pins.join("\n"));
     let size = block.chars().count();
     let budget = agentops_mcp::budget::PIN_BUDGET;
@@ -598,7 +613,8 @@ mod tests {
     #[test]
     fn the_index_maps_linked_files_to_their_line() {
         let index = index_lines("# Memory\n- [A](a.md) — hook\n- [B](b.md)\n");
-        assert_eq!((index.get("a.md"), index.get("b.md"), index.get("c.md")), (Some(&2), Some(&3), None));
+        assert_eq!((index.get("a.md").map(|l| l.0), index.get("b.md").map(|l| l.0), index.get("c.md")), (Some(2), Some(3), None));
+        assert_eq!(index["a.md"].1, "- [A](a.md) — hook");
     }
 
     #[test]
@@ -610,8 +626,14 @@ mod tests {
         assert_eq!((heuristic.signal, heuristic.note_type), ("heuristic", Some(NoteType::Gotcha)));
         let none = classify(&e("misc.md", None, "Lunch is at noon."), None).unwrap();
         assert_eq!((none.signal, none.needs_review), ("none", Some(UNCLASSIFIED_REASON)));
-        let stale = classify(&e("project_b.md", Some("project"), "Superseded by the new deploy flow."), None).unwrap();
+        let stale_body = classify(&e("project_b.md", Some("project"), "Superseded by the new deploy flow."), None).unwrap();
+        assert_eq!(stale_body.needs_review, None, "only the one-line summaries count, not the body");
+        let stale = classify(&Entry { description: Some("old topology, superseded".into()), ..e("project_b.md", Some("project"), "x") }, None).unwrap();
         assert_eq!((stale.memory_kind, stale.needs_review), (Some(MemoryKind::Episodic), Some(STALE_REASON)));
+        let by_index = classify(&Entry { index_line: Some("- [B](b.md) — STALE stub note".into()), ..e("project_b.md", Some("project"), "x") }, None).unwrap();
+        assert_eq!(by_index.needs_review, Some(STALE_REASON));
+        let rule = classify(&Entry { description: Some("a stale tab causes a false alarm; restart first".into()), ..e("feedback_b.md", Some("feedback"), "x") }, None).unwrap();
+        assert_eq!((rule.memory_kind, rule.needs_review), (Some(MemoryKind::Procedural), None), "a rule is never sent to review");
     }
 
     struct Fixed(Option<MemoryKind>, f32);
@@ -669,7 +691,8 @@ mod tests {
             ("user_role.md", "---\nname: user role\nmetadata:\n  type: user\n---\n\nThe user is a senior engineer who prefers terse answers.\n"),
             ("notes_misc.md", "Lunch with the team on Friday.\n"),
             ("broken.md", "---\nname: broken\nthis frontmatter never closes\n"),
-            ("project_old.md", "---\nname: old topology\ntype: project\n---\n\nSuperseded: the two-backend setup was merged into one server.\n"),
+            ("project_old.md", "---\nname: old topology\ndescription: superseded two-backend setup\ntype: project\n---\n\nThe two-backend setup was merged into one server.\n"),
+            ("feedback_tests_again.md", "---\nname: tests belong on the server\ndescription: always run the suites on the server\nmetadata:\n  type: feedback\n---\n\nThe laptop build is too slow; use agentops-test-remote.\n"),
         ];
         for (name, content) in files {
             std::fs::write(memory.path().join(name), content).unwrap();
@@ -700,7 +723,10 @@ mod tests {
         let original = by_file(&first, "project_deploy.md");
         assert_eq!((copy.action, copy.duplicate_of), ("duplicate", original.node_id), "{first:#?}");
         let created = memories();
-        assert_eq!(created, files.len() - 1, "every entry but the duplicate becomes a node");
+        assert_eq!(created, files.len() - 2, "every entry but the two duplicates becomes a node");
+        let again_rule = by_file(&first, "feedback_tests_again.md");
+        let first_rule = by_file(&first, "feedback_tests.md");
+        assert_eq!((again_rule.action, again_rule.duplicate_of, again_rule.pinned), ("duplicate", first_rule.node_id, true), "a duplicate rule pins the memory it copies");
         let rule = by_file(&first, "feedback_tests.md");
         assert!(rule.pinned && rule.rule_line.as_deref() == Some("always run the suites on the server"), "{rule:?}");
         let rule_node = store.get_node(&name, rule.node_id.unwrap()).unwrap().unwrap();
@@ -729,9 +755,9 @@ mod tests {
         let records: Vec<Value> = serde_json::from_str(&std::fs::read_to_string(report_dir.join("report.json")).unwrap()).unwrap();
         assert_eq!(records.len(), files.len());
         let summary = std::fs::read_to_string(report_dir.join("summary.md")).unwrap();
-        assert!(summary.contains("8 entries") && !summary.contains("Lunch with the team"), "counts, never entry text: {summary}");
-        assert!(summary.contains("## Pinned rules (0 rules"), "a re-run pins nothing new: {summary}");
+        assert!(summary.contains("9 entries") && !summary.contains("Lunch with the team"), "counts, never entry text: {summary}");
+        assert!(summary.contains("## Pinned rules (1 rules"), "a re-run only re-pins the duplicate rule's existing memory: {summary}");
         let first_summary = summary_markdown(&first, true);
-        assert!(first_summary.contains("## Pinned rules (1 rules") && first_summary.contains("- always run the suites on the server (id "), "{first_summary}");
+        assert!(first_summary.contains("## Pinned rules (2 rules") && first_summary.contains("- always run the suites on the server (id "), "{first_summary}");
     }
 }
