@@ -105,7 +105,16 @@ The fallback means this mode never returns fewer results than flat search would 
 
 ## Similarity hop in the recall seed
 
-`recall_seed` (`agentops-retrieval/src/recall.rs`), the hook seed, follows one `SimilarTo` hop from each memory that qualified on its own cues (keywords or a named symbol). Doc sections are not recall kinds (`RECALL_KINDS`, F53), so none is ever a source, a hit or a neighbour. A neighbour reached this way scores half its source, counts as one cue so it ranks below direct matches, gives `similar to "<source title>"` as its reason, and is dropped if excluded, pinned or `NeedsReview`. Edges are only read here, so the hook loads no embedding model ([ADR 0051](adr/0051-similarity-edges-between-memories.md)). This is how a memory that names no symbol and shares no keyword with the prompt can still be recalled.
+`recall_seed` (`agentops-retrieval/src/recall.rs`), the hook seed, follows one `SimilarTo` hop from each memory that qualified on its own cues (keywords or a named symbol). Doc sections are not recall kinds (`RECALL_KINDS`, F53), so none is ever a source, a hit or a neighbour. A neighbour reached this way inherits its source's strength:
+- **Cues:** the same cue count as its source.
+- **Score:** `source score × cosine × HOP_FACTOR` (0.8), halved again if the neighbour is reduced. It can outrank a weaker direct hit but never its own source.
+- **Cosine:** `SimilarTo` edges keep no score, so it is read from the two stored vectors with `GraphStore::get_embeddings` (one query on Postgres). A neighbour without a vector isn't reached.
+- **Reached twice:** a node reached directly and by a hop, or by two hops, keeps the stronger and every reason.
+- **Order:** sources are walked strongest first, so the seed never depends on map order (gotcha 117291).
+- **Reason:** `similar to "<source title>"`.
+- **Dropped:** neighbours that are excluded, pinned or `NeedsReview`.
+
+Edges and vectors are only read here, so the hook loads no embedding model ([ADR 0051](adr/0051-similarity-edges-between-memories.md)). This is how a memory that names no symbol and shares no keyword with the prompt can still be recalled.
 
 ## Measuring recall
 

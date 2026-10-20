@@ -1195,6 +1195,19 @@ pub trait GraphStore {
         }
         Ok(())
     }
+
+    /// Batched `get_embedding`: the vectors of whichever `ids` have one.
+    /// `SimilarTo` edges keep no score, so recall's hop and the similarity
+    /// prune read their cosines from these; Postgres answers in one query.
+    fn get_embeddings(&self, repo: &str, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
+        let mut out = HashMap::new();
+        for &id in ids {
+            if let Some(vector) = self.get_embedding(repo, id)? {
+                out.insert(id, vector);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// `(kind, path, name, container)` -- the natural-key identity portion not

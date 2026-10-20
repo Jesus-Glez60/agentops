@@ -606,6 +606,17 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn get_embeddings(&self, repo: &str, ids: &[i64]) -> Result<std::collections::HashMap<i64, Vec<f32>>> {
+        if ids.is_empty() {
+            return Ok(Default::default());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT id, embedding FROM nodes WHERE repo = $1 AND id = ANY($2) AND embedding IS NOT NULL", &[&repo, &ids]).await?;
+            Ok(rows.into_iter().map(|row| (row.get::<_, i64>("id"), row.get::<_, pgvector::Vector>("embedding").to_vec())).collect())
+        })
+    }
+
     fn search_similar(&self, repo: &str, embedding: &[f32], top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
         anyhow::ensure!(embedding.len() == EMBEDDING_DIM, "query embedding has {} dims, expected {EMBEDDING_DIM}", embedding.len());
         self.rt.block_on(async {
@@ -1692,6 +1703,24 @@ mod tests {
         let moved = store.get_node("pg-repo-needs-review", id).unwrap().unwrap();
         assert_eq!((moved.id, moved.kind), (id, NodeKind::Decision));
         store.delete_nodes("pg-repo-needs-review", &[id]).unwrap();
+    }
+
+    #[test]
+    fn get_embeddings_reads_every_embedded_vector_in_one_call_and_skips_the_rest() {
+        const REPO: &str = "pg-repo-get-embeddings";
+        let store = require_store!();
+        store.wipe_repo(REPO).unwrap();
+        let a = upsert_node(&store, node(REPO, NodeKind::Note, Some("vault:a.md"), Some("a"))).unwrap();
+        let b = upsert_node(&store, node(REPO, NodeKind::Note, Some("vault:b.md"), Some("b"))).unwrap();
+        let mut v = vec![0.0f32; 384];
+        v[3] = 1.0;
+        store.set_embedding(REPO, a, &v).unwrap();
+        let got = store.get_embeddings(REPO, &[a, b, 999_999]).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[&a], v);
+        assert!(store.get_embeddings(REPO, &[]).unwrap().is_empty());
+        assert!(store.get_embeddings("pg-repo-other", &[a]).unwrap().is_empty(), "repo-scoped");
+        store.wipe_repo(REPO).unwrap();
     }
 
     #[test]

@@ -34,6 +34,10 @@ Add a plastic `EdgeRelation::SimilarTo` between memories (gotcha, decision, note
 - A hosted reindex fills in missing edges for every embedded memory, so it doubles as a backfill.
 - Postgres needed `edges_relation_check` widened (gotcha 54053).
 
+## Amendment, 2026-10-20 (milestone 3a item 3)
+
+Neighbour scoring changed. A neighbour now inherits its source's cue count and scores `source score × cosine × 0.8`, instead of counting as one cue at half its source's score. Under the old rule, seeds full of 2-to-5-cue keyword hits always cut the neighbours (`m2-report.md` §5). The cosine comes from stored vectors, because edges keep no score. The hop is still one step, still read-only, and still free of any embedding model.
+
 ## Evidence
 
 - `agentops-core/crates/agentops-graph/src/similarity.rs` and its tests (at most K both ways, never a doc section, degree cap, reinforce vs rescan).

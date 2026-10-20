@@ -16,6 +16,7 @@ Scores from `agentops recall-eval --remote --repeat 5` (`agentops-cli/src/recall
 | Baseline | `bc0d370` | 10/20 (50%), 10 exact, 0 equivalent | 3/5 | 0.239 | 105 / 141 | 20/20 |
 | Re-baseline with deep ranks (0b) | `e5e165f` | 9/20 (45%), 9 exact, 0 equivalent | 2/5 | 0.233 | 95 / 124 | 20/20 |
 | 1. Retitled imports (46 renamed on the server) | `e976a03` | 11/20 (55%), 11 exact, 0 equivalent | 3/5 | 0.245 | 99 / 128 | 20/20 |
+| 2. No doc sections in seeds | `6399325` | 13/20 (65%), 13 exact, 0 equivalent | 3/5 | 0.415 | 68 / 99 | 0/20 |
 
 Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 

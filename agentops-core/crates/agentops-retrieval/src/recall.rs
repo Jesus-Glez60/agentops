@@ -116,49 +116,98 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
 
     let enough = |c: &Candidate| c.reasons.iter().any(|r| r.starts_with("affects")) || c.reasons.len() >= min_keyword_matches;
     let shown = |id: &i64, prominence: NodeProminence| !exclude.contains(id) && prominence != NodeProminence::Pinned && prominence.recallable();
-    let mut ranked: Vec<(i64, Candidate)> = candidates.into_iter().filter(|(id, c)| shown(id, c.prominence) && enough(c)).collect();
-
-    // One `SimilarTo` hop from each memory that made it on its own cues
-    // (ADR 0051), so a memory that names no symbol and shares no keyword
-    // can still come up beside the one it resembles. Edges are only read
-    // here; they're computed at write time. A neighbour counts as one cue
-    // and scores half its source, so it ranks below what matched directly.
-    let mut seen: HashSet<i64> = ranked.iter().map(|(id, _)| *id).collect();
-    let mut neighbours = Vec::new();
-    for (source_id, source) in &ranked {
-        for edge in store.edges_from(repo, *source_id)? {
-            if edge.relation != EdgeRelation::SimilarTo || !seen.insert(edge.dst_id) {
-                continue;
-            }
-            let Some(neighbour) = store.get_node(repo, edge.dst_id)? else { continue };
-            if !RECALL_KINDS.contains(&neighbour.kind) || !shown(&neighbour.id, neighbour.prominence) {
-                continue;
-            }
-            let title = neighbour.name.clone().unwrap_or_else(|| "(untitled)".to_string());
-            neighbours.push((neighbour.id, Candidate { score: source.score * 0.5, kind: neighbour.kind, title, prominence: neighbour.prominence, reasons: vec![format!("similar to \"{}\"", source.title)] }));
-        }
-    }
-    ranked.extend(neighbours);
-    for (_, c) in &mut ranked {
-        if c.prominence == NodeProminence::Reduced {
-            c.score *= 0.5;
-        }
-    }
     // How many distinct cues a node matched comes first: rank fusion runs
     // per kind, so every kind's top hit scores alike, and a gotcha matching
     // three keywords must beat a decision matching two (seen live on the
-    // server graph). A named symbol's note counts as one cue more. Then the
-    // fused score, then id as a stable tiebreak.
-    let cues = |c: &Candidate| c.reasons.len() + usize::from(c.reasons.iter().any(|r| r.starts_with("affects")));
-    ranked.sort_by(|a, b| cues(&b.1).cmp(&cues(&a.1)).then(b.1.score.total_cmp(&a.1.score)).then(a.0.cmp(&b.0)));
+    // server graph). A named symbol's note counts as one cue more.
+    let mut ranked: Vec<Ranked> = candidates
+        .into_iter()
+        .filter(|(id, c)| shown(id, c.prominence) && enough(c))
+        .map(|(id, c)| {
+            let cues = c.reasons.len() + usize::from(c.reasons.iter().any(|r| r.starts_with("affects")));
+            let score = if c.prominence == NodeProminence::Reduced { c.score * 0.5 } else { c.score };
+            Ranked { id, cues, score, kind: c.kind, title: c.title, reasons: c.reasons }
+        })
+        .collect();
+    sort_ranked(&mut ranked);
+    hop(store, repo, &mut ranked, &shown)?;
     Ok(ranked
         .into_iter()
         .take(limit)
-        .map(|(id, c)| {
-            let reason = if c.reasons.iter().all(|r| r.starts_with('"')) { format!("matched {}", c.reasons.join(", ")) } else { c.reasons.join("; ") };
-            RecallPointer { node_id: id, kind: c.kind, title: c.title, reason }
+        .map(|r| {
+            let reason = if r.reasons.iter().all(|x| x.starts_with('"')) { format!("matched {}", r.reasons.join(", ")) } else { r.reasons.join("; ") };
+            RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason }
         })
         .collect())
+}
+
+/// What a neighbour reached over `SimilarTo` keeps of its source's score,
+/// on top of their cosine: a neighbour of a strong match can beat a weaker
+/// direct hit, but never its own source.
+pub const HOP_FACTOR: f64 = 0.8;
+
+/// A recall candidate with its strength: cues first, then score.
+struct Ranked {
+    id: i64,
+    cues: usize,
+    score: f64,
+    kind: NodeKind,
+    title: String,
+    reasons: Vec<String>,
+}
+
+/// Strongest first: cues, then score, then id as a stable tiebreak.
+fn sort_ranked(ranked: &mut [Ranked]) {
+    ranked.sort_by(|a, b| b.cues.cmp(&a.cues).then(b.score.total_cmp(&a.score)).then(a.id.cmp(&b.id)));
+}
+
+/// One `SimilarTo` hop from each memory that made it on its own cues
+/// (ADR 0051), so a memory that names no symbol and shares no keyword can
+/// still come up beside the one it resembles. A neighbour inherits its
+/// source's strength: the same cue count, and `source score × cosine ×
+/// HOP_FACTOR` (halved again if it's reduced). Edges keep no score, so the
+/// cosine comes from the two stored vectors; a neighbour without one isn't
+/// reached. A node reached directly and by a hop, or by two hops, keeps
+/// the stronger of them and every reason. Sources are walked strongest
+/// first, so the result never depends on map order.
+fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&i64, NodeProminence) -> bool) -> Result<()> {
+    let mut position: HashMap<i64, usize> = ranked.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
+    let sources: Vec<(i64, usize, f64, String)> = ranked.iter().map(|r| (r.id, r.cues, r.score, r.title.clone())).collect();
+    for (source_id, cues, score, title) in sources {
+        let targets: Vec<i64> = store.edges_from(repo, source_id)?.into_iter().filter(|e| e.relation == EdgeRelation::SimilarTo).map(|e| e.dst_id).collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let vectors = store.get_embeddings(repo, &[&[source_id][..], &targets].concat())?;
+        let Some(source_vector) = vectors.get(&source_id) else { continue };
+        for target in targets {
+            let Some(vector) = vectors.get(&target) else { continue };
+            let reason = format!("similar to \"{title}\"");
+            let cosine = f64::from(agentops_graph::similarity::cosine(source_vector, vector));
+            if let Some(&i) = position.get(&target) {
+                let r = &mut ranked[i];
+                if (cues, score * cosine * HOP_FACTOR) > (r.cues, r.score) && r.id != source_id {
+                    (r.cues, r.score) = (cues, score * cosine * HOP_FACTOR);
+                }
+                if r.id != source_id && !r.reasons.contains(&reason) {
+                    r.reasons.push(reason);
+                }
+                continue;
+            }
+            let Some(neighbour) = store.get_node(repo, target)? else { continue };
+            if !RECALL_KINDS.contains(&neighbour.kind) || !shown(&neighbour.id, neighbour.prominence) {
+                continue;
+            }
+            let mut hop_score = score * cosine * HOP_FACTOR;
+            if neighbour.prominence == NodeProminence::Reduced {
+                hop_score *= 0.5;
+            }
+            position.insert(target, ranked.len());
+            ranked.push(Ranked { id: target, cues, score: hop_score, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
+        }
+    }
+    sort_ranked(ranked);
+    Ok(())
 }
 
 /// Common English and instruction words that would match half the graph.
@@ -258,6 +307,9 @@ mod tests {
             store.add_edge("r", a, b, EdgeRelation::SimilarTo).unwrap();
             store.add_edge("r", b, a, EdgeRelation::SimilarTo).unwrap();
         }
+        for (id, tilt) in [(matched, 0.0), (associated, 0.3), (unsettled, 0.3)] {
+            store.set_embedding("r", id, &vector(tilt)).unwrap();
+        }
 
         let seed = recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap();
         assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![matched, associated], "{seed:?}");
@@ -266,6 +318,62 @@ mod tests {
         // Excluded or already-shown neighbours stay out too.
         let again = recall_seed(&store, "r", "webhook signature", 8, &HashSet::from([associated])).unwrap();
         assert_eq!(again.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![matched]);
+    }
+
+    /// A full-size unit-ish vector leaning `tilt` off the first axis.
+    fn vector(tilt: f32) -> Vec<f32> {
+        let mut v = vec![0.0; agentops_embeddings::EMBEDDING_DIM];
+        (v[0], v[1]) = (1.0, tilt);
+        v
+    }
+
+    fn link(store: &SqliteGraphStore, a: i64, b: i64) {
+        store.add_edge("r", a, b, EdgeRelation::SimilarTo).unwrap();
+        store.add_edge("r", b, a, EdgeRelation::SimilarTo).unwrap();
+    }
+
+    #[test]
+    fn a_neighbour_inherits_its_sources_strength_beats_a_weaker_direct_hit_but_never_its_source() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let source = note(&store, NodeKind::Gotcha, "Webhook signature deploy failure", "webhook signature deploy");
+        let weaker = note(&store, NodeKind::Decision, "Webhook signature rotation", "webhook signature");
+        let neighbour = note(&store, NodeKind::Note, "Rotate the app secret", "nothing shared");
+        link(&store, source, neighbour);
+        store.set_embedding("r", source, &vector(0.0)).unwrap();
+        store.set_embedding("r", neighbour, &vector(0.1)).unwrap();
+        let seed = recall_seed(&store, "r", "webhook signature deploy", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![source, neighbour, weaker], "3 cues inherited beat 2 direct: {seed:?}");
+        assert_eq!(seed[1].reason, "similar to \"Webhook signature deploy failure\"");
+    }
+
+    #[test]
+    fn a_node_reached_directly_and_by_a_hop_keeps_the_stronger_and_both_reasons() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let strong = note(&store, NodeKind::Gotcha, "Webhook signature deploy failure", "webhook signature deploy");
+        let weak = note(&store, NodeKind::Decision, "Webhook signature rotation", "webhook signature");
+        link(&store, strong, weak);
+        store.set_embedding("r", strong, &vector(0.0)).unwrap();
+        store.set_embedding("r", weak, &vector(0.1)).unwrap();
+        let seed = recall_seed(&store, "r", "webhook signature deploy", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![strong, weak]);
+        assert_eq!(seed[1].reason, "\"webhook\"; \"signature\"; similar to \"Webhook signature deploy failure\"", "{seed:?}");
+        assert!(seed[0].reason.starts_with("\"webhook\"; \"signature\"; \"deploy\""), "the reverse edge only adds a reason, never strength: {seed:?}");
+    }
+
+    #[test]
+    fn the_same_prompt_on_the_same_graph_always_gives_the_same_seed() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let sources: Vec<i64> = (0..6).map(|n| note(&store, NodeKind::Gotcha, &format!("webhook signature {n}"), "webhook signature")).collect();
+        let shared = note(&store, NodeKind::Note, "Shared neighbour", "nothing");
+        for (i, &s) in sources.iter().enumerate() {
+            link(&store, s, shared);
+            store.set_embedding("r", s, &vector(i as f32 * 0.1)).unwrap();
+        }
+        store.set_embedding("r", shared, &vector(0.25)).unwrap();
+        let first = recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap();
+        for _ in 0..20 {
+            assert_eq!(recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap(), first);
+        }
     }
 
     #[test]
