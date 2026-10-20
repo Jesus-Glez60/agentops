@@ -6,8 +6,8 @@
 //! evaluation measures the code the hook runs.
 //!
 //! A file cue's sources, in order of trust:
-//! 1. memories with `Affects` edges to symbols defined in the file
-//!    (score `AFFECTS_SCORE`);
+//! 1. memories with `Affects` edges to symbols defined in the file, scored
+//!    `affects_confidence_for` how many such memories the file reaches;
 //! 2. memories whose text mentions the file's repo-relative path
 //!    (`MENTION_PATH_SCORE`), or its bare file name when no other file in
 //!    the repo has that name (`MENTION_NAME_SCORE`);
@@ -24,7 +24,8 @@
 //!
 //! An error cue is the failed call's text, cleaned of paths, line numbers,
 //! hashes and timestamps, through the same recall. Gotchas get
-//! `ERROR_GOTCHA_BOOST`.
+//! `ERROR_GOTCHA_BOOST`, up to 1.0. Ties break on arrival order, never on
+//! node id.
 //!
 //! [`CueSources::AffectsOnly`] stops after source 1: what an agent gets
 //! today by calling `get_symbol` on the file's symbols, and the
@@ -37,10 +38,9 @@ use agentops_graph::{EdgeRelation, GraphStore, NodeKind, NodeProminence};
 use anyhow::Result;
 
 use crate::recall::{closest_similar, HOP_MAX_PER_SOURCE};
+use crate::recall::affects_confidence_for;
 use crate::{recall_scored_with, RecallPointer, HOP_FACTOR, RECALL_KINDS};
 
-/// Score of a memory `Affects`-linked to a symbol in the file.
-pub const AFFECTS_SCORE: f64 = 1.0;
 /// Score of a memory whose text names the file's repo-relative path.
 pub const MENTION_PATH_SCORE: f64 = 0.9;
 /// Score of a memory naming only the file's name, when that name is unique
@@ -50,8 +50,9 @@ pub const MENTION_NAME_SCORE: f64 = 0.7;
 pub const FILE_CUE_TEXT_MAX: usize = 300;
 /// Longest cleaned error text sent to recall.
 pub const ERROR_CUE_TEXT_MAX: usize = 300;
-/// A gotcha matching an error counts this much more: an error is when a
-/// gotcha matters most.
+/// A gotcha matching an error counts this much more, up to a score of 1.0:
+/// an error is when a gotcha matters most, but the boost lifts a partial
+/// match rather than putting a full one above everything.
 pub const ERROR_GOTCHA_BOOST: f64 = 1.5;
 /// Candidates taken from each source before merging.
 const PER_SOURCE: usize = 20;
@@ -237,7 +238,7 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
                 return Ok(Vec::new());
             }
             merged.extend(recall_scored_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().map(|(pointer, score)| {
-                let score = if pointer.kind == NodeKind::Gotcha { score * ERROR_GOTCHA_BOOST } else { score };
+                let score = if pointer.kind == NodeKind::Gotcha { (score * ERROR_GOTCHA_BOOST).min(1.0).max(score) } else { score };
                 WorkCandidate { pointer, score }
             }));
         }
@@ -270,26 +271,30 @@ pub fn activation(cues: &[Vec<(i64, f64)>], window: usize, decay: f64) -> HashMa
 
 /// Candidates by node id, each keeping its best score and the reason that
 /// came with it (the first source wins a tie).
+/// Ties break on arrival order: sources in order of trust, each in its own
+/// rank order (recall's ranking for the query sources), so a tie never
+/// falls back to node id.
 #[derive(Default)]
-struct Merged(HashMap<i64, WorkCandidate>);
+struct Merged(HashMap<i64, (usize, WorkCandidate)>);
 
 impl Merged {
     fn extend(&mut self, candidates: impl IntoIterator<Item = WorkCandidate>) {
         for c in candidates {
+            let arrival = self.0.len();
             match self.0.get_mut(&c.pointer.node_id) {
-                Some(existing) if c.score > existing.score => *existing = c,
+                Some((_, existing)) if c.score > existing.score => *existing = c,
                 Some(_) => {}
                 None => {
-                    self.0.insert(c.pointer.node_id, c);
+                    self.0.insert(c.pointer.node_id, (arrival, c));
                 }
             }
         }
     }
 
     fn sorted(&self) -> Vec<WorkCandidate> {
-        let mut out: Vec<WorkCandidate> = self.0.values().cloned().collect();
-        out.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.pointer.node_id.cmp(&b.pointer.node_id)));
-        out
+        let mut out: Vec<&(usize, WorkCandidate)> = self.0.values().collect();
+        out.sort_by(|(ia, a), (ib, b)| b.score.total_cmp(&a.score).then(ia.cmp(ib)));
+        out.into_iter().map(|(_, c)| c.clone()).collect()
     }
 }
 
@@ -324,6 +329,7 @@ fn affects_candidates(store: &dyn GraphStore, repo: &str, symbols: &[agentops_gr
             }
         }
     }
+    let score = affects_confidence_for(order.len());
     let mut out = Vec::new();
     for id in order {
         let Some(note) = store.get_node(repo, id)? else { continue };
@@ -331,7 +337,7 @@ fn affects_candidates(store: &dyn GraphStore, repo: &str, symbols: &[agentops_gr
             continue;
         }
         let reason = format!("affects {}", affected[&id].iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", "));
-        out.push(candidate(note, AFFECTS_SCORE, reason));
+        out.push(candidate(note, score, reason));
     }
     Ok(out)
 }
@@ -577,6 +583,13 @@ mod tests {
         assert!((a[&old] - ACTIVATION_DECAY.powi(10)).abs() < 1e-9, "ten cues back: {}", a[&old]);
         let windowed = activation(&cues, 5, ACTIVATION_DECAY);
         assert!(!windowed.contains_key(&old), "outside the window");
+    }
+
+    #[test]
+    fn an_affects_link_counts_less_the_more_memories_the_file_reaches() {
+        assert_eq!(affects_confidence_for(1), 1.0);
+        assert!((affects_confidence_for(crate::recall::AFFECTS_HUB) - 0.5).abs() < 1e-9);
+        assert!(affects_confidence_for(50) < 0.45 && affects_confidence_for(50) > 0.4);
     }
 
     #[test]

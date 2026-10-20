@@ -174,16 +174,16 @@ Milestone 3b, `agentops-retrieval/src/work_recall.rs`. A work cue is a file the 
 
 | Source | Score |
 | --- | --- |
-| 1. `Affects` edge to a symbol in the file (`GraphStore::nodes_in_file`) | `AFFECTS_SCORE` 1.0 |
+| 1. `Affects` edge to a symbol in the file (`GraphStore::nodes_in_file`) | `affects_confidence_for(n)`: 1.0 when the file reaches one such memory, 0.5 at `AFFECTS_HUB` (20), 0.43 at 50 |
 | 2. A memory naming the file's repo-relative path (`nodes_mentioning`, a plain substring) | `MENTION_PATH_SCORE` 0.9 |
 | 2. A memory naming only the file name, when no other file has that name (`count_files_named`) | `MENTION_NAME_SCORE` 0.7 |
 | One `SimilarTo` hop from sources 1-2, at most `HOP_MAX_PER_SOURCE` | source × cosine × `HOP_FACTOR` |
 | 3. The file as a query: name, non-generic parent directory, first heading, top-level symbols, at most `FILE_CUE_TEXT_MAX` characters | recall's confidence |
-| An error cue, cleaned (see below) | recall's confidence; gotchas × `ERROR_GOTCHA_BOOST` |
+| An error cue, cleaned (see below) | recall's confidence; gotchas × `ERROR_GOTCHA_BOOST`, capped at 1.0 |
 
-**Recall's confidence** (`recall_scored_with`) is recall's comparable score: the share of the query's rarity weight that a memory matched, 1.0 for a named symbol's `Affects` edge, and the cosine when recall by meaning scores higher. A hop neighbour gets its source's confidence × cosine × `HOP_FACTOR`, and a reduced memory gets half. It doesn't change recall's order, so `recall_seed_with` returns the same pointers as before.
+**Recall's confidence** (`recall_scored_with`) is recall's comparable score: the share of the query's rarity weight that a memory matched, capped at 0.5 for a one-keyword query; `affects_confidence_for` for a named symbol's `Affects` edge; and the cosine rescaled so that `DENSE_MIN_SCORE` is 0 and 1.0 is 1, when that scores higher. A hop neighbour gets its source's confidence × cosine × `HOP_FACTOR`, and a reduced memory gets half. It doesn't change recall's order, so `recall_seed_with` returns the same pointers as before.
 
-**How sources combine.** Path mentions are a substring search, not a full-text query, because the two stores combine full-text words differently (SQLite ORs them, Postgres ANDs them). A memory reached several ways keeps its best score.
+**How sources combine.** Path mentions are a substring search, not a full-text query, because the two stores combine full-text words differently (SQLite ORs them, Postgres ANDs them). A memory reached several ways keeps its best score. Ties break on arrival order (sources in trust order, each in its own rank), never on node id.
 
 **Cleaning an error cue.** Lines carrying `ERROR_KEYWORDS` come first. A path is cut to its file name; line:column suffixes, hex hashes, timestamps and `Exit code N` lines are dropped. The result is at most `ERROR_CUE_TEXT_MAX` characters.
 

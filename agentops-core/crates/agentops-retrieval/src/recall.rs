@@ -100,8 +100,9 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
 /// rank order alone isn't (milestone 3b: work-time recall thresholds and
 /// sums it). The order is exactly `recall_seed_with`'s.
 /// - Keywords: the share of the query's rarity weight the memory matched
-///   (all of its keywords is 1.0).
-/// - An `Affects` edge from a named symbol: 1.0.
+///   (all of its keywords is 1.0; a one-keyword query tops out at 0.5).
+/// - An `Affects` edge from a named symbol: `affects_confidence_for` the
+///   number of memories that symbol reaches.
 /// - Recall by meaning: the cosine rescaled from `DENSE_MIN_SCORE`..1 to
 ///   0..1, when higher.
 /// - A hop neighbour: its source's confidence × cosine × `HOP_FACTOR`.
@@ -174,23 +175,35 @@ pub fn recall_scored_with(store: &dyn GraphStore, repo: &str, query: &str, limit
 
     // An exactly named symbol is a strong cue: its notes rank like a
     // top-ranked keyword hit for each symbol named.
+    // Confidence of each memory reached through a named symbol: a symbol
+    // many memories affect says less about any one of them.
+    let mut affects_confidence: HashMap<i64, f64> = HashMap::new();
     for identifier in identifiers(query) {
         for (symbol, score) in store.search_exact(repo, &identifier, 3, Some(NodeKind::Symbol))? {
             if score != 0.0 {
                 continue; // substring match only, not the named symbol
             }
+            let mut notes = Vec::new();
             for edge in store.edges_to(repo, symbol.id)? {
                 if edge.relation != EdgeRelation::Affects {
                     continue;
                 }
                 let Some(note) = store.get_node(repo, edge.src_id)? else { continue };
                 if RECALL_KINDS.contains(&note.kind) {
-                    add(note.id, note.kind, note.name.as_deref(), note.prominence, 1.0, format!("affects `{identifier}`"), symbol_weight);
+                    notes.push(note);
                 }
+            }
+            let confidence = affects_confidence_for(notes.len());
+            for note in notes {
+                let best = affects_confidence.entry(note.id).or_insert(0.0);
+                *best = best.max(confidence);
+                add(note.id, note.kind, note.name.as_deref(), note.prominence, 1.0, format!("affects `{identifier}`"), symbol_weight);
             }
         }
     }
 
+    // One keyword, however rare, is half the evidence of two.
+    let single_keyword_cap = if keywords.len() >= 2 { 1.0 } else { 0.5 };
     let enough = |c: &Candidate| c.reasons.iter().any(|r| r.starts_with("affects")) || c.reasons.len() >= min_keyword_matches;
     let shown = |id: &i64, prominence: NodeProminence| !exclude.contains(id) && prominence != NodeProminence::Pinned && prominence.recallable();
     // The rarity-weighted strength of what a node matched comes first: rank
@@ -202,7 +215,8 @@ pub fn recall_scored_with(store: &dyn GraphStore, repo: &str, query: &str, limit
         .filter(|(id, c)| shown(id, c.prominence) && enough(c))
         .map(|(id, c)| {
             let reduced = if c.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
-            let confidence = if c.reasons.iter().any(|r| r.starts_with("affects")) || query_weight == 0.0 { 1.0 } else { (c.strength / query_weight).min(1.0) };
+            let keyword = if query_weight == 0.0 { 0.0 } else { (c.strength / query_weight).min(1.0) * single_keyword_cap };
+            let confidence = affects_confidence.get(&id).copied().unwrap_or(0.0).max(keyword);
             Ranked { id, strength: c.strength, score: c.score * reduced, confidence: confidence * reduced, hop: false, kind: c.kind, title: c.title, reasons: c.reasons }
         })
         .collect();
@@ -271,6 +285,18 @@ fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
     }
     ranked.extend(fused.into_values());
     sort_ranked(ranked);
+}
+
+/// Memories one symbol (or file) must reach before an `Affects` link to it
+/// counts half: a hub linked to 20 memories says little about each.
+pub const AFFECTS_HUB: usize = 20;
+
+/// Confidence of a memory reached over an `Affects` edge when `n` memories
+/// are reached the same way: 1.0 for the only one, 0.5 at `AFFECTS_HUB`,
+/// 0.43 at 50. Without it a hub file's 50 linked memories all scored 1.0
+/// and nothing else could rank (milestone 3b item 2).
+pub fn affects_confidence_for(n: usize) -> f64 {
+    1.0 / (1.0 + (n.max(1) as f64).ln() / (AFFECTS_HUB as f64).ln())
 }
 
 /// A cosine as confidence: 0 at `DENSE_MIN_SCORE` (barely related, the
