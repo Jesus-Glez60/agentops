@@ -12,7 +12,8 @@ Status values: **confirmed** (proven from repo artifacts), **likely** (read from
 | Resolved (2026-10-14, `9eb75fd`; F9 by deleting the files) | F1, F2, F9, F7, F8, F12, F13, F14, F16, F18, F19, F21–F28, F30, F34, F36, F41, F42, F44–F47; F29 hidden until a consumer exists |
 | Won't fix (author) | F3, F11, F17, F20, F32 |
 | Accepted (historical brief) | F4, F5, F6 |
-| Open | F48 (flaky verify test) |
+| Open | F48 (flaky verify test), F55–F58, F62 |
+| Resolved (milestone 2, 2026-10-16/17) | F59, F60, F61 |
 | Resolved before the docs | F10 |
 
 The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-15 and ADRs 0037 to 0045. Deployed as `5b13527`; live checks on 2026-10-14 confirmed F27 (onboarding doc of this repo: 372 files, 3,711 symbols), F28 (web search finds `startup_auth_check` by name), F30 (notes land in `.notes/` and attach to symbols) and F44 (search hits show `#<id>`).
@@ -417,6 +418,52 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 - Status: seen 2026-10-14; recorded as a gotcha on the hosted graph.
 - `connect --agents claude` rewrote the Ruler block to the claude paths only and un-ignored `.cursor/`, `.gemini/skills` and `AGENTS.md`. Restored by hand with `git checkout .gitignore`. Not fixed.
+
+### F55. Imported memories are titled with their kebab-case file slug
+
+- Status: found 2026-10-17 in the milestone 2 pilot (five-prompt check).
+- `agentops import-memory` titles a note with the entry's frontmatter `name`, which Claude Code writes as a slug (for example node 104450's title is its file name). The entry's human `description` would match prompts better; lexical recall weighs titles.
+- Open. Changing titles changes `add_note`'s natural key, so a fix needs a re-title path, not a re-import.
+
+### F56. `SIMILAR_MIN_SCORE = 0.75` links 77% of candidate pairs
+
+- Status: measured 2026-10-17 by `agentops-server link-similar` on this repo's hosted graph (357 memories, 2,621 candidate pairs, 10 nearest each).
+- 2,013 pairs score at least 0.75; the 0.75–0.80 bucket alone holds 1,258. On BGE-small, 0.75 means "same repo and style", not "related". The degree cap (12) then did most of the selecting: 115 edges dropped.
+- Open. Proposal in `handoffs/m2-report.md` §3.
+
+### F57. The five-prompt recall check scored 2 of 5
+
+- Status: run 2026-10-19 against the hosted graph after the milestone 2 import (`handoffs/m2-report.md` §5).
+- Misses come from three causes: the three digest doc sections take 3 of the 8 seed slots on every prompt (F53), prompts that share no word with the memory (lexical recall only), and `SimilarTo` neighbours counting as one cue so the 8-slot limit cuts them.
+- Open; milestone 3 (recall tuning) material.
+
+### F58. Hosted reindex never embeds or links notes
+
+- Status: found 2026-10-17 planning the milestone 2 backfill.
+- `indexing.rs` calls `persist(.., false)`, so the note-embedding pass (and since `e4e8fef` its `link_all_similar`) never runs on the hosted server; notes get vectors only when written by `add_note` with embeddings. 51 of 357 memories had none until the backfill.
+- Open. Workaround: `agentops-server link-similar <repo>` inside the app container (`bf5f702`).
+
+### F59. Hooks routed by the shell's cwd and wrote to stray local graphs
+
+- Status: found 2026-10-16 re-running milestone 1's checks; recorded as a gotcha on the hosted graph.
+- After a `cd` into a subdirectory, `hook-capture` missed `.context/agentops-remote.json` and opened a local graph there. Five stray graphs held the evidence the plan gate needed, and check 4's "anomaly" came from the same cause.
+- **Resolved** in `3ebe5a1` (`CLAUDE_PROJECT_DIR`, then the nearest ancestor with `.git`).
+
+### F60. A long pinned memory pushed a rule out of the pin block
+
+- Status: found 2026-10-17 measuring the live pin block after the import.
+- Decision 54003, pinned in place of a duplicate rule, has a 690-character first line; node 104420 was cut (and named, not dropped).
+- **Resolved** in `e054b45` (`PIN_LINE_MAX = 180`). Live block after: 15 rules, 2,482 characters.
+
+### F61. The importer's stale check matched words in entry bodies
+
+- Status: found 2026-10-17 in the first dry run: 12 of 49 entries to review, mostly other senses of "stale".
+- **Resolved** in `9e8a289`: only the description and the MEMORY.md line count, and a rule is never sent to review. Second dry run: 2.
+
+### F62. A Postgres store test failed once on the shared CI database
+
+- Status: seen 2026-10-17 at `9e8a289`; recorded as a gotcha.
+- `reinforce_edges_batch_bumps_every_edges_weight_and_respects_bump_confirmed_at` panicked on an `unwrap`; the commit touched no Postgres code and the next three runs passed. Panic message not captured. **Likely** a parallel-test interaction on the shared database.
 
 ### Observation: a scratch docbrain library on the hosted server
 
