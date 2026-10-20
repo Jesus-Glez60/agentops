@@ -107,6 +107,28 @@ The fallback means this mode never returns fewer results than flat search would 
 
 `recall_seed` (`agentops-retrieval/src/recall.rs`), the hook seed, follows one `SimilarTo` hop from each memory that qualified on its own cues (keywords or a named symbol), never from a doc section. A neighbour reached this way scores half its source, counts as one cue so it ranks below direct matches, gives `similar to "<source title>"` as its reason, and is dropped if excluded, pinned or `NeedsReview`. Edges are only read here, so the hook loads no embedding model ([ADR 0051](adr/0051-similarity-edges-between-memories.md)). This is how a memory that names no symbol and shares no keyword with the prompt can still be recalled.
 
+## Measuring recall
+
+`agentops recall-eval [--remote] [--cases <file>] [--mode plan|default] [--repeat N]` (`agentops-cli/src/recall_eval.rs`) scores the hook seed against fixed cases.
+
+**Cases.** JSONL lines of the form `{id, prompt, mode, targets: [node_id]}`, kept in `.context/recall-eval.jsonl` (git-ignored, because prompts can reveal private memories). A target that is pinned, needs review or missing is refused up front, since the seed never shows such a node.
+
+**Code path.** Each case is sent as a `UserPromptSubmit` payload through the real hook: `hooks::handle` locally, or `POST /repos/{id}/hooks/userpromptsubmit` with `--remote`. It is scored on the pointers the hook actually injected, after its budget cut. Only lines under the recall header count, because the pins above it have the same line shape. Latency is the hook call alone, which is how milestone 2 measured it.
+
+**Hits.** A target in the seed is an `exact` hit. Otherwise, a recalled gotcha, decision or note with cosine ≥ `EQUIVALENT_MIN_SCORE` (0.88) to a target is an `equivalent` hit: the same fact recorded twice.
+- `SimilarTo` edges keep no score, so the cosine is computed from the stored vectors.
+- Remotely it comes from `GET /repos/{id}/nodes/{node_id}/similarity?to=a,b`.
+- A node with no vector is left out, so it counts as no equivalent.
+- No embedding model is loaded on either path.
+
+**Output.**
+- A table with no prompt text.
+- `.context/recall-eval/<unix-time>.json`, with per case `{case_id, mode, first_hit_rank, hit_type, digest_in_seed, seed_kinds, latency_ms, latency_runs_ms, seed_stable}`, plus `{hit_rate, mrr, p50_ms, p95_ms}` overall.
+- Latency percentiles are nearest-rank over every run.
+- MRR uses each case's first run.
+
+**Side effect.** Runs are recorded as sessions whose ids start with `recall-eval-`, so per-session statistics should filter them out. Milestone 3a's baseline and per-item scores are in [`handoffs/m3a-eval.md`](handoffs/m3a-eval.md).
+
 ## Prominence dampening
 
 A `Reduced` gotcha ranks ×0.1 in `dense`, `hybrid` and `gist_then_detail`, and every result shows "⚠ reduced prominence — <reason>". The decision "Gotchas are curated, never resolved/dismissed -- don't reintroduce a bug-tracker model" lists the other surfaces it reaches: `list_gotchas`, `get_symbol`, `explain_symbol`'s prompt and docgen. Hosted `/local-search` applies it too (`dashboard.rs`); the single-operator `/local-search` in `agentops-api/src/search.rs` does not. In `dense` mode the distance is divided by the multiplier for sorting only; the printed distance is unchanged.

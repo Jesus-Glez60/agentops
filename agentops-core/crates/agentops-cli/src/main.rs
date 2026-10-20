@@ -13,6 +13,7 @@ mod compress_output;
 mod librarian;
 mod import_memory;
 mod mcp_client;
+mod recall_eval;
 mod remote_marker;
 mod usage;
 mod usage_report;
@@ -176,6 +177,28 @@ enum Command {
     LinkSimilar {
         #[arg(long, default_value = ".")]
         path: PathBuf,
+    },
+    /// Scores the prompt-time recall seed against fixed cases: each case
+    /// goes through the same `UserPromptSubmit` hook path a real prompt
+    /// takes (this repo's graph, or its server with `--remote`). Prints hit
+    /// rate, MRR and latency; writes per-case JSON under
+    /// `.context/recall-eval/`. Records its runs as `recall-eval-*` sessions.
+    RecallEval {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Run against the server this repo is connected to.
+        #[arg(long)]
+        remote: bool,
+        /// JSONL cases `{id, prompt, mode, targets}`; defaults to
+        /// `.context/recall-eval.jsonl`.
+        #[arg(long)]
+        cases: Option<PathBuf>,
+        /// Run every case in this mode instead of its own.
+        #[arg(long, value_enum)]
+        mode: Option<recall_eval::Mode>,
+        /// Runs per case (latency percentiles come from all of them).
+        #[arg(long, default_value_t = 5)]
+        repeat: usize,
     },
     /// Dense-vector search over embedded symbols/gotchas/decisions/notes —
     /// requires having scanned/added notes with --with-embeddings first.
@@ -692,6 +715,7 @@ fn main() -> Result<()> {
         Command::Changelog { path, since, limit } => changelog(&path, since, limit),
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
         Command::LinkSimilar { path } => link_similar(&path),
+        Command::RecallEval { path, remote, cases, mode, repeat } => recall_eval::run(&path, remote, cases.as_deref(), mode, repeat),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)

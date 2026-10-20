@@ -129,7 +129,7 @@ fn hook_repo_root(cwd: &Path, project_dir: Option<&str>) -> PathBuf {
 /// auth `usage::push_usage_remote` uses. The payload goes up without its
 /// local paths (`cwd`, `transcript_path`): the server resolves the repo
 /// from the connection and never reads them.
-fn call_remote(marker: &RemoteMcpMarker, event: &str, payload: &Value) -> Result<Option<Value>> {
+pub(crate) fn call_remote(marker: &RemoteMcpMarker, event: &str, payload: &Value) -> Result<Option<Value>> {
     let url = format!("{}/repos/{}/hooks/{event}", marker.server_url.trim_end_matches('/'), marker.connection_id);
     let mut body = payload.clone();
     if let Some(map) = body.as_object_mut() {

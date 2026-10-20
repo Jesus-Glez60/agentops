@@ -228,6 +228,55 @@ pub(crate) async fn node_detail_json(State(state): State<AppState>, user: Option
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct SimilarityQuery {
+    #[serde(default)]
+    tenant: Option<String>,
+    /// Comma-separated node ids. `#[serde(default)]` for the same reason
+    /// as `TenantQuery::tenant`: an absent query string must not 400.
+    #[serde(default)]
+    to: String,
+}
+
+/// `GET /repos/{id}/nodes/{node_id}/similarity?to=a,b` -- the cosine
+/// between `node_id`'s stored vector and each listed node's, read from the
+/// store (no model is loaded). `SimilarTo` edges keep no score, so this is
+/// how `agentops recall-eval --remote` tells an equivalent memory from a
+/// miss. A listed id that doesn't exist or has no vector is left out of
+/// `scores`, as is everything when `node_id` itself has none.
+pub(crate) async fn node_similarity_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath((id, node_id)): AxumPath<(String, i64)>, Query(q): Query<SimilarityQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let to: Vec<i64> = q.to.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Map<String, Value>>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        let mut scores = serde_json::Map::new();
+        let Some(source) = store.get_embedding(&repo, node_id)? else { return Ok(Some(scores)) };
+        for other in to {
+            if let Some(vector) = store.get_embedding(&repo, other)? {
+                scores.insert(other.to_string(), json!(agentops_graph::similarity::cosine(&source, &vector)));
+            }
+        }
+        Ok(Some(scores))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(scores))) => (StatusCode::OK, Json(json!({ "scores": scores }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// Writes one curation action to the tenant's audit log (milestone 2, ADR
 /// 0050: every curation is logged, not only team actions). The actor is
 /// the session's or personal API key's user; the instance-wide key has
@@ -1017,6 +1066,54 @@ mod tests {
         let resp = app.clone().oneshot(post("nosuchevent", &owner_token, json!({}))).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
         let resp = app.oneshot(post("userpromptsubmit", &other_token, json!({ "session_id": "s1", "prompt": "x" }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
+    }
+
+    #[tokio::test]
+    async fn node_similarity_scores_stored_vectors_skips_missing_ones_and_never_crosses_tenants() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&other.tenant, other.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+
+        let path = crate::indexing::checkout_path(checkouts_dir.path(), &owner.tenant, &connection_id);
+        let (a, b, c, unembedded) = {
+            let graph = agentops_mcp::open_store(&path).unwrap();
+            let repo = agentops_mcp::repo_name(&path);
+            let note = |name: &str| agentops_graph::upsert_node(graph.as_ref(), agentops_graph::NewNode { kind: agentops_graph::NodeKind::Note, repo: repo.clone(), path: Some(format!("vault:{name}")), name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some(name.into()) }).unwrap();
+            let (a, b, c, d) = (note("a"), note("b"), note("c"), note("d"));
+            let vector = |i: usize| {
+                let mut v = vec![0.0_f32; agentops_embeddings::EMBEDDING_DIM];
+                v[i] = 1.0;
+                v
+            };
+            graph.set_embedding(&repo, a, &vector(0)).unwrap();
+            graph.set_embedding(&repo, b, &vector(0)).unwrap();
+            graph.set_embedding(&repo, c, &vector(1)).unwrap();
+            (a, b, c, d)
+        };
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let get = |uri: String, token: &str| Request::builder().uri(uri).header("authorization", format!("Bearer {token}")).body(Body::empty()).unwrap();
+
+        let resp = app.clone().oneshot(get(format!("/repos/{connection_id}/nodes/{a}/similarity?to={b},{c},{unembedded},999999"), &owner_token)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let scores = body_json(resp).await["scores"].clone();
+        assert!((scores[b.to_string()].as_f64().unwrap() - 1.0).abs() < 1e-6, "{scores}");
+        assert!(scores[c.to_string()].as_f64().unwrap().abs() < 1e-6, "{scores}");
+        assert_eq!(scores.as_object().unwrap().len(), 2, "a node with no vector, or no such node, is left out: {scores}");
+
+        let resp = app.clone().oneshot(get(format!("/repos/{connection_id}/nodes/{a}/similarity"), &owner_token)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK, "an absent `to` must not 400");
+        assert_eq!(body_json(resp).await["scores"], json!({}));
+        let resp = app.clone().oneshot(get(format!("/repos/{connection_id}/nodes/{unembedded}/similarity?to={a}"), &owner_token)).await.unwrap();
+        assert_eq!(body_json(resp).await["scores"], json!({}));
+
+        let resp = app.oneshot(get(format!("/repos/{connection_id}/nodes/{a}/similarity?to={b}"), &other_token)).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
     }
 
