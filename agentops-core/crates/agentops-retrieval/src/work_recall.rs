@@ -401,6 +401,13 @@ pub fn file_query(path: &str, heading: Option<&str>, symbols: &[agentops_graph::
 /// means there's no heading.
 pub fn first_heading(text: &str) -> Option<String> {
     for line in text.lines().take(20) {
+        // A Read result as the model sees it numbers its lines
+        // (`     1\t# Title`, `1→# Title`).
+        let line = line.trim_start();
+        let line = match line.find(|c: char| !c.is_ascii_digit()) {
+            Some(i) if i > 0 => line[i..].strip_prefix('\t').or_else(|| line[i..].strip_prefix('→')).unwrap_or(line),
+            _ => line,
+        };
         let line = line.trim();
         if line.is_empty() || line.starts_with("#!") || line == "---" {
             continue;
@@ -558,6 +565,8 @@ mod tests {
         assert_eq!(first_heading("#!/bin/sh\n# Installs the CLI\nset -e").as_deref(), Some("Installs the CLI"));
         assert_eq!(first_heading("//! Cue resolution for recall\nuse x;").as_deref(), Some("Cue resolution for recall"));
         assert_eq!(first_heading("fn main() {}\n// later").as_deref(), None);
+        assert_eq!(first_heading("     1\t# Release checklist\n     2\tbody").as_deref(), Some("Release checklist"));
+        assert_eq!(first_heading("1→//! Hooks\n2→use x;").as_deref(), Some("Hooks"));
     }
 
     #[test]

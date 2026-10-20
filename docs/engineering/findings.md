@@ -503,6 +503,29 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 - Status: found 2026-10-20; recorded as a gotcha. `PER_QUERY = 10` lexical candidates per keyword and kind, plus `DENSE_TOP_K = 20`, bound the "deep" ranking as much as its cap of 50 does. A `vocabulary` miss means "not in recall's candidate pool".
 
+### F70. No unique index on a note's natural key: two concurrent writes can both create it
+
+- Status: known race, accepted in milestone 3b (the author approved milestone 3a's deviation, 2026-10-20).
+- `retitle_note` and the importer refuse a taken title with a check before the write, not a constraint. Two writes racing between the check and the insert can both succeed.
+
+### F71. Parallel tool calls can inject the same memory twice
+
+- Status: known race, milestone 3b. The author approved it as a deviation from "never twice", 2026-10-20.
+- `PostToolUse` fires concurrently for parallel tool calls (hooks reference). Two cues handled at once each read the shown set before either records its injection.
+- `work_recall::on_cue` reads the shown set again just before recording, which narrows the window. Only a lock across processes would close it. The manual session counts how often it happens.
+
+### F72. Searches go through Bash, so the `search` event records almost nothing
+
+- Status: measured 2026-10-20 (`handoffs/m3b-eval.md`). In 30 days: 1 `Grep` call and 0 `Glob` calls, against about 6,000 Bash `grep`/`rg`/`find` commands. Milestone 3b keeps the spec's Grep/Glob-only scope; recording Bash searches is open for milestone 4.
+
+### F73. Work-time scores saturate on hub files and one-word queries
+
+- Status: found and partly fixed in milestone 3b item 2 (`b783df4`).
+- **Affects floods.** A hub file reached up to 50 `Affects` memories, all at 1.0. They're now dampened by count (0.43 at 50).
+- **One-word queries.** A one-keyword query gave every match full confidence; it now tops out at 0.5.
+- **Ties.** Ties now break on rank rather than node id.
+- **Hit rate unchanged at 10/20.** The remaining misses are mostly ties among several relevant memories, or targets ranked low (`m3b-eval.md`).
+
 ### Observation: a scratch docbrain library on the hosted server
 
 - The 2026-10-13 SSRF check registered `zz-ssrf-check` in the author's org docbrain store. No tool deletes a library; it is hidden from the Libraries list because it has no content. Not a defect.

@@ -28,7 +28,10 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::recall_eval::{percentile, remote_send, unix_secs, Backend, DEEP_LIMIT};
+use agentops_mcp::work_recall::{ReplayInjection, ReplayStep};
+use agentops_retrieval::work_recall::first_heading;
+
+use crate::recall_eval::{percentile, remote_send, remote_send_within, unix_secs, Backend, DEEP_LIMIT};
 use crate::remote_marker::read_remote_marker;
 
 /// Transcripts older than this aren't sized (the spec's 30 days).
@@ -408,47 +411,168 @@ fn render(results: &[CaseResult], summary: &Summary, label: &str) -> String {
 // Replay
 // ---------------------------------------------------------------------
 
-/// Per-session replay numbers. Injection fields stay zero until the hook
-/// injects (milestone 3b item 4).
+/// Replay steps sent per request (each cue takes ~85 ms on the server).
+const REPLAY_CHUNK: usize = 25;
+/// Time one replay chunk may take.
+const REPLAY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One transcript as replay steps, in order: user prompts (main session
+/// only), compactions, and a cue per tool call when its result arrives,
+/// which is when `PostToolUse` fires. A read's heading comes from its
+/// result; an error is redacted, as the hook redacts it.
+pub(crate) fn read_steps(path: &Path, root: &Path, agent_id: Option<&str>) -> Result<Vec<ReplayStep>> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let mut calls: HashMap<String, (String, Value)> = HashMap::new();
+    let mut done: HashSet<String> = HashSet::new();
+    let mut steps = Vec::new();
+    for line in text.lines() {
+        let Ok(entry) = serde_json::from_str::<Value>(line) else { continue };
+        if entry.get("subtype").and_then(Value::as_str) == Some("compact_boundary") && agent_id.is_none() {
+            steps.push(ReplayStep::Compact);
+            continue;
+        }
+        let content = entry.pointer("/message/content");
+        if let (Some(Value::String(prompt)), None, Some("user")) = (content, agent_id, entry.get("type").and_then(Value::as_str)) {
+            let meta = entry.get("isMeta").and_then(Value::as_bool).unwrap_or(false);
+            if !meta && !prompt.trim().is_empty() && !prompt.trim_start().starts_with('<') {
+                let plan = entry.get("permissionMode").and_then(Value::as_str) == Some("plan");
+                steps.push(ReplayStep::Prompt { prompt: agentops_security::redact(prompt).text, plan });
+            }
+            continue;
+        }
+        let Some(blocks) = content.and_then(Value::as_array) else { continue };
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        calls.entry(id.to_string()).or_insert_with(|| (block.get("name").and_then(Value::as_str).unwrap_or_default().to_string(), block.get("input").cloned().unwrap_or(Value::Null)));
+                    }
+                }
+                Some("tool_result") => {
+                    let Some(id) = block.get("tool_use_id").and_then(Value::as_str) else { continue };
+                    let Some((tool, input)) = calls.get(id) else { continue };
+                    if !done.insert(id.to_string()) {
+                        continue;
+                    }
+                    let call = ToolCall { tool: tool.clone(), input: input.clone(), failed: block.get("is_error").and_then(Value::as_bool).unwrap_or(false), result: result_text(block.get("content").unwrap_or(&Value::Null)) };
+                    let cue = match cue_of(&call, root) {
+                        Some(WorkCue::File { path, .. }) => WorkCue::File { path, heading: matches!(call.tool.as_str(), "Read" | "NotebookRead" | "Bash").then(|| first_heading(&call.result)).flatten() },
+                        Some(WorkCue::Error { text }) => WorkCue::Error { text: agentops_security::redact(&text).text },
+                        None => continue,
+                    };
+                    steps.push(ReplayStep::Cue { agent_id: agent_id.map(String::from), cue });
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(steps)
+}
+
+/// Per-session replay numbers.
 #[derive(Debug, Default, Serialize)]
 struct ReplaySession {
     session: String,
     events: usize,
     cues: usize,
-    file_cues: usize,
-    error_cues: usize,
     contexts: usize,
     injections: usize,
     chars_added: usize,
     distinct_memories: usize,
+    /// The most work-time pointers any one context got.
+    max_per_context: usize,
 }
 
-fn replay(path: &Path, root: &Path, sessions: &[String]) -> Result<()> {
+/// One labelling line: an injection's pointer with its cue. Node ids and
+/// paths only, no memory text (the author labels it `useful`, `neutral`
+/// or `noise`).
+#[derive(Debug, Serialize)]
+struct LabelLine {
+    session: String,
+    context: String,
+    step: usize,
+    cue: String,
+    node_id: i64,
+    kind: String,
+    activation: f64,
+    label: String,
+}
+
+fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score: Option<f64>) -> Result<()> {
     let transcripts = read_transcripts(path, None, None, Some(sessions))?;
-    let mut by_session: BTreeMap<String, ReplaySession> = BTreeMap::new();
-    for t in &transcripts {
-        let s = by_session.entry(t.session_id.clone()).or_insert_with(|| ReplaySession { session: t.session_id.clone(), ..Default::default() });
-        s.events += t.calls.len();
-        s.contexts += 1;
-        for cue in t.calls.iter().filter_map(|c| cue_of(c, root)) {
-            s.cues += 1;
-            match cue {
-                WorkCue::File { .. } => s.file_cues += 1,
-                WorkCue::Error { .. } => s.error_cues += 1,
-            }
-        }
-    }
     for prefix in sessions {
-        if !by_session.keys().any(|k| k.starts_with(prefix.as_str())) {
+        if !transcripts.iter().any(|t| t.session_id.starts_with(prefix.as_str())) {
             bail!("no transcript for session {prefix}");
         }
     }
-    let sessions: Vec<ReplaySession> = by_session.into_values().collect();
-    println!("{:<10} {:>6} {:>5} {:>5} {:>5} {:>8} {:>10} {:>6} {:>8}", "session", "events", "cues", "file", "error", "contexts", "injections", "chars", "memories");
-    for s in &sessions {
-        println!("{:<10} {:>6} {:>5} {:>5} {:>5} {:>8} {:>10} {:>6} {:>8}", &s.session[..8.min(s.session.len())], s.events, s.cues, s.file_cues, s.error_cues, s.contexts, s.injections, s.chars_added, s.distinct_memories);
+    let marker = if remote { Some(read_remote_marker(path).with_context(|| format!("--remote needs a server connection; {} has no .context/agentops-remote.json", path.display()))?) } else { None };
+    let local = if remote { None } else { Some((agentops_mcp::open_store(path)?, agentops_mcp::repo_name(path))) };
+    let home = crate::usage::default_claude_home().join("projects").join(crate::usage::sanitize_project_path(root));
+
+    let mut summaries: BTreeMap<String, ReplaySession> = BTreeMap::new();
+    let mut labels = Vec::new();
+    for t in &transcripts {
+        let file = match &t.agent_id {
+            None => home.join(format!("{}.jsonl", t.session_id)),
+            Some(agent) => home.join(&t.session_id).join("subagents").join(format!("{agent}.jsonl")),
+        };
+        let steps = read_steps(&file, root, t.agent_id.as_deref())?;
+        let summary = summaries.entry(t.session_id.clone()).or_insert_with(|| ReplaySession { session: t.session_id.clone(), ..Default::default() });
+        summary.events += t.calls.len();
+        summary.contexts += 1;
+        summary.cues += steps.iter().filter(|s| matches!(s, ReplayStep::Cue { .. })).count();
+
+        // Contexts never share state, so each transcript replays on its own.
+        let mut events: Vec<agentops_mcp::work_recall::LoggedEvent> = Vec::new();
+        let mut shown_here = 0;
+        for (chunk_no, chunk) in steps.chunks(REPLAY_CHUNK).enumerate() {
+            let injections: Vec<ReplayInjection> = match (&marker, &local) {
+                (Some(marker), _) => {
+                    let reply = remote_send_within(marker, "work-recall/replay", Some(&json!({ "events": events, "steps": chunk, "min_score": min_score })), REPLAY_TIMEOUT)?;
+                    events = serde_json::from_value(reply["events"].clone()).context("reading the replay's events")?;
+                    serde_json::from_value(reply["injections"].clone()).context("reading the replay's injections")?
+                }
+                (None, Some((store, repo))) => {
+                    let mut log = agentops_mcp::work_recall::MemoryLog::from_logged(&events);
+                    let mut settings = agentops_mcp::work_recall::Settings::default();
+                    if let Some(min) = min_score {
+                        settings.min_score = min;
+                    }
+                    let out = agentops_mcp::work_recall::replay(store.as_ref(), repo, &mut log, chunk, None, settings)?;
+                    events = log.to_logged();
+                    out
+                }
+                (None, None) => unreachable!(),
+            };
+            for injection in injections {
+                summary.injections += 1;
+                summary.chars_added += injection.chars;
+                shown_here += injection.shown.len();
+                let cue = match &injection.cue {
+                    WorkCue::File { path, .. } => path.clone(),
+                    WorkCue::Error { .. } => "(error)".to_string(),
+                };
+                for (node_id, kind, _title, _reason, activation) in injection.shown {
+                    labels.push(LabelLine { session: t.session_id.clone(), context: t.agent_id.clone().unwrap_or_else(|| "main".into()), step: chunk_no * REPLAY_CHUNK + injection.step, cue: cue.clone(), node_id, kind, activation, label: String::new() });
+                }
+            }
+        }
+        summary.max_per_context = summary.max_per_context.max(shown_here);
     }
-    write_result(path, "replay", &json!({ "sessions": sessions }))
+    for summary in summaries.values_mut() {
+        summary.distinct_memories = labels.iter().filter(|l| l.session == summary.session).map(|l| l.node_id).collect::<HashSet<_>>().len();
+    }
+
+    println!("{:<10} {:>6} {:>5} {:>8} {:>10} {:>6} {:>8} {:>8}", "session", "events", "cues", "contexts", "injections", "chars", "memories", "max/ctx");
+    for s in summaries.values() {
+        println!("{:<10} {:>6} {:>5} {:>8} {:>10} {:>6} {:>8} {:>8}", &s.session[..8.min(s.session.len())], s.events, s.cues, s.contexts, s.injections, s.chars_added, s.distinct_memories, s.max_per_context);
+    }
+    let dir = path.join(".context").join("work-recall-eval");
+    std::fs::create_dir_all(&dir)?;
+    let labels_file = dir.join(format!("labels-{}.jsonl", unix_secs()));
+    std::fs::write(&labels_file, labels.iter().map(|l| serde_json::to_string(l).unwrap_or_default()).collect::<Vec<_>>().join("\n") + "\n")?;
+    println!("Labelling file ({} pointers): {}", labels.len(), labels_file.display());
+    write_result(path, "replay", &json!({ "min_score": min_score, "sessions": summaries.values().collect::<Vec<_>>() }))
 }
 
 // ---------------------------------------------------------------------
@@ -469,6 +593,7 @@ pub(crate) struct Options<'a> {
     pub(crate) repeat: usize,
     pub(crate) sizing: bool,
     pub(crate) replay: &'a [String],
+    pub(crate) min_score: Option<f64>,
 }
 
 pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
@@ -477,7 +602,7 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
         return sizing(path, &root);
     }
     if !options.replay.is_empty() {
-        return replay(path, &root, options.replay);
+        return replay(path, &root, options.replay, options.remote, options.min_score);
     }
     let cases_file = options.cases.map(Path::to_path_buf).unwrap_or_else(|| path.join(".context").join("work-recall-eval.jsonl"));
     let cases = read_cases(&cases_file)?;
@@ -548,6 +673,36 @@ mod tests {
         for unhooked in ["<tool_use_error>InputValidationError: x</tool_use_error>", "Permission for this action was denied by the Claude Code auto mode classifier."] {
             assert_eq!(cue_of(&call("Bash", json!({}), true, unhooked), root), None, "{unhooked}");
         }
+    }
+
+    #[test]
+    fn a_transcript_replays_as_prompts_compactions_and_a_cue_per_finished_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Path::new("/r");
+        let path = write(
+            dir.path(),
+            "s.jsonl",
+            &[
+                json!({"type": "user", "permissionMode": "plan", "message": {"content": "tag the release"}}),
+                json!({"type": "user", "isMeta": true, "message": {"content": "meta"}}),
+                json!({"type": "user", "message": {"content": "<task-notification>x"}}),
+                json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "a", "name": "Read", "input": {"file_path": "/r/docs/release.md"}}]}}),
+                json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "a", "content": "     1\t# Release checklist\n     2\tbody"}]}}),
+                json!({"type": "system", "subtype": "compact_boundary"}),
+                json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "cargo test"}}]}}),
+                json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "b", "is_error": true, "content": "Exit code 101\npanicked"}]}}),
+            ],
+        );
+        let steps = read_steps(&path, root, None).unwrap();
+        let shape: Vec<String> = steps.iter().map(|s| match s {
+            ReplayStep::Prompt { prompt, plan } => format!("prompt:{prompt}:{plan}"),
+            ReplayStep::Compact => "compact".into(),
+            ReplayStep::Cue { cue: WorkCue::File { path, heading }, .. } => format!("file:{path}:{}", heading.clone().unwrap_or_default()),
+            ReplayStep::Cue { cue: WorkCue::Error { text }, .. } => format!("error:{}", text.lines().count()),
+        }).collect();
+        assert_eq!(shape, ["prompt:tag the release:true", "file:docs/release.md:Release checklist", "compact", "error:2"]);
+        let sub = read_steps(&path, root, Some("agent-a")).unwrap();
+        assert!(sub.iter().all(|s| matches!(s, ReplayStep::Cue { agent_id: Some(_), .. })), "a subagent has no prompts or compactions of its own");
     }
 
     #[test]

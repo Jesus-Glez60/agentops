@@ -194,12 +194,18 @@ fn remote_get(marker: &RemoteMcpMarker, rest: &str) -> Result<Value> {
 
 /// `GET`, or `POST` with a JSON body, to `{server}/repos/{connection}/{rest}`.
 pub(crate) fn remote_send(marker: &RemoteMcpMarker, rest: &str, body: Option<&Value>) -> Result<Value> {
+    remote_send_within(marker, rest, body, crate::hook_capture::REMOTE_HOOK_TIMEOUT)
+}
+
+/// `remote_send` with its own timeout, for calls slower than a hook (a
+/// replay chunk).
+pub(crate) fn remote_send_within(marker: &RemoteMcpMarker, rest: &str, body: Option<&Value>, timeout: std::time::Duration) -> Result<Value> {
     let url = format!("{}/repos/{}/{rest}", marker.server_url.trim_end_matches('/'), marker.connection_id);
     let auth = format!("Bearer {}", marker.api_key);
     let method = if body.is_some() { "POST" } else { "GET" };
     let response = match body {
-        Some(body) => ureq::post(&url).header("Authorization", &auth).config().http_status_as_error(false).timeout_global(Some(crate::hook_capture::REMOTE_HOOK_TIMEOUT)).build().send_json(body),
-        None => ureq::get(&url).header("Authorization", &auth).config().http_status_as_error(false).timeout_global(Some(crate::hook_capture::REMOTE_HOOK_TIMEOUT)).build().call(),
+        Some(body) => ureq::post(&url).header("Authorization", &auth).config().http_status_as_error(false).timeout_global(Some(timeout)).build().send_json(body),
+        None => ureq::get(&url).header("Authorization", &auth).config().http_status_as_error(false).timeout_global(Some(timeout)).build().call(),
     };
     let mut response = response.with_context(|| format!("calling {method} {url}"))?;
     if !response.status().is_success() {

@@ -22,6 +22,16 @@ pub const DEFAULT_SEED_MAX_ITEMS: usize = 5;
 /// Most recall pointers one work cue (a file read or edited, an error)
 /// injects (milestone 3b): a glance, not a briefing.
 pub const WORK_RECALL_MAX_ITEMS: usize = 3;
+/// Everything one work cue may inject: about 3 pointers, small enough to
+/// add to many tool results.
+pub const WORK_RECALL_BUDGET: usize = 800;
+/// Activation a memory needs before a work cue shows it: the precision
+/// lever. **Provisional** until the author labels the replay (milestone 3b
+/// spec, instruction 6).
+pub const INJECT_MIN_SCORE: f64 = 0.6;
+/// Work-time pointers one context gets at most; past it only error cues
+/// inject. Caps the worst case at a few thousand characters per context.
+pub const MAX_INJECTED_PER_CONTEXT: usize = 30;
 /// Everything a `SubagentStart` hook injects; same as the session guide.
 pub const SUBAGENT_SEED_BUDGET: usize = 2000;
 /// The pinned block (milestone 2): its own budget, added on top of

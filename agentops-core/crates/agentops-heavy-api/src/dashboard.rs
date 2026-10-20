@@ -810,6 +810,52 @@ pub(crate) async fn work_recall_json(State(state): State<AppState>, user: Option
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct WorkRecallReplayBody {
+    #[serde(default)]
+    events: Vec<agentops_mcp::work_recall::LoggedEvent>,
+    steps: Vec<agentops_mcp::work_recall::ReplayStep>,
+    #[serde(default)]
+    min_score: Option<f64>,
+}
+
+/// `POST /repos/{id}/work-recall/replay` -- runs a chunk of a past
+/// session's steps (cues, prompts, compactions) through the hook's own
+/// work-time recall (`agentops_mcp::work_recall::replay`) against an
+/// in-memory event log, never the store's. The caller passes the log the
+/// previous chunk returned, so a long session replays in several requests.
+/// Replies `{events, injections}`.
+pub(crate) async fn work_recall_replay_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<WorkRecallReplayBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        let mut log = agentops_mcp::work_recall::MemoryLog::from_logged(&body.events);
+        let mut settings = agentops_mcp::work_recall::Settings::default();
+        if let Some(min) = body.min_score {
+            settings.min_score = min;
+        }
+        let injections = agentops_mcp::work_recall::replay(store.as_ref(), &repo, &mut log, &body.steps, Some(&SERVER_EMBEDDER), settings)?;
+        Ok(Some(json!({ "events": log.to_logged(), "injections": injections })))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(reply))) => (StatusCode::OK, Json(reply)),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// `GET /repos/{id}/docs` -- mirrors `agentops-api`'s `docs_json` cache-hit/
 /// miss logic exactly (persisted `doc_pages` row if present, else a
 /// heuristic-only page built on the fly, never persisted from here).
@@ -1403,6 +1449,29 @@ mod tests {
         let graph = agentops_mcp::open_store(&path).unwrap();
         assert!(graph.session_events_for_repo(&repo, None).unwrap().is_empty(), "a work-recall probe records nothing");
 
+        let replay = |token: &str, body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/repos/{connection_id}/work-recall/replay"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let steps = json!([{ "step": "cue", "cue": { "kind": "file", "path": "src/hooks.rs" } }, { "step": "cue", "cue": { "kind": "file", "path": "src/hooks.rs" } }]);
+        let resp = app.clone().oneshot(replay(&owner_token, json!({ "steps": steps, "min_score": 0.1 }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let reply = body_json(resp).await;
+        let injections = reply["injections"].as_array().unwrap();
+        assert_eq!(injections.len(), 1, "shown once, never twice: {reply}");
+        assert_eq!(injections[0]["shown"][0][0], json!(gotcha));
+        // The returned log carries on: the next chunk doesn't show it again.
+        let resp = app.clone().oneshot(replay(&owner_token, json!({ "events": reply["events"], "steps": [steps[0]], "min_score": 0.1 }))).await.unwrap();
+        assert!(body_json(resp).await["injections"].as_array().unwrap().is_empty());
+        assert!(graph.session_events_for_repo(&repo, None).unwrap().is_empty(), "a replay records nothing in the store");
+
+        let resp = app.clone().oneshot(replay(&other_token, json!({ "steps": [] }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
         let resp = app.oneshot(post(&other_token, json!({ "cue": { "kind": "file", "path": "src/hooks.rs" } }))).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
     }

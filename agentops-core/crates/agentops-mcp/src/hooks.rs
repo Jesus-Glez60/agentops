@@ -59,8 +59,8 @@ pub fn handle(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value) 
 /// `handle` and never loads it (ADR 0052).
 pub fn handle_with(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     match event {
-        "posttooluse" => post_tool_use(store, repo, payload, embedder).map(|()| None),
-        "posttoolusefailure" => post_tool_use_failure(store, repo, payload, embedder).map(|()| None),
+        "posttooluse" => post_tool_use(store, repo, payload, embedder),
+        "posttoolusefailure" => post_tool_use_failure(store, repo, payload, embedder),
         "userpromptsubmit" => user_prompt_submit(store, repo, payload, embedder),
         "sessionstart" => session_start(store, repo, payload),
         "pretooluse" => pre_tool_use(store, repo, payload),
@@ -122,7 +122,7 @@ struct PostToolUsePayload {
     tool_response: Value,
 }
 
-fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
+fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     let session_id = session_id(payload);
     let raw = payload;
     let payload: PostToolUsePayload = serde_json::from_value(payload.clone()).context("parsing PostToolUse payload")?;
@@ -140,16 +140,18 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: 
     // A file read or edited inside the repo is a work cue (milestone 3b).
     // Its first heading comes from a read's result; the content itself is
     // never stored.
+    let mut injected = None;
     if let (Some((FILE_READ | "file_modified", _)), Some(path)) = (&recorded, rel_path(raw)) {
-        let heading = matches!(payload.tool_name.as_str(), "Read" | "NotebookRead" | "Bash").then(|| agentops_retrieval::work_recall::first_heading(&render_tool_response(&payload.tool_response))).flatten();
-        work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::File { path: path.to_string(), heading }, embedder)?;
+        let heading = matches!(payload.tool_name.as_str(), "Read" | "NotebookRead" | "Bash").then(|| agentops_retrieval::work_recall::first_heading(&read_text(&payload.tool_response))).flatten();
+        injected = work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::File { path: path.to_string(), heading }, embedder)?;
     }
+    let output = injected.map(|context| hook_output("PostToolUse", Some(&context), None));
 
     let text = render_tool_response(&payload.tool_response);
     if text.chars().count() <= DEFAULT_CHAR_BUDGET {
         // Small enough to not be worth capturing — the whole point is only
         // ever intervening on the outputs that would otherwise bloat context.
-        return Ok(());
+        return Ok(output);
     }
 
     // Stored in full (redacted, not truncated) — the whole point of a
@@ -195,7 +197,7 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: 
         let _ = store.record_session_event(repo, session_id, &payload.tool_name, &format!("captured tool output contains volatile content ({summary}) — may look stale if reused verbatim in a later session"), Some(node_id), "cache_hazard_warning");
     }
 
-    Ok(())
+    Ok(output)
 }
 
 /// Feeds `get_session_guide`'s "Files Modified"/"Git Ops"/"External
@@ -318,16 +320,20 @@ fn render_tool_response(value: &Value) -> String {
 // PostToolUseFailure
 // ---------------------------------------------------------------------
 
-/// Resolves a work cue and records what it reached as one `work_cue` event
-/// in the payload's context (nothing when it reached nothing).
-fn work_cue(store: &dyn GraphStore, repo: &str, payload: &Value, cue: &agentops_retrieval::work_recall::WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
-    use agentops_retrieval::work_recall::{resolve_cue, CueSources};
-    let candidates = resolve_cue(store, repo, cue, CueSources::All, embedder)?;
-    if !candidates.is_empty() {
-        let scores = crate::work_recall::cue_scores(&candidates);
-        store.record_session_event_in(repo, session_id(payload), "cue", &crate::work_recall::format_cue(&scores), None, crate::work_recall::WORK_CUE, agent_id(payload))?;
-    }
-    Ok(())
+/// One work cue in the payload's context (`work_recall::on_cue`): the
+/// context to inject, if any.
+fn work_cue(store: &dyn GraphStore, repo: &str, payload: &Value, cue: &agentops_retrieval::work_recall::WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<String>> {
+    let mut log = crate::work_recall::StoreLog { store, repo, session_id: session_id(payload) };
+    Ok(crate::work_recall::on_cue(store, repo, &mut log, agent_id(payload), cue, embedder, crate::work_recall::Settings::default())?.map(|i| i.context))
+}
+
+/// The text a read returned, for its first heading. `PostToolUse` passes
+/// the tool's structured output (hooks reference): for `Read` the file's
+/// content sits under `file.content` (**unverified** against a recorded
+/// payload), for Bash under `stdout`; anything else goes through
+/// `render_tool_response`.
+fn read_text(response: &Value) -> String {
+    response.pointer("/file/content").or_else(|| response.get("stdout")).and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| render_tool_response(response))
 }
 
 /// Claude Code's docs (as fetched) confirm `tool_name`/`tool_input` but
@@ -342,7 +348,7 @@ struct PostToolUseFailurePayload {
     error: Value,
 }
 
-fn post_tool_use_failure(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
+fn post_tool_use_failure(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     let session_id = session_id(payload);
     let raw = payload;
     let payload: PostToolUseFailurePayload = serde_json::from_value(payload.clone()).context("parsing PostToolUseFailure payload")?;
@@ -351,10 +357,11 @@ fn post_tool_use_failure(store: &dyn GraphStore, repo: &str, payload: &Value, em
     let redacted = agentops_security::redact(&capped.text);
     store.record_session_event_in(repo, session_id, &payload.tool_name, &redacted.text, None, "error", agent_id(raw))?;
     // The error is a work cue, unless the user interrupted the call.
-    if !raw.get("is_interrupt").and_then(|v| v.as_bool()).unwrap_or(false) {
-        work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::Error { text: redacted.text }, embedder)?;
+    if raw.get("is_interrupt").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return Ok(None);
     }
-    Ok(())
+    let injected = work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::Error { text: redacted.text }, embedder)?;
+    Ok(injected.map(|context| hook_output("PostToolUseFailure", Some(&context), None)))
 }
 
 // ---------------------------------------------------------------------
@@ -403,9 +410,9 @@ pub fn last_prompt(store: &dyn GraphStore, repo: &str, session_id: &str) -> Resu
     Ok(store.session_events(repo, session_id)?.into_iter().rev().find(|e| e.event_kind == "user_intent" && (e.tool_name == PROMPT_TOOL || e.tool_name == PLAN_PROMPT_TOOL)).map(|e| e.description))
 }
 
-/// Node ids a hook already injected in this session.
-fn injected_ids(events: &[agentops_graph::SessionEvent]) -> std::collections::HashSet<i64> {
-    events.iter().filter(|e| e.event_kind == RECALL_INJECTED).flat_map(|e| e.description.trim_start_matches("ids ").split(',').filter_map(|id| id.trim().parse().ok()).collect::<Vec<i64>>()).collect()
+/// The node ids in a `recall_injected` description (`ids 1,2,3`).
+pub fn parse_injected(description: &str) -> Vec<i64> {
+    description.trim_start_matches("ids ").split(',').filter_map(|id| id.trim().parse().ok()).collect()
 }
 
 /// Appends a recall section to `parts` with as many pointers as fit in
@@ -491,7 +498,10 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embed
         record_prompt_cue(store, repo, session_id, &seed)?;
         push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     } else {
-        let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &injected_ids(&events), embedder)?;
+        // What the main context has been shown; a subagent's injections
+        // went to its own context (milestone 3b).
+        let shown = crate::work_recall::shown_ids(&crate::work_recall::context_events(&events, None));
+        let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &shown, embedder)?;
         record_prompt_cue(store, repo, session_id, &seed)?;
         push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     }
@@ -665,6 +675,12 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder:
     if let Some(prompt) = last_prompt(store, repo, session_id(payload))? {
         let seed = agentops_retrieval::recall_seed_with(store, repo, &prompt, PLAN_SEED_MAX_ITEMS, &Default::default(), embedder)?;
         if !seed.is_empty() {
+            // Shown in the subagent's own context, so its work-time recall
+            // doesn't repeat it; the main session can still be shown these.
+            if let Some(agent) = agent_id(payload) {
+                let ids = seed.iter().map(|p| p.node_id.to_string()).collect::<Vec<_>>().join(",");
+                store.record_session_event_in(repo, session_id(payload), "subagent_seed", &format!("ids {ids}"), None, RECALL_INJECTED, Some(agent))?;
+            }
             const HEADER: &str = "Recalled from AgentOps for the task you were spawned for (pointers; query `get_symbol`/`related_context`/`list_gotchas` or `fetch_content` with the id before grepping):";
             parts.push(format!("{HEADER}\n{}", seed.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n")));
         }
@@ -1048,7 +1064,7 @@ mod tests {
         let (_dir, store, repo) = store();
         let id = gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hook capture opens the local store");
         prompt(store.as_ref(), &repo, "make the hooks follow the remote server", "plan");
-        let recorded = || store.session_events(&repo, "s").unwrap().into_iter().filter(|e| e.event_kind == RECALL_INJECTED).count();
+        let recorded = || store.session_events(&repo, "s").unwrap().into_iter().filter(|e| e.event_kind == RECALL_INJECTED && e.agent_id.is_none()).count();
         let before = recorded();
         let explore = context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a1" })).unwrap());
         assert!(explore.contains(&format!("(id {id})")) && explore.starts_with(&format!("Pass `path: \"{repo}\"`")), "{explore}");
@@ -1058,6 +1074,8 @@ mod tests {
         assert!(explore.chars().count() <= crate::budget::SUBAGENT_SEED_BUDGET);
         assert!(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "statusline-setup" })).unwrap().is_none());
         assert_eq!(recorded(), before, "a subagent's seed never counts as shown to the main session");
+        let events = store.session_events(&repo, "s").unwrap();
+        assert!(crate::work_recall::shown_ids(&crate::work_recall::context_events(&events, Some("a1"))).contains(&id), "it counts as shown to that subagent");
     }
 
     #[test]
