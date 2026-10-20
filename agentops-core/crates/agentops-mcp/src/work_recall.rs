@@ -110,15 +110,18 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
         return Ok(None);
     }
     let scores = cue_scores(&candidates);
+    let key = cue_key(cue);
     let events = log.events()?;
     let context = context_events(&events, agent_id);
-    let activated = context_activation(&context, &scores);
-    log.record("cue", &format_cue(&scores), WORK_CUE, agent_id)?;
+    let activated = context_activation(&context, &key, &scores);
+    log.record(&key, &format_cue(&scores), WORK_CUE, agent_id)?;
     if !settings.enabled {
         return Ok(None);
     }
-    // Past the ceiling, only an error still speaks.
-    if matches!(cue, WorkCue::File { .. }) && work_injected(&context) >= MAX_INJECTED_PER_CONTEXT {
+    // Past the ceiling, only an error still speaks. The ceiling spans the
+    // whole context, compactions included.
+    let whole: Vec<&SessionEvent> = events.iter().filter(|e| e.agent_id.as_deref() == agent_id).collect();
+    if matches!(cue, WorkCue::File { .. }) && work_injected(&whole) >= MAX_INJECTED_PER_CONTEXT {
         return Ok(None);
     }
     let shown = shown_ids(&context);
@@ -198,14 +201,35 @@ pub fn cue_scores(candidates: &[WorkCandidate]) -> Vec<(i64, f64)> {
     candidates.iter().map(|c| (c.pointer.node_id, c.score)).collect()
 }
 
-/// Session activation for a context whose events are `context` (see
-/// `context_events`), plus `current`, the cue being handled now, which
-/// isn't recorded yet.
-pub fn context_activation(context: &[&SessionEvent], current: &[(i64, f64)]) -> HashMap<i64, f64> {
-    let mut cues: Vec<Vec<(i64, f64)>> = context.iter().filter(|e| e.event_kind == WORK_CUE).map(|e| parse_cue(&e.description)).collect();
-    if !current.is_empty() {
-        cues.push(current.to_vec());
+/// A `work_cue` event's `tool_name`: what the cue was, so a file read
+/// again counts once (`file:<path>`). Errors, prompts and older events
+/// never merge.
+pub fn cue_key(cue: &WorkCue) -> String {
+    match cue {
+        WorkCue::File { path, .. } => format!("file:{path}"),
+        WorkCue::Error { .. } => "error".to_string(),
     }
+}
+
+/// Session activation for a context whose events are `context` (see
+/// `context_events`), plus `current`, the cue being handled now under
+/// `current_key`, which isn't recorded yet. A file cued again counts once,
+/// at its latest position: re-reading one file is one cue, not convergent
+/// evidence (the first labelling replay had re-reads lift a file's every
+/// memory past 1.0).
+pub fn context_activation(context: &[&SessionEvent], current_key: &str, current: &[(i64, f64)]) -> HashMap<i64, f64> {
+    let mut keyed: Vec<(&str, Vec<(i64, f64)>)> = context.iter().filter(|e| e.event_kind == WORK_CUE).map(|e| (e.tool_name.as_str(), parse_cue(&e.description))).collect();
+    if !current.is_empty() {
+        keyed.push((current_key, current.to_vec()));
+    }
+    let mut seen = HashSet::new();
+    let mut cues: Vec<Vec<(i64, f64)>> = keyed
+        .into_iter()
+        .rev()
+        .filter(|(key, _)| !key.starts_with("file:") || seen.insert(*key))
+        .map(|(_, scores)| scores)
+        .collect();
+    cues.reverse();
     activation(&cues, ACTIVATION_WINDOW, ACTIVATION_DECAY)
 }
 
@@ -371,6 +395,19 @@ mod tests {
     }
 
     #[test]
+    fn a_file_read_again_counts_once_but_different_cues_add_up() {
+        let mut log = MemoryLog::default();
+        for _ in 0..4 {
+            log.record("file:a.rs", "1:0.5", WORK_CUE, None).unwrap();
+        }
+        let events = log.events().unwrap();
+        let again = context_activation(&context_events(&events, None), "file:a.rs", &[(1, 0.5)]);
+        assert!((again[&1] - 0.5).abs() < 1e-9, "five reads of one file are one cue: {again:?}");
+        let other = context_activation(&context_events(&events, None), "file:b.rs", &[(1, 0.5)]);
+        assert!(other[&1] > 0.9, "a second file reaching it adds up: {other:?}");
+    }
+
+    #[test]
     fn a_cue_round_trips_through_its_event_description() {
         let cue = format_cue(&[(12, 0.8125), (40, 0.33)]);
         assert_eq!(cue, "12:0.812,40:0.330");
@@ -389,9 +426,9 @@ mod tests {
             event(CONTEXT_RESET, "compact", Some("agent-a")),
             event(WORK_CUE, "4:1.0", Some("agent-a")),
         ];
-        let main = context_activation(&context_events(&events, None), &[]);
+        let main = context_activation(&context_events(&events, None), "x", &[]);
         assert_eq!(main.keys().copied().collect::<Vec<_>>(), [3], "main sees only its own cues after its compaction");
-        let mut sub: Vec<i64> = context_activation(&context_events(&events, Some("agent-a")), &[(5, 1.0)]).into_keys().collect();
+        let mut sub: Vec<i64> = context_activation(&context_events(&events, Some("agent-a")), "file:y", &[(5, 1.0)]).into_keys().collect();
         sub.sort();
         assert_eq!(sub, [2, 4, 5], "a subagent never resets and never sees the main session's cues");
     }
