@@ -168,6 +168,27 @@ On the server, `recall_seed_with` (`agentops-retrieval/src/recall.rs`) also reca
 
 If embedding plus the search exceed `DENSE_TIMEOUT_MS = 250`, the dense half is dropped, `dense recall timeout` is logged, and the keyword result stands. `agentops-server` warms the model at startup (`warm_embedder`).
 
+## Recall during work: cue resolution
+
+Milestone 3b, `agentops-retrieval/src/work_recall.rs`. A work cue is a file the agent read or edited, or the text of a failed tool call. `resolve_cue` turns it into ranked candidates. Each candidate carries a score of about 0 to 1, which session activation sums and `INJECT_MIN_SCORE` thresholds. `agentops work-recall-eval` and the `PostToolUse` hook call the same function. The server's `POST /repos/{id}/work-recall` exposes it and records nothing.
+
+| Source | Score |
+| --- | --- |
+| 1. `Affects` edge to a symbol in the file (`GraphStore::nodes_in_file`) | `AFFECTS_SCORE` 1.0 |
+| 2. A memory naming the file's repo-relative path (`nodes_mentioning`, a plain substring) | `MENTION_PATH_SCORE` 0.9 |
+| 2. A memory naming only the file name, when no other file has that name (`count_files_named`) | `MENTION_NAME_SCORE` 0.7 |
+| One `SimilarTo` hop from sources 1-2, at most `HOP_MAX_PER_SOURCE` | source × cosine × `HOP_FACTOR` |
+| 3. The file as a query: name, non-generic parent directory, first heading, top-level symbols, at most `FILE_CUE_TEXT_MAX` characters | recall's confidence |
+| An error cue, cleaned (see below) | recall's confidence; gotchas × `ERROR_GOTCHA_BOOST` |
+
+**Recall's confidence** (`recall_scored_with`) is recall's comparable score: the share of the query's rarity weight that a memory matched, 1.0 for a named symbol's `Affects` edge, and the cosine when recall by meaning scores higher. A hop neighbour gets its source's confidence × cosine × `HOP_FACTOR`, and a reduced memory gets half. It doesn't change recall's order, so `recall_seed_with` returns the same pointers as before.
+
+**How sources combine.** Path mentions are a substring search, not a full-text query, because the two stores combine full-text words differently (SQLite ORs them, Postgres ANDs them). A memory reached several ways keeps its best score.
+
+**Cleaning an error cue.** Lines carrying `ERROR_KEYWORDS` come first. A path is cut to its file name; line:column suffixes, hex hashes, timestamps and `Exit code N` lines are dropped. The result is at most `ERROR_CUE_TEXT_MAX` characters.
+
+**What is never a cue.** Paths on `WORK_CUE_SKIP` (`.git/`, `.context/`, `target/`, `node_modules/`, `.next/`, lockfiles).
+
 ## Prominence dampening
 
 A `Reduced` gotcha ranks ×0.1 in `dense`, `hybrid` and `gist_then_detail`, and every result shows "⚠ reduced prominence — <reason>". The decision "Gotchas are curated, never resolved/dismissed -- don't reintroduce a bug-tracker model" lists the other surfaces it reaches: `list_gotchas`, `get_symbol`, `explain_symbol`'s prompt and docgen. Hosted `/local-search` applies it too (`dashboard.rs`); the single-operator `/local-search` in `agentops-api/src/search.rs` does not. In `dense` mode the distance is divided by the multiplier for sorting only; the printed distance is unchanged.

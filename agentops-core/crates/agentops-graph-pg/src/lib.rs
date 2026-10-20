@@ -373,6 +373,23 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn nodes_mentioning(&self, repo: &str, needle: &str, kinds: &[NodeKind], limit: usize) -> Result<Vec<Node>> {
+        let kinds: Vec<&str> = kinds.iter().map(|k| k.as_db_str()).collect();
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM nodes WHERE repo = $1 AND kind = ANY($2) AND strpos(LOWER(content), LOWER($3)) > 0 ORDER BY id LIMIT $4", &[&repo, &kinds, &needle, &(limit as i64)]).await?;
+            Ok(rows.iter().map(row_to_node).collect())
+        })
+    }
+
+    fn count_files_named(&self, repo: &str, basename: &str) -> Result<usize> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client.query_one("SELECT COUNT(*) FROM nodes WHERE repo = $1 AND kind = 'file' AND (path = $2 OR right(path, length($2) + 1) = '/' || $2)", &[&repo, &basename]).await?;
+            Ok(row.get::<_, i64>(0) as usize)
+        })
+    }
+
     fn nodes_pinned(&self, repo: &str) -> Result<Vec<Node>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
@@ -1454,7 +1471,14 @@ mod tests {
         let f = upsert_node(&store, node(&repo, NodeKind::Symbol, Some("src/a.rs"), Some("f"))).unwrap();
         let other = upsert_node(&store, node(&repo, NodeKind::Symbol, Some("src/a.rs.bak"), Some("g"))).unwrap();
         assert_eq!(store.nodes_in_file(&repo, "src/a.rs").unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [f]);
-        store.delete_nodes(&repo, &[f, other]).unwrap();
+
+        let mut g = node(&repo, NodeKind::Gotcha, Some("vault:g"), Some("g"));
+        g.content = Some("Edit agentops-cli/src/Usage.rs with care".into());
+        let g = upsert_node(&store, g).unwrap();
+        assert_eq!(store.nodes_mentioning(&repo, "agentops-cli/src/usage.rs", &[NodeKind::Gotcha], 10).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [g]);
+        let files: Vec<i64> = ["a/lib.rs", "b/lib.rs", "a/mylib.rs"].iter().map(|p| upsert_node(&store, node(&repo, NodeKind::File, Some(p), None)).unwrap()).collect();
+        assert_eq!(store.count_files_named(&repo, "lib.rs").unwrap(), 2);
+        store.delete_nodes(&repo, &[&[f, other, g][..], &files].concat()).unwrap();
         store.wipe_repo(&repo).unwrap();
     }
 

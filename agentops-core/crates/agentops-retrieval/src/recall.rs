@@ -92,6 +92,21 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
 /// `recall_seed`. Only the server passes an embedder; a local hook process
 /// never loads the model (ADR 0052).
 pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<RecallPointer>> {
+    Ok(recall_scored_with(store, repo, query, limit, exclude, embedder)?.into_iter().map(|(pointer, _)| pointer).collect())
+}
+
+/// `recall_seed_with`, each pointer paired with its **confidence**: how
+/// strongly the query reached it, comparable across queries, which the
+/// rank order alone isn't (milestone 3b: work-time recall thresholds and
+/// sums it). The order is exactly `recall_seed_with`'s.
+/// - Keywords: the share of the query's rarity weight the memory matched
+///   (all of its keywords is 1.0).
+/// - An `Affects` edge from a named symbol: 1.0.
+/// - Recall by meaning: the cosine, when higher.
+/// - A hop neighbour: its source's confidence × cosine × `HOP_FACTOR`.
+///
+/// A reduced memory's confidence is halved, like its score.
+pub fn recall_scored_with(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<(RecallPointer, f64)>> {
     // The prompt is embedded on its own thread while the keyword queries
     // run, so a stalled embed can be abandoned at the deadline.
     let pending = embedder.map(|embedder| {
@@ -138,10 +153,12 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
     // matches (milestone 3a eval, 4 of the last 5 misses).
     let memories = store.count_nodes(repo, RECALL_KINDS)?.max(1) as f64;
     let mut weakest = f64::INFINITY;
+    let mut query_weight = 0.0;
     for keyword in &keywords {
         let df = store.count_lexical(repo, keyword, RECALL_KINDS)?.max(1) as f64;
         let weight = (1.0 + memories / df).ln();
         weakest = weakest.min(weight);
+        query_weight += weight;
         for &kind in RECALL_KINDS {
             for (rank, (node, _)) in store.search_lexical(repo, keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
                 add(node.id, node.kind, node.name.as_deref(), node.prominence, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""), weight);
@@ -183,8 +200,9 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
         .into_iter()
         .filter(|(id, c)| shown(id, c.prominence) && enough(c))
         .map(|(id, c)| {
-            let score = if c.prominence == NodeProminence::Reduced { c.score * 0.5 } else { c.score };
-            Ranked { id, strength: c.strength, score, hop: false, kind: c.kind, title: c.title, reasons: c.reasons }
+            let reduced = if c.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
+            let confidence = if c.reasons.iter().any(|r| r.starts_with("affects")) || query_weight == 0.0 { 1.0 } else { (c.strength / query_weight).min(1.0) };
+            Ranked { id, strength: c.strength, score: c.score * reduced, confidence: confidence * reduced, hop: false, kind: c.kind, title: c.title, reasons: c.reasons }
         })
         .collect();
     sort_ranked(&mut ranked);
@@ -202,7 +220,7 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
         .take(limit)
         .map(|r| {
             let reason = if r.reasons.iter().all(|x| x.starts_with('"')) { format!("matched {}", r.reasons.join(", ")) } else { r.reasons.join("; ") };
-            RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason }
+            (RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason }, r.confidence)
         })
         .collect())
 }
@@ -243,10 +261,11 @@ fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
     let rrf = crate::rrf;
     let mut fused: HashMap<i64, Ranked> = ranked.drain(..).enumerate().map(|(i, r)| (r.id, Ranked { strength: FUSED_STRENGTH, score: rrf(i), ..r })).collect();
     for (i, (node, cosine)) in dense.into_iter().enumerate() {
-        let share = rrf(i) * if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
+        let reduced = if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
         let reason = format!("close in meaning ({cosine:.2})");
-        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), reasons: Vec::new() });
-        entry.score += share;
+        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, confidence: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), reasons: Vec::new() });
+        entry.score += rrf(i) * reduced;
+        entry.confidence = entry.confidence.max(f64::from(cosine) * reduced);
         entry.reasons.push(reason);
     }
     ranked.extend(fused.into_values());
@@ -272,6 +291,8 @@ struct Ranked {
     id: i64,
     strength: f64,
     score: f64,
+    /// See `recall_scored_with`.
+    confidence: f64,
     /// Reached only through a `SimilarTo` hop, not on its own cues.
     hop: bool,
     kind: NodeKind,
@@ -302,16 +323,9 @@ fn sort_ranked(ranked: &mut [Ranked]) {
 /// first, so the result never depends on map order.
 fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&i64, NodeProminence) -> bool, hop_strength: f64) -> Result<()> {
     let mut position: HashMap<i64, usize> = ranked.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
-    let sources: Vec<(i64, f64, String)> = ranked.iter().map(|r| (r.id, r.score, r.title.clone())).collect();
-    for (source_id, score, title) in sources {
-        let targets: Vec<i64> = store.edges_from(repo, source_id)?.into_iter().filter(|e| e.relation == EdgeRelation::SimilarTo).map(|e| e.dst_id).collect();
-        if targets.is_empty() {
-            continue;
-        }
-        let vectors = store.get_embeddings(repo, &[&[source_id][..], &targets].concat())?;
-        let Some(source_vector) = vectors.get(&source_id) else { continue };
-        let mut closest: Vec<(f64, i64)> = targets.iter().filter(|&&t| t != source_id).filter_map(|t| vectors.get(t).map(|v| (f64::from(agentops_graph::similarity::cosine(source_vector, v)), *t))).collect();
-        closest.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    let sources: Vec<(i64, f64, f64, String)> = ranked.iter().map(|r| (r.id, r.score, r.confidence, r.title.clone())).collect();
+    for (source_id, score, confidence, title) in sources {
+        let closest = closest_similar(store, repo, source_id)?;
         let mut taken = 0;
         for (cosine, target) in closest {
             if taken == HOP_MAX_PER_SOURCE {
@@ -325,6 +339,7 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
                 if (hop_strength, score * cosine * HOP_FACTOR) > (r.strength, r.score) {
                     (r.strength, r.score) = (hop_strength, score * cosine * HOP_FACTOR);
                 }
+                r.confidence = r.confidence.max(confidence * cosine * HOP_FACTOR);
                 if !r.reasons.contains(&reason) {
                     r.reasons.push(reason);
                 }
@@ -334,17 +349,29 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
             if !RECALL_KINDS.contains(&neighbour.kind) || !shown(&neighbour.id, neighbour.prominence) {
                 continue;
             }
-            let mut hop_score = score * cosine * HOP_FACTOR;
-            if neighbour.prominence == NodeProminence::Reduced {
-                hop_score *= 0.5;
-            }
+            let reduced = if neighbour.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
             taken += 1;
             position.insert(target, ranked.len());
-            ranked.push(Ranked { id: target, strength: hop_strength, score: hop_score, hop: true, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
+            ranked.push(Ranked { id: target, strength: hop_strength, score: score * cosine * HOP_FACTOR * reduced, confidence: confidence * cosine * HOP_FACTOR * reduced, hop: true, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
         }
     }
     sort_ranked(ranked);
     Ok(())
+}
+
+/// The memories `source_id` has `SimilarTo` edges to, closest first
+/// (cosine of the two stored vectors, then id). Edges keep no score, and a
+/// neighbour without a vector is left out.
+pub(crate) fn closest_similar(store: &dyn GraphStore, repo: &str, source_id: i64) -> Result<Vec<(f64, i64)>> {
+    let targets: Vec<i64> = store.edges_from(repo, source_id)?.into_iter().filter(|e| e.relation == EdgeRelation::SimilarTo).map(|e| e.dst_id).collect();
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
+    let vectors = store.get_embeddings(repo, &[&[source_id][..], &targets].concat())?;
+    let Some(source_vector) = vectors.get(&source_id) else { return Ok(Vec::new()) };
+    let mut closest: Vec<(f64, i64)> = targets.iter().filter(|&&t| t != source_id).filter_map(|t| vectors.get(t).map(|v| (f64::from(agentops_graph::similarity::cosine(source_vector, v)), *t))).collect();
+    closest.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    Ok(closest)
 }
 
 /// Common English and instruction words that would match half the graph.

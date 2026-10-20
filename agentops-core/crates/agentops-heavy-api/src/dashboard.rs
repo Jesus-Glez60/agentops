@@ -797,7 +797,7 @@ pub(crate) async fn work_recall_json(State(state): State<AppState>, user: Option
         };
         let repo = agentops_mcp::repo_name(&path);
         let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
-        let candidates = agentops_retrieval::work_recall::resolve_cue(store.as_ref(), &repo, &body.cue, body.sources)?;
+        let candidates = agentops_retrieval::work_recall::resolve_cue(store.as_ref(), &repo, &body.cue, body.sources, Some(&SERVER_EMBEDDER))?;
         Ok(Some(candidates.into_iter().take(limit).map(|c| json!({ "node_id": c.pointer.node_id, "kind": c.pointer.kind.as_db_str(), "title": c.pointer.title, "reason": c.pointer.reason, "score": c.score })).collect()))
     })
     .await;

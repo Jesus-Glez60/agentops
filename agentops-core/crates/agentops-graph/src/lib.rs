@@ -832,6 +832,15 @@ pub trait GraphStore {
     /// `File` node and the symbols defined in it. Work-time recall starts
     /// from these to reach the notes that `Affects` a file's symbols.
     fn nodes_in_file(&self, repo: &str, path: &str) -> Result<Vec<Node>>;
+    /// Nodes of `kinds` whose content contains `needle` (case-insensitive,
+    /// a plain substring, not a full-text query), up to `limit`, by id.
+    /// Work-time recall uses it to find memories that mention a file's
+    /// path, where `search_lexical` would split the path into words (and
+    /// the two stores combine those differently).
+    fn nodes_mentioning(&self, repo: &str, needle: &str, kinds: &[NodeKind], limit: usize) -> Result<Vec<Node>>;
+    /// How many `File` nodes are named `basename` (the path's last segment),
+    /// so a bare `lib.rs` counts as a mention only when it's unique.
+    fn count_files_named(&self, repo: &str, basename: &str) -> Result<usize>;
     /// All nodes across every kind with `prominence == Pinned` in `repo` --
     /// backs the sticky-pin "always inject" context feature. Unlike
     /// `nodes_by_kind`, this is kind-agnostic: a pinned node can be a

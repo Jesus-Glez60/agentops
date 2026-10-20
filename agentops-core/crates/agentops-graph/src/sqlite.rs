@@ -588,6 +588,28 @@ impl GraphStore for SqliteGraphStore {
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
+    fn nodes_mentioning(&self, repo: &str, needle: &str, kinds: &[NodeKind], limit: usize) -> Result<Vec<Node>> {
+        if kinds.is_empty() || needle.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = (0..kinds.len()).map(|i| format!("?{}", i + 4)).collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT * FROM nodes WHERE repo = ?1 AND instr(LOWER(content), LOWER(?2)) > 0 AND kind IN ({placeholders}) ORDER BY id LIMIT ?3");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(repo.to_string()), Box::new(needle.to_string()), Box::new(limit as i64)];
+        params.extend(kinds.iter().map(|k| Box::new(k.as_db_str()) as Box<dyn rusqlite::ToSql>));
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), Self::row_to_node)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn count_files_named(&self, repo: &str, basename: &str) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM nodes WHERE repo = ?1 AND kind = 'file' AND (path = ?2 OR substr(path, -length(?2) - 1) = '/' || ?2)",
+            rusqlite::params![repo, basename],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     fn nodes_pinned(&self, repo: &str) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE repo = ?1 AND prominence = 'pinned'")?;
         let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_node)?;
@@ -1948,6 +1970,22 @@ mod tests {
         let f = node("src/a.rs", "f");
         node("src/a.rs.bak", "g");
         assert_eq!(store.nodes_in_file("r", "src/a.rs").unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [f]);
+    }
+
+    #[test]
+    fn nodes_mentioning_matches_a_plain_substring_and_count_files_named_matches_the_last_segment() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let add = |kind, path: &str, content: &str| upsert_node(&store, NewNode { kind, repo: "r".into(), path: Some(path.into()), name: Some(path.into()), container: None, start_line: None, end_line: None, content: Some(content.into()) }).unwrap();
+        let g = add(NodeKind::Gotcha, "vault:g", "Edit agentops-cli/src/Usage.rs with care");
+        add(NodeKind::Gotcha, "vault:h", "usage and rs are separate words here");
+        add(NodeKind::Symbol, "x.rs", "agentops-cli/src/usage.rs");
+        assert_eq!(store.nodes_mentioning("r", "agentops-cli/src/usage.rs", &[NodeKind::Gotcha], 10).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [g]);
+
+        for path in ["a/src/lib.rs", "b/src/lib.rs", "lib.rs", "a/src/mylib.rs", "a/src/main.rs"] {
+            upsert_node(&store, NewNode { kind: NodeKind::File, repo: "r".into(), path: Some(path.into()), name: None, container: None, start_line: None, end_line: None, content: None }).unwrap();
+        }
+        assert_eq!(store.count_files_named("r", "lib.rs").unwrap(), 3);
+        assert_eq!(store.count_files_named("r", "main.rs").unwrap(), 1);
     }
 
     #[test]

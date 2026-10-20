@@ -106,13 +106,14 @@ pub fn cap_sections(sections: &[(&str, String)], total_budget: usize) -> String 
     out.trim_end().to_string()
 }
 
-/// Case-insensitive substring match against a JSON value's own stringified
-/// form -- deliberately coarse (not a schema-aware "does this item represent
-/// an error" check), matching Headroom's own documented `SmartCrusher`
-/// behavior: a keyword match anywhere in an item is reason enough to never
-/// drop it, since a false *keep* costs budget but a false *drop* loses a
-/// real error silently.
-const ERROR_KEYWORDS: [&str; 5] = ["error", "fail", "exception", "panic", "fatal"];
+// `ERROR_KEYWORDS` is matched case-insensitively against a JSON value's own
+// stringified form -- deliberately coarse (not a schema-aware "does this
+// item represent an error" check), matching Headroom's own documented
+// `SmartCrusher` behavior: a keyword match anywhere in an item is reason
+// enough to never drop it, since a false *keep* costs budget but a false
+// *drop* loses a real error silently. Shared with work-time recall's error
+// cues.
+use agentops_retrieval::work_recall::ERROR_KEYWORDS;
 
 /// Result of [`compress_json`] -- `value` is what the caller should actually
 /// return to the agent; `dropped` is every item that didn't fit, each paired

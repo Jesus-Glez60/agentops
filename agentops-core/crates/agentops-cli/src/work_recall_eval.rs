@@ -293,7 +293,7 @@ fn cue_kind(cue: &WorkCue) -> &'static str {
 /// The candidate node ids `cue` reaches with `sources`, best first.
 fn resolve(backend: &Backend, cue: &WorkCue, sources: CueSources) -> Result<Vec<i64>> {
     match backend {
-        Backend::Local { store, repo } => Ok(agentops_retrieval::work_recall::resolve_cue(store.as_ref(), repo, cue, sources)?.into_iter().take(DEEP_LIMIT).map(|c| c.pointer.node_id).collect()),
+        Backend::Local { store, repo } => Ok(agentops_retrieval::work_recall::resolve_cue(store.as_ref(), repo, cue, sources, None)?.into_iter().take(DEEP_LIMIT).map(|c| c.pointer.node_id).collect()),
         Backend::Remote(marker) => {
             let reply = remote_send(marker, "work-recall", Some(&json!({ "cue": cue, "sources": sources, "limit": DEEP_LIMIT })))?;
             Ok(reply["candidates"].as_array().context("reading the work-recall route's candidates")?.iter().filter_map(|c| c["node_id"].as_i64()).collect())
@@ -307,6 +307,20 @@ fn cue_text(cue: &WorkCue) -> &str {
         WorkCue::File { path, .. } => path,
         WorkCue::Error { text } => text,
     }
+}
+
+/// Each file case's first heading, read from the working tree the way the
+/// hook takes it from a `Read`'s result.
+fn with_headings(root: &Path, cases: Vec<Case>) -> Vec<Case> {
+    cases
+        .into_iter()
+        .map(|mut case| {
+            if let WorkCue::File { path, heading: heading @ None } = &mut case.cue {
+                *heading = std::fs::read_to_string(root.join(&*path)).ok().and_then(|text| agentops_retrieval::work_recall::first_heading(&text));
+            }
+            case
+        })
+        .collect()
 }
 
 fn read_cases(file: &Path) -> Result<Vec<Case>> {
@@ -472,6 +486,7 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
     } else {
         Backend::Local { store: agentops_mcp::open_store(path)?, repo: agentops_mcp::repo_name(path) }
     };
+    let cases = with_headings(&root, cases);
     validate(&backend, &cases)?;
     let (results, summary) = evaluate(&backend, &cases, options.baseline, options.repeat.max(1))?;
     let label = match options.baseline {
