@@ -498,7 +498,7 @@ mod tests {
         let (results, summary) = evaluate(&backend, &cases, None, 2).unwrap();
         assert_eq!((results[0].hit_type, results[0].first_hit_rank), (HitType::Exact, Some(1)), "{results:?}");
         assert_eq!(results[1].hit_type, HitType::Equivalent, "a same-fact memory counts, the digest never does: {results:?}");
-        assert!(results[1].digest_in_seed);
+        assert!(!results[1].digest_in_seed, "doc sections never reach a seed (milestone 3a item 2)");
         assert_eq!(results[2].hit_type, HitType::Miss, "{results:?}");
         assert_eq!((summary.cases, summary.runs, summary.exact, summary.equivalent), (3, 6, 1, 1));
         assert!((summary.hit_rate - 2.0 / 3.0).abs() < 1e-9);
