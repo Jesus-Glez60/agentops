@@ -127,6 +127,15 @@ The fallback means this mode never returns fewer results than flat search would 
 - Latency percentiles are nearest-rank over every run.
 - MRR uses each case's first run.
 
+**Deep rank.** Per case, the eval also asks for the deeper ranking from the same retrieval, without the seed's cut: `POST /repos/{id}/recall` remotely (capped at 50, records nothing), `recall_seed` locally.
+- `deep_rank` is where the first target or equivalent sits in that ranking.
+- The ranking is bounded by `recall_seed`'s candidate pool (`PER_QUERY` per keyword and kind) as well as by the cap.
+- Each miss gets a `miss_category`:
+  - `vocabulary`: not in the deep ranking at all.
+  - `noise`: ranked below the seed, with a doc section or a `SimilarTo` neighbour holding one of the 8 seed slots above it.
+  - `ranking`: ranked below the seed behind direct matches only.
+- A target that can't be recalled at all is refused before the run, so there is no "missing memory" category.
+
 **Side effect.** Runs are recorded as sessions whose ids start with `recall-eval-`, so per-session statistics should filter them out. Milestone 3a's baseline and per-item scores are in [`handoffs/m3a-eval.md`](handoffs/m3a-eval.md).
 
 ## Prominence dampening

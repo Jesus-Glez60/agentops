@@ -658,6 +658,48 @@ pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<
     }
 }
 
+/// Most pointers `POST /repos/{id}/recall` returns.
+const RECALL_DEEP_MAX: usize = 50;
+
+#[derive(Deserialize)]
+pub(crate) struct RecallBody {
+    prompt: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /repos/{id}/recall` -- the ranked recall pointers for `prompt`
+/// from the same retrieval call the prompt hook makes, but deeper than a
+/// seed (up to `RECALL_DEEP_MAX`) and without recording anything in the
+/// session. `agentops recall-eval` uses it to tell a memory ranked just
+/// below the seed from one recall never finds.
+pub(crate) async fn recall_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<RecallBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let limit = body.limit.unwrap_or(RECALL_DEEP_MAX).min(RECALL_DEEP_MAX);
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<Value>>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        let pointers = agentops_retrieval::recall_seed(store.as_ref(), &repo, &body.prompt, limit, &Default::default())?;
+        Ok(Some(pointers.into_iter().map(|p| json!({ "node_id": p.node_id, "kind": p.kind.as_db_str(), "title": p.title, "reason": p.reason })).collect()))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(pointers))) => (StatusCode::OK, Json(json!({ "pointers": pointers }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// `GET /repos/{id}/docs` -- mirrors `agentops-api`'s `docs_json` cache-hit/
 /// miss logic exactly (persisted `doc_pages` row if present, else a
 /// heuristic-only page built on the fly, never persisted from here).
@@ -1114,6 +1156,53 @@ mod tests {
         assert_eq!(body_json(resp).await["scores"], json!({}));
 
         let resp = app.oneshot(get(format!("/repos/{connection_id}/nodes/{a}/similarity?to={b}"), &other_token)).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
+    }
+
+    #[tokio::test]
+    async fn recall_ranks_deeper_than_a_seed_records_no_session_and_never_crosses_tenants() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&other.tenant, other.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+
+        let path = crate::indexing::checkout_path(checkouts_dir.path(), &owner.tenant, &connection_id);
+        let repo = agentops_mcp::repo_name(&path);
+        {
+            let graph = agentops_mcp::open_store(&path).unwrap();
+            for n in 0..60 {
+                let name = format!("webhook signature note {n}");
+                agentops_graph::upsert_node(graph.as_ref(), agentops_graph::NewNode { kind: agentops_graph::NodeKind::Gotcha, repo: repo.clone(), path: Some(format!("vault:{n}.md")), name: Some(name.clone()), container: None, start_line: None, end_line: None, content: Some(name) }).unwrap();
+            }
+        }
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let post = |token: &str, body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/repos/{connection_id}/recall"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(post(&owner_token, json!({ "prompt": "webhook signature", "limit": 500 }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let pointers = body_json(resp).await["pointers"].as_array().unwrap().clone();
+        // recall_seed's candidate pool (PER_QUERY per keyword and kind)
+        // bounds the list as much as the limit does.
+        assert!(pointers.len() > 8 && pointers.len() <= super::RECALL_DEEP_MAX, "deeper than a seed, capped at {}: {}", super::RECALL_DEEP_MAX, pointers.len());
+        assert_eq!(pointers[0]["kind"], "gotcha");
+        assert!(pointers[0]["node_id"].as_i64().is_some() && pointers[0]["reason"].as_str().is_some());
+        let graph = agentops_mcp::open_store(&path).unwrap();
+        assert!(graph.session_events_for_repo(&repo, None).unwrap().is_empty(), "a recall probe records nothing");
+
+        let resp = app.oneshot(post(&other_token, json!({ "prompt": "webhook signature" }))).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
     }
 

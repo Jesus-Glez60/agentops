@@ -86,6 +86,12 @@ struct CaseResult {
     latency_runs_ms: Vec<f64>,
     /// Whether every repeat injected the same seed.
     seed_stable: bool,
+    /// Rank of the first target or equivalent in the deep ranking (up to
+    /// `DEEP_LIMIT` pointers from the same retrieval, before the seed's
+    /// cut), or `None` when recall never reaches it.
+    deep_rank: Option<usize>,
+    /// Why a miss missed (see `miss_category`); `None` for a hit.
+    miss_category: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -98,6 +104,20 @@ struct Summary {
     mrr: f64,
     p50_ms: f64,
     p95_ms: f64,
+    /// Misses per `miss_category`.
+    misses: std::collections::BTreeMap<&'static str, usize>,
+}
+
+/// How deep `recall-eval` looks past the seed: the server's
+/// `POST /repos/{id}/recall` cap.
+const DEEP_LIMIT: usize = 50;
+
+/// One pointer of the deep ranking.
+#[derive(Debug, Clone, Deserialize)]
+struct DeepPointer {
+    node_id: i64,
+    kind: String,
+    reason: String,
 }
 
 /// Where the hook runs: this repo's local graph, or the server it's
@@ -139,6 +159,21 @@ impl Backend {
         }
     }
 
+    /// The deep ranking for `prompt`: the retrieval the hook runs, up to
+    /// `DEEP_LIMIT` pointers, with nothing recorded.
+    fn deep(&self, prompt: &str) -> Result<Vec<DeepPointer>> {
+        match self {
+            Backend::Local { store, repo } => Ok(agentops_retrieval::recall_seed(store.as_ref(), repo, prompt, DEEP_LIMIT, &Default::default())?
+                .into_iter()
+                .map(|p| DeepPointer { node_id: p.node_id, kind: p.kind.as_db_str().to_string(), reason: p.reason })
+                .collect()),
+            Backend::Remote(marker) => {
+                let reply = remote_send(marker, "recall", Some(&json!({ "prompt": prompt, "limit": DEEP_LIMIT })))?;
+                serde_json::from_value(reply["pointers"].clone()).context("reading the recall route's pointers")
+            }
+        }
+    }
+
     /// A node's prominence, or `None` if it doesn't exist.
     fn prominence(&self, node: i64) -> Result<Option<NodeProminence>> {
         match self {
@@ -154,19 +189,23 @@ impl Backend {
 
 /// `GET {server}/repos/{connection}/{rest}` with the marker's API key.
 fn remote_get(marker: &RemoteMcpMarker, rest: &str) -> Result<Value> {
+    remote_send(marker, rest, None)
+}
+
+/// `GET`, or `POST` with a JSON body, to `{server}/repos/{connection}/{rest}`.
+fn remote_send(marker: &RemoteMcpMarker, rest: &str, body: Option<&Value>) -> Result<Value> {
     let url = format!("{}/repos/{}/{rest}", marker.server_url.trim_end_matches('/'), marker.connection_id);
-    let mut response = ureq::get(&url)
-        .header("Authorization", &format!("Bearer {}", marker.api_key))
-        .config()
-        .http_status_as_error(false)
-        .timeout_global(Some(crate::hook_capture::REMOTE_HOOK_TIMEOUT))
-        .build()
-        .call()
-        .with_context(|| format!("calling GET {url}"))?;
+    let auth = format!("Bearer {}", marker.api_key);
+    let method = if body.is_some() { "POST" } else { "GET" };
+    let response = match body {
+        Some(body) => ureq::post(&url).header("Authorization", &auth).config().http_status_as_error(false).timeout_global(Some(crate::hook_capture::REMOTE_HOOK_TIMEOUT)).build().send_json(body),
+        None => ureq::get(&url).header("Authorization", &auth).config().http_status_as_error(false).timeout_global(Some(crate::hook_capture::REMOTE_HOOK_TIMEOUT)).build().call(),
+    };
+    let mut response = response.with_context(|| format!("calling {method} {url}"))?;
     if !response.status().is_success() {
-        bail!("GET {url} returned {}", response.status().as_u16());
+        bail!("{method} {url} returned {}", response.status().as_u16());
     }
-    response.body_mut().read_json().with_context(|| format!("parsing GET {url} response"))
+    response.body_mut().read_json().with_context(|| format!("parsing {method} {url} response"))
 }
 
 pub(crate) fn run(path: &Path, remote: bool, cases_file: Option<&Path>, mode: Option<Mode>, repeat: usize) -> Result<()> {
@@ -256,6 +295,9 @@ fn evaluate(backend: &Backend, cases: &[Case], mode: Option<Mode>, repeat: usize
                 break;
             }
         }
+        let deep = backend.deep(&case.prompt)?;
+        let deep_rank = deep_rank(backend, &deep, &case.targets)?;
+        let miss_category = if first_hit.is_some() { None } else { Some(miss_category(&deep, deep_rank)) };
         all_latencies.extend(&latencies);
         results.push(CaseResult {
             case_id: case.id.clone(),
@@ -267,6 +309,8 @@ fn evaluate(backend: &Backend, cases: &[Case], mode: Option<Mode>, repeat: usize
             latency_ms: percentile(&latencies, 50.0),
             latency_runs_ms: latencies,
             seed_stable: seeds.iter().all(|s| s == seed),
+            deep_rank,
+            miss_category,
         });
     }
 
@@ -280,9 +324,48 @@ fn evaluate(backend: &Backend, cases: &[Case], mode: Option<Mode>, repeat: usize
         mrr: results.iter().map(|r| r.first_hit_rank.map_or(0.0, |rank| 1.0 / rank as f64)).sum::<f64>() / results.len() as f64,
         p50_ms: percentile(&all_latencies, 50.0),
         p95_ms: percentile(&all_latencies, 95.0),
+        misses: results.iter().filter_map(|r| r.miss_category).fold(Default::default(), |mut m, c| {
+            *m.entry(c).or_insert(0) += 1;
+            m
+        }),
     };
     Ok((results, summary))
 }
+
+/// Rank of the first target, or memory equivalent to one, in `deep`. One
+/// similarity lookup per target covers the whole list.
+fn deep_rank(backend: &Backend, deep: &[DeepPointer], targets: &[i64]) -> Result<Option<usize>> {
+    let memories: Vec<i64> = deep.iter().filter(|p| MEMORY_KINDS.contains(&NodeKind::from_db_str(&p.kind))).map(|p| p.node_id).collect();
+    let mut equivalent = std::collections::HashSet::new();
+    if !memories.is_empty() {
+        for &target in targets {
+            equivalent.extend(backend.cosines(target, &memories)?.into_iter().filter(|&(_, s)| s >= EQUIVALENT_MIN_SCORE).map(|(id, _)| id));
+        }
+    }
+    Ok(deep.iter().position(|p| targets.contains(&p.node_id) || equivalent.contains(&p.node_id)).map(|i| i + 1))
+}
+
+/// Why a case missed:
+/// - `vocabulary`: recall never reaches the target (not in the deep
+///   ranking): its words don't meet the prompt's.
+/// - `noise`: the target ranks below the seed, and a doc section or a
+///   `SimilarTo` neighbour holds one of the seed slots above it.
+/// - `ranking`: it ranks below the seed behind direct matches only.
+///
+/// A target that isn't recallable at all (the spec's "missing memory") is
+/// refused before any case runs, so it never shows up here.
+fn miss_category(deep: &[DeepPointer], deep_rank: Option<usize>) -> &'static str {
+    let Some(rank) = deep_rank else { return "vocabulary" };
+    let above = &deep[..(rank - 1).min(SEED_SLOTS)];
+    if above.iter().any(|p| p.kind == NodeKind::DocSection.as_db_str() || p.reason.starts_with("similar to")) {
+        "noise"
+    } else {
+        "ranking"
+    }
+}
+
+/// Seed slots in plan mode (`agentops_mcp::budget::PLAN_SEED_MAX_ITEMS`).
+const SEED_SLOTS: usize = 8;
 
 /// The `(node id, kind)` of each recall pointer the hook injected, in
 /// order. Only lines after `SEED_HEADER` count: pins above it share the
@@ -323,12 +406,13 @@ fn percentile(samples: &[f64], p: f64) -> f64 {
 }
 
 fn render_table(results: &[CaseResult], summary: &Summary) -> String {
-    let mut out = format!("{:<10} {:<8} {:>4} {:<11} {:<6} {:>8}  {}\n", "case", "mode", "rank", "hit", "digest", "p50 ms", "seed kinds");
+    let mut out = format!("{:<10} {:<8} {:>4} {:<11} {:>4} {:<11} {:<6} {:>8}  {}\n", "case", "mode", "rank", "hit", "deep", "miss", "digest", "p50 ms", "seed kinds");
     for r in results {
         let rank = r.first_hit_rank.map_or("-".to_string(), |n| n.to_string());
         let hit = format!("{:?}", r.hit_type).to_lowercase();
         let stable = if r.seed_stable { "" } else { " (seed varied across runs)" };
-        out.push_str(&format!("{:<10} {:<8} {:>4} {:<11} {:<6} {:>8.0}  {}{stable}\n", r.case_id, r.mode.permission_mode(), rank, hit, if r.digest_in_seed { "yes" } else { "no" }, r.latency_ms, r.seed_kinds.join(",")));
+        let deep = r.deep_rank.map_or("-".to_string(), |n| n.to_string());
+        out.push_str(&format!("{:<10} {:<8} {:>4} {:<11} {:>4} {:<11} {:<6} {:>8.0}  {}{stable}\n", r.case_id, r.mode.permission_mode(), rank, hit, deep, r.miss_category.unwrap_or(""), if r.digest_in_seed { "yes" } else { "no" }, r.latency_ms, r.seed_kinds.join(",")));
     }
     out.push_str(&format!(
         "\nhit rate {}/{} ({:.0}%: {} exact, {} equivalent), MRR {:.3}, latency p50 {:.0} ms / p95 {:.0} ms over {} runs\n",
@@ -342,6 +426,9 @@ fn render_table(results: &[CaseResult], summary: &Summary) -> String {
         summary.p95_ms,
         summary.runs
     ));
+    if !summary.misses.is_empty() {
+        out.push_str(&format!("misses: {}\n", summary.misses.iter().map(|(c, n)| format!("{n} {c}")).collect::<Vec<_>>().join(", ")));
+    }
     out
 }
 
@@ -419,6 +506,38 @@ mod tests {
     }
 
     #[test]
+    fn a_miss_is_vocabulary_when_recall_never_reaches_it_noise_behind_a_digest_or_hop_else_ranking() {
+        let p = |id: i64, kind: &str, reason: &str| DeepPointer { node_id: id, kind: kind.into(), reason: reason.into() };
+        let direct: Vec<DeepPointer> = (1..=9).map(|i| p(i, "gotcha", "matched \"x\"")).collect();
+        assert_eq!(miss_category(&direct, None), "vocabulary");
+        assert_eq!(miss_category(&direct, Some(9)), "ranking");
+        let mut noisy = direct.clone();
+        noisy[2] = p(3, "doc_section", "matched \"x\"");
+        assert_eq!(miss_category(&noisy, Some(9)), "noise");
+        let mut hopped = direct.clone();
+        hopped[7] = p(8, "note", "similar to \"A\"");
+        assert_eq!(miss_category(&hopped, Some(9)), "noise");
+        // Only the seed slots above the target count.
+        let mut late = direct;
+        late.push(p(10, "doc_section", "matched \"x\""));
+        late.push(p(11, "gotcha", "matched \"x\""));
+        assert_eq!(miss_category(&late, Some(11)), "ranking");
+    }
+
+    #[test]
+    fn deep_rank_finds_a_target_below_the_seed_cut() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..12).map(|n| note(&store, NodeKind::Gotcha, &format!("webhook signature {n}"), &format!("webhook signature {n}"))).collect();
+        let backend = Backend::Local { store: Box::new(store), repo: "r".into() };
+        let deep = backend.deep("webhook signature").unwrap();
+        assert!(deep.len() > SEED_SLOTS, "{deep:?}");
+        let last = deep.last().unwrap().node_id;
+        assert_eq!(deep_rank(&backend, &deep, &[last]).unwrap(), Some(deep.len()));
+        assert_eq!(deep_rank(&backend, &deep, &[999_999]).unwrap(), None);
+        assert!(ids.contains(&last));
+    }
+
+    #[test]
     fn a_pinned_needs_review_or_missing_target_is_refused_by_case() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let pinned = note(&store, NodeKind::Gotcha, "pinned rule", "x");
@@ -452,7 +571,7 @@ mod tests {
         let file = std::fs::read_dir(&out_dir).unwrap().next().unwrap().unwrap().path();
         let report: Value = serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
         for c in report["cases"].as_array().unwrap() {
-            for field in ["case_id", "mode", "first_hit_rank", "hit_type", "digest_in_seed", "seed_kinds", "latency_ms"] {
+            for field in ["case_id", "mode", "first_hit_rank", "hit_type", "digest_in_seed", "seed_kinds", "latency_ms", "deep_rank", "miss_category"] {
                 assert!(c.get(field).is_some(), "missing {field}: {c}");
             }
         }
