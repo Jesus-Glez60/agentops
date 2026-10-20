@@ -824,6 +824,10 @@ pub trait GraphStore {
     fn add_node(&self, node: NewNode) -> Result<i64>;
     fn get_node(&self, repo: &str, id: i64) -> Result<Option<Node>>;
     fn nodes_by_kind(&self, repo: &str, kind: NodeKind) -> Result<Vec<Node>>;
+    /// Every node whose `path` is exactly `path` (repo-relative): a file's
+    /// `File` node and the symbols defined in it. Work-time recall starts
+    /// from these to reach the notes that `Affects` a file's symbols.
+    fn nodes_in_file(&self, repo: &str, path: &str) -> Result<Vec<Node>>;
     /// All nodes across every kind with `prominence == Pinned` in `repo` --
     /// backs the sticky-pin "always inject" context feature. Unlike
     /// `nodes_by_kind`, this is kind-agnostic: a pinned node can be a

@@ -578,6 +578,12 @@ impl GraphStore for SqliteGraphStore {
         rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
+    fn nodes_in_file(&self, repo: &str, path: &str) -> Result<Vec<Node>> {
+        let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE repo = ?1 AND path = ?2 ORDER BY id")?;
+        let rows = stmt.query_map(rusqlite::params![repo, path], Self::row_to_node)?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
     fn nodes_pinned(&self, repo: &str) -> Result<Vec<Node>> {
         let mut stmt = self.conn.prepare("SELECT * FROM nodes WHERE repo = ?1 AND prominence = 'pinned'")?;
         let rows = stmt.query_map(rusqlite::params![repo], Self::row_to_node)?;

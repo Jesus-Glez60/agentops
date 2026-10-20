@@ -460,6 +460,7 @@ dependencies = [
  "agentops-embeddings",
  "agentops-graph",
  "anyhow",
+ "serde",
  "tempfile",
 ]
 

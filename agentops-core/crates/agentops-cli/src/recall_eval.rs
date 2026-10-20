@@ -110,19 +110,19 @@ struct Summary {
 
 /// How deep `recall-eval` looks past the seed: the server's
 /// `POST /repos/{id}/recall` cap.
-const DEEP_LIMIT: usize = 50;
+pub(crate) const DEEP_LIMIT: usize = 50;
 
 /// One pointer of the deep ranking.
 #[derive(Debug, Clone, Deserialize)]
-struct DeepPointer {
-    node_id: i64,
-    kind: String,
-    reason: String,
+pub(crate) struct DeepPointer {
+    pub(crate) node_id: i64,
+    pub(crate) kind: String,
+    pub(crate) reason: String,
 }
 
 /// Where the hook runs: this repo's local graph, or the server it's
 /// connected to.
-enum Backend {
+pub(crate) enum Backend {
     Local { store: Box<dyn GraphStore>, repo: String },
     Remote(RemoteMcpMarker),
 }
@@ -161,7 +161,7 @@ impl Backend {
 
     /// The deep ranking for `prompt`: the retrieval the hook runs, up to
     /// `DEEP_LIMIT` pointers, with nothing recorded.
-    fn deep(&self, prompt: &str) -> Result<Vec<DeepPointer>> {
+    pub(crate) fn deep(&self, prompt: &str) -> Result<Vec<DeepPointer>> {
         match self {
             Backend::Local { store, repo } => Ok(agentops_retrieval::recall_seed(store.as_ref(), repo, prompt, DEEP_LIMIT, &Default::default())?
                 .into_iter()
@@ -175,7 +175,7 @@ impl Backend {
     }
 
     /// A node's prominence, or `None` if it doesn't exist.
-    fn prominence(&self, node: i64) -> Result<Option<NodeProminence>> {
+    pub(crate) fn prominence(&self, node: i64) -> Result<Option<NodeProminence>> {
         match self {
             Backend::Local { store, repo } => Ok(store.get_node(repo, node)?.map(|n| n.prominence)),
             Backend::Remote(marker) => match remote_get(marker, &format!("nodes/{node}")) {
@@ -193,7 +193,7 @@ fn remote_get(marker: &RemoteMcpMarker, rest: &str) -> Result<Value> {
 }
 
 /// `GET`, or `POST` with a JSON body, to `{server}/repos/{connection}/{rest}`.
-fn remote_send(marker: &RemoteMcpMarker, rest: &str, body: Option<&Value>) -> Result<Value> {
+pub(crate) fn remote_send(marker: &RemoteMcpMarker, rest: &str, body: Option<&Value>) -> Result<Value> {
     let url = format!("{}/repos/{}/{rest}", marker.server_url.trim_end_matches('/'), marker.connection_id);
     let auth = format!("Bearer {}", marker.api_key);
     let method = if body.is_some() { "POST" } else { "GET" };
@@ -395,7 +395,7 @@ fn parse_pointer(line: &str) -> Option<(i64, String)> {
 
 /// Nearest-rank percentile: the smallest sample with at least `p`% of
 /// samples at or below it.
-fn percentile(samples: &[f64], p: f64) -> f64 {
+pub(crate) fn percentile(samples: &[f64], p: f64) -> f64 {
     if samples.is_empty() {
         return 0.0;
     }
@@ -432,7 +432,7 @@ fn render_table(results: &[CaseResult], summary: &Summary) -> String {
     out
 }
 
-fn unix_secs() -> u64 {
+pub(crate) fn unix_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 

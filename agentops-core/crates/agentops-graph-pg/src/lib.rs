@@ -364,6 +364,14 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn nodes_in_file(&self, repo: &str, path: &str) -> Result<Vec<Node>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT * FROM nodes WHERE repo = $1 AND path = $2 ORDER BY id", &[&repo, &path]).await?;
+            Ok(rows.iter().map(row_to_node).collect())
+        })
+    }
+
     fn nodes_pinned(&self, repo: &str) -> Result<Vec<Node>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;

@@ -19,6 +19,9 @@ pub const PLAN_FLOW_BUDGET: usize = 4000;
 pub const PLAN_SEED_MAX_ITEMS: usize = 8;
 /// New recall pointers on an ordinary (non-plan) prompt.
 pub const DEFAULT_SEED_MAX_ITEMS: usize = 5;
+/// Most recall pointers one work cue (a file read or edited, an error)
+/// injects (milestone 3b): a glance, not a briefing.
+pub const WORK_RECALL_MAX_ITEMS: usize = 3;
 /// Everything a `SubagentStart` hook injects; same as the session guide.
 pub const SUBAGENT_SEED_BUDGET: usize = 2000;
 /// The pinned block (milestone 2): its own budget, added on top of

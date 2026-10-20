@@ -17,6 +17,7 @@ mod recall_eval;
 mod remote_marker;
 mod usage;
 mod usage_report;
+mod work_recall_eval;
 
 use std::path::{Path, PathBuf};
 
@@ -207,6 +208,34 @@ enum Command {
         /// Runs per case (latency percentiles come from all of them).
         #[arg(long, default_value_t = 5)]
         repeat: usize,
+    },
+    /// Measures recall during work (milestone 3b): `--sizing` counts the
+    /// tool calls a work-time hook would see in this repo's transcripts;
+    /// the default scores `.context/work-recall-eval.jsonl`'s file and
+    /// error cues; `--replay` walks past sessions' tool calls in order.
+    /// Records nothing in the graph.
+    WorkRecallEval {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Run against the server this repo is connected to.
+        #[arg(long)]
+        remote: bool,
+        /// JSONL cases `{id, cue: {kind, path?, text?}, targets}`; defaults
+        /// to `.context/work-recall-eval.jsonl`.
+        #[arg(long)]
+        cases: Option<PathBuf>,
+        /// Score a baseline instead of work-time recall.
+        #[arg(long, value_enum)]
+        baseline: Option<work_recall_eval::Baseline>,
+        /// Runs per case (latency percentiles come from all of them).
+        #[arg(long, default_value_t = 3)]
+        repeat: usize,
+        /// Count tool calls per session in the last 30 days of transcripts.
+        #[arg(long)]
+        sizing: bool,
+        /// Session ids (or prefixes) to replay, in order.
+        #[arg(long, num_args = 1..)]
+        replay: Vec<String>,
     },
     /// Dense-vector search over embedded symbols/gotchas/decisions/notes —
     /// requires having scanned/added notes with --with-embeddings first.
@@ -724,6 +753,7 @@ fn main() -> Result<()> {
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
         Command::LinkSimilar { path, prune } => link_similar(&path, prune),
         Command::RecallEval { path, remote, cases, mode, repeat } => recall_eval::run(&path, remote, cases.as_deref(), mode, repeat),
+        Command::WorkRecallEval { path, remote, cases, baseline, repeat, sizing, replay } => work_recall_eval::run(&path, work_recall_eval::Options { remote, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay }),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)

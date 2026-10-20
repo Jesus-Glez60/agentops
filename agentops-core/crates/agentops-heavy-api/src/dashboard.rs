@@ -769,6 +769,47 @@ pub(crate) async fn recall_json(State(state): State<AppState>, user: Option<axum
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct WorkRecallBody {
+    cue: agentops_retrieval::work_recall::WorkCue,
+    #[serde(default)]
+    sources: agentops_retrieval::work_recall::CueSources,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /repos/{id}/work-recall` -- the candidates one work cue (a file or
+/// an error) reaches, ranked, from the same resolution the `PostToolUse`
+/// hook runs (`agentops_retrieval::work_recall::resolve_cue`), up to
+/// `RECALL_DEEP_MAX`, recording nothing. `agentops work-recall-eval` scores
+/// its cases against it.
+pub(crate) async fn work_recall_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<WorkRecallBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let limit = body.limit.unwrap_or(RECALL_DEEP_MAX).min(RECALL_DEEP_MAX);
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Vec<Value>>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        let candidates = agentops_retrieval::work_recall::resolve_cue(store.as_ref(), &repo, &body.cue, body.sources)?;
+        Ok(Some(candidates.into_iter().take(limit).map(|c| json!({ "node_id": c.pointer.node_id, "kind": c.pointer.kind.as_db_str(), "title": c.pointer.title, "reason": c.pointer.reason, "score": c.score })).collect()))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(candidates))) => (StatusCode::OK, Json(json!({ "candidates": candidates }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// `GET /repos/{id}/docs` -- mirrors `agentops-api`'s `docs_json` cache-hit/
 /// miss logic exactly (persisted `doc_pages` row if present, else a
 /// heuristic-only page built on the fly, never persisted from here).
@@ -1317,6 +1358,52 @@ mod tests {
         assert!(graph.session_events_for_repo(&repo, None).unwrap().is_empty(), "a recall probe records nothing");
 
         let resp = app.oneshot(post(&other_token, json!({ "prompt": "webhook signature" }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
+    }
+
+    #[tokio::test]
+    async fn work_recall_resolves_a_file_cue_records_no_session_and_never_crosses_tenants() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&other.tenant, other.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+
+        let path = crate::indexing::checkout_path(checkouts_dir.path(), &owner.tenant, &connection_id);
+        let repo = agentops_mcp::repo_name(&path);
+        let gotcha = {
+            let graph = agentops_mcp::open_store(&path).unwrap();
+            let node = |kind, path: &str, name: &str| agentops_graph::upsert_node(graph.as_ref(), agentops_graph::NewNode { kind, repo: repo.clone(), path: Some(path.into()), name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some(name.into()) }).unwrap();
+            let symbol = node(agentops_graph::NodeKind::Symbol, "src/hooks.rs", "handle");
+            let gotcha = node(agentops_graph::NodeKind::Gotcha, "vault:g.md", "hook payload trap");
+            graph.add_edge(&repo, gotcha, symbol, agentops_graph::EdgeRelation::Affects).unwrap();
+            gotcha
+        };
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let post = |token: &str, body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/repos/{connection_id}/work-recall"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let resp = app.clone().oneshot(post(&owner_token, json!({ "cue": { "kind": "file", "path": "src/hooks.rs" }, "sources": "affects_only" }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let candidates = body_json(resp).await["candidates"].as_array().unwrap().clone();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0]["node_id"], json!(gotcha));
+        assert_eq!(candidates[0]["reason"], "affects `handle`");
+        let graph = agentops_mcp::open_store(&path).unwrap();
+        assert!(graph.session_events_for_repo(&repo, None).unwrap().is_empty(), "a work-recall probe records nothing");
+
+        let resp = app.oneshot(post(&other_token, json!({ "cue": { "kind": "file", "path": "src/hooks.rs" } }))).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
     }
 

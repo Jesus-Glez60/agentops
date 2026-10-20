@@ -9,6 +9,7 @@ name = "agentops_retrieval"
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
 agentops-graph = { path = "../agentops-graph" }
 agentops-embeddings = { path = "../agentops-embeddings" }
 
