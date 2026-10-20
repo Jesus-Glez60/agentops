@@ -75,7 +75,7 @@ Change in hit rate per item: 0b re-baseline −1 (graph drift; m2-2 moved from r
 | `SIMILAR_MIN_SCORE` | 0.82 | Yes: +1 case after the prune; 709 pairs pruned |
 | `SIMILAR_MIN_EDGES` | 1 | Yes: 0 memories unlinked before and after |
 | `SIMILAR_FLOOR_SCORE` | 0.75 | Yes: 94 floor pairs kept or added |
-| `RETITLE_MAX` (new) | 90 | Titles read as titles in the dry-run list; the author's web-workspace read is **unverified** at the time of writing |
+| `RETITLE_MAX` (new) | 90 | Yes: the author read the 46 retitled titles in the web workspace (2026-10-20) |
 | Keyword weight (new) | `ln(1 + N/df)` | MRR +0.03, hit rate unchanged |
 
 ## 4. Interfaces milestone 3b will reuse
@@ -134,7 +134,7 @@ Code files are well reached through `Affects`. Docs files are reached by neither
 - F63: edges store no score.
 - F64: the hop was nondeterministic (resolved).
 - F65: the `LocalEmbedder` test.
-- F66: the CI cache filled the disk; still open, nothing caps it.
+- F66: the CI cache filled the disk; resolved, now capped at 20 GB with a 25 GB free-space floor.
 - F67: stale CI builds after a gate.
 - F68: PostToolUse records very little.
 - F69: deep rank is bounded by the candidate pool.
@@ -154,5 +154,4 @@ Each is also a gotcha on the hosted graph.
 1. **The last case to 16/20.** All four ranking misses tie on common words, and neither IDF nor meaning lifts them into the seed. Options: weight the keyword list above the dense list in fusion; give the work-time hook its own cue (the file being edited) instead of improving the prompt seed further; or accept 15/20 for prompt-time recall.
 2. **Sizing work-time recall.** `session_events` can't size it (F68). Measure from session transcripts first, or record every Read/Grep for a pilot week?
 3. **Docs files.** Docs files have no reachable memories (§5). Should recall during work on a doc fall back to the doc's own section or its links?
-4. **The CI cache (F66).** Cap or prune `agentops-ci-target` in `agentops-ci` before milestone 3b's runs.
-5. **Retitles.** The author's review of the 46 retitled titles in the web workspace is still open.
+4. **CI cold builds.** The 20 GB cap on the CI cache (F66) means a cold build every few gates. If that gets slow, a larger disk (about 75 GB is unallocated in `ubuntu-vg`) would allow a higher cap.

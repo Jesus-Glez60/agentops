@@ -487,7 +487,7 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 - Status: 2026-10-20, about 05:22 to 15:57 UTC; fixed by the author's approval; recorded as a gotcha.
 - The `agentops-ci-target` volume reached 54.5 GB and the root LV hit 100%. Postgres then failed every write and crash-looped. Hook writes in that window were lost, and an autodeploy health check failed mid-deploy.
 - Removing the volume (a pure cache) freed 48 GB, and Postgres recovered on its own.
-- **Open:** nothing caps or prunes that volume.
+- **Resolved** 2026-10-20 in the private CI script (`/usr/local/bin/agentops-ci`, not in this repo). The script already had a 60 GB cap, but it was larger than the free disk and checked only before a run. The volume had regrown to 23.3 GB within about 90 minutes of gates after the wipe. The cap is now 20 GB, and the volume is also wiped whenever `/` would have under 25 GB free. Both checks run before and after every Rust suite, and a forced run with a 1 MB cap showed both firing.
 
 ### F67. `agentops-test-remote` can build stale code after an autodeploy gate
 
