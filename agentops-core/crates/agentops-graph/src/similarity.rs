@@ -20,9 +20,15 @@ use crate::{effective_edge_weight, EdgeRelation, GraphStore, Node, NodeKind};
 /// Neighbours linked per write: enough to reach a cluster in one hop.
 pub const SIMILAR_K: usize = 5;
 /// Cosine at or above which two memories are related, not merely on the
-/// same topic. A starting value; the milestone 2 pilot reports the score
-/// distribution it was tuned from.
-pub const SIMILAR_MIN_SCORE: f32 = 0.75;
+/// same topic. Milestone 2 started at 0.75, which linked 77% of candidate
+/// pairs (F56); 0.82 keeps roughly the top quarter (milestone 3a).
+pub const SIMILAR_MIN_SCORE: f32 = 0.82;
+/// Fewest `SimilarTo` edges a memory keeps when a neighbour at or above
+/// `SIMILAR_FLOOR_SCORE` exists, so raising the threshold leaves no memory
+/// without an association it had a reasonable claim to.
+pub const SIMILAR_MIN_EDGES: usize = 1;
+/// The old threshold, used only to keep a memory from becoming unlinked.
+pub const SIMILAR_FLOOR_SCORE: f32 = 0.75;
 /// Most `SimilarTo` edges one memory keeps, so a generic note can't become
 /// a hub. Over the cap, the weakest edge (by decayed weight) goes.
 pub const SIMILAR_MAX_DEGREE: usize = 12;
@@ -119,7 +125,13 @@ fn link(store: &dyn GraphStore, repo: &str, node_id: i64, reinforce: bool) -> Re
         return Ok(summary);
     }
     let Some(embedding) = store.get_embedding(repo, node_id)? else { return Ok(summary) };
-    let neighbours: Vec<(Node, f32)> = similar_memories(store, repo, &embedding, Some(node_id), SIMILAR_K)?.into_iter().filter(|(_, score)| *score >= SIMILAR_MIN_SCORE).collect();
+    let nearest = similar_memories(store, repo, &embedding, Some(node_id), SIMILAR_K)?;
+    let mut neighbours: Vec<(Node, f32)> = nearest.iter().filter(|(_, score)| *score >= SIMILAR_MIN_SCORE).cloned().collect();
+    // Nothing above the threshold: keep the closest above the floor, so a
+    // memory that has a reasonable neighbour isn't left unlinked.
+    if neighbours.len() < SIMILAR_MIN_EDGES && similar_degree(store, repo, node_id)? < SIMILAR_MIN_EDGES {
+        neighbours.extend(nearest.into_iter().filter(|(_, score)| *score >= SIMILAR_FLOOR_SCORE).take(SIMILAR_MIN_EDGES - neighbours.len()));
+    }
     for (neighbour, score) in &neighbours {
         for (src, dst) in [(node_id, neighbour.id), (neighbour.id, node_id)] {
             match link_one(store, repo, src, dst, reinforce)? {
@@ -171,6 +183,112 @@ fn hold_degree(store: &dyn GraphStore, repo: &str, id: i64) -> Result<usize> {
         }
     }
     Ok(excess)
+}
+
+fn similar_degree(store: &dyn GraphStore, repo: &str, id: i64) -> Result<usize> {
+    Ok(store.edges_from(repo, id)?.iter().filter(|e| e.relation == EdgeRelation::SimilarTo).count())
+}
+
+/// What `prune_similar` did, and the unlinked share around it.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct PruneSummary {
+    pub memories: usize,
+    /// Undirected pairs deleted (two edges each).
+    pub pairs_pruned: usize,
+    /// Pairs under `SIMILAR_MIN_SCORE` kept or added as a memory's floor.
+    pub floor_pairs: usize,
+    /// Memories with no edge of any kind, before and after.
+    pub unlinked_before: usize,
+    pub unlinked_after: usize,
+}
+
+/// Raises existing `SimilarTo` edges to `SIMILAR_MIN_SCORE`: every pair
+/// whose cosine (read from the stored vectors, since edges keep no score)
+/// is below it is deleted in both directions, unless it is a memory's floor:
+/// its closest pair at or above `SIMILAR_FLOOR_SCORE` when the memory would
+/// otherwise keep fewer than `SIMILAR_MIN_EDGES`. A memory left with none
+/// is then linked to its closest neighbour above the floor, if any.
+/// Idempotent: a second run keeps the same pairs and adds nothing, and a
+/// run cut short is completed by the next.
+pub fn prune_similar(store: &dyn GraphStore, repo: &str) -> Result<PruneSummary> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    let mut summary = PruneSummary::default();
+    let mut memories = Vec::new();
+    for &kind in MEMORY_KINDS {
+        memories.extend(store.nodes_by_kind(repo, kind)?.into_iter().map(|n| n.id));
+    }
+    summary.memories = memories.len();
+    summary.unlinked_before = count_unlinked(store, repo, &memories)?;
+
+    // Every undirected SimilarTo pair, with its cosine (None: a vector is missing).
+    let mut pairs: BTreeMap<(i64, i64), Option<f32>> = BTreeMap::new();
+    for &id in &memories {
+        let targets: Vec<i64> = store.edges_from(repo, id)?.into_iter().filter(|e| e.relation == EdgeRelation::SimilarTo).map(|e| e.dst_id).collect();
+        if targets.is_empty() {
+            continue;
+        }
+        let vectors = store.get_embeddings(repo, &[&[id][..], &targets].concat())?;
+        for t in targets {
+            let score = match (vectors.get(&id), vectors.get(&t)) {
+                (Some(a), Some(b)) => Some(cosine(a, b)),
+                _ => None,
+            };
+            pairs.entry((id.min(t), id.max(t))).or_insert(score);
+        }
+    }
+    let strong = |s: &Option<f32>| s.is_some_and(|s| s >= SIMILAR_MIN_SCORE);
+    let mut keep: HashSet<(i64, i64)> = pairs.iter().filter(|(_, s)| strong(s)).map(|(p, _)| *p).collect();
+    let mut by_node: HashMap<i64, Vec<((i64, i64), f32)>> = HashMap::new();
+    for (&pair, score) in &pairs {
+        if let Some(s) = *score {
+            by_node.entry(pair.0).or_default().push((pair, s));
+            by_node.entry(pair.1).or_default().push((pair, s));
+        }
+    }
+    for &id in &memories {
+        let Some(mine) = by_node.get_mut(&id) else { continue };
+        let kept = mine.iter().filter(|(p, _)| keep.contains(p)).count();
+        if kept >= SIMILAR_MIN_EDGES {
+            continue;
+        }
+        mine.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        let floor: Vec<(i64, i64)> = mine.iter().filter(|(p, s)| *s >= SIMILAR_FLOOR_SCORE && !keep.contains(p)).take(SIMILAR_MIN_EDGES - kept).map(|(p, _)| *p).collect();
+        summary.floor_pairs += floor.len();
+        keep.extend(floor);
+    }
+    for &(a, b) in pairs.keys().filter(|p| !keep.contains(p)) {
+        for (src, dst) in [(a, b), (b, a)] {
+            let ids: Vec<i64> = store.edges_from(repo, src)?.into_iter().filter(|e| e.relation == EdgeRelation::SimilarTo && e.dst_id == dst).map(|e| e.id).collect();
+            store.delete_edges_batch(repo, &ids)?;
+        }
+        summary.pairs_pruned += 1;
+    }
+
+    // A memory with no SimilarTo edge left: its closest neighbour above the floor.
+    for &id in &memories {
+        if similar_degree(store, repo, id)? >= SIMILAR_MIN_EDGES {
+            continue;
+        }
+        let Some(embedding) = store.get_embedding(repo, id)? else { continue };
+        if let Some((neighbour, _)) = similar_memories(store, repo, &embedding, Some(id), 1)?.into_iter().find(|(_, s)| *s >= SIMILAR_FLOOR_SCORE) {
+            link_one(store, repo, id, neighbour.id, false)?;
+            link_one(store, repo, neighbour.id, id, false)?;
+            summary.floor_pairs += 1;
+        }
+    }
+    summary.unlinked_after = count_unlinked(store, repo, &memories)?;
+    Ok(summary)
+}
+
+/// Memories with no edge of any kind, in or out.
+fn count_unlinked(store: &dyn GraphStore, repo: &str, memories: &[i64]) -> Result<usize> {
+    let mut n = 0;
+    for &id in memories {
+        if store.edges_from(repo, id)?.is_empty() && store.edges_to(repo, id)?.is_empty() {
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Cosine of every distinct pair among each memory's `per_node` nearest
@@ -251,6 +369,60 @@ mod tests {
         for id in &linked {
             assert_eq!(similar_to(&store, *id), vec![new], "stored both ways");
         }
+    }
+
+    /// A unit vector at `degrees` in the plane of dimensions `x` and `x + 1`:
+    /// two of them have cosine `cos(difference)`.
+    fn angled(x: usize, degrees: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; 384];
+        (v[x], v[x + 1]) = (degrees.to_radians().cos(), degrees.to_radians().sin());
+        v
+    }
+
+    fn pair(store: &SqliteGraphStore, a: i64, b: i64) {
+        store.add_edge("r", a, b, EdgeRelation::SimilarTo).unwrap();
+        store.add_edge("r", b, a, EdgeRelation::SimilarTo).unwrap();
+    }
+
+    #[test]
+    fn a_prune_keeps_strong_pairs_and_one_floor_pair_per_memory_relinks_the_unlinked_and_is_idempotent() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = memory(&store, NodeKind::Note, "a", &angled(0, 0.0));
+        let b = memory(&store, NodeKind::Note, "b", &angled(0, 25.0)); // a-b 0.906
+        let c = memory(&store, NodeKind::Note, "c", &angled(0, -40.0)); // a-c 0.766
+        let d = memory(&store, NodeKind::Note, "d", &angled(0, -77.0)); // c-d 0.799
+        let e = memory(&store, NodeKind::Gotcha, "e", &angled(10, 0.0));
+        let f = memory(&store, NodeKind::Gotcha, "f", &angled(10, 53.0)); // e-f 0.602
+        let g = memory(&store, NodeKind::Decision, "g", &angled(0, 63.0)); // g-b 0.788, no edge yet
+        for (x, y) in [(a, b), (a, c), (c, d), (e, f)] {
+            pair(&store, x, y);
+        }
+
+        let first = prune_similar(&store, "r").unwrap();
+        assert_eq!((first.memories, first.unlinked_before, first.unlinked_after), (7, 1, 2), "{first:?}");
+        assert_eq!(first.pairs_pruned, 2, "a-c is under the threshold and not c's best; e-f is under the floor: {first:?}");
+        assert_eq!(first.floor_pairs, 2, "c-d kept as c's floor, g linked to b: {first:?}");
+        assert_eq!(similar_to(&store, a), vec![b]);
+        assert_eq!(similar_to(&store, c), vec![d]);
+        assert_eq!(similar_to(&store, g), vec![b]);
+        assert!(similar_to(&store, e).is_empty() && similar_to(&store, f).is_empty(), "nothing above the floor for them");
+
+        let edges = |store: &SqliteGraphStore| [a, b, c, d, e, f, g].map(|id| similar_to(store, id));
+        let before = edges(&store);
+        let second = prune_similar(&store, "r").unwrap();
+        assert_eq!((second.pairs_pruned, second.unlinked_after), (0, 2), "{second:?}");
+        assert_eq!(edges(&store), before, "a second run changes nothing");
+    }
+
+    #[test]
+    fn a_write_with_nothing_above_the_threshold_keeps_its_closest_neighbour_above_the_floor() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let near = memory(&store, NodeKind::Note, "near", &angled(0, 38.0)); // 0.788
+        let too_far = memory(&store, NodeKind::Note, "too-far", &angled(0, -60.0)); // 0.5
+        let new = memory(&store, NodeKind::Note, "new", &angled(0, 0.0));
+        link_similar(&store, "r", new).unwrap();
+        assert_eq!(similar_to(&store, new), vec![near]);
+        assert!(!similar_to(&store, new).contains(&too_far));
     }
 
     #[test]

@@ -17,7 +17,7 @@ Hooks must stay free of embedding work: each hook is a fresh process with a tigh
 Add a plastic `EdgeRelation::SimilarTo` between memories (gotcha, decision, note), stored in both directions.
 
 - **Computed at write time only** (`agentops_graph::similarity::link_similar`), where the embedding already exists: `add_note` with embeddings, `ingest_notes`, the importer, the scan's note-embedding pass, and the `agentops link-similar` backfill.
-- **Top `SIMILAR_K = 5` above `SIMILAR_MIN_SCORE = 0.75` cosine**, computed in Rust from stored vectors so SQLite (L2 KNN) and Postgres (cosine KNN) agree. At most `SIMILAR_MAX_DEGREE = 12` per memory; the weakest pair goes first.
+- **Top `SIMILAR_K = 5` above `SIMILAR_MIN_SCORE` cosine** (0.75 at first; raised to 0.82 in milestone 3a, with a 0.75 floor so no memory loses its only reasonable link — see the amendment), computed in Rust from stored vectors so SQLite (L2 KNN) and Postgres (cosine KNN) agree. At most `SIMILAR_MAX_DEGREE = 12` per memory; the weakest pair goes first.
 - **Doc sections are excluded**: they're generated digests and already the main source of recall noise (F53).
 - **Reinforced, not reset**, on an explicit re-write; only created, never reinforced, on a rescan, which re-reads every note. Decays with a 90-day half-life, like `References`.
 - **Followed, never computed, in hooks**: `recall_seed` takes one hop from each memory that qualified on its own cues. The neighbour's reason is `similar to "<title>"`.

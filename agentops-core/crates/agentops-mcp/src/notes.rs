@@ -238,10 +238,13 @@ pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, cl
 /// decision and note that has no vector yet, creates the missing
 /// `SimilarTo` edges (never reinforcing existing ones), and returns a plain
 /// text report: the candidate-pair cosine histogram the thresholds are tuned
-/// from, and how many memories still have no edge of any kind. Shared by
-/// `agentops link-similar` and `agentops-server link-similar`, which runs it
-/// inside the hosted app with that deployment's own store settings.
-pub fn link_similar_backfill(store: &dyn agentops_graph::GraphStore, repo: &str) -> Result<String> {
+/// from, and how many memories still have no edge of any kind. With
+/// `prune`, edges below `SIMILAR_MIN_SCORE` are pruned first
+/// (`similarity::prune_similar`) and the unlinked share is reported before
+/// and after. Shared by `agentops link-similar` and `agentops-server
+/// link-similar`, which runs it inside the hosted app with that
+/// deployment's own store settings.
+pub fn link_similar_backfill(store: &dyn agentops_graph::GraphStore, repo: &str, prune: bool) -> Result<String> {
     use agentops_graph::similarity;
     use std::fmt::Write as _;
     let mut embedded = 0;
@@ -253,8 +256,17 @@ pub fn link_similar_backfill(store: &dyn agentops_graph::GraphStore, repo: &str)
             }
         }
     }
-    let summary = similarity::link_all_similar(store, repo, false)?;
     let mut out = String::new();
+    let share = |n: usize, total: usize| if total == 0 { 0.0 } else { 100.0 * n as f64 / total as f64 };
+    if prune {
+        let p = similarity::prune_similar(store, repo)?;
+        writeln!(out, "repo {repo}: pruned {} SimilarTo pairs below {}, kept or added {} floor pairs (>= {})", p.pairs_pruned, similarity::SIMILAR_MIN_SCORE, p.floor_pairs, similarity::SIMILAR_FLOOR_SCORE)?;
+        writeln!(out, "unlinked memories: {} of {} ({:.1}%) before, {} ({:.1}%) after", p.unlinked_before, p.memories, share(p.unlinked_before, p.memories), p.unlinked_after, share(p.unlinked_after, p.memories))?;
+        if share(p.unlinked_after, p.memories) > 5.0 {
+            writeln!(out, "WARNING: more than 5% of memories are unlinked after the prune")?;
+        }
+    }
+    let summary = similarity::link_all_similar(store, repo, false)?;
     writeln!(out, "repo {repo}: embedded {embedded} memories, created {} SimilarTo edges, dropped {} over the degree cap", summary.edges_created, summary.edges_dropped)?;
 
     let per_node = 2 * similarity::SIMILAR_K;
@@ -283,7 +295,7 @@ pub fn link_similar_backfill(store: &dyn agentops_graph::GraphStore, repo: &str)
             }
         }
     }
-    writeln!(out, "memories with no edges of any kind: {unlinked} of {total}")?;
+    writeln!(out, "memories with no edges of any kind: {unlinked} of {total} ({:.1}%)", share(unlinked, total))?;
     Ok(out)
 }
 
@@ -452,9 +464,9 @@ mod tests {
         let store = crate::store::open_store(dir.path()).unwrap();
         let repo = crate::scan::repo_name(dir.path());
 
-        let first = super::link_similar_backfill(store.as_ref(), &repo).unwrap();
+        let first = super::link_similar_backfill(store.as_ref(), &repo, false).unwrap();
         assert!(first.contains("embedded 2 memories") && first.contains("created 2 SimilarTo edges") && first.contains("memories with no edges of any kind: 0 of 2"), "{first}");
-        let second = super::link_similar_backfill(store.as_ref(), &repo).unwrap();
+        let second = super::link_similar_backfill(store.as_ref(), &repo, false).unwrap();
         assert!(second.contains("embedded 0 memories") && second.contains("created 0 SimilarTo edges"), "{second}");
     }
 }

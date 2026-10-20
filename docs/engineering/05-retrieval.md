@@ -214,7 +214,7 @@ Compile-time constants (change in code):
 | `GIST_TOP_K`, `DETAIL_PASS_MAX_TOP_K` | 3, 1000 | same |
 | `PATTERN_COMPLETE_SIMILARITY_FLOOR`, `_PPR_FLOOR`, `_FETCH_MULTIPLE` | 0.5, 0.01, 3 | same |
 | `AFFECTS_EDGE_HALF_LIFE_DAYS`, `REFERENCES_EDGE_HALF_LIFE_DAYS`, `SIMILAR_TO_EDGE_HALF_LIFE_DAYS` | 30, 90, 90 | `agentops-graph/src/lib.rs` |
-| `SIMILAR_K`, `SIMILAR_MIN_SCORE`, `SIMILAR_MAX_DEGREE`, `DUPLICATE_MIN_SCORE` | 5, 0.75, 12, 0.92 | `agentops-graph/src/similarity.rs` |
+| `SIMILAR_K`, `SIMILAR_MIN_SCORE`, `SIMILAR_MAX_DEGREE`, `DUPLICATE_MIN_SCORE`, `SIMILAR_MIN_EDGES`, `SIMILAR_FLOOR_SCORE` | 5, 0.82, 12, 0.92, 1, 0.75 | `agentops-graph/src/similarity.rs` |
 | `prominence_rank_multiplier` (`Reduced`) | 0.1 | same |
 | `CANDIDATE_POOL_MULTIPLIER`, `MIN_CANDIDATE_POOL` | 4, 20 | `agentops-heavy-embeddings/src/lib.rs` |
 

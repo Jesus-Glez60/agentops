@@ -428,6 +428,8 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 ### F56. `SIMILAR_MIN_SCORE = 0.75` links 77% of candidate pairs
 
+- **Resolved** in milestone 3a item 5: the threshold is now 0.82, with a 0.75 floor per memory, and `link-similar --prune` removes the existing edges below it.
+
 - Status: measured 2026-10-17 by `agentops-server link-similar` on this repo's hosted graph (357 memories, 2,621 candidate pairs, 10 nearest each).
 - 2,013 pairs score at least 0.75; the 0.75–0.80 bucket alone holds 1,258. On BGE-small, 0.75 means "same repo and style", not "related". The degree cap (12) then did most of the selecting: 115 edges dropped.
 - Open. Proposal in `handoffs/m2-report.md` §3.

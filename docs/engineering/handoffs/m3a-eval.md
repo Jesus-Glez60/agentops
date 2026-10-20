@@ -21,6 +21,7 @@ Scores from `agentops recall-eval --remote --repeat 5` (`agentops-cli/src/recall
 | 3b. + cap of 2 per source | `0fd3880` | 11/20 (55%), 11 exact, 0 equivalent | – | 0.399 | 60 / 84 | 0/20 |
 | 3c. + one cue fewer | `4699cdb` | 11/20 (55%), 11 exact, 0 equivalent | – | 0.396 | 62 / 93 | 0/20 |
 | 3. Reverted to one cue (kept: cosine score, cap, determinism) | `c68d349` | 13/20 (65%), 13 exact, 0 equivalent | – | 0.414 | 65 / 85 | 0/20 |
+| 4. Recall by meaning on the server | `1aab7ff` | 14/20 (70%), 14 exact, 0 equivalent | 4/5 | 0.446 | 102 / 127 | 0/20 |
 
 Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 
@@ -75,6 +76,12 @@ Retrieval is unchanged from the baseline. The graph has gained notes since then,
 | c18 | 3 | exact | 3 |  |
 | c19 | 1 | exact | 1 |  |
 | c20 | – | miss | 10 | noise |
+
+## Item 4 notes
+
+The dense timeout fired 0 times in 100 runs. That count comes from the PM2 error log inside the app container, because the server's output doesn't reach `docker logs`. m2-5, a vocabulary miss in every earlier run, is now found by meaning at rank 2. c12 dropped out (deep rank 16), and m2-5 and c11 came in.
+
+The measurement was delayed by an outage. The server's disk filled with the CI cargo cache (`agentops-ci-target`, 54.5 GB), and Postgres crash-looped from about 05:22 to 15:57 UTC on 2026-10-20. Hook writes in that window were lost. The fix was removing the cache volume, approved by the author.
 
 ## Item 3: what was tried
 

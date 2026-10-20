@@ -181,6 +181,10 @@ enum Command {
     LinkSimilar {
         #[arg(long, default_value = ".")]
         path: PathBuf,
+        /// First prune edges below the link threshold (keeping each
+        /// memory's floor), reporting the unlinked share before and after.
+        #[arg(long)]
+        prune: bool,
     },
     /// Scores the prompt-time recall seed against fixed cases: each case
     /// goes through the same `UserPromptSubmit` hook path a real prompt
@@ -718,7 +722,7 @@ fn main() -> Result<()> {
         Command::Docgen { path } => docgen(&path),
         Command::Changelog { path, since, limit } => changelog(&path, since, limit),
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
-        Command::LinkSimilar { path } => link_similar(&path),
+        Command::LinkSimilar { path, prune } => link_similar(&path, prune),
         Command::RecallEval { path, remote, cases, mode, repeat } => recall_eval::run(&path, remote, cases.as_deref(), mode, repeat),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
@@ -2312,9 +2316,9 @@ fn note(path: &Path, kind: Option<NoteKindArg>, tags: &[String], with_embeddings
     Ok(())
 }
 
-fn link_similar(path: &Path) -> Result<()> {
+fn link_similar(path: &Path, prune: bool) -> Result<()> {
     let store = agentops_mcp::open_store(path)?;
-    print!("{}", agentops_mcp::link_similar_backfill(store.as_ref(), &agentops_mcp::repo_name(path))?);
+    print!("{}", agentops_mcp::link_similar_backfill(store.as_ref(), &agentops_mcp::repo_name(path), prune)?);
     Ok(())
 }
 
