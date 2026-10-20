@@ -38,3 +38,26 @@ Five past sessions, chosen 2026-10-20 and approved by the author. The ids are th
 | `d58de736` | Engineering docs (docs-heavy) | 2,218 | 41 | 378 | 42 |
 | `5431fe7b` | Agents and plan pipeline | 1,133 | 30 | 251 | 23 |
 | `46354763` | Web app design (frontend contrast) | 705 | 21 | 185 | 23 |
+
+## Cases
+
+20 cases: 10 file cues and 10 error cues. They were drafted from the graph and from real failed tool calls on 2026-10-20, and approved by the author.
+
+- **File cases.** Four are config files, two are docs or scripts, and four are code or frontend files. No target is `Affects`-linked to its file: the harness checks that and refuses such a case.
+  - The check refused 4 drafted file cases (f06–f09), which were replaced with unlinked ones.
+- **Error cases.** Each target is a gotcha that explains the error.
+  - e07 was replaced: the drafted one was an auto-mode classifier denial, which never reaches `PostToolUseFailure`.
+- **A hit** is a target within the first `WORK_RECALL_MAX_ITEMS` (3) candidates. **Latency** is the round trip from the author's machine to the server, 3 runs per case.
+
+## Scores
+
+| Point | Commit | Hit rate | File | Error | MRR | p50 / p95 ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| Baseline: `Affects` lookup only (what `get_symbol` gives) | `f892bc3` | 0/20 | 0/10 | 0/10 | 0.000 | 22 / 45 |
+| Baseline: cue text through prompt-time recall (`/recall`) | `f892bc3` | 11/20 | 7/10 | 4/10 | 0.442 | 97 / 140 |
+
+Target: at least 14/20, with at least 7/10 file cases and at least 7/10 error cases.
+
+**The `Affects` baseline is 0/20 by construction.** The spec requires file cases whose target isn't `Affects`-linked, and an error names no file. So that baseline only confirms the cases are valid. The second baseline is the informative one: m3a's prompt recall fed nothing but the path or the error text.
+
+**The file half of the case set is easier than intended.** Seven of the ten file targets carry the file's name in their title, so a keyword match on the path alone already ranks them in the top 3. Work-time recall has to beat 7/10 on file cases to show anything the path keyword doesn't already give. The error cases are where the prompt baseline is weak (4/10).
