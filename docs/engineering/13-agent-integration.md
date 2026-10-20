@@ -163,6 +163,7 @@ Milestone 3b (`agentops_mcp::work_recall`). The file the agent opens or edits, a
 - **A ceiling.** After `MAX_INJECTED_PER_CONTEXT` (30) work-time pointers in a context, only error cues inject.
 - **Silence is normal.** A cue that shows nothing records no `recall_injected`.
 - **Measuring it.** `agentops work-recall-eval --replay` runs past sessions through the same code via `POST /repos/{id}/work-recall/replay`, against an in-memory log.
+- **Off switch.** `AGENTOPS_WORK_RECALL=off` turns injection off and leaves prompt-time recall alone. `agentops connect --no-work-recall` sets the variable in `.claude/settings.json`'s `env`, and connecting again without the flag removes it. `hook-capture` forwards the setting as `agentops_work_recall: false` in the payload, so a remote server honors it too. Reads and cues are still recorded. There is no separate repo config file: AgentOps has none.
 
 ### Importing MEMORY.md
 

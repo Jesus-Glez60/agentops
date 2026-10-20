@@ -264,6 +264,17 @@ pub const SEARCH: &str = "search";
 /// (`call_remote` strips `cwd`), so the client works it out.
 pub const REL_PATH_FIELD: &str = "agentops_rel_path";
 
+/// The environment variable that turns recall during work off
+/// (`AGENTOPS_WORK_RECALL=off`, which `connect --no-work-recall` sets), and
+/// the payload field `hook-capture` forwards it in. Reads and cues are
+/// still recorded; prompt-time recall is untouched.
+pub const WORK_RECALL_ENV: &str = "AGENTOPS_WORK_RECALL";
+pub const WORK_RECALL_FIELD: &str = "agentops_work_recall";
+
+fn work_recall_settings(payload: &Value) -> crate::work_recall::Settings {
+    crate::work_recall::Settings { enabled: payload.get(WORK_RECALL_FIELD).and_then(|v| v.as_bool()) != Some(false), ..Default::default() }
+}
+
 fn rel_path(payload: &Value) -> Option<&str> {
     payload.get(REL_PATH_FIELD).and_then(|v| v.as_str()).filter(|p| !p.is_empty())
 }
@@ -324,7 +335,7 @@ fn render_tool_response(value: &Value) -> String {
 /// context to inject, if any.
 fn work_cue(store: &dyn GraphStore, repo: &str, payload: &Value, cue: &agentops_retrieval::work_recall::WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<String>> {
     let mut log = crate::work_recall::StoreLog { store, repo, session_id: session_id(payload) };
-    Ok(crate::work_recall::on_cue(store, repo, &mut log, agent_id(payload), cue, embedder, crate::work_recall::Settings::default())?.map(|i| i.context))
+    Ok(crate::work_recall::on_cue(store, repo, &mut log, agent_id(payload), cue, embedder, work_recall_settings(payload))?.map(|i| i.context))
 }
 
 /// The text a read returned, for its first heading. `PostToolUse` passes
@@ -834,6 +845,25 @@ mod tests {
         let events = store.session_events(&repo, "s").unwrap();
         let prompt_cue = context_events(&events, None).into_iter().find(|e| e.event_kind == WORK_CUE).expect("the prompt is a cue");
         assert_eq!(parse_cue(&prompt_cue.description)[0].0, release);
+    }
+
+    #[test]
+    fn with_the_off_switch_nothing_is_injected_and_reads_are_still_recorded() {
+        let (_dir, store, repo) = store();
+        gotcha(store.as_ref(), &repo, "Release tagging needs the changelog bumped first", "Tagging a release fails unless the changelog entry exists.");
+        let read = |session: &str, off: bool| {
+            let mut payload = json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/docs/release.md"}, "tool_response": {"type": "text", "file": {"content": "# Release tagging changelog checklist"}}, "session_id": session, REL_PATH_FIELD: "docs/release.md" });
+            if off {
+                payload[WORK_RECALL_FIELD] = json!(false);
+            }
+            handle(store.as_ref(), &repo, "posttooluse", &payload).unwrap()
+        };
+        assert!(read("off", true).is_none(), "nothing injected");
+        let events = store.session_events(&repo, "off").unwrap();
+        assert!(events.iter().any(|e| e.event_kind == FILE_READ), "the read is still recorded");
+        assert!(events.iter().all(|e| e.event_kind != RECALL_INJECTED));
+        let on = context(read("on", false));
+        assert!(on.contains("Release tagging"), "{on}");
     }
 
     #[test]

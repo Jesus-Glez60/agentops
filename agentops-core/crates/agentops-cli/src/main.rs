@@ -427,6 +427,14 @@ enum Command {
         /// hook suite. Claude Code only; conflicts with --no-hooks.
         #[arg(long, conflicts_with = "no_hooks")]
         compress_commands: bool,
+        /// Turn off recall during work (milestone 3b): file reads, edits
+        /// and errors no longer inject memories, though reads are still
+        /// recorded and prompt-time recall is untouched. Sets
+        /// `AGENTOPS_WORK_RECALL=off` in `.claude/settings.json`'s `env`;
+        /// connecting again without it turns work-time recall back on.
+        /// Claude Code only.
+        #[arg(long, conflicts_with = "no_hooks")]
+        no_work_recall: bool,
     },
     /// Internal: invoked by a Claude Code hook (installed via
     /// `connect`), not meant to be run by hand. Reads the
@@ -820,11 +828,11 @@ fn main() -> Result<()> {
             }
         },
         Command::Init { yes, path } => init(yes, &path),
-        Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks: _, no_hooks, compress_commands } => {
+        Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks: _, no_hooks, compress_commands, no_work_recall } => {
             if global {
                 connect_global(agents, access_mode, yes, remote, api_key, device_login)
             } else {
-                connect(&path, agents, access_mode, yes, remote, api_key, device_login, !no_hooks, compress_commands)
+                connect(&path, agents, access_mode, yes, remote, api_key, device_login, !no_hooks, compress_commands, no_work_recall)
             }
         }
         Command::HookCapture { event, compress } => hook_capture::run(&event, compress),
@@ -1226,7 +1234,8 @@ fn select_agents(mut agents: Vec<String>, yes: bool) -> Result<Vec<String>> {
     Ok(agents)
 }
 
-fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool, with_hooks: bool, compress_commands: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool, with_hooks: bool, compress_commands: bool, no_work_recall: bool) -> Result<()> {
     // Whether to use local/stdio vs. remote/HTTP is not inferable from
     // anything about this invocation on its own (a solo dev can self-host
     // on their own separate personal server too) -- ask directly rather
@@ -1258,7 +1267,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
             return Ok(());
         }
         if with_hooks {
-            maybe_install_claude_hooks(path, &agents, compress_commands)?;
+            maybe_install_claude_hooks(path, &agents, compress_commands, no_work_recall)?;
         }
         return connect_remote(path, &server_url, api_key, &agents, yes, device_login);
     }
@@ -1297,7 +1306,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
     distribute_via_ruler(path, &agents_md_content, &agents, access_mode_str);
 
     if with_hooks {
-        maybe_install_claude_hooks(path, &agents, compress_commands)?;
+        maybe_install_claude_hooks(path, &agents, compress_commands, no_work_recall)?;
     }
 
     println!("\nConnected: {}", agents.join(", "));
@@ -1323,7 +1332,7 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
 /// `PreToolUse` (proactive secret-exposure warning, never blocking). One
 /// `--event` per hook so `hook_capture::run` can dispatch without sniffing
 /// payload shape.
-fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands: bool) -> Result<()> {
+fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands: bool, no_work_recall: bool) -> Result<()> {
     if !agents.iter().any(|a| a == "claude") {
         return Ok(());
     }
@@ -1348,12 +1357,54 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
         let extra_flag = if compress_commands && *event_name == "PreToolUse" { " --compress" } else { "" };
         write_claude_hook(&settings_path, event_name, &format!("agentops hook-capture --event {event_flag}{extra_flag}"), *timeout)?;
     }
-    let compress_note = if compress_commands { ", command-output compression enabled" } else { "" };
+    set_claude_env(&settings_path, agentops_mcp::hooks::WORK_RECALL_ENV, no_work_recall.then_some("off"))?;
+    let compress_note = match (compress_commands, no_work_recall) {
+        (true, true) => ", command-output compression enabled, recall during work off",
+        (true, false) => ", command-output compression enabled",
+        (false, true) => ", recall during work off",
+        (false, false) => "",
+    };
     println!(
         "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse/SessionEnd/SubagentStart{compress_note} — see the get_session_guide/fetch_content/semantic_search MCP tools).",
         settings_path.display()
     );
     Ok(())
+}
+
+/// Sets (or, with `None`, removes) one variable in a project-level
+/// `.claude/settings.json`'s `env`, which Claude Code passes to every hook
+/// it runs. Every other key is kept.
+fn set_claude_env(settings_path: &Path, key: &str, value: Option<&str>) -> Result<()> {
+    let mut root: serde_json::Value = if settings_path.exists() {
+        serde_json::from_str(&std::fs::read_to_string(settings_path).with_context(|| format!("reading {}", settings_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
+    } else if value.is_none() {
+        return Ok(());
+    } else {
+        serde_json::json!({})
+    };
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let env = root.as_object_mut().expect("just normalized to an object above").entry("env").or_insert_with(|| serde_json::json!({}));
+    if !env.is_object() {
+        *env = serde_json::json!({});
+    }
+    let env = env.as_object_mut().expect("just normalized to an object above");
+    match value {
+        Some(v) => {
+            env.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+        }
+        None => {
+            env.remove(key);
+        }
+    }
+    if env.is_empty() {
+        root.as_object_mut().expect("object").remove("env");
+    }
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(settings_path, serde_json::to_string_pretty(&root)? + "\n").with_context(|| format!("writing {}", settings_path.display()))
 }
 
 /// Merges (never overwrites) one hook entry into a project-level
@@ -2586,8 +2637,8 @@ mod tests {
     #[test]
     fn installing_the_hook_suite_twice_leaves_one_agentops_entry_per_event() {
         let dir = tempfile::tempdir().unwrap();
-        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false).unwrap();
-        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], true).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false, false).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], true, false).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap()).unwrap();
         let hooks = parsed["hooks"].as_object().unwrap();
         assert_eq!(hooks.len(), 7, "{parsed}");
@@ -2609,6 +2660,24 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(parsed["hooks"]["SessionEnd"], serde_json::json!([{ "hooks": [{ "type": "command", "command": "agentops hook-capture --event sessionend" }] }]));
+    }
+
+    #[test]
+    fn the_work_recall_switch_is_set_in_settings_env_and_cleared_without_touching_other_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, r#"{"env": {"KEEP": "1"}, "theme": "dark"}"#).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(v["env"]["AGENTOPS_WORK_RECALL"], "off");
+        assert_eq!(v["env"]["KEEP"], "1");
+        assert_eq!(v["theme"], "dark");
+        assert!(v["hooks"]["PostToolUse"].is_array(), "hooks still installed");
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert!(v["env"].get("AGENTOPS_WORK_RECALL").is_none(), "connecting again without the flag turns it back on");
+        assert_eq!(v["env"]["KEEP"], "1");
     }
 
     #[test]
@@ -2647,7 +2716,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");
 
-        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], false, false).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         for (event, flag) in [("PostToolUse", "posttooluse"), ("PostToolUseFailure", "posttoolusefailure"), ("UserPromptSubmit", "userpromptsubmit"), ("SessionStart", "sessionstart"), ("PreToolUse", "pretooluse"), ("SessionEnd", "sessionend"), ("SubagentStart", "subagentstart")] {
@@ -2659,7 +2728,7 @@ mod tests {
     #[test]
     fn maybe_install_claude_hooks_is_a_noop_when_claude_is_not_among_the_selected_agents() {
         let dir = tempfile::tempdir().unwrap();
-        maybe_install_claude_hooks(dir.path(), &["cursor".to_string()], false).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["cursor".to_string()], false, false).unwrap();
         assert!(!dir.path().join(".claude").join("settings.json").exists());
     }
 
@@ -2668,7 +2737,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let settings_path = dir.path().join(".claude").join("settings.json");
 
-        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], true).unwrap();
+        maybe_install_claude_hooks(dir.path(), &["claude".to_string()], true, false).unwrap();
 
         let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&settings_path).unwrap()).unwrap();
         assert_eq!(last_hook_command(&parsed, "PreToolUse"), "agentops hook-capture --event pretooluse --compress");

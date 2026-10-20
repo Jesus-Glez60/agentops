@@ -94,6 +94,10 @@ fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
     if !hooks::is_relevant(event, &payload) {
         return Ok(None);
     }
+    // The off switch travels in the payload, so a remote server honors it.
+    if std::env::var(hooks::WORK_RECALL_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("off")) {
+        payload[hooks::WORK_RECALL_FIELD] = Value::Bool(false);
+    }
     // The `path` the agent should pass to agentops tools, echoed into the
     // context the hook injects: the connection id for a remote repo (the
     // hosted `/mcp` never resolves a local checkout path), else this repo.
