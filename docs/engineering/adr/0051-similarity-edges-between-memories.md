@@ -10,7 +10,7 @@ Accepted, 2026-10-16.
 
 Every AgentOps edge is structural or explicit: `DependsOn`, `Documents`, `Affects`, `References`, `Covers`. A memory that names no symbol has no edge, so recall that starts from a cue (a prompt keyword, a named symbol) can never reach it unless it shares a keyword. Imported MEMORY.md entries and past-session notes are mostly like that.
 
-Hooks must stay free of embedding work: each hook is a fresh process with a tight latency budget (milestone 1: p95 under 300 ms local, under 1 s remote).
+Hooks must stay free of embedding work: each hook is a fresh process with a tight latency budget (milestone 1: p95 under 300 ms local, under 1 s remote). *Amended by [ADR 0052](0052-the-server-may-embed-the-prompt-in-a-hook.md): this still holds for local hook processes, but the server, which keeps the model loaded, may embed the prompt.*
 
 ## Decision
 

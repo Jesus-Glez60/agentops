@@ -44,8 +44,17 @@ impl Embedder for LocalEmbedder {
 /// BGE-small-en-v1.5 — chosen for a light local footprint over a larger
 /// model like BGE-M3, since this runs inline in the ingestion/query path
 /// with no dedicated GPU assumed.
+/// The process-wide model, loaded on the first `embed`.
+static MODEL: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
+
+/// Whether this process has loaded the embedding model. A local hook
+/// process must never have (milestone 3a, ADR 0052): the test
+/// `hooks_never_load_the_model` checks it after running every seeding hook.
+pub fn model_loaded() -> bool {
+    MODEL.get().is_some()
+}
+
 fn model() -> Result<&'static Mutex<TextEmbedding>> {
-    static MODEL: OnceLock<Mutex<TextEmbedding>> = OnceLock::new();
     // Double-checked locking: `OnceLock::get_or_init` can't propagate a
     // `Result`, and a naive "check-then-init" race lets two threads both
     // see it uninitialized and call `TextEmbedding::try_new` concurrently —

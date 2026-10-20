@@ -507,6 +507,22 @@ fn resolve_anthropic_config(credentials: &agentops_integrations::CredentialStore
     Ok(config)
 }
 
+/// Loads the embedding model in the background with one dummy embed, so
+/// the first prompt hook doesn't pay the load inside its dense-recall
+/// budget (`DENSE_TIMEOUT_MS`). Never blocks: a prompt that arrives first
+/// just falls back to keyword recall. Called by `agentops-server` at
+/// startup, not by `build_full_router`, so tests never load the model.
+pub fn warm_embedder() {
+    std::thread::spawn(|| {
+        use agentops_embeddings::Embedder;
+        let started = std::time::Instant::now();
+        match agentops_embeddings::LocalEmbedder.embed("warm up the recall embedder") {
+            Ok(_) => println!("agentops-heavy-api: embedding model warm in {} ms", started.elapsed().as_millis()),
+            Err(e) => eprintln!("agentops-heavy-api: embedding model warm-up failed: {e:#}"),
+        }
+    });
+}
+
 /// Builds this service's complete, ready-to-serve `Router` — every route
 /// table this crate owns (`/repos/*`, `/search*`, `/docs/search*`,
 /// the GitHub/Linear webhook receivers, `/auth/*`,

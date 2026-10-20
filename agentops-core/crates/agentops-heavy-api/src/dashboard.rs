@@ -622,6 +622,12 @@ pub(crate) async fn usage_sync_json(State(state): State<AppState>, user: Option<
     }
 }
 
+/// The embedder the server's hooks recall by meaning with. The model stays
+/// loaded in this long-running process (warmed at startup by
+/// `agentops-server`), unlike a local hook process, which never loads it
+/// (ADR 0052).
+static SERVER_EMBEDDER: LocalEmbedder = LocalEmbedder;
+
 /// `POST /repos/{id}/hooks/{event}` -- the hosted half of `agentops
 /// hook-capture`. A repo connected via `agentops connect --remote` forwards
 /// each Claude Code hook payload here instead of opening a local graph, and
@@ -646,7 +652,7 @@ pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<
         };
         let repo = agentops_mcp::repo_name(&path);
         let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
-        Ok(Some(agentops_mcp::hooks::handle(store.as_ref(), &repo, &event, &payload)?))
+        Ok(Some(agentops_mcp::hooks::handle_with(store.as_ref(), &repo, &event, &payload, Some(&SERVER_EMBEDDER))?))
     })
     .await;
 
@@ -750,7 +756,7 @@ pub(crate) async fn recall_json(State(state): State<AppState>, user: Option<axum
         };
         let repo = agentops_mcp::repo_name(&path);
         let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
-        let pointers = agentops_retrieval::recall_seed(store.as_ref(), &repo, &body.prompt, limit, &Default::default())?;
+        let pointers = agentops_retrieval::recall_seed_with(store.as_ref(), &repo, &body.prompt, limit, &Default::default(), Some(&SERVER_EMBEDDER))?;
         Ok(Some(pointers.into_iter().map(|p| json!({ "node_id": p.node_id, "kind": p.kind.as_db_str(), "title": p.title, "reason": p.reason })).collect()))
     })
     .await;

@@ -148,6 +148,16 @@ Edges and vectors are only read here, so the hook loads no embedding model ([ADR
 
 **Side effect.** Runs are recorded as sessions whose ids start with `recall-eval-`, so per-session statistics should filter them out. Milestone 3a's baseline and per-item scores are in [`handoffs/m3a-eval.md`](handoffs/m3a-eval.md).
 
+## Meaning in the recall seed
+
+On the server, `recall_seed_with` (`agentops-retrieval/src/recall.rs`) also recalls by meaning ([ADR 0052](adr/0052-the-server-may-embed-the-prompt-in-a-hook.md)). A local hook process never does, because it passes no embedder.
+1. The prompt is embedded on a helper thread while the keyword queries run.
+2. `similarity::similar_memories` returns the `DENSE_TOP_K = 20` nearest gotchas, decisions and notes. Those with cosine ≥ `DENSE_MIN_SCORE = 0.55` are kept, in cosine order with id as the tiebreak. Excluded, pinned and `NeedsReview` memories are dropped as usual.
+3. That list and the keyword ranking (cues, then score) are fused by reciprocal rank with k = 60, the same constant as `search_hybrid`. A reduced memory's dense share is halved. Their reason reads `close in meaning (0.71)`.
+4. The similarity hop then runs from the fused order.
+
+If embedding plus the search exceed `DENSE_TIMEOUT_MS = 250`, the dense half is dropped, `dense recall timeout` is logged, and the keyword result stands. `agentops-server` warms the model at startup (`warm_embedder`).
+
 ## Prominence dampening
 
 A `Reduced` gotcha ranks ×0.1 in `dense`, `hybrid` and `gist_then_detail`, and every result shows "⚠ reduced prominence — <reason>". The decision "Gotchas are curated, never resolved/dismissed -- don't reintroduce a bug-tracker model" lists the other surfaces it reaches: `list_gotchas`, `get_symbol`, `explain_symbol`'s prompt and docgen. Hosted `/local-search` applies it too (`dashboard.rs`); the single-operator `/local-search` in `agentops-api/src/search.rs` does not. In `dense` mode the distance is divided by the multiplier for sorting only; the printed distance is unchanged.

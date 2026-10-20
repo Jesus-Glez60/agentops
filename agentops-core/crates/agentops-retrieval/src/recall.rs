@@ -1,10 +1,11 @@
 //! Cue-driven recall for hooks: given what the user just said, which
-//! recorded gotchas, decisions and notes should the agent
-//! know about before it starts? Lexical and graph only. A hook runs in a
-//! fresh process on every prompt, so this never loads the embedding model
-//! (milestone 1 decision; semantic search stays in the planning step).
+//! recorded gotchas, decisions and notes should the agent know about
+//! before it starts? `recall_seed` is lexical and graph only: a local hook
+//! runs in a fresh process on every prompt, so it never loads the
+//! embedding model. `recall_seed_with` can also recall by meaning, given an
+//! embedder; only the long-running server passes one (ADR 0052).
 //!
-//! Signals, fused by reciprocal rank:
+//! Signals:
 //! - **Keywords.** The prompt is cut into keywords and each one is searched
 //!   separately with `GraphStore::search_lexical`, per note kind. Separate
 //!   queries rather than one, because the two adapters disagree on how a
@@ -18,12 +19,22 @@
 //!   against symbol names with `search_exact`, then followed one hop over
 //!   `Affects` edges to the notes recorded against that symbol.
 //!
+//! - **Meaning** (`recall_seed_with` and an embedder only). The prompt is
+//!   embedded and its nearest memories by cosine, above `DENSE_MIN_SCORE`,
+//!   are fused with the keyword ranking by reciprocal rank. If embedding
+//!   and the nearest-neighbour search take longer than `DENSE_TIMEOUT_MS`,
+//!   that half is dropped and the keyword result stands.
+//! - **Similarity hop.** One `SimilarTo` hop from what matched (see `hop`).
+//!
 //! Output is pointers, not content: kind, title, node id and why it
 //! matched. The agent fetches the body with `fetch_content` if it needs it.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
-use agentops_graph::{EdgeRelation, GraphStore, NodeKind, NodeProminence};
+use agentops_embeddings::Embedder;
+use agentops_graph::{EdgeRelation, GraphStore, Node, NodeKind, NodeProminence};
 use anyhow::Result;
 
 /// The node kinds recall points at: memories, never code. Generated doc
@@ -39,6 +50,17 @@ pub const RECALL_KINDS: &[NodeKind] = &[NodeKind::Gotcha, NodeKind::Decision, No
 const MAX_KEYWORDS: usize = 8;
 /// Candidates fetched per keyword and kind before fusion.
 const PER_QUERY: usize = 10;
+/// Lowest prompt-to-memory cosine that counts as close in meaning. A prompt
+/// is shorter than a note, so these run lower than note-to-note scores.
+pub const DENSE_MIN_SCORE: f32 = 0.55;
+/// Nearest memories taken by meaning before fusion.
+pub const DENSE_TOP_K: usize = 20;
+/// Budget for embedding the prompt plus the nearest-neighbour search;
+/// over it, the dense half is dropped. Keeps a remote hook's p95 well
+/// under its 1 s target.
+pub const DENSE_TIMEOUT_MS: u64 = 250;
+/// Reciprocal rank fusion constant, as in `search_hybrid`.
+const RRF_K: f64 = 60.0;
 
 /// One recalled node, as a pointer the agent can follow.
 #[derive(Debug, Clone, PartialEq)]
@@ -61,8 +83,30 @@ impl RecallPointer {
 /// node id in `exclude` (already shown this session) and pinned nodes
 /// (the pin block already shows those). Reduced-prominence nodes still
 /// appear, ranked lower, since a curated-down gotcha is still knowledge
-/// (ADR 0016).
+/// (ADR 0016). Keywords, named symbols and the similarity hop only.
 pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>) -> Result<Vec<RecallPointer>> {
+    recall_seed_with(store, repo, query, limit, exclude, None)
+}
+
+/// `recall_seed`, plus recall by meaning when `embedder` is given: the
+/// prompt's nearest memories are fused with the keyword ranking, then the
+/// similarity hop runs from the fused order. With `None` it is exactly
+/// `recall_seed`. Only the server passes an embedder; a local hook process
+/// never loads the model (ADR 0052).
+pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<RecallPointer>> {
+    // The prompt is embedded on its own thread while the keyword queries
+    // run, so a stalled embed can be abandoned at the deadline.
+    let pending = embedder.map(|embedder| {
+        let (tx, rx) = mpsc::channel();
+        let prompt = query.to_string();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let embedding = embedder.embed(&prompt);
+            let _ = tx.send((embedding, started.elapsed()));
+        });
+        (rx, Instant::now())
+    });
+
     struct Candidate {
         score: f64,
         kind: NodeKind,
@@ -130,6 +174,11 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
         })
         .collect();
     sort_ranked(&mut ranked);
+    if let Some((rx, started)) = pending {
+        if let Some(dense) = dense_candidates(store, repo, &rx, started, &shown)? {
+            fuse(&mut ranked, dense);
+        }
+    }
     hop(store, repo, &mut ranked, &shown)?;
     Ok(ranked
         .into_iter()
@@ -139,6 +188,52 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
             RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason }
         })
         .collect())
+}
+
+/// The memories closest in meaning to the prompt, best first (cosine, then
+/// id), or `None` when embedding plus the search overran
+/// `DENSE_TIMEOUT_MS` or the embed failed. Each case is logged.
+fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Result<Vec<f32>>, Duration)>, started: Instant, shown: &dyn Fn(&i64, NodeProminence) -> bool) -> Result<Option<Vec<(Node, f32)>>> {
+    let budget = Duration::from_millis(DENSE_TIMEOUT_MS);
+    let (embedding, embed_time) = match rx.recv_timeout(budget.saturating_sub(started.elapsed())) {
+        Ok((Ok(embedding), took)) => (embedding, took),
+        Ok((Err(e), _)) => {
+            eprintln!("agentops: dense recall skipped, embedding failed: {e:#}");
+            return Ok(None);
+        }
+        Err(_) => {
+            eprintln!("agentops: dense recall timeout: embedding took over {DENSE_TIMEOUT_MS} ms; keyword recall only");
+            return Ok(None);
+        }
+    };
+    let searching = Instant::now();
+    let nearest = agentops_graph::similarity::similar_memories(store, repo, &embedding, None, DENSE_TOP_K)?;
+    let total = embed_time + searching.elapsed();
+    if total > budget {
+        eprintln!("agentops: dense recall timeout: embedding plus search took {} ms; keyword recall only", total.as_millis());
+        return Ok(None);
+    }
+    Ok(Some(nearest.into_iter().filter(|(node, score)| *score >= DENSE_MIN_SCORE && RECALL_KINDS.contains(&node.kind) && shown(&node.id, node.prominence)).collect()))
+}
+
+/// Replaces `ranked`'s order with the reciprocal rank fusion of it and
+/// `dense` (k = `RRF_K`). Fused scores are comparable across both lists, so
+/// cue counts no longer lead: every candidate gets one, the same as a hop
+/// neighbour, which then ranks after them on the tie and by its fused
+/// score among other neighbours. A reduced memory's dense share is
+/// halved, as its keyword rank already was.
+fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
+    let rrf = |rank: usize| 1.0 / (RRF_K + rank as f64 + 1.0);
+    let mut fused: HashMap<i64, Ranked> = ranked.drain(..).enumerate().map(|(i, r)| (r.id, Ranked { cues: 1, score: rrf(i), ..r })).collect();
+    for (i, (node, cosine)) in dense.into_iter().enumerate() {
+        let share = rrf(i) * if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
+        let reason = format!("close in meaning ({cosine:.2})");
+        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, cues: 1, score: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), reasons: Vec::new() });
+        entry.score += share;
+        entry.reasons.push(reason);
+    }
+    ranked.extend(fused.into_values());
+    sort_ranked(ranked);
 }
 
 /// What a neighbour reached over `SimilarTo` keeps of its source's score,
@@ -414,6 +509,84 @@ mod tests {
         for _ in 0..20 {
             assert_eq!(recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap(), first);
         }
+    }
+
+    /// Embeds every prompt as the first axis: no model, fixed geometry.
+    struct Fixed;
+    impl Embedder for Fixed {
+        fn embed(&self, _: &str) -> Result<Vec<f32>> {
+            Ok(vector(0.0))
+        }
+    }
+    static FIXED: Fixed = Fixed;
+
+    /// An embedder that hangs far past the deadline.
+    struct Stalled;
+    impl Embedder for Stalled {
+        fn embed(&self, _: &str) -> Result<Vec<f32>> {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(vector(0.0))
+        }
+    }
+    static STALLED: Stalled = Stalled;
+
+    fn fixture() -> SqliteGraphStore {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = note(&store, NodeKind::Gotcha, "Webhook signature deploy failure", "webhook signature deploy");
+        let b = note(&store, NodeKind::Decision, "Webhook signature rotation", "webhook signature");
+        let c = note(&store, NodeKind::Note, "Rotate the app secret", "nothing shared");
+        link(&store, a, c);
+        for (id, tilt) in [(a, 0.0), (b, 0.5), (c, 0.1)] {
+            store.set_embedding("r", id, &vector(tilt)).unwrap();
+        }
+        store
+    }
+
+    #[test]
+    fn with_no_embedder_the_seed_is_exactly_recall_seeds() {
+        let store = fixture();
+        for prompt in ["webhook signature deploy", "webhook signature", "rotate", "nothing at all here"] {
+            assert_eq!(recall_seed_with(&store, "r", prompt, 8, &HashSet::new(), None).unwrap(), recall_seed(&store, "r", prompt, 8, &HashSet::new()).unwrap(), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn with_an_embedder_a_prompt_sharing_no_word_with_a_note_recalls_it() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let close = note(&store, NodeKind::Note, "Rotate the app secret after a deploy", "rotate secret deploy");
+        let far = note(&store, NodeKind::Gotcha, "Unrelated memory", "nothing in common");
+        store.set_embedding("r", close, &vector(0.2)).unwrap();
+        let mut orthogonal = vec![0.0; agentops_embeddings::EMBEDDING_DIM];
+        orthogonal[5] = 1.0;
+        store.set_embedding("r", far, &orthogonal).unwrap();
+        let prompt = "credentials keep expiring overnight";
+        assert!(recall_seed(&store, "r", prompt, 8, &HashSet::new()).unwrap().is_empty(), "no shared word");
+        let seed = recall_seed_with(&store, "r", prompt, 8, &HashSet::new(), Some(&FIXED)).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![close], "only what's close in meaning: {seed:?}");
+        assert!(seed[0].reason.starts_with("close in meaning (0.98)"), "{seed:?}");
+        // Excluded, pinned and needs-review memories stay out by meaning too.
+        assert!(recall_seed_with(&store, "r", prompt, 8, &HashSet::from([close]), Some(&FIXED)).unwrap().is_empty());
+        store.set_curation("r", close, NodeProminence::NeedsReview, Some("unclassified")).unwrap();
+        assert!(recall_seed_with(&store, "r", prompt, 8, &HashSet::new(), Some(&FIXED)).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_stalled_embedder_returns_the_keyword_result_within_the_deadline() {
+        let store = fixture();
+        let started = Instant::now();
+        let seed = recall_seed_with(&store, "r", "webhook signature deploy", 8, &HashSet::new(), Some(&STALLED)).unwrap();
+        let took = started.elapsed();
+        assert!(took < Duration::from_millis(DENSE_TIMEOUT_MS + 50), "{took:?}");
+        assert_eq!(seed, recall_seed(&store, "r", "webhook signature deploy", 8, &HashSet::new()).unwrap());
+    }
+
+    #[test]
+    fn fusion_keeps_a_keyword_hit_and_adds_what_is_close_in_meaning() {
+        let store = fixture();
+        let seed = recall_seed_with(&store, "r", "webhook signature deploy", 8, &HashSet::new(), Some(&FIXED)).unwrap();
+        assert_eq!(seed[0].title, "Webhook signature deploy failure", "matched by words and by meaning: {seed:?}");
+        assert!(seed[0].reason.contains("close in meaning"), "{seed:?}");
+        assert_eq!(seed.len(), 3, "{seed:?}");
     }
 
     #[test]

@@ -48,15 +48,23 @@ pub const SEEDED_AGENTS: &[&str] = &["Explore", "Plan", "plan-council-member", "
 /// Runs `event`'s store-touching logic for a raw hook `payload` against
 /// `repo` in `store`. The payload's `cwd` is never used to pick the repo:
 /// the caller already resolved it (from `cwd` locally, from the connection
-/// on the server).
+/// on the server). Recall is lexical and graph only; see `handle_with`.
 pub fn handle(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value) -> Result<Option<Value>> {
+    handle_with(store, repo, event, payload, None)
+}
+
+/// `handle`, with an embedder for the prompt and subagent seeds to also
+/// recall by meaning (`recall_seed_with`). Only the long-running server
+/// passes one, where the model stays loaded; a local hook process runs
+/// `handle` and never loads it (ADR 0052).
+pub fn handle_with(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     match event {
         "posttooluse" => post_tool_use(store, repo, payload).map(|()| None),
         "posttoolusefailure" => post_tool_use_failure(store, repo, payload).map(|()| None),
-        "userpromptsubmit" => user_prompt_submit(store, repo, payload),
+        "userpromptsubmit" => user_prompt_submit(store, repo, payload, embedder),
         "sessionstart" => session_start(store, repo, payload),
         "pretooluse" => pre_tool_use(store, repo, payload),
-        "subagentstart" => subagent_start(store, repo, payload),
+        "subagentstart" => subagent_start(store, repo, payload, embedder),
         other => anyhow::bail!("unknown hook event '{other}'"),
     }
 }
@@ -375,7 +383,7 @@ fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, parts: &mut V
 ///
 /// Everything fits in `PLAN_FLOW_BUDGET` plus `PIN_BUDGET` for the pins;
 /// recall pointers are dropped first.
-fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
+fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     use crate::budget::{DEFAULT_SEED_MAX_ITEMS, PLAN_FLOW_BUDGET, PLAN_SEED_MAX_ITEMS};
 
     let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) else {
@@ -404,10 +412,10 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value) -> Re
         parts.push(plan_flow_directive(agentops_path(payload, repo)));
         // The whole seed, even pointers shown earlier in the session: the
         // plan is built from this, and earlier context may be compacted.
-        let seed = agentops_retrieval::recall_seed(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default())?;
+        let seed = agentops_retrieval::recall_seed_with(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default(), embedder)?;
         push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     } else {
-        let seed = agentops_retrieval::recall_seed(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &injected_ids(&events))?;
+        let seed = agentops_retrieval::recall_seed_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &injected_ids(&events), embedder)?;
         push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     }
     if parts.is_empty() {
@@ -557,7 +565,7 @@ fn detect_secret_exposure(tool_name: &str, tool_input: &Value) -> Option<String>
 /// task of its own), within `SUBAGENT_SEED_BUDGET`. Nothing is recorded as
 /// injected: a subagent's context isn't the main session's, so the main
 /// session must still be able to see these pointers itself.
-fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
+fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     use crate::budget::{PLAN_SEED_MAX_ITEMS, SUBAGENT_SEED_BUDGET};
 
     if !is_relevant("subagentstart", payload) {
@@ -578,7 +586,7 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result
         parts.push(pinned);
     }
     if let Some(prompt) = last_prompt(store, repo, session_id(payload))? {
-        let seed = agentops_retrieval::recall_seed(store, repo, &prompt, PLAN_SEED_MAX_ITEMS, &Default::default())?;
+        let seed = agentops_retrieval::recall_seed_with(store, repo, &prompt, PLAN_SEED_MAX_ITEMS, &Default::default(), embedder)?;
         if !seed.is_empty() {
             const HEADER: &str = "Recalled from AgentOps for the task you were spawned for (pointers; query `get_symbol`/`related_context`/`list_gotchas` or `fetch_content` with the id before grepping):";
             parts.push(format!("{HEADER}\n{}", seed.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n")));

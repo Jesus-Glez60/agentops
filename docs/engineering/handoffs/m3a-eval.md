@@ -17,6 +17,10 @@ Scores from `agentops recall-eval --remote --repeat 5` (`agentops-cli/src/recall
 | Re-baseline with deep ranks (0b) | `e5e165f` | 9/20 (45%), 9 exact, 0 equivalent | 2/5 | 0.233 | 95 / 124 | 20/20 |
 | 1. Retitled imports (46 renamed on the server) | `e976a03` | 11/20 (55%), 11 exact, 0 equivalent | 3/5 | 0.245 | 99 / 128 | 20/20 |
 | 2. No doc sections in seeds | `6399325` | 13/20 (65%), 13 exact, 0 equivalent | 3/5 | 0.415 | 68 / 99 | 0/20 |
+| 3a. Hop inherits full cue count | `9db16a7` | 9/20 (45%), 9 exact, 0 equivalent | – | 0.377 | 74 / 116 | 0/20 |
+| 3b. + cap of 2 per source | `0fd3880` | 11/20 (55%), 11 exact, 0 equivalent | – | 0.399 | 60 / 84 | 0/20 |
+| 3c. + one cue fewer | `4699cdb` | 11/20 (55%), 11 exact, 0 equivalent | – | 0.396 | 62 / 93 | 0/20 |
+| 3. Reverted to one cue (kept: cosine score, cap, determinism) | `c68d349` | 13/20 (65%), 13 exact, 0 equivalent | – | 0.414 | 65 / 85 | 0/20 |
 
 Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 
@@ -71,6 +75,14 @@ Retrieval is unchanged from the baseline. The graph has gained notes since then,
 | c18 | 3 | exact | 3 |  |
 | c19 | 1 | exact | 1 |  |
 | c20 | – | miss | 10 | noise |
+
+## Item 3: what was tried
+
+The spec has a `SimilarTo` neighbour inherit its source's strength. Two forms were measured, and both regressed against item 2's 13/20:
+- **Full cue count (3a):** neighbours of one strongly matched hub filled 5 to 7 of the 8 slots.
+- **Cap of 2 per source, then one cue fewer (3b, 3c):** these cut the flood, but neighbours of a 3-cue match still pushed out 2-cue direct hits that were the answer.
+
+With the author's approval, the shipped form (3) counts a neighbour as one cue again, ranked after direct matches with as many. It keeps the cosine-scaled score, the cap and the deterministic order. The "m2 cases" column is filled only where it was counted.
 
 ## Notes on the baseline
 

@@ -101,6 +101,9 @@ pub async fn run() -> anyhow::Result<()> {
 
     let heavy_db_path = std::env::var("AGENTOPS_HEAVY_API_DB").map(PathBuf::from).unwrap_or_else(|_| agentops_data_dir().join("heavy-api.sqlite"));
     let heavy_router = agentops_heavy_api::build_full_router(&heavy_db_path, false).await?;
+    // Prompt hooks recall by meaning here; load the model before the
+    // first one arrives (ADR 0052).
+    agentops_heavy_api::warm_embedder();
 
     let app = Router::new().merge(agentops_router).nest("/docbrain", docbrain_router).merge(heavy_router).merge(connect_sh::router());
 
