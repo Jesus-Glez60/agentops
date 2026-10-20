@@ -109,6 +109,7 @@ The fallback means this mode never returns fewer results than flat search would 
 - **Cues:** the same cue count as its source.
 - **Score:** `source score × cosine × HOP_FACTOR` (0.8), halved again if the neighbour is reduced. It can outrank a weaker direct hit but never its own source.
 - **Cosine:** `SimilarTo` edges keep no score, so it is read from the two stored vectors with `GraphStore::get_embeddings` (one query on Postgres). A neighbour without a vector isn't reached.
+- **Cap:** each source reaches at most `HOP_MAX_PER_SOURCE = 2` neighbours, its closest by cosine. Without the cap, one strongly matched hub filled 5 to 7 of the 8 slots, and the eval fell from 13/20 to 9/20.
 - **Reached twice:** a node reached directly and by a hop, or by two hops, keeps the stronger and every reason.
 - **Order:** sources are walked strongest first, so the seed never depends on map order (gotcha 117291).
 - **Reason:** `similar to "<source title>"`.

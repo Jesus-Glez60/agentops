@@ -145,6 +145,11 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
 /// on top of their cosine: a neighbour of a strong match can beat a weaker
 /// direct hit, but never its own source.
 pub const HOP_FACTOR: f64 = 0.8;
+/// Neighbours one source brings into the seed (or lifts within it), best
+/// cosine first. Without a cap a strongly matched hub memory, with up to
+/// `SIMILAR_MAX_DEGREE` edges, filled 5-7 of 8 seed slots with its own
+/// neighbours and recall fell from 13/20 to 9/20 (milestone 3a eval).
+pub const HOP_MAX_PER_SOURCE: usize = 2;
 
 /// A recall candidate with its strength: cues first, then score.
 struct Ranked {
@@ -167,7 +172,8 @@ fn sort_ranked(ranked: &mut [Ranked]) {
 /// source's strength: the same cue count, and `source score × cosine ×
 /// HOP_FACTOR` (halved again if it's reduced). Edges keep no score, so the
 /// cosine comes from the two stored vectors; a neighbour without one isn't
-/// reached. A node reached directly and by a hop, or by two hops, keeps
+/// reached. Each source reaches at most `HOP_MAX_PER_SOURCE` neighbours,
+/// its closest. A node reached directly and by a hop, or by two hops, keeps
 /// the stronger of them and every reason. Sources are walked strongest
 /// first, so the result never depends on map order.
 fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&i64, NodeProminence) -> bool) -> Result<()> {
@@ -180,16 +186,21 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
         }
         let vectors = store.get_embeddings(repo, &[&[source_id][..], &targets].concat())?;
         let Some(source_vector) = vectors.get(&source_id) else { continue };
-        for target in targets {
-            let Some(vector) = vectors.get(&target) else { continue };
+        let mut closest: Vec<(f64, i64)> = targets.iter().filter(|&&t| t != source_id).filter_map(|t| vectors.get(t).map(|v| (f64::from(agentops_graph::similarity::cosine(source_vector, v)), *t))).collect();
+        closest.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let mut taken = 0;
+        for (cosine, target) in closest {
+            if taken == HOP_MAX_PER_SOURCE {
+                break;
+            }
             let reason = format!("similar to \"{title}\"");
-            let cosine = f64::from(agentops_graph::similarity::cosine(source_vector, vector));
             if let Some(&i) = position.get(&target) {
+                taken += 1;
                 let r = &mut ranked[i];
-                if (cues, score * cosine * HOP_FACTOR) > (r.cues, r.score) && r.id != source_id {
+                if (cues, score * cosine * HOP_FACTOR) > (r.cues, r.score) {
                     (r.cues, r.score) = (cues, score * cosine * HOP_FACTOR);
                 }
-                if r.id != source_id && !r.reasons.contains(&reason) {
+                if !r.reasons.contains(&reason) {
                     r.reasons.push(reason);
                 }
                 continue;
@@ -202,6 +213,7 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
             if neighbour.prominence == NodeProminence::Reduced {
                 hop_score *= 0.5;
             }
+            taken += 1;
             position.insert(target, ranked.len());
             ranked.push(Ranked { id: target, cues, score: hop_score, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
         }
@@ -358,6 +370,23 @@ mod tests {
         assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![strong, weak]);
         assert_eq!(seed[1].reason, "\"webhook\"; \"signature\"; similar to \"Webhook signature deploy failure\"", "{seed:?}");
         assert!(seed[0].reason.starts_with("\"webhook\"; \"signature\"; \"deploy\""), "the reverse edge only adds a reason, never strength: {seed:?}");
+    }
+
+    #[test]
+    fn one_source_brings_at_most_its_two_closest_neighbours() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let hub = note(&store, NodeKind::Gotcha, "Webhook signature deploy failure", "webhook signature deploy");
+        store.set_embedding("r", hub, &vector(0.0)).unwrap();
+        let neighbours: Vec<i64> = (0..6)
+            .map(|n| {
+                let id = note(&store, NodeKind::Note, &format!("Neighbour {n}"), "nothing shared");
+                link(&store, hub, id);
+                store.set_embedding("r", id, &vector(0.1 * (n as f32 + 1.0))).unwrap();
+                id
+            })
+            .collect();
+        let seed = recall_seed(&store, "r", "webhook signature deploy", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![hub, neighbours[0], neighbours[1]], "the two closest only: {seed:?}");
     }
 
     #[test]
