@@ -24,6 +24,7 @@ Scores from `agentops recall-eval --remote --repeat 5` (`agentops-cli/src/recall
 | 4. Recall by meaning on the server | `1aab7ff` | 14/20 (70%), 14 exact, 0 equivalent | 4/5 | 0.446 | 102 / 127 | 0/20 |
 | 5. Threshold 0.82 + prune (run on the server) | `197d892` | 15/20 (75%), 15 exact, 0 equivalent | 4/5 | 0.472 | 101 / 125 | 0/20 |
 | 6. Embed and link memories on reindex (final) | `f17850c` | 15/20 (75%), 15 exact, 0 equivalent | 4/5 | 0.475 | 101 / 124 | 0/20 |
+| 7. Keyword rarity (IDF), approved extra | `f001b01` | 15/20 (75%), 15 exact, 0 equivalent | 4/5 | 0.506 | 104 / 129 | 0/20 |
 
 Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 
@@ -78,6 +79,10 @@ Retrieval is unchanged from the baseline. The graph has gained notes since then,
 | c18 | 3 | exact | 3 |  |
 | c19 | 1 | exact | 1 |  |
 | c20 | – | miss | 10 | noise |
+
+## After IDF: still 15/20
+
+Rarity weighting raised MRR from 0.475 to 0.506 and moved two missed targets up (c06 from deep rank 25 to 13, c07 from 28 to 24), but none entered the 8 seed slots. On the server, the keyword rank is one input to reciprocal-rank fusion. A target that ranks 13th by keywords and isn't among the dense candidates still loses to what both lists agree on. The dense timeout fired 0 times in 100 runs.
 
 ## Final: 15/20, one short of the target
 
