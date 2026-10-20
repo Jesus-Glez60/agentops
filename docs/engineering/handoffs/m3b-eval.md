@@ -89,3 +89,19 @@ Resolving one cue on the server takes about 85 ms at p50: the 106 ms round trip,
 More tuning against 20 single-target cases would mostly fit these cases. The replay labels measure precision directly.
 
 **Prompt-time `recall-eval` after `b783df4`:** 15/20, MRR 0.472, p95 117 ms, misses 3 ranking and 2 vocabulary. This holds the 3a contract of at least 15/20. MRR is below m3a's 0.506 (`f001b01`); the graph has gained notes since. `recall_seed_with`'s order is unchanged by design, and its tests check that.
+
+## Replay (before labels)
+
+`agentops work-recall-eval --remote --replay <5 sessions> --min-score T`. All contexts of each session: the main session and every subagent.
+
+| Run | Commit | Threshold | Characters added per session | Pointers (main / all) | Most work-time pointers in one context |
+| --- | --- | --- | --- | --- | --- |
+| First | `cc9f272` | 0.4 | 48,576 – 198,111 | – / 1,757 | 106 (ceiling reset by compaction) |
+| Re-reads counted once, ceiling spans compactions | `823bbf4` | 0.6 | 43,926 – 180,631 | 199 / 1,505 | 62 (error cues past the ceiling) |
+| Same | `823bbf4` | 1.0 | 25,004 – 115,026 | 56 / 813 | 39 |
+
+- **Subagents carry the volume.** 87% of pointers at 0.6 went to subagent contexts. There are 102 subagent contexts with at least one injection, at a median of 11 pointers each. Each subagent starts with an empty shown set.
+- **Above 1.0 means convergence.** A single cue scores at most 1.0, so a memory needs two or more converging cues to pass a threshold above 1.0.
+- **What 1.5 would give**, estimated from the 0.6 run by filtering on activation (the shown sets would differ, so this is approximate): about 340–3,600 characters per session, near the 3,000 median target. Nearly every error cue would then be silent, since an error cue alone tops out at 1.0.
+
+The author labels a stratified sample before `INJECT_MIN_SCORE` is set: 79 pointers at 1.5 or above, 94 from error cues, and 100 random ones from 1.0–1.5.
