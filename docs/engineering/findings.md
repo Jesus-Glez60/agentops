@@ -468,6 +468,41 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 - Status: seen 2026-10-17 at `9e8a289`; recorded as a gotcha.
 - `reinforce_edges_batch_bumps_every_edges_weight_and_respects_bump_confirmed_at` panicked on an `unwrap`; the commit touched no Postgres code and the next three runs passed. Panic message not captured. **Likely** a parallel-test interaction on the shared database.
 
+### F63. `SimilarTo` edges store no cosine
+
+- Status: found 2026-10-19 planning milestone 3a; recorded as a gotcha.
+- `Edge` has only a reinforcement `weight`, so "the edge's score" isn't stored. The spec's items 0, 3 and 5 assumed it was. Every reader computes the cosine from `get_embedding` / `get_embeddings` instead (`recall-eval`, the hop, `prune_similar`). There is no migration.
+
+### F64. The recall hop's neighbour score depended on `HashMap` order
+
+- Status: seen 2026-10-19 in the baseline (a case's seed varied across repeats); **resolved** in `9db16a7`. Sources are now walked in rank order.
+
+### F65. "A local hook never constructs `LocalEmbedder`" can't be tested
+
+- Status: found 2026-10-19; resolved in `1aab7ff`.
+- The struct is zero-sized and the model loads lazily, so the test checks `agentops_embeddings::model_loaded()` in its own process instead (`agentops-mcp/tests/hooks_never_load_the_model.rs`).
+
+### F66. The CI cargo cache filled the server's disk and took production down
+
+- Status: 2026-10-20, about 05:22 to 15:57 UTC; fixed by the author's approval; recorded as a gotcha.
+- The `agentops-ci-target` volume reached 54.5 GB and the root LV hit 100%. Postgres then failed every write and crash-looped. Hook writes in that window were lost, and an autodeploy health check failed mid-deploy.
+- Removing the volume (a pure cache) freed 48 GB, and Postgres recovered on its own.
+- **Open:** nothing caps or prunes that volume.
+
+### F67. `agentops-test-remote` can build stale code after an autodeploy gate
+
+- Status: seen 2026-10-20; recorded as a gotcha. The gate and the scratch run share a cargo target dir mounted at `/src`, so a gate build newer than the laptop's edit times made cargo reuse stale artifacts. Workaround: `touch` the edited files.
+
+### F68. PostToolUse records tool calls in very few sessions
+
+- Status: measured 2026-10-20 for the milestone 3a handoff (§5).
+- Over 30 days, 14 of 241 real sessions in this repo have any tool event at all. Only edits, git ops, large outputs, errors and cache hazards are recorded, and most edits made through scripts never pass the hook.
+- `session_events` alone can't size a work-time recall hook.
+
+### F69. `recall-eval`'s deep rank is bounded by recall's candidate pool
+
+- Status: found 2026-10-20; recorded as a gotcha. `PER_QUERY = 10` lexical candidates per keyword and kind, plus `DENSE_TOP_K = 20`, bound the "deep" ranking as much as its cap of 50 does. A `vocabulary` miss means "not in recall's candidate pool".
+
 ### Observation: a scratch docbrain library on the hosted server
 
 - The 2026-10-13 SSRF check registered `zz-ssrf-check` in the author's org docbrain store. No tool deletes a library; it is hidden from the Libraries list because it has no content. Not a defect.
