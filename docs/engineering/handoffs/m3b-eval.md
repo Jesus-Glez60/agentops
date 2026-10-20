@@ -55,9 +55,24 @@ Five past sessions, chosen 2026-10-20 and approved by the author. The ids are th
 | --- | --- | --- | --- | --- | --- | --- |
 | Baseline: `Affects` lookup only (what `get_symbol` gives) | `f892bc3` | 0/20 | 0/10 | 0/10 | 0.000 | 22 / 45 |
 | Baseline: cue text through prompt-time recall (`/recall`) | `f892bc3` | 11/20 | 7/10 | 4/10 | 0.442 | 97 / 140 |
+| Baseline: same, error cases with real newlines (re-run) | `9679731` | 10/20 | 7/10 | 3/10 | 0.442 | 87 / 146 |
+| 2. Cue resolution (error cues cleaned to empty, see below) | `87aae38` | 7/20 | 7/10 | 0/10 | 0.233 | 90 / 169 |
+| 2. + empty-query guard, dense confidence rescaled | `9679731` | 10/20 | 6/10 | 4/10 | 0.375 | 106 / 262 |
 
 Target: at least 14/20, with at least 7/10 file cases and at least 7/10 error cases.
 
 **The `Affects` baseline is 0/20 by construction.** The spec requires file cases whose target isn't `Affects`-linked, and an error names no file. So that baseline only confirms the cases are valid. The second baseline is the informative one: m3a's prompt recall fed nothing but the path or the error text.
 
 **The file half of the case set is easier than intended.** Seven of the ten file targets carry the file's name in their title, so a keyword match on the path alone already ranks them in the top 3. Work-time recall has to beat 7/10 on file cases to show anything the path keyword doesn't already give. The error cases are where the prompt baseline is weak (4/10).
+
+**Item 2's misses**, diagnosed on the server. The targets are in the candidate lists, but scores saturate in three ways:
+
+- **Ties at 1.0.** A one-keyword file query (`docker-compose.yml`) scores every memory containing that word 1.0, and ties fall back to node id (f01, rank 4).
+- **`Affects` floods.** A hub file reaches up to 50 `Affects`-linked memories, all at 1.0 (f08, f10). So does an error that names a symbol (e03).
+- **The gotcha boost saturates.** A fully matched gotcha scores 1.5 and outranks a partly matched target (e01).
+
+**First item 2 run.** The case texts had their newlines flattened to `|`. An error whose single line started with `Exit code N` cleaned to an empty query, and that empty query still reached generic memories by meaning at confidence about 0.85. Fixed in `9679731`, and the cases now keep the real newlines.
+
+## Timing gate before item 3
+
+Resolving one cue on the server takes about 85 ms at p50: the 106 ms round trip, less the about 22 ms the trivial `Affects`-only probe takes. On a hub file, the p95 is about 240 ms. Recomputing activation from the last `ACTIVATION_WINDOW` (20) cues on every hook call would cost about 20 × 85 ms ≈ 1.7 s at p50, against a 300 ms remote p95 budget. So each cue's candidate scores are stored once, as a `work_cue` event, and activation sums those.
