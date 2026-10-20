@@ -882,6 +882,28 @@ impl GraphStore for SqliteGraphStore {
         Ok(hits)
     }
 
+    fn count_lexical(&self, repo: &str, query: &str, kinds: &[NodeKind]) -> Result<usize> {
+        let match_query = fts5_match_query(query);
+        if match_query.is_empty() || kinds.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = (0..kinds.len()).map(|i| format!("?{}", i + 3)).collect::<Vec<_>>().join(", ");
+        let sql = format!("SELECT count(*) FROM nodes_fts JOIN nodes ON nodes.id = nodes_fts.rowid WHERE nodes_fts MATCH ?1 AND nodes.repo = ?2 AND nodes.kind IN ({placeholders})");
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(match_query), Box::new(repo.to_string())];
+        params.extend(kinds.iter().map(|k| Box::new(k.as_db_str()) as Box<dyn rusqlite::ToSql>));
+        let n: i64 = self.conn.query_row(&sql, rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), |row| row.get(0))?;
+        Ok(n as usize)
+    }
+
+    fn count_nodes(&self, repo: &str, kinds: &[NodeKind]) -> Result<usize> {
+        let mut n = 0;
+        for &kind in kinds {
+            let c: i64 = self.conn.query_row("SELECT count(*) FROM nodes WHERE repo = ?1 AND kind = ?2", rusqlite::params![repo, kind.as_db_str()], |row| row.get(0))?;
+            n += c as usize;
+        }
+        Ok(n)
+    }
+
     fn search_exact(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
         let mut stmt = self.conn.prepare(
             "SELECT * FROM nodes WHERE repo = ?1 AND (?2 IS NULL OR kind = ?2) AND (LOWER(name) = LOWER(?3) OR LOWER(name) LIKE '%' || LOWER(?3) || '%') \

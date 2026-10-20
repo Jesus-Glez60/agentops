@@ -113,13 +113,16 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
         title: String,
         prominence: NodeProminence,
         reasons: Vec<String>,
+        /// Sum of the rarity weights of the distinct cues it matched.
+        strength: f64,
     }
     let mut candidates: HashMap<i64, Candidate> = HashMap::new();
-    let mut add = |id: i64, kind: NodeKind, title: Option<&str>, prominence: NodeProminence, score: f64, reason: String| {
-        let c = candidates.entry(id).or_insert_with(|| Candidate { score: 0.0, kind, title: title.unwrap_or("(untitled)").to_string(), prominence, reasons: Vec::new() });
+    let mut add = |id: i64, kind: NodeKind, title: Option<&str>, prominence: NodeProminence, score: f64, reason: String, weight: f64| {
+        let c = candidates.entry(id).or_insert_with(|| Candidate { score: 0.0, kind, title: title.unwrap_or("(untitled)").to_string(), prominence, reasons: Vec::new(), strength: 0.0 });
         c.score += score;
         if !c.reasons.contains(&reason) {
             c.reasons.push(reason);
+            c.strength += weight;
         }
     };
 
@@ -131,12 +134,26 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
     // must match at least two. An empty seed beats a noisy one, which only
     // teaches the agent to skip seeds.
     let min_keyword_matches = if keywords.len() >= 3 { 2 } else { 1 };
+    // A keyword counts for its rarity: ln(1 + memories / memories matching
+    // it). Without it, two common words ("repo", "hooks") tied with two
+    // telling ones and the answer sank among dozens of equal two-word
+    // matches (milestone 3a eval, 4 of the last 5 misses).
+    let memories = store.count_nodes(repo, RECALL_KINDS)?.max(1) as f64;
+    let mut weakest = f64::INFINITY;
     for keyword in &keywords {
+        let df = store.count_lexical(repo, keyword, RECALL_KINDS)?.max(1) as f64;
+        let weight = (1.0 + memories / df).ln();
+        weakest = weakest.min(weight);
         for &kind in RECALL_KINDS {
             for (rank, (node, _)) in store.search_lexical(repo, keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
-                add(node.id, node.kind, node.name.as_deref(), node.prominence, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""));
+                add(node.id, node.kind, node.name.as_deref(), node.prominence, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""), weight);
             }
         }
+    }
+    // A named symbol is as telling as two of the rarest possible words.
+    let symbol_weight = 2.0 * (1.0 + memories).ln();
+    if !weakest.is_finite() {
+        weakest = 1.0;
     }
 
     // An exactly named symbol is a strong cue: its notes rank like a
@@ -152,7 +169,7 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
                 }
                 let Some(note) = store.get_node(repo, edge.src_id)? else { continue };
                 if RECALL_KINDS.contains(&note.kind) {
-                    add(note.id, note.kind, note.name.as_deref(), note.prominence, 1.0, format!("affects `{identifier}`"));
+                    add(note.id, note.kind, note.name.as_deref(), note.prominence, 1.0, format!("affects `{identifier}`"), symbol_weight);
                 }
             }
         }
@@ -160,26 +177,28 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
 
     let enough = |c: &Candidate| c.reasons.iter().any(|r| r.starts_with("affects")) || c.reasons.len() >= min_keyword_matches;
     let shown = |id: &i64, prominence: NodeProminence| !exclude.contains(id) && prominence != NodeProminence::Pinned && prominence.recallable();
-    // How many distinct cues a node matched comes first: rank fusion runs
-    // per kind, so every kind's top hit scores alike, and a gotcha matching
-    // three keywords must beat a decision matching two (seen live on the
-    // server graph). A named symbol's note counts as one cue more.
+    // The rarity-weighted strength of what a node matched comes first: rank
+    // fusion runs per kind, so every kind's top hit scores alike, and a
+    // gotcha matching three keywords must beat a decision matching two
+    // (seen live on the server graph). Then the fused score.
     let mut ranked: Vec<Ranked> = candidates
         .into_iter()
         .filter(|(id, c)| shown(id, c.prominence) && enough(c))
         .map(|(id, c)| {
-            let cues = c.reasons.len() + usize::from(c.reasons.iter().any(|r| r.starts_with("affects")));
             let score = if c.prominence == NodeProminence::Reduced { c.score * 0.5 } else { c.score };
-            Ranked { id, cues, score, hop: false, kind: c.kind, title: c.title, reasons: c.reasons }
+            Ranked { id, strength: c.strength, score, hop: false, kind: c.kind, title: c.title, reasons: c.reasons }
         })
         .collect();
     sort_ranked(&mut ranked);
+    // A hop neighbour weighs like one hit on the prompt's weakest word.
+    let mut hop_strength = weakest;
     if let Some((rx, started)) = pending {
         if let Some(dense) = dense_candidates(store, repo, &rx, started, &shown)? {
             fuse(&mut ranked, dense);
+            hop_strength = FUSED_STRENGTH;
         }
     }
-    hop(store, repo, &mut ranked, &shown)?;
+    hop(store, repo, &mut ranked, &shown, hop_strength)?;
     Ok(ranked
         .into_iter()
         .take(limit)
@@ -224,11 +243,11 @@ fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Res
 /// halved, as its keyword rank already was.
 fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
     let rrf = |rank: usize| 1.0 / (RRF_K + rank as f64 + 1.0);
-    let mut fused: HashMap<i64, Ranked> = ranked.drain(..).enumerate().map(|(i, r)| (r.id, Ranked { cues: 1, score: rrf(i), ..r })).collect();
+    let mut fused: HashMap<i64, Ranked> = ranked.drain(..).enumerate().map(|(i, r)| (r.id, Ranked { strength: FUSED_STRENGTH, score: rrf(i), ..r })).collect();
     for (i, (node, cosine)) in dense.into_iter().enumerate() {
         let share = rrf(i) * if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
         let reason = format!("close in meaning ({cosine:.2})");
-        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, cues: 1, score: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), reasons: Vec::new() });
+        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), reasons: Vec::new() });
         entry.score += share;
         entry.reasons.push(reason);
     }
@@ -246,10 +265,14 @@ pub const HOP_FACTOR: f64 = 0.8;
 /// neighbours and recall fell from 13/20 to 9/20 (milestone 3a eval).
 pub const HOP_MAX_PER_SOURCE: usize = 2;
 
-/// A recall candidate with its strength: cues first, then score.
+/// Every candidate's strength once keyword and dense ranks are fused: the
+/// fused score orders them, and hop neighbours tie and rank after.
+const FUSED_STRENGTH: f64 = 1.0;
+
+/// A recall candidate with its strength (rarity-weighted cues), then score.
 struct Ranked {
     id: i64,
-    cues: usize,
+    strength: f64,
     score: f64,
     /// Reached only through a `SimilarTo` hop, not on its own cues.
     hop: bool,
@@ -258,16 +281,17 @@ struct Ranked {
     reasons: Vec<String>,
 }
 
-/// Strongest first: cues, then a direct match before a hop neighbour, then
-/// score, then id as a stable tiebreak.
+/// Strongest first: strength, then a direct match before a hop neighbour,
+/// then score, then id as a stable tiebreak.
 fn sort_ranked(ranked: &mut [Ranked]) {
-    ranked.sort_by(|a, b| b.cues.cmp(&a.cues).then(a.hop.cmp(&b.hop)).then(b.score.total_cmp(&a.score)).then(a.id.cmp(&b.id)));
+    ranked.sort_by(|a, b| b.strength.total_cmp(&a.strength).then(a.hop.cmp(&b.hop)).then(b.score.total_cmp(&a.score)).then(a.id.cmp(&b.id)));
 }
 
 /// One `SimilarTo` hop from each memory that made it on its own cues
 /// (ADR 0051), so a memory that names no symbol and shares no keyword can
-/// still come up beside the one it resembles. A neighbour counts as one
-/// cue, ranks after the direct matches with as many, and scores `source
+/// still come up beside the one it resembles. A neighbour weighs like one
+/// hit on the prompt's weakest word (`hop_strength`), ranks after the
+/// direct matches as strong, and scores `source
 /// score × cosine × HOP_FACTOR` (halved again if it's reduced), so among
 /// neighbours the closest one of the strongest match comes first. Inheriting the source's cue count, in
 /// full or one step down, lost 2 of 20 eval cases against this: the
@@ -278,7 +302,7 @@ fn sort_ranked(ranked: &mut [Ranked]) {
 /// its closest. A node reached directly and by a hop, or by two hops, keeps
 /// the stronger of them and every reason. Sources are walked strongest
 /// first, so the result never depends on map order.
-fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&i64, NodeProminence) -> bool) -> Result<()> {
+fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&i64, NodeProminence) -> bool, hop_strength: f64) -> Result<()> {
     let mut position: HashMap<i64, usize> = ranked.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
     let sources: Vec<(i64, f64, String)> = ranked.iter().map(|r| (r.id, r.score, r.title.clone())).collect();
     for (source_id, score, title) in sources {
@@ -296,12 +320,12 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
                 break;
             }
             let reason = format!("similar to \"{title}\"");
-            let hop_cues = 1;
+
             if let Some(&i) = position.get(&target) {
                 taken += 1;
                 let r = &mut ranked[i];
-                if (hop_cues, score * cosine * HOP_FACTOR) > (r.cues, r.score) {
-                    (r.cues, r.score) = (hop_cues, score * cosine * HOP_FACTOR);
+                if (hop_strength, score * cosine * HOP_FACTOR) > (r.strength, r.score) {
+                    (r.strength, r.score) = (hop_strength, score * cosine * HOP_FACTOR);
                 }
                 if !r.reasons.contains(&reason) {
                     r.reasons.push(reason);
@@ -318,7 +342,7 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
             }
             taken += 1;
             position.insert(target, ranked.len());
-            ranked.push(Ranked { id: target, cues: hop_cues, score: hop_score, hop: true, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
+            ranked.push(Ranked { id: target, strength: hop_strength, score: hop_score, hop: true, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
         }
     }
     sort_ranked(ranked);
@@ -396,6 +420,19 @@ mod tests {
         let seed = recall_seed(&store, "r", "remote hooks", 8, &HashSet::new()).unwrap();
         assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![both, one], "more matched keywords rank higher: {seed:?}");
         assert!(seed[0].render().contains("matched \"remote\", \"hooks\""), "{}", seed[0].render());
+    }
+
+    #[test]
+    fn a_match_on_a_rare_word_outranks_matches_on_common_words_only() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let common: Vec<i64> = (0..12).map(|n| note(&store, NodeKind::Note, &format!("Repo hooks note {n}"), "the repo hooks run on every commit")).collect();
+        let telling = note(&store, NodeKind::Gotcha, "Port remap", "hooks broke after the port remap");
+        let seed = recall_seed(&store, "r", "hooks repo port", 8, &HashSet::new()).unwrap();
+        assert_eq!(seed[0].node_id, telling, "\"port\" is rarer than \"repo\": {seed:?}");
+        assert!(seed[1..].iter().all(|p| common.contains(&p.node_id)));
+        assert_eq!(store.count_lexical("r", "port", RECALL_KINDS).unwrap(), 1);
+        assert_eq!(store.count_lexical("r", "hooks", RECALL_KINDS).unwrap(), 13);
+        assert_eq!(store.count_nodes("r", RECALL_KINDS).unwrap(), 13);
     }
 
     #[test]

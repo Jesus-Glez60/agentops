@@ -651,6 +651,27 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn count_lexical(&self, repo: &str, query: &str, kinds: &[NodeKind]) -> Result<usize> {
+        if query.trim().is_empty() || kinds.is_empty() {
+            return Ok(0);
+        }
+        let kinds: Vec<&str> = kinds.iter().map(NodeKind::as_db_str).collect();
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client.query_one("SELECT count(*) FROM nodes WHERE repo = $1 AND kind = ANY($2) AND search_vector @@ plainto_tsquery('english', $3)", &[&repo, &kinds, &query]).await?;
+            Ok(row.get::<_, i64>(0) as usize)
+        })
+    }
+
+    fn count_nodes(&self, repo: &str, kinds: &[NodeKind]) -> Result<usize> {
+        let kinds: Vec<&str> = kinds.iter().map(NodeKind::as_db_str).collect();
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let row = client.query_one("SELECT count(*) FROM nodes WHERE repo = $1 AND kind = ANY($2)", &[&repo, &kinds]).await?;
+            Ok(row.get::<_, i64>(0) as usize)
+        })
+    }
+
     fn search_lexical(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
         if query.trim().is_empty() {
             return Ok(vec![]);
@@ -1703,6 +1724,28 @@ mod tests {
         let moved = store.get_node("pg-repo-needs-review", id).unwrap().unwrap();
         assert_eq!((moved.id, moved.kind), (id, NodeKind::Decision));
         store.delete_nodes("pg-repo-needs-review", &[id]).unwrap();
+    }
+
+    #[test]
+    fn count_lexical_and_count_nodes_count_only_this_repos_listed_kinds() {
+        const REPO: &str = "pg-repo-counts";
+        let store = require_store!();
+        store.wipe_repo(REPO).unwrap();
+        let mut add = |kind: NodeKind, name: &str, content: &str| {
+            let mut n = node(REPO, kind, Some(format!("vault:{name}.md").as_str()), Some(name));
+            n.content = Some(content.into());
+            upsert_node(&store, n).unwrap();
+        };
+        add(NodeKind::Note, "a", "the port remap broke hooks");
+        add(NodeKind::Gotcha, "b", "hooks run on every commit");
+        add(NodeKind::Symbol, "c", "fn hooks() {}");
+        let memories = [NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note];
+        assert_eq!(store.count_lexical(REPO, "hooks", &memories).unwrap(), 2, "the symbol isn't a listed kind");
+        assert_eq!(store.count_lexical(REPO, "port", &memories).unwrap(), 1);
+        assert_eq!(store.count_lexical(REPO, "nothing", &memories).unwrap(), 0);
+        assert_eq!(store.count_nodes(REPO, &memories).unwrap(), 2);
+        assert_eq!(store.count_lexical("pg-repo-other", "hooks", &memories).unwrap(), 0);
+        store.wipe_repo(REPO).unwrap();
     }
 
     #[test]

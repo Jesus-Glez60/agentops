@@ -1196,6 +1196,26 @@ pub trait GraphStore {
         Ok(())
     }
 
+    /// How many nodes of `kinds` in `repo` match `query` lexically: a
+    /// keyword's document frequency, for recall's rarity weighting. Both
+    /// stores override this with one counting query.
+    fn count_lexical(&self, repo: &str, query: &str, kinds: &[NodeKind]) -> Result<usize> {
+        let mut n = 0;
+        for &kind in kinds {
+            n += self.search_lexical(repo, query, 10_000, Some(kind))?.len();
+        }
+        Ok(n)
+    }
+
+    /// How many nodes of `kinds` `repo` has.
+    fn count_nodes(&self, repo: &str, kinds: &[NodeKind]) -> Result<usize> {
+        let mut n = 0;
+        for &kind in kinds {
+            n += self.nodes_by_kind(repo, kind)?.len();
+        }
+        Ok(n)
+    }
+
     /// Batched `get_embedding`: the vectors of whichever `ids` have one.
     /// `SimilarTo` edges keep no score, so recall's hop and the similarity
     /// prune read their cosines from these; Postgres answers in one query.

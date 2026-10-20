@@ -148,6 +148,16 @@ Edges and vectors are only read here, so the hook loads no embedding model ([ADR
 
 **Side effect.** Runs are recorded as sessions whose ids start with `recall-eval-`, so per-session statistics should filter them out. Milestone 3a's baseline and per-item scores are in [`handoffs/m3a-eval.md`](handoffs/m3a-eval.md).
 
+## Keyword rarity in the recall seed
+
+`recall_seed` ranks direct matches by the summed rarity of the keywords they matched, not by how many keywords they matched.
+- **Keyword weight:** `ln(1 + N / df)`, where N is the number of memories (`GraphStore::count_nodes`) and df is how many match the keyword (`count_lexical`, one counting query per keyword on each store).
+- **Named symbol:** weighs twice the rarest possible word.
+- **Hop neighbour:** weighs like one hit on the prompt's weakest word.
+- **Unchanged:** a note must still match at least two of three or more keywords.
+
+This was added after milestone 3a's eval ended at 15/20. Four of the five misses matched two common words and sank among dozens of equal two-word matches. The spec allowed IDF only if the target couldn't be met without it, and the author approved it.
+
 ## Meaning in the recall seed
 
 On the server, `recall_seed_with` (`agentops-retrieval/src/recall.rs`) also recalls by meaning ([ADR 0052](adr/0052-the-server-may-embed-the-prompt-in-a-hook.md)). A local hook process never does, because it passes no embedder.
