@@ -133,7 +133,7 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<
     // own event recording, there's no catch-all "activity" fallback: not
     // every tool call is guide-worthy.
     if let Some((event_kind, description)) = recorded_post_tool_event(raw, &payload.tool_name, &payload.tool_input) {
-        store.record_session_event(repo, session_id, &payload.tool_name, &description, None, event_kind)?;
+        store.record_session_event_in(repo, session_id, &payload.tool_name, &description, None, event_kind, agent_id(raw))?;
     }
 
     let text = render_tool_response(&payload.tool_response);
@@ -190,18 +190,35 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<
 }
 
 /// Feeds `get_session_guide`'s "Files Modified"/"Git Ops"/"External
-/// References" sections. Deliberately narrow, pattern-based, no LLM call --
-/// "Rejected Approaches"/"Constraints"/"Blockers" need actual semantic
-/// judgment and are out of scope here (see the plan this was built from).
-fn classify_post_tool_use(tool_name: &str, tool_input: &Value) -> Option<(&'static str, String)> {
+/// References" sections, and records every file read and search (milestone
+/// 3b, F68) for work-time recall. Deliberately narrow, pattern-based, no
+/// LLM call -- "Rejected Approaches"/"Constraints"/"Blockers" need actual
+/// semantic judgment and are out of scope here (see the plan this was
+/// built from).
+///
+/// A read is recorded by its repo-relative path (`rel_path`, which
+/// `agentops hook-capture` puts in the payload), never its content; a read
+/// outside the repo has none and isn't recorded. A read is the `Read` or
+/// `NotebookRead` tool, or a Bash command that only reads one file
+/// (`work_recall::bash_read_path`).
+fn classify_post_tool_use(tool_name: &str, tool_input: &Value, rel_path: Option<&str>) -> Option<(&'static str, String)> {
     match tool_name {
         "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => {
             let path = tool_input.get("file_path").or_else(|| tool_input.get("notebook_path")).and_then(|v| v.as_str())?;
             Some(("file_modified", path.to_string()))
         }
+        "Read" | "NotebookRead" => Some((FILE_READ, rel_path?.to_string())),
+        "Grep" | "Glob" => {
+            let pattern = tool_input.get("pattern").and_then(|v| v.as_str())?;
+            Some((SEARCH, agentops_security::redact(pattern).text))
+        }
         "Bash" => {
             let command = tool_input.get("command").and_then(|v| v.as_str())?;
-            is_git_op(command).then(|| ("git_op", agentops_security::redact(command).text))
+            if is_git_op(command) {
+                return Some(("git_op", agentops_security::redact(command).text));
+            }
+            agentops_retrieval::work_recall::bash_read_path(command)?;
+            Some((FILE_READ, rel_path?.to_string()))
         }
         "WebFetch" | "WebSearch" => {
             let reference = tool_input.get("url").or_else(|| tool_input.get("query")).and_then(|v| v.as_str())?;
@@ -221,9 +238,29 @@ fn classify_post_tool_use(tool_name: &str, tool_input: &Value) -> Option<(&'stat
 /// planner's. Subagent payloads carry `agent_id` (logged live on Claude
 /// Code 2.1.286, 2026-10-16); the main thread's don't.
 fn recorded_post_tool_event(payload: &Value, tool_name: &str, tool_input: &Value) -> Option<(&'static str, String)> {
-    let event = classify_post_tool_use(tool_name, tool_input)?;
+    let event = classify_post_tool_use(tool_name, tool_input, rel_path(payload))?;
     let from_subagent = payload.get("agent_id").is_some();
     (!(from_subagent && matches!(event.0, RECALL_CALL | FLOW_SKILL))).then_some(event)
+}
+
+/// `event_kind` of a file read (description: the repo-relative path) and
+/// of a `Grep`/`Glob` search (description: the pattern).
+pub const FILE_READ: &str = "file_read";
+pub const SEARCH: &str = "search";
+
+/// The payload field `agentops hook-capture` sets to the repo-relative path
+/// of the file a tool call touches. The server never sees the repo root
+/// (`call_remote` strips `cwd`), so the client works it out.
+pub const REL_PATH_FIELD: &str = "agentops_rel_path";
+
+fn rel_path(payload: &Value) -> Option<&str> {
+    payload.get(REL_PATH_FIELD).and_then(|v| v.as_str()).filter(|p| !p.is_empty())
+}
+
+/// The subagent a hook payload came from (Claude Code sets `agent_id` on a
+/// subagent's tool calls); `None` for the main session.
+fn agent_id(payload: &Value) -> Option<&str> {
+    payload.get("agent_id").and_then(|v| v.as_str()).filter(|a| !a.is_empty())
 }
 
 /// `event_kind`s recording that the task-start flow actually ran, read back
@@ -670,8 +707,11 @@ mod tests {
     }
 
     #[test]
-    fn is_relevant_skips_an_ordinary_read_but_not_an_edit_a_large_output_or_a_secret() {
-        assert!(!is_relevant("posttooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "src/main.rs"}, "tool_response": "short" })));
+    fn is_relevant_skips_a_read_outside_the_repo_but_not_one_inside_an_edit_a_large_output_or_a_secret() {
+        assert!(!is_relevant("posttooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "/elsewhere/main.rs"}, "tool_response": "short" })), "no repo-relative path: outside the repo");
+        assert!(is_relevant("posttooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/src/main.rs"}, "tool_response": "short", REL_PATH_FIELD: "src/main.rs" })));
+        assert!(is_relevant("posttooluse", &json!({ "tool_name": "Grep", "tool_input": {"pattern": "fn main"} })));
+        assert!(!is_relevant("posttooluse", &json!({ "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": "short" })));
         assert!(is_relevant("posttooluse", &json!({ "tool_name": "Edit", "tool_input": {"file_path": "src/main.rs"}, "tool_response": "ok" })));
         assert!(is_relevant("posttooluse", &json!({ "tool_name": "Read", "tool_response": "x".repeat(DEFAULT_CHAR_BUDGET + 1) })));
         assert!(!is_relevant("pretooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "src/main.rs"} })));
@@ -683,6 +723,26 @@ mod tests {
         assert!(is_relevant("userpromptsubmit", &json!({ "prompt": "hi" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<task-notification>x" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<agent-message from=\"a1\">\n[Subagent hand-back] report\n</agent-message>" })));
+    }
+
+    #[test]
+    fn a_read_records_a_file_read_by_its_repo_relative_path_and_never_its_content() {
+        let (_dir, store, repo) = store();
+        let read = |tool: &str, input: Value, extra: Value| {
+            let mut payload = json!({ "tool_name": tool, "tool_input": input, "tool_response": {"type": "text", "text": "SECRET FILE BODY"}, "session_id": "s" });
+            payload.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            handle(store.as_ref(), &repo, "posttooluse", &payload).unwrap();
+        };
+        read("Read", json!({"file_path": "/home/u/repo/src/a.rs"}), json!({ REL_PATH_FIELD: "src/a.rs" }));
+        read("Bash", json!({"command": "sed -n 1,40p /home/u/repo/docs/b.md"}), json!({ REL_PATH_FIELD: "docs/b.md", "agent_id": "agent-1" }));
+        read("Read", json!({"file_path": "/etc/hosts"}), json!({}));
+        read("Grep", json!({"pattern": "fn handle", "path": "src"}), json!({}));
+        read("Glob", json!({"pattern": "**/*.md"}), json!({}));
+        let events = store.session_events(&repo, "s").unwrap();
+        let got: Vec<(&str, &str, &str, Option<&str>)> = events.iter().map(|e| (e.event_kind.as_str(), e.tool_name.as_str(), e.description.as_str(), e.agent_id.as_deref())).collect();
+        assert_eq!(got, [(FILE_READ, "Read", "src/a.rs", None), (FILE_READ, "Bash", "docs/b.md", Some("agent-1")), (SEARCH, "Grep", "fn handle", None), (SEARCH, "Glob", "**/*.md", None)], "a read outside the repo is not recorded");
+        assert!(events.iter().all(|e| !e.description.contains("SECRET FILE BODY")));
+        assert!(store.nodes_by_kind(&repo, NodeKind::ToolOutput).unwrap().is_empty());
     }
 
     #[test]

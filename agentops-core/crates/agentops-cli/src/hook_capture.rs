@@ -84,15 +84,19 @@ fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
     let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
-    if !hooks::is_relevant(event, payload) {
-        return Ok(None);
-    }
     let root = hook_repo_root(Path::new(cwd), std::env::var("CLAUDE_PROJECT_DIR").ok().as_deref());
     let repo_path = root.as_path();
+    let mut payload = payload.clone();
+    // Worked out here because the server never sees the repo root.
+    if let Some(rel) = touched_rel_path(&payload, Path::new(cwd), repo_path) {
+        payload[hooks::REL_PATH_FIELD] = Value::String(rel);
+    }
+    if !hooks::is_relevant(event, &payload) {
+        return Ok(None);
+    }
     // The `path` the agent should pass to agentops tools, echoed into the
     // context the hook injects: the connection id for a remote repo (the
     // hosted `/mcp` never resolves a local checkout path), else this repo.
-    let mut payload = payload.clone();
     let marker = read_remote_marker(repo_path);
     payload["agentops_path"] = Value::String(marker.as_ref().map_or_else(|| repo_path.to_string_lossy().into_owned(), |m| m.connection_id.clone()));
     let payload = &payload;
@@ -110,6 +114,25 @@ fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
             hooks::handle(store.as_ref(), &repo, event, payload)
         }
     }
+}
+
+/// The repo-relative path of the file a tool call touches: its
+/// `file_path`/`notebook_path`, or the one file a Bash command only reads
+/// (`work_recall::bash_read_path`). A relative path is taken from the
+/// shell's `cwd`. `None` when there is no such file or it's outside `root`.
+pub(crate) fn touched_rel_path(payload: &Value, cwd: &Path, root: &Path) -> Option<String> {
+    let input = payload.get("tool_input")?;
+    let raw = match input.get("file_path").or_else(|| input.get("notebook_path")).and_then(Value::as_str) {
+        Some(path) => path.to_string(),
+        None => agentops_retrieval::work_recall::bash_read_path(input.get("command").and_then(Value::as_str)?)?,
+    };
+    let path = cwd.join(raw);
+    // macOS reaches the same directory as /tmp and /private/tmp, so compare
+    // canonical forms when they exist (a deleted file has none).
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let path = std::fs::canonicalize(&path).unwrap_or(path);
+    let rel = path.strip_prefix(&root).ok()?.to_string_lossy().into_owned();
+    (!rel.is_empty()).then_some(rel)
 }
 
 /// The repo a hook belongs to. The payload's `cwd` follows the session's
@@ -363,9 +386,34 @@ mod tests {
     }
 
     #[test]
+    fn the_touched_files_repo_relative_path_is_worked_out_on_the_client() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(root.join("src/a.rs"), "").unwrap();
+        let rel = |input: Value, cwd: &Path| touched_rel_path(&json!({ "tool_input": input }), cwd, root);
+        let abs = root.join("src/a.rs").to_string_lossy().into_owned();
+        assert_eq!(rel(json!({"file_path": abs}), root).as_deref(), Some("src/a.rs"));
+        assert_eq!(rel(json!({"command": "sed -n 1,9p a.rs"}), &root.join("src")).as_deref(), Some("src/a.rs"), "relative to the shell's cwd");
+        assert_eq!(rel(json!({"file_path": "/etc/hosts"}), root), None, "outside the repo");
+        assert_eq!(rel(json!({"command": "cargo test"}), root), None, "not a read");
+    }
+
+    #[test]
+    fn a_local_read_is_recorded_by_its_repo_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        let path = dir.path().join("a.rs").to_string_lossy().into_owned();
+        process("posttooluse", false, &payload(dir.path(), json!({ "tool_name": "Read", "tool_input": {"file_path": path}, "tool_response": "fn a() {}" }))).unwrap();
+        let store = agentops_mcp::open_store(dir.path()).unwrap();
+        let events = store.session_events(&agentops_mcp::repo_name(dir.path()), "sess-1").unwrap();
+        assert_eq!(events.iter().map(|e| (e.event_kind.as_str(), e.description.as_str())).collect::<Vec<_>>(), [("file_read", "a.rs")]);
+    }
+
+    #[test]
     fn an_irrelevant_tool_call_never_opens_the_store() {
         let dir = tempfile::tempdir().unwrap();
-        process("posttooluse", false, &payload(dir.path(), json!({ "tool_name": "Read", "tool_input": {"file_path": "a.rs"}, "tool_response": "ok" }))).unwrap();
+        process("posttooluse", false, &payload(dir.path(), json!({ "tool_name": "Bash", "tool_input": {"command": "ls"}, "tool_response": "ok" }))).unwrap();
         assert!(!dir.path().join(".context").join("graph.db").exists());
     }
 

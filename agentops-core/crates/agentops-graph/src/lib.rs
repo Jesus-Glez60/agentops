@@ -664,6 +664,10 @@ pub struct SessionEvent {
     pub node_id: Option<i64>,
     pub event_kind: String,
     pub created_at: String,
+    /// The Claude Code subagent the event came from (the hook payload's
+    /// `agent_id`); `None` for the main session. Work-time recall keeps its
+    /// shown set and activation per context (milestone 3b).
+    pub agent_id: Option<String>,
 }
 
 /// One local coding session's token/cost usage for one `(repo, session_id,
@@ -984,7 +988,13 @@ pub trait GraphStore {
     /// like everything else in this trait, but note `session_events` (unlike
     /// `session_id` returns) is queried by `(repo, session_id)` together:
     /// a session_id is only meaningful within one repo's activity feed.
-    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> Result<i64>;
+    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> Result<i64> {
+        self.record_session_event_in(repo, session_id, tool_name, description, node_id, event_kind, None)
+    }
+    /// `record_session_event` for one context: `agent_id` is the subagent
+    /// the event came from, `None` for the main session.
+    #[allow(clippy::too_many_arguments)]
+    fn record_session_event_in(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str, agent_id: Option<&str>) -> Result<i64>;
     /// Every event recorded under `session_id` in `repo`, oldest first —
     /// the correlated feed `get_session` renders.
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>>;

@@ -127,7 +127,7 @@ A `References` edge whose target disappeared is deleted (`delete_edge`). The aut
 | `scan_history_entries` | Per-node changes of a scan. `node_id` is deliberately not an FK, since removed nodes are already deleted. |
 | `repo_state` | One upserted row per repo: last scan, top gotcha and decision ids (JSON). |
 | `node_versions` | Bi-temporal history: `valid_from`, `valid_until`. No FK, so history survives pruning. |
-| `session_events` | Per-session activity and knowledge-reuse "hits" (`event_kind`, `node_id`). |
+| `session_events` | Per-session activity and knowledge-reuse "hits" (`event_kind`, `node_id`). `agent_id` names the subagent an event came from (`NULL` for the main session), so work-time recall can keep each context apart (milestone 3b). |
 | `tasks`, `task_links` | Native tasks; partial unique index on `(external_source, external_id)` for synced issues. |
 | `nodes_fts` | FTS5 external-content index over `name`, `content`, kept in sync by triggers. |
 | `doc_pages` | One generated `DocPage` per repo, as opaque JSON. |
@@ -245,6 +245,7 @@ The 20 SQLite graph steps, oldest first:
 18. `llm_usage`
 19. `peak_context_tokens`
 20. `session_report`
+21. `session_events.agent_id` (nullable, no default; Postgres: `ADD COLUMN IF NOT EXISTS` in `schema.sql`)
 
 The vector table is created separately (`vec_table_migration`).
 

@@ -384,6 +384,9 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_session_report_unique ON session_report(repo, session_id);",
     ),
+    // Milestone 3b: which context (subagent) an event came from. Nullable,
+    // no default, so it adds cleanly to a non-empty table.
+    M::up("ALTER TABLE session_events ADD COLUMN agent_id TEXT;"),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -481,6 +484,7 @@ impl SqliteGraphStore {
             node_id: row.get("node_id")?,
             event_kind: row.get("event_kind")?,
             created_at: row.get("created_at")?,
+            agent_id: row.get("agent_id")?,
         })
     }
 
@@ -989,10 +993,10 @@ impl GraphStore for SqliteGraphStore {
         Ok(rows.next().transpose()?)
     }
 
-    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> Result<i64> {
+    fn record_session_event_in(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str, agent_id: Option<&str>) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO session_events (repo, session_id, tool_name, description, node_id, event_kind, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)",
-            rusqlite::params![repo, session_id, tool_name, description, node_id, event_kind],
+            "INSERT INTO session_events (repo, session_id, tool_name, description, node_id, event_kind, agent_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, CURRENT_TIMESTAMP)",
+            rusqlite::params![repo, session_id, tool_name, description, node_id, event_kind, agent_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -1930,6 +1934,20 @@ mod tests {
         assert_eq!(events.len(), 2, "must exclude other sessions and other repos: {events:?}");
         assert_eq!(events[0].tool_name, "scan_repo", "oldest first");
         assert_eq!(events[1].tool_name, "add_note");
+    }
+
+    #[test]
+    fn session_events_keep_their_agent_id_and_nodes_in_file_match_the_path_exactly() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.record_session_event("r", "s", "Read", "src/a.rs", None, "file_read").unwrap();
+        store.record_session_event_in("r", "s", "Read", "src/b.rs", None, "file_read", Some("agent-x")).unwrap();
+        let events = store.session_events("r", "s").unwrap();
+        assert_eq!(events.iter().map(|e| e.agent_id.as_deref()).collect::<Vec<_>>(), [None, Some("agent-x")]);
+
+        let node = |path: &str, name: &str| upsert_node(&store, NewNode { kind: NodeKind::Symbol, repo: "r".into(), path: Some(path.into()), name: Some(name.into()), container: None, start_line: None, end_line: None, content: None }).unwrap();
+        let f = node("src/a.rs", "f");
+        node("src/a.rs.bak", "g");
+        assert_eq!(store.nodes_in_file("r", "src/a.rs").unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [f]);
     }
 
     #[test]

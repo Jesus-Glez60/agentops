@@ -146,15 +146,6 @@ fn reaches_failure_hook(result: &str) -> bool {
     !(result.contains("<tool_use_error>") || result.starts_with("Permission for this action was denied") || result.contains("doesn't want to proceed") || result.contains("user rejected"))
 }
 
-/// `path` relative to `root`, or `None` when it's outside the repo.
-fn repo_relative(path: &str, root: &Path) -> Option<String> {
-    let p = Path::new(path);
-    if p.is_relative() {
-        return Some(path.trim_start_matches("./").to_string());
-    }
-    p.strip_prefix(root).ok().map(|r| r.to_string_lossy().into_owned())
-}
-
 /// The work cue a tool call produces, as the hook will see it: a file read
 /// or edited inside the repo and off the skip list, or a failure that
 /// reaches `PostToolUseFailure`.
@@ -162,12 +153,12 @@ pub(crate) fn cue_of(call: &ToolCall, root: &Path) -> Option<WorkCue> {
     if call.failed {
         return reaches_failure_hook(&call.result).then(|| WorkCue::Error { text: call.result.clone() });
     }
-    let path = match call.tool.as_str() {
-        "Read" | "NotebookRead" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => call.input.get("file_path").or_else(|| call.input.get("notebook_path")).and_then(Value::as_str)?.to_string(),
-        "Bash" => bash_read_path(call.input.get("command").and_then(Value::as_str)?)?,
-        _ => return None,
-    };
-    let path = repo_relative(&path, root)?;
+    if !matches!(call.tool.as_str(), "Read" | "NotebookRead" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit" | "Bash") {
+        return None;
+    }
+    // The hook's own path logic; a transcript keeps no per-call cwd, so a
+    // relative path is taken from the repo root.
+    let path = crate::hook_capture::touched_rel_path(&json!({ "tool_input": call.input }), root, root)?;
     (!is_skipped(&path)).then_some(WorkCue::File { path, heading: None })
 }
 

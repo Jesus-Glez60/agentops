@@ -283,6 +283,8 @@ CREATE INDEX IF NOT EXISTS idx_task_links_node ON task_links(node_id);
 ALTER TABLE session_events ADD COLUMN IF NOT EXISTS node_id BIGINT;
 ALTER TABLE session_events ADD COLUMN IF NOT EXISTS event_kind TEXT NOT NULL DEFAULT 'activity';
 CREATE INDEX IF NOT EXISTS idx_session_events_repo_kind ON session_events(repo, event_kind);
+-- Milestone 3b: the subagent an event came from; NULL for the main session.
+ALTER TABLE session_events ADD COLUMN IF NOT EXISTS agent_id TEXT;
 
 -- Per-session token/cost usage (Phase 5, 1.0 roadmap, Module 8), sourced
 -- from `agentops-cli usage sync` parsing a local Claude Code JSONL

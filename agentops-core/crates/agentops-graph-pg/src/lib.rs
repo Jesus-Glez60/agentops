@@ -240,11 +240,12 @@ fn row_to_session_event(row: &tokio_postgres::Row) -> SessionEvent {
         node_id: row.get("node_id"),
         event_kind: row.get("event_kind"),
         created_at: row.get("created_at"),
+        agent_id: row.get("agent_id"),
     }
 }
 
 // Same `::text` cast reasoning as EDGES_COLUMNS.
-const SESSION_EVENTS_COLUMNS: &str = "id, repo, session_id, tool_name, description, node_id, event_kind, created_at::text AS created_at";
+const SESSION_EVENTS_COLUMNS: &str = "id, repo, session_id, tool_name, description, node_id, event_kind, created_at::text AS created_at, agent_id";
 
 fn row_to_session_usage(row: &tokio_postgres::Row) -> SessionUsage {
     SessionUsage {
@@ -864,13 +865,13 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
-    fn record_session_event(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str) -> Result<i64> {
+    fn record_session_event_in(&self, repo: &str, session_id: &str, tool_name: &str, description: &str, node_id: Option<i64>, event_kind: &str, agent_id: Option<&str>) -> Result<i64> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
             let row = client
                 .query_one(
-                    "INSERT INTO session_events (repo, session_id, tool_name, description, node_id, event_kind) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
-                    &[&repo, &session_id, &tool_name, &description, &node_id, &event_kind],
+                    "INSERT INTO session_events (repo, session_id, tool_name, description, node_id, event_kind, agent_id) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id",
+                    &[&repo, &session_id, &tool_name, &description, &node_id, &event_kind, &agent_id],
                 )
                 .await?;
             Ok(row.get(0))
@@ -1439,6 +1440,22 @@ mod tests {
         assert_eq!(got.content.as_deref(), Some("fn foo() { changed }"));
 
         store.delete_nodes("pg-repo-a", &[id1]).unwrap();
+    }
+
+    #[test]
+    fn session_events_keep_their_agent_id_and_nodes_in_file_match_the_path_exactly() {
+        let store = require_store!();
+        let repo = format!("pg-repo-m3b-{}", std::process::id());
+        store.record_session_event(&repo, "s", "Read", "src/a.rs", None, "file_read").unwrap();
+        store.record_session_event_in(&repo, "s", "Read", "src/b.rs", None, "file_read", Some("agent-x")).unwrap();
+        let events = store.session_events(&repo, "s").unwrap();
+        assert_eq!(events.iter().map(|e| e.agent_id.as_deref()).collect::<Vec<_>>(), [None, Some("agent-x")]);
+
+        let f = upsert_node(&store, node(&repo, NodeKind::Symbol, Some("src/a.rs"), Some("f"))).unwrap();
+        let other = upsert_node(&store, node(&repo, NodeKind::Symbol, Some("src/a.rs.bak"), Some("g"))).unwrap();
+        assert_eq!(store.nodes_in_file(&repo, "src/a.rs").unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [f]);
+        store.delete_nodes(&repo, &[f, other]).unwrap();
+        store.wipe_repo(&repo).unwrap();
     }
 
     #[test]

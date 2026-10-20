@@ -126,7 +126,7 @@ The store logic for every event lives in one place, `agentops_mcp::hooks::handle
 
 | Event | What it does |
 | --- | --- |
-| `PostToolUse` | Categorizes the call (edit, git, web) into `session_events`. If output is too large to inline, redacts it and stores it as a `ToolOutput` node, findable by search and `fetch_content`. |
+| `PostToolUse` | Categorizes the call (edit, git, web) into `session_events`. Every file read becomes a `file_read` event and every `Grep`/`Glob` a `search` event (milestone 3b, F68). A read is the `Read` tool or a Bash command that only reads one file (`cat`, `head`, `tail`, `sed -n`). The event stores the repo-relative path or the pattern, never content. `hook-capture` works out that path (`agentops_rel_path`) because the server never sees the repo root, and a read outside the repo isn't recorded. A subagent's events carry its `agent_id`. If output is too large to inline, redacts it and stores it as a `ToolOutput` node, findable by search and `fetch_content`. |
 | `PostToolUseFailure` | Records an `error` event. `PostToolUse` never fires on failure (gotcha 53971). |
 | `UserPromptSubmit` | Records `user_intent` and injects pinned nodes (their own `PIN_BUDGET`; a pinned rule shows as its rule line alone, see [06-notes-and-consolidation.md](06-notes-and-consolidation.md), "Pins"), plus the task-start flow in plan mode or a recall seed otherwise (see "Task-start flow and recall seed" below). Skips the `<task-notification>` prompts Claude Code sends when a background task finishes. Installed with a 10 s timeout. |
 | `SessionStart` | On startup, resume or compact, injects the session guide (`session_guide::build`) and pinned nodes. |
