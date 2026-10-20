@@ -36,7 +36,7 @@ Add a plastic `EdgeRelation::SimilarTo` between memories (gotcha, decision, note
 
 ## Amendment, 2026-10-20 (milestone 3a item 3)
 
-Neighbour scoring changed. A neighbour now inherits its source's strength one step down: one cue fewer than its source, losing ties to direct matches, and scored `source score × cosine × 0.8`. It used to count as one cue at half its source's score. Each source reaches at most two neighbours, its closest. Under the old rule, seeds full of 2-to-5-cue keyword hits always cut the neighbours (`m2-report.md` §5). The cosine comes from stored vectors, because edges keep no score. The hop is still one step, still read-only, and still free of any embedding model.
+Neighbour scoring changed. A neighbour still counts as one cue and ranks after direct matches with as many, but it now scores `source score × cosine × 0.8` instead of half its source's score. Each source reaches at most two neighbours, its closest, and sources are walked in rank order, so the seed is deterministic. The spec's "inherit the source's strength" was tried with the full cue count and with one cue fewer. Both lost 2 of 20 eval cases to neighbours crowding out direct hits, so it was reverted with the author's approval. Under the old rule, seeds full of 2-to-5-cue keyword hits always cut the neighbours (`m2-report.md` §5). The cosine comes from stored vectors, because edges keep no score. The hop is still one step, still read-only, and still free of any embedding model.
 
 ## Evidence
 

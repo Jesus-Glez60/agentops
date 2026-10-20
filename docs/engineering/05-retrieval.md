@@ -105,8 +105,8 @@ The fallback means this mode never returns fewer results than flat search would 
 
 ## Similarity hop in the recall seed
 
-`recall_seed` (`agentops-retrieval/src/recall.rs`), the hook seed, follows one `SimilarTo` hop from each memory that qualified on its own cues (keywords or a named symbol). Doc sections are not recall kinds (`RECALL_KINDS`, F53), so none is ever a source, a hit or a neighbour. A neighbour reached this way inherits its source's strength:
-- **Cues:** one cue fewer than its source, and on equal cues the direct match ranks first. Inheriting the full count let the neighbours of a 3-cue match push out the 2-cue direct hits that were the answer (eval 13/20 → 11/20).
+`recall_seed` (`agentops-retrieval/src/recall.rs`), the hook seed, follows one `SimilarTo` hop from each memory that qualified on its own cues (keywords or a named symbol). Doc sections are not recall kinds (`RECALL_KINDS`, F53), so none is ever a source, a hit or a neighbour. A neighbour reached this way is scored from its source:
+- **Cues:** one cue, ranked after the direct matches with as many. The spec had neighbours inherit their source's cue count, in full or one step down, but that lost 2 of 20 eval cases: the neighbours of a strong match pushed out the direct hits that were the answer. It was reverted with the author's approval.
 - **Score:** `source score × cosine × HOP_FACTOR` (0.8), halved again if the neighbour is reduced. It can outrank a weaker direct hit but never its own source.
 - **Cosine:** `SimilarTo` edges keep no score, so it is read from the two stored vectors with `GraphStore::get_embeddings` (one query on Postgres). A neighbour without a vector isn't reached.
 - **Cap:** each source reaches at most `HOP_MAX_PER_SOURCE = 2` neighbours, its closest by cosine. Without the cap, one strongly matched hub filled 5 to 7 of the 8 slots, and the eval fell from 13/20 to 9/20.

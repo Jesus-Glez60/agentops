@@ -171,13 +171,13 @@ fn sort_ranked(ranked: &mut [Ranked]) {
 
 /// One `SimilarTo` hop from each memory that made it on its own cues
 /// (ADR 0051), so a memory that names no symbol and shares no keyword can
-/// still come up beside the one it resembles. A neighbour inherits its
-/// source's strength, one step down: one cue fewer than its source, losing
-/// ties to direct matches, scored `source score × cosine × HOP_FACTOR`
-/// (halved again if it's reduced). So it beats a direct hit with fewer cues
-/// but never one with as many, and never its own source. Inheriting the full
-/// cue count let neighbours of a 3-cue match push out the 2-cue direct hits
-/// that were the answer (eval 13/20 → 11/20). Edges keep no score, so the
+/// still come up beside the one it resembles. A neighbour counts as one
+/// cue, ranks after the direct matches with as many, and scores `source
+/// score × cosine × HOP_FACTOR` (halved again if it's reduced), so among
+/// neighbours the closest one of the strongest match comes first. Inheriting the source's cue count, in
+/// full or one step down, lost 2 of 20 eval cases against this: the
+/// neighbours of a strong match pushed out the direct hits that were the
+/// answer (milestone 3a item 3, reverted with the author's approval). Edges keep no score, so the
 /// cosine comes from the two stored vectors; a neighbour without one isn't
 /// reached. Each source reaches at most `HOP_MAX_PER_SOURCE` neighbours,
 /// its closest. A node reached directly and by a hop, or by two hops, keeps
@@ -185,8 +185,8 @@ fn sort_ranked(ranked: &mut [Ranked]) {
 /// first, so the result never depends on map order.
 fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&i64, NodeProminence) -> bool) -> Result<()> {
     let mut position: HashMap<i64, usize> = ranked.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
-    let sources: Vec<(i64, usize, f64, String)> = ranked.iter().map(|r| (r.id, r.cues, r.score, r.title.clone())).collect();
-    for (source_id, cues, score, title) in sources {
+    let sources: Vec<(i64, f64, String)> = ranked.iter().map(|r| (r.id, r.score, r.title.clone())).collect();
+    for (source_id, score, title) in sources {
         let targets: Vec<i64> = store.edges_from(repo, source_id)?.into_iter().filter(|e| e.relation == EdgeRelation::SimilarTo).map(|e| e.dst_id).collect();
         if targets.is_empty() {
             continue;
@@ -201,7 +201,7 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
                 break;
             }
             let reason = format!("similar to \"{title}\"");
-            let hop_cues = cues.saturating_sub(1);
+            let hop_cues = 1;
             if let Some(&i) = position.get(&target) {
                 taken += 1;
                 let r = &mut ranked[i];
@@ -353,7 +353,7 @@ mod tests {
     }
 
     #[test]
-    fn a_neighbour_inherits_its_sources_strength_one_step_down() {
+    fn a_neighbour_counts_as_one_cue_and_ranks_after_the_direct_hits() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let source = note(&store, NodeKind::Gotcha, "Webhook signature deploy rollback", "webhook signature deploy rollback");
         let equal = note(&store, NodeKind::Decision, "Webhook signature deploy order", "webhook signature deploy");
@@ -363,9 +363,10 @@ mod tests {
         store.set_embedding("r", source, &vector(0.0)).unwrap();
         store.set_embedding("r", neighbour, &vector(0.1)).unwrap();
         let seed = recall_seed(&store, "r", "webhook signature deploy rollback", 8, &HashSet::new()).unwrap();
-        // 4 cues, then a 3-cue direct hit, then the 3-cue (inherited) neighbour, then 2 cues.
-        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![source, equal, neighbour, weaker], "{seed:?}");
-        assert_eq!(seed[2].reason, "similar to \"Webhook signature deploy rollback\"");
+        // Every direct hit with two or more cues, then the one-cue neighbour.
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![source, equal, weaker, neighbour], "{seed:?}");
+        assert_eq!(seed[3].reason, "similar to \"Webhook signature deploy rollback\"");
+
     }
 
     #[test]
