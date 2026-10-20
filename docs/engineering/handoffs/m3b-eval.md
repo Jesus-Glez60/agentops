@@ -58,6 +58,7 @@ Five past sessions, chosen 2026-10-20 and approved by the author. The ids are th
 | Baseline: same, error cases with real newlines (re-run) | `9679731` | 10/20 | 7/10 | 3/10 | 0.442 | 87 / 146 |
 | 2. Cue resolution (error cues cleaned to empty, see below) | `87aae38` | 7/20 | 7/10 | 0/10 | 0.233 | 90 / 169 |
 | 2. + empty-query guard, dense confidence rescaled | `9679731` | 10/20 | 6/10 | 4/10 | 0.375 | 106 / 262 |
+| 2. + Affects dampened, gotcha boost capped, ties on rank (approved fix) | `b783df4` | 10/20 | 6/10 | 4/10 | 0.375 | 99 / 169 |
 
 Target: at least 14/20, with at least 7/10 file cases and at least 7/10 error cases.
 
@@ -76,3 +77,15 @@ Target: at least 14/20, with at least 7/10 file cases and at least 7/10 error ca
 ## Timing gate before item 3
 
 Resolving one cue on the server takes about 85 ms at p50: the 106 ms round trip, less the about 22 ms the trivial `Affects`-only probe takes. On a hub file, the p95 is about 240 ms. Recomputing activation from the last `ACTIVATION_WINDOW` (20) cues on every hook call would cost about 20 × 85 ms ≈ 1.7 s at p50, against a 300 ms remote p95 budget. So each cue's candidate scores are stored once, as a `work_cue` event, and activation sums those.
+
+**The approved scoring fix (`b783df4`) left the hit rate unchanged**, though it is live: a hub file's `Affects` memories now score 0.43 rather than 1.0. The ten misses fall into three groups:
+
+| Why it misses | Cases |
+| --- | --- |
+| Not reached by any source | f10, e02, e04 |
+| Tied with other memories that mention the same file or words, several of them arguably relevant too | f01, f08 |
+| Reached but ranked low | f09, e01, e03, e05, e07 |
+
+More tuning against 20 single-target cases would mostly fit these cases. The replay labels measure precision directly.
+
+**Prompt-time `recall-eval` after `b783df4`:** 15/20, MRR 0.472, p95 117 ms, misses 3 ranking and 2 vocabulary. This holds the 3a contract of at least 15/20. MRR is below m3a's 0.506 (`f001b01`); the graph has gained notes since. `recall_seed_with`'s order is unchanged by design, and its tests check that.
