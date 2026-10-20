@@ -413,6 +413,7 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 - Status: found 2026-10-14 measuring milestone 1 against this repo's graph.
 - The first seed for "add a --json flag to agentops status" matched only the repo's own name and single weak words, and digest doc sections matched every prompt.
 - **Partly resolved** in `a998c7e` and `591bbed` (repo name excluded, two-keyword floor, digest sections down-weighted, cue-count ranking). Still open: one large note ("agentops-teams: Organizations, memberships...") matches many prompts on one or two words. IDF-style weighting is milestone 3 material.
+- **Resolved** for digests in milestone 3a item 2: `RECALL_KINDS` no longer includes `DocSection`, so no seed (plan, default or subagent) contains one. The single-large-note case remains, and IDF stays out of scope unless the evaluation needs it.
 
 ### F54. `connect` with a subset of agents shrinks Ruler's .gitignore block
 

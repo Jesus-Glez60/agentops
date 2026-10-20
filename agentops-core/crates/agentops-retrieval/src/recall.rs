@@ -1,5 +1,5 @@
 //! Cue-driven recall for hooks: given what the user just said, which
-//! recorded gotchas, decisions, notes and doc sections should the agent
+//! recorded gotchas, decisions and notes should the agent
 //! know about before it starts? Lexical and graph only. A hook runs in a
 //! fresh process on every prompt, so this never loads the embedding model
 //! (milestone 1 decision; semantic search stays in the planning step).
@@ -26,16 +26,19 @@ use std::collections::{HashMap, HashSet};
 use agentops_graph::{EdgeRelation, GraphStore, NodeKind, NodeProminence};
 use anyhow::Result;
 
-/// The node kinds recall points at: recorded knowledge, never code.
-pub const RECALL_KINDS: &[NodeKind] = &[NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note, NodeKind::DocSection];
+/// The node kinds recall points at: memories, never code. Generated doc
+/// sections are left out too: digests such as "Known Gotchas" contain
+/// every note's words, so they matched almost any prompt and filled three
+/// of eight seed slots on every one (F53). They stay in search, the
+/// gist-then-detail tier and the repo briefing, which orient rather than
+/// recall.
+pub const RECALL_KINDS: &[NodeKind] = &[NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note];
 
 /// Keywords searched per prompt. Bounds the number of store queries a hook
 /// makes (`MAX_KEYWORDS * RECALL_KINDS.len()`).
 const MAX_KEYWORDS: usize = 8;
 /// Candidates fetched per keyword and kind before fusion.
 const PER_QUERY: usize = 10;
-/// Score multiplier for generated doc sections (see `recall_seed`).
-const DOC_SECTION_WEIGHT: f64 = 0.25;
 
 /// One recalled node, as a pointer the agent can follow.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,9 +126,6 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
     let mut seen: HashSet<i64> = ranked.iter().map(|(id, _)| *id).collect();
     let mut neighbours = Vec::new();
     for (source_id, source) in &ranked {
-        if source.kind == NodeKind::DocSection {
-            continue;
-        }
         for edge in store.edges_from(repo, *source_id)? {
             if edge.relation != EdgeRelation::SimilarTo || !seen.insert(edge.dst_id) {
                 continue;
@@ -142,12 +142,6 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
     for (_, c) in &mut ranked {
         if c.prominence == NodeProminence::Reduced {
             c.score *= 0.5;
-        }
-        // Generated doc sections such as "Known Gotchas" digest many notes
-        // at once, so they match almost any prompt. They rank below the
-        // specific notes they summarize.
-        if c.kind == NodeKind::DocSection {
-            c.score *= DOC_SECTION_WEIGHT;
         }
     }
     // How many distinct cues a node matched comes first: rank fusion runs
@@ -308,12 +302,15 @@ mod tests {
     }
 
     #[test]
-    fn a_specific_note_outranks_a_doc_section_digest_matching_the_same_words() {
+    fn a_doc_section_never_reaches_a_seed_by_keyword_or_by_symbol() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let digest = note(&store, NodeKind::DocSection, "Known Gotchas", "webhook signature deadlock pool postgres everything");
         let specific = note(&store, NodeKind::Gotcha, "Webhook signature mismatch", "every webhook gets 401");
+        let symbol = note(&store, NodeKind::Symbol, "verify_signature", "fn verify_signature() {}");
+        store.add_edge("r", digest, symbol, EdgeRelation::Affects).unwrap();
         let seed = recall_seed(&store, "r", "webhook signature", 8, &HashSet::new()).unwrap();
-        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![specific, digest], "{seed:?}");
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![specific], "{seed:?}");
+        assert!(recall_seed(&store, "r", "why does verify_signature fail", 8, &HashSet::new()).unwrap().iter().all(|p| p.kind != NodeKind::DocSection));
     }
 
     #[test]

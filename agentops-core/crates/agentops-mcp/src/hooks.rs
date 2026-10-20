@@ -930,6 +930,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn no_prompt_seed_or_subagent_seed_contains_a_doc_section() {
+        let (_dir, store, repo) = store();
+        let kept = gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hook capture opens the local store");
+        let digest = agentops_graph::upsert_node(store.as_ref(), agentops_graph::NewNode { kind: agentops_graph::NodeKind::DocSection, repo: repo.clone(), path: Some("doc:known-gotchas".into()), name: Some("Known Gotchas".into()), container: None, start_line: None, end_line: None, content: Some("hooks remote server local store capture everything".into()) }).unwrap();
+        let plan = prompt(store.as_ref(), &repo, "make the hooks follow the remote server", "plan");
+        let explore = context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a1" })).unwrap());
+        let other = prompt(store.as_ref(), &repo, "hooks remote server store capture", "default");
+        assert!(plan.contains(&format!("(id {kept})")), "{plan}");
+        for text in [&plan, &explore, &other] {
+            assert!(!text.contains(&format!("(id {digest})")) && !text.contains("[doc_section]"), "{text}");
+        }
+    }
+
     fn present(store: &dyn GraphStore, repo: &str, plan: Option<&str>) -> Option<Value> {
         let input = plan.map(|p| json!({ "plan": p })).unwrap_or(json!({}));
         handle(store, repo, "pretooluse", &json!({ "session_id": "s", "tool_name": "ExitPlanMode", "tool_input": input })).unwrap()
