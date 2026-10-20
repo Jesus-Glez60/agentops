@@ -168,6 +168,10 @@ enum Command {
         /// (requires AGENTOPS_ANTHROPIC_API_KEY).
         #[arg(long)]
         llm_classify: bool,
+        /// Rename memories imported earlier under their file-slug title to
+        /// their description (kept id, edges and tags). With `--apply`.
+        #[arg(long)]
+        retitle: bool,
     },
     /// Links every gotcha, decision and note to the memories it reads most
     /// like (`SimilarTo` edges, ADR 0051), embedding any that has no vector
@@ -716,7 +720,7 @@ fn main() -> Result<()> {
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
         Command::LinkSimilar { path } => link_similar(&path),
         Command::RecallEval { path, remote, cases, mode, repeat } => recall_eval::run(&path, remote, cases.as_deref(), mode, repeat),
-        Command::ImportMemory { project, memory_dir, apply, report, llm_classify } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify),
+        Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
         }

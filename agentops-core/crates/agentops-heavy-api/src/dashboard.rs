@@ -658,6 +658,69 @@ pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct SetNodeTitleBody {
+    title: String,
+}
+
+/// `POST /repos/{id}/nodes/{node_id}/title` -- renames a gotcha, decision
+/// or note in place through `agentops_mcp::retitle_note` (id, edges, tags,
+/// curation and vector kept; its note file in the checkout moves too).
+/// `agentops import-memory --retitle` uses it to replace slug titles with
+/// descriptions. Audit-logged like every curation action.
+pub(crate) async fn set_node_title_json(
+    State(state): State<AppState>,
+    user: Option<axum::Extension<User>>,
+    AxumPath((id, node_id)): AxumPath<(String, i64)>,
+    Query(q): Query<TenantQuery>,
+    Json(body): Json<SetNodeTitleBody>,
+) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let title = body.title.trim().to_string();
+    if title.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({ "error": "'title' can't be empty" })));
+    }
+
+    let audit_state = state.clone();
+    let audit_tenant = tenant.clone();
+    let audit_target = format!("{id}/nodes/{node_id}");
+    let new_title = title.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(Option<String>, bool), (StatusCode, String)>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(Err((StatusCode::NOT_FOUND, "no such node".into()))),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        let Some(node) = store.get_node(&repo, node_id)? else {
+            return Ok(Err((StatusCode::NOT_FOUND, "no such node".into())));
+        };
+        if !matches!(node.kind, NodeKind::Gotcha | NodeKind::Decision | NodeKind::Note) {
+            return Ok(Err((StatusCode::BAD_REQUEST, format!("only gotchas, decisions and notes are retitled, not a {}", node.kind.as_db_str()))));
+        }
+        match agentops_mcp::retitle_note(store.as_ref(), &repo, &crate::indexing::notes_dir_for_checkout(&path), node_id, &title) {
+            Ok(changed) => Ok(Ok((node.name, changed))),
+            Err(e) => Ok(Err((StatusCode::CONFLICT, e.to_string()))),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Ok((old, changed)))) => {
+            if changed {
+                audit_curation(&audit_state, &audit_tenant, &user, "node_retitled", &audit_target, json!({ "from": old, "to": new_title }));
+            }
+            (StatusCode::OK, Json(json!({ "id": node_id, "title": new_title, "changed": changed })))
+        }
+        Ok(Ok(Err((status, error)))) => (status, Json(json!({ "error": error }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// Most pointers `POST /repos/{id}/recall` returns.
 const RECALL_DEEP_MAX: usize = 50;
 
@@ -1071,6 +1134,51 @@ mod tests {
         actions.sort();
         assert_eq!(actions, vec![("node_curated".to_string(), Some(owner.id)), ("node_curated".to_string(), Some(owner.id)), ("node_kind_set".to_string(), Some(owner.id))]);
         assert!(audit.iter().any(|e| e.metadata.contains("needs_review") && e.metadata.contains("unclassified on import")), "{audit:?}");
+    }
+
+    #[tokio::test]
+    async fn a_retitle_renames_the_node_and_its_file_refuses_a_taken_title_and_is_audited() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let teams_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let teams = agentops_teams::TeamStore::open(&teams_dir.path().join("teams.db")).unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+        let path = crate::indexing::checkout_path(checkouts_dir.path(), &owner.tenant, &connection_id);
+        let repo = agentops_mcp::repo_name(&path);
+        let notes_dir = crate::indexing::notes_dir_for_checkout(&path);
+        std::fs::create_dir_all(&notes_dir).unwrap();
+        std::fs::write(notes_dir.join("project-x.md"), "---\ntitle: \"project-x\"\ntype: knowledge\n---\n\nbody\n").unwrap();
+        let (node_id, taken) = {
+            let graph = agentops_mcp::open_store(&path).unwrap();
+            let add = |p: &str, n: &str| graph.add_node(agentops_graph::NewNode { kind: agentops_graph::NodeKind::Note, repo: repo.clone(), path: Some(p.into()), name: Some(n.into()), container: None, start_line: None, end_line: None, content: Some("body".into()) }).unwrap();
+            (add("vault:project-x.md", "project-x"), add("vault:already-here.md", "Already here"))
+        };
+
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let post = |uri: String, body: Value| Request::builder().method("POST").uri(uri).header("authorization", format!("Bearer {owner_token}")).header("content-type", "application/json").body(Body::from(body.to_string())).unwrap();
+        let title = |id: i64| format!("/repos/{repo}/nodes/{id}/title");
+
+        let ok = app.clone().oneshot(post(title(node_id), json!({ "title": "Project X shipped its first release" }))).await.unwrap();
+        assert_eq!(ok.status(), axum::http::StatusCode::OK);
+        let node = agentops_mcp::open_store(&path).unwrap().get_node(&repo, node_id).unwrap().unwrap();
+        assert_eq!((node.name.as_deref(), node.path.as_deref()), (Some("Project X shipped its first release"), Some("vault:project-x-shipped-its-first-release.md")));
+        assert!(!notes_dir.join("project-x.md").exists());
+        assert!(std::fs::read_to_string(notes_dir.join("project-x-shipped-its-first-release.md")).unwrap().contains("title: \"Project X shipped its first release\""));
+
+        let clash = app.clone().oneshot(post(title(node_id), json!({ "title": "Already here" }))).await.unwrap();
+        assert_eq!(clash.status(), axum::http::StatusCode::CONFLICT, "node {taken} holds that title");
+        let empty = app.clone().oneshot(post(title(node_id), json!({ "title": "  " }))).await.unwrap();
+        assert_eq!(empty.status(), axum::http::StatusCode::BAD_REQUEST);
+        let same = app.oneshot(post(title(node_id), json!({ "title": "Project X shipped its first release" }))).await.unwrap();
+        assert_eq!(body_json(same).await["changed"], json!(false));
+
+        let audit = agentops_teams::TeamStore::open(&teams_dir.path().join("teams.db")).unwrap().list_audit_log(&owner.tenant, None, None, None).unwrap();
+        let retitles: Vec<_> = audit.iter().filter(|e| e.action == "node_retitled").collect();
+        assert_eq!(retitles.len(), 1, "only the real change is logged: {audit:?}");
+        assert!(retitles[0].metadata.contains("project-x") && retitles[0].metadata.contains("first release"), "{:?}", retitles[0]);
     }
 
     #[tokio::test]

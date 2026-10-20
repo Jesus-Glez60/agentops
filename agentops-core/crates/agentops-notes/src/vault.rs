@@ -347,6 +347,23 @@ pub fn with_frontmatter_type(content: &str, note_type: &str) -> String {
     format!("---\n{}{after}", lines.join("\n"))
 }
 
+/// `content` with its frontmatter `title` set to `title` (double-quoted,
+/// escaped the way `add_note` writes it), adding frontmatter if there is
+/// none. Used to keep a renamed note's file and node in step.
+pub fn with_frontmatter_title(content: &str, title: &str) -> String {
+    let line = format!("title: \"{}\"", title.replace('\\', "\\\\").replace('"', "\\\""));
+    let Some(rest) = content.strip_prefix("---\n") else {
+        return format!("---\n{line}\n---\n\n{content}");
+    };
+    let Some(end) = rest.find("\n---") else {
+        return format!("---\n{line}\n---\n\n{content}");
+    };
+    let (front, after) = rest.split_at(end);
+    let mut lines: Vec<String> = vec![line];
+    lines.extend(front.lines().filter(|l| !l.trim_start().starts_with("title:")).map(str::to_string));
+    format!("---\n{}{after}", lines.join("\n"))
+}
+
 pub fn content_with_tags(body: &str, tags: &[String]) -> String {
     let tags: Vec<&str> = tags.iter().map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
     if tags.is_empty() {
@@ -637,6 +654,8 @@ mod tests {
     fn a_kind_change_rewrites_or_adds_the_frontmatter_type() {
         assert_eq!(with_frontmatter_type("---\ntitle: \"T\"\ntype: knowledge\ntags: [a]\n---\n\nBody\n", "gotcha"), "---\ntitle: \"T\"\ntags: [a]\ntype: gotcha\n---\n\nBody\n");
         assert_eq!(with_frontmatter_type("---\ntitle: \"T\"\n---\n\nBody\n", "decision"), "---\ntitle: \"T\"\ntype: decision\n---\n\nBody\n");
+        assert_eq!(with_frontmatter_title("---\ntitle: \"old-slug\"\ntype: knowledge\n---\n\nBody\n", "Say \"hi\": now"), "---\ntitle: \"Say \\\"hi\\\": now\"\ntype: knowledge\n---\n\nBody\n");
+        assert_eq!(with_frontmatter_title("Body\n", "T"), "---\ntitle: \"T\"\n---\n\nBody\n");
         assert_eq!(with_frontmatter_type("Body\n", "gotcha"), "---\ntype: gotcha\n---\n\nBody\n");
     }
 }

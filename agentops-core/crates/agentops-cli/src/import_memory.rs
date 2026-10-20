@@ -198,6 +198,9 @@ pub(crate) trait Sink {
     fn add_note(&self, title: &str, body: &str, note_type: Option<NoteType>, tags: &[String], mode: AddMode) -> Result<NoteOutcome>;
     /// `prominence` is a REST value: `needs_review`, `pinned`, ...
     fn set_curation(&self, node_id: i64, prominence: &str, reason: Option<&str>) -> Result<()>;
+    /// Renames a memory in place (`agentops_mcp::retitle_note`); false
+    /// when it already had this title.
+    fn retitle(&self, node_id: i64, title: &str) -> Result<bool>;
 }
 
 pub(crate) struct LocalSink {
@@ -218,6 +221,11 @@ impl Sink for LocalSink {
             other => anyhow::bail!("unsupported prominence {other:?}"),
         };
         store.set_curation(&agentops_mcp::repo_name(&self.repo), node_id, prominence, reason)
+    }
+
+    fn retitle(&self, node_id: i64, title: &str) -> Result<bool> {
+        let store = agentops_mcp::open_store(&self.repo)?;
+        agentops_mcp::retitle_note(store.as_ref(), &agentops_mcp::repo_name(&self.repo), &agentops_notes::resolve_notes_path(&self.repo, None), node_id, title)
     }
 }
 
@@ -254,6 +262,22 @@ impl Sink for RemoteSink {
             anyhow::bail!("POST {url} returned {status}: {}", response.body_mut().read_to_string().unwrap_or_default());
         }
         Ok(())
+    }
+
+    fn retitle(&self, node_id: i64, title: &str) -> Result<bool> {
+        let url = format!("{}/repos/{}/nodes/{node_id}/title", self.marker.server_url.trim_end_matches('/'), self.marker.connection_id);
+        let mut response = ureq::post(&url)
+            .header("Authorization", &format!("Bearer {}", self.marker.api_key))
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send_json(json!({ "title": title }))
+            .with_context(|| format!("calling POST {url}"))?;
+        let reply: serde_json::Value = response.body_mut().read_json().unwrap_or_default();
+        if !response.status().is_success() {
+            anyhow::bail!("POST {url} returned {}: {}", response.status(), reply["error"].as_str().unwrap_or_default());
+        }
+        Ok(reply["changed"].as_bool().unwrap_or(true))
     }
 }
 
@@ -336,7 +360,7 @@ fn note_body(entry: &Entry, kind: Option<MemoryKind>, mtime_date: &str) -> Strin
 
 /// Classifies and (with `apply`) writes every entry in `memory_dir`.
 /// Returns one record per entry file, sorted by file name.
-pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindClassifier>, apply: bool) -> Result<Vec<Record>> {
+pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindClassifier>, apply: bool, retitle: bool) -> Result<Vec<Record>> {
     let index = std::fs::read_to_string(memory_dir.join("MEMORY.md")).map(|s| index_lines(&s)).unwrap_or_default();
     let mut files: Vec<PathBuf> = std::fs::read_dir(memory_dir)
         .with_context(|| format!("reading {}", memory_dir.display()))?
@@ -346,6 +370,7 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
     files.sort();
 
     let mut records = Vec::new();
+    let mut titles_used = std::collections::HashSet::new();
     for path in files {
         let file = path.file_name().unwrap().to_string_lossy().to_string();
         let source_line = index.get(&file).map(|(line, _)| *line);
@@ -361,7 +386,17 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
         if source_line.is_none() {
             entry.warnings.push("not linked from MEMORY.md".into());
         }
-        let title = entry.name.clone().unwrap_or_else(|| file.trim_end_matches(".md").to_string());
+        // A memory's `name` is a file slug; its description reads as a
+        // title, so that's the title (F55). Memories imported before carry
+        // the slug, and are found under it below.
+        let slug_title = entry.name.clone().unwrap_or_else(|| file.trim_end_matches(".md").to_string());
+        let mut title = entry.description.as_deref().and_then(description_title).unwrap_or_else(|| slug_title.clone());
+        // Two entries sharing a description would share a natural key, and
+        // the second would read as already imported instead of a duplicate.
+        if !titles_used.insert(title.clone()) {
+            entry.warnings.push("description shared with an earlier entry; titled by its name".into());
+            title = slug_title.clone();
+        }
         if entry.body.is_empty() && entry.description.is_none() {
             records.push(skipped(&file, source_line, &title, [entry.warnings, vec!["empty entry".into()]].concat()));
             continue;
@@ -380,6 +415,26 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
         }
 
         let preview = sink.add_note(&title, &body, note_type, &tags, AddMode::DryRun)?;
+        let under_slug = if !preview.already_exists && title != slug_title { Some(sink.add_note(&slug_title, &body, note_type, &tags, AddMode::DryRun)?).filter(|p| p.already_exists) } else { None };
+        if let Some(old) = under_slug {
+            let mut record = skipped(&file, source_line, &title, entry.warnings);
+            record.node_id = old.node_id;
+            record.node_kind = Some(old.note_type);
+            if !retitle {
+                record.warnings.push(format!("already imported as node {} under its slug title; --retitle renames it", old.node_id.unwrap_or_default()));
+            } else {
+                record.action = "retitle";
+                record.warnings.push(format!("was {slug_title:?}"));
+                if let (true, Some(id)) = (apply, old.node_id) {
+                    sink.retitle(id, &title)?;
+                }
+            }
+            records.push(record);
+            continue;
+        }
+        if retitle && title == slug_title {
+            entry.warnings.push("no description; title kept".into());
+        }
         let mut record = Record {
             source_file: file.clone(),
             source_line,
@@ -440,6 +495,25 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
 
 fn skipped(file: &str, source_line: Option<usize>, title: &str, warnings: Vec<String>) -> Record {
     Record { source_file: file.into(), source_line, title: title.into(), signal: "none", memory_kind: None, node_kind: None, confidence: None, action: "skip", node_id: None, duplicate_of: None, pinned: false, similar_to: Vec::new(), warnings, rule_line: None }
+}
+
+/// Longest title taken from a description. Longer ones are cut at the
+/// last word boundary before it, with an ellipsis.
+const RETITLE_MAX: usize = 90;
+
+/// A description as a title: first line, trimmed, without a closing
+/// period, cut to `RETITLE_MAX` at a word boundary. `None` when empty.
+fn description_title(description: &str) -> Option<String> {
+    let line = description.lines().next()?.trim().trim_end_matches('.').trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= RETITLE_MAX {
+        return Some(line.to_string());
+    }
+    let head: String = line.chars().take(RETITLE_MAX).collect();
+    let cut = head.rfind(char::is_whitespace).map_or(head.as_str(), |i| &head[..i]);
+    Some(format!("{}…", cut.trim_end_matches(|c: char| !c.is_alphanumeric())))
 }
 
 /// Counts and warnings, plus the pin block the imported rules add (their
@@ -542,7 +616,7 @@ impl KindClassifier for LlmKindClassifier {
 }
 
 /// The `import-memory` command.
-pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report: Option<&Path>, llm_classify: bool) -> Result<()> {
+pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report: Option<&Path>, llm_classify: bool, retitle: bool) -> Result<()> {
     let memory_dir = match memory_dir {
         Some(d) => d.to_path_buf(),
         None => default_memory_dir(project)?,
@@ -571,7 +645,7 @@ pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report
         println!("backed up {} to {}", memory_dir.display(), backup.display());
     }
 
-    let records = import(&memory_dir, sink.as_ref(), llm.as_ref().map(|l| l as &dyn KindClassifier), apply)?;
+    let records = import(&memory_dir, sink.as_ref(), llm.as_ref().map(|l| l as &dyn KindClassifier), apply, retitle)?;
     let report_path = match report {
         Some(p) => p.to_path_buf(),
         None => project.join(".context").join("memory-import").join(&date).join("report.json"),
@@ -608,6 +682,59 @@ mod tests {
         assert_eq!(top.claude_type.as_deref(), Some("project"));
         let broken = parse_entry("b.md", "---\nname: b\nno closing marker\n");
         assert!(broken.warnings.iter().any(|w| w.contains("malformed")) && broken.name.is_none());
+    }
+
+    #[test]
+    fn a_description_becomes_the_title_cut_at_a_word_boundary() {
+        assert_eq!(description_title("Deploys go through push-to-main.\nmore"), Some("Deploys go through push-to-main".into()));
+        assert_eq!(description_title("   "), None);
+        let long = "word ".repeat(40);
+        let title = description_title(&long).unwrap();
+        assert!(title.ends_with("word…") && title.chars().count() <= RETITLE_MAX + 1, "{title}");
+    }
+
+    #[test]
+    fn an_imported_body_starts_with_its_description_so_a_retitle_never_needs_a_new_vector() {
+        // Retitling keeps the vector: notes are embedded from their body,
+        // and an imported (non-rule) body leads with the description.
+        let entry = Entry { description: Some("the summary line".into()), body: "Details.".into(), ..Default::default() };
+        for kind in [None, Some(MemoryKind::Semantic), Some(MemoryKind::Episodic)] {
+            assert!(note_body(&entry, kind, "2026-10-19").starts_with("the summary line"), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn memories_imported_under_slug_titles_are_found_retitled_with_retitle_and_never_duplicated() {
+        let repo = tempfile::tempdir().unwrap();
+        agentops_mcp::scan_and_persist(repo.path(), false).unwrap();
+        let memory = tempfile::tempdir().unwrap();
+        let content = "---\nname: project-deploy-pipeline\ndescription: Deploys go through the push-to-main gate\ntype: project\n---\n\nPush to main runs the CI gate.\n";
+        std::fs::write(memory.path().join("project_deploy.md"), content).unwrap();
+        std::fs::write(memory.path().join("MEMORY.md"), "# Memory\n- [d](project_deploy.md)\n").unwrap();
+        let sink = LocalSink { repo: repo.path().to_path_buf() };
+        let store = agentops_mcp::open_store(repo.path()).unwrap();
+        let name = agentops_mcp::repo_name(repo.path());
+        // As milestone 2 imported it: titled by the slug.
+        let entry = parse_entry("project_deploy.md", content);
+        let body = note_body(&entry, Some(MemoryKind::Episodic), "2026-10-17");
+        let tags = vec![IMPORTED_TAG.to_string(), "memory-kind:episodic".to_string()];
+        let old = sink.add_note("project-deploy-pipeline", &body, Some(NoteType::Knowledge), &tags, AddMode::Write).unwrap().node_id.unwrap();
+        let count = || store.nodes_by_kind(&name, agentops_graph::NodeKind::Note).unwrap().len();
+        assert_eq!(count(), 1);
+
+        let plain = import(memory.path(), &sink, None, true, false).unwrap();
+        assert_eq!((plain[0].action, plain[0].node_id), ("skip", Some(old)), "{plain:?}");
+        assert!(plain[0].warnings.iter().any(|w| w.contains("--retitle")), "{plain:?}");
+        let dry = import(memory.path(), &sink, None, false, true).unwrap();
+        assert_eq!(dry[0].action, "retitle");
+        assert_eq!(store.get_node(&name, old).unwrap().unwrap().name.as_deref(), Some("project-deploy-pipeline"), "a dry run renames nothing");
+
+        let applied = import(memory.path(), &sink, None, true, true).unwrap();
+        assert_eq!((applied[0].action, applied[0].title.as_str()), ("retitle", "Deploys go through the push-to-main gate"));
+        assert_eq!(store.get_node(&name, old).unwrap().unwrap().name.as_deref(), Some("Deploys go through the push-to-main gate"));
+        let again = import(memory.path(), &sink, None, true, true).unwrap();
+        assert_eq!((again[0].action, again[0].node_id), ("skip", Some(old)), "{again:?}");
+        assert_eq!(count(), 1, "the importer still finds the note after a rename");
     }
 
     #[test]
@@ -706,7 +833,7 @@ mod tests {
         let name = agentops_mcp::repo_name(repo.path());
         let memories = || agentops_graph::similarity::MEMORY_KINDS.iter().map(|&k| store.nodes_by_kind(&name, k).unwrap().len()).sum::<usize>();
 
-        let dry = import(memory.path(), &sink, None, false).unwrap();
+        let dry = import(memory.path(), &sink, None, false, false).unwrap();
         assert_eq!(dry.len(), files.len(), "entries in equals records out");
         assert_eq!(memories(), 0, "the dry run writes nothing to the graph");
         let by_file = |records: &[Record], f: &str| records.iter().find(|r| r.source_file == f).unwrap().clone();
@@ -717,7 +844,7 @@ mod tests {
         assert!(by_file(&dry, "broken.md").warnings.iter().any(|w| w.contains("malformed")));
         assert!(by_file(&dry, "user_role.md").source_line.is_none() && by_file(&dry, "user_role.md").warnings.iter().any(|w| w.contains("not linked")));
 
-        let first = import(memory.path(), &sink, None, true).unwrap();
+        let first = import(memory.path(), &sink, None, true, false).unwrap();
         assert_eq!(first.len(), files.len());
         let copy = by_file(&first, "project_deploy_copy.md");
         let original = by_file(&first, "project_deploy.md");
@@ -739,7 +866,7 @@ mod tests {
         assert_eq!(review.prominence, agentops_graph::NodeProminence::NeedsReview);
         assert!(agentops_notes::tags_of(review.content.as_deref().unwrap()).contains(&IMPORTED_TAG.to_string()));
 
-        let second = import(memory.path(), &sink, None, true).unwrap();
+        let second = import(memory.path(), &sink, None, true, false).unwrap();
         assert_eq!(memories(), created, "--apply twice creates nodes once");
         assert!(second.iter().all(|r| matches!(r.action, "skip" | "duplicate")), "{second:#?}");
         for ((n, _), bytes) in files.iter().zip(&originals) {
@@ -747,7 +874,7 @@ mod tests {
         }
 
         // The command itself: backup before writing, report and summary beside it.
-        run(repo.path(), Some(memory.path()), true, None, false).unwrap();
+        run(repo.path(), Some(memory.path()), true, None, false, false).unwrap();
         let date = utc_date(std::time::SystemTime::now());
         let backup = repo.path().join(".context").join("memory-backup").join(&date);
         assert_eq!(std::fs::read(backup.join("feedback_tests.md")).unwrap(), originals[0], "the backup exists");

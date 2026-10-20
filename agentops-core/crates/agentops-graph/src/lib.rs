@@ -855,6 +855,12 @@ pub trait GraphStore {
     /// A vault-backed note's file must be rewritten to the same kind by the
     /// caller, or the next ingest recreates a node of the old kind.
     fn set_node_kind(&self, repo: &str, node_id: i64, kind: NodeKind) -> Result<()>;
+    /// Changes a node's `path` and `name` in place: its natural key. Id,
+    /// edges, content (with its tags), curation and embedding are kept.
+    /// The caller checks no other node holds the new key (there's no
+    /// unique index on it) and moves a vault-backed note's file to match,
+    /// or the next ingest recreates the node under its old key.
+    fn rename_node(&self, repo: &str, node_id: i64, path: Option<&str>, name: &str) -> Result<()>;
     fn delete_nodes(&self, repo: &str, ids: &[i64]) -> Result<()>;
 
     fn add_edge(&self, repo: &str, src_id: i64, dst_id: i64, relation: EdgeRelation) -> Result<i64>;

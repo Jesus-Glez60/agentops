@@ -284,6 +284,7 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/nodes/{node_id}", get(dashboard::node_detail_json))
         .route("/repos/{id}/nodes/{node_id}/curation", post(dashboard::set_curation_json))
         .route("/repos/{id}/nodes/{node_id}/kind", post(dashboard::set_node_kind_json))
+        .route("/repos/{id}/nodes/{node_id}/title", post(dashboard::set_node_title_json))
         .route("/repos/{id}/nodes/{node_id}/graph", get(dashboard::subgraph_json))
         .route("/repos/{id}/nodes/{node_id}/similarity", get(dashboard::node_similarity_json))
         .route("/repos/{id}/graph", get(dashboard::repo_graph_json))

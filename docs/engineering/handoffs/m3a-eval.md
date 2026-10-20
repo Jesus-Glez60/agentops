@@ -14,6 +14,7 @@ Scores from `agentops recall-eval --remote --repeat 5` (`agentops-cli/src/recall
 | Point | Commit | Hit rate | m2 cases | MRR | p50 / p95 ms | Digest in seed |
 | --- | --- | --- | --- | --- | --- | --- |
 | Baseline | `bc0d370` | 10/20 (50%), 10 exact, 0 equivalent | 3/5 | 0.239 | 105 / 141 | 20/20 |
+| Re-baseline with deep ranks (0b) | `e5e165f` | 9/20 (45%), 9 exact, 0 equivalent | 2/5 | 0.233 | 95 / 124 | 20/20 |
 
 Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 
@@ -41,6 +42,33 @@ Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 | c18 | 3 | exact | 3 |
 | c19 | 1 | exact | 3 |
 | c20 | – | miss | 3 |
+
+## Re-baseline per case (0b)
+
+Retrieval is unchanged from the baseline. The graph has gained notes since then, which moved m2-2 from rank 8 to rank 9, just past the cut. **Misses:** 8 noise, 3 vocabulary, 0 ranking. "Deep" is the target's rank in the 50-deep ranking (see [05-retrieval.md](../05-retrieval.md#measuring-recall)).
+
+| Case | Rank | Hit | Deep | Miss |
+| --- | --- | --- | --- | --- |
+| m2-1 | 1 | exact | 1 |  |
+| m2-2 | – | miss | 9 | noise |
+| m2-3 | – | miss | – | vocabulary |
+| m2-4 | 2 | exact | 2 |  |
+| m2-5 | – | miss | – | vocabulary |
+| c06 | – | miss | 16 | noise |
+| c07 | – | miss | 21 | noise |
+| c08 | 8 | exact | 8 |  |
+| c09 | – | miss | 13 | noise |
+| c10 | 5 | exact | 5 |  |
+| c11 | – | miss | 26 | noise |
+| c12 | – | miss | 13 | noise |
+| c13 | – | miss | 9 | noise |
+| c14 | – | miss | – | vocabulary |
+| c15 | 4 | exact | 4 |  |
+| c16 | 1 | exact | 1 |  |
+| c17 | 4 | exact | 4 |  |
+| c18 | 3 | exact | 3 |  |
+| c19 | 1 | exact | 1 |  |
+| c20 | – | miss | 10 | noise |
 
 ## Notes on the baseline
 

@@ -632,6 +632,11 @@ impl GraphStore for SqliteGraphStore {
         Ok(())
     }
 
+    fn rename_node(&self, repo: &str, node_id: i64, path: Option<&str>, name: &str) -> Result<()> {
+        self.conn.execute("UPDATE nodes SET path = ?1, name = ?2 WHERE repo = ?3 AND id = ?4", rusqlite::params![path, name, repo, node_id])?;
+        Ok(())
+    }
+
     fn delete_nodes(&self, repo: &str, ids: &[i64]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -1557,6 +1562,31 @@ mod tests {
         assert_eq!((moved.id, moved.kind, moved.prominence), (id, NodeKind::Gotcha, NodeProminence::NeedsReview));
         store.set_curation("repo-a", id, NodeProminence::Full, None).unwrap();
         assert!(store.get_node("repo-a", id).unwrap().unwrap().curated);
+    }
+
+    #[test]
+    fn rename_node_changes_only_the_natural_key() {
+        const REPO: &str = "repo-a";
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let mut n = node(REPO, NodeKind::Note, Some("vault:old-slug.md"), Some("old-slug"));
+        n.content = Some("body\n\n<!-- agentops:tags imported:memory-md -->".into());
+        let id = upsert_node(&store, n).unwrap();
+        let other = upsert_node(&store, node(REPO, NodeKind::Gotcha, Some("vault:other.md"), Some("other"))).unwrap();
+        store.add_edge(REPO, id, other, EdgeRelation::SimilarTo).unwrap();
+        store.set_curation(REPO, id, NodeProminence::Reduced, Some("why")).unwrap();
+        let mut v = vec![0.0f32; 384];
+        v[0] = 1.0;
+        store.set_embedding(REPO, id, &v).unwrap();
+
+        store.rename_node(REPO, id, Some("vault:a-readable-title.md"), "A readable title").unwrap();
+        let renamed = store.get_node(REPO, id).unwrap().unwrap();
+        assert_eq!((renamed.path.as_deref(), renamed.name.as_deref()), (Some("vault:a-readable-title.md"), Some("A readable title")));
+        assert_eq!(renamed.content.as_deref(), Some("body\n\n<!-- agentops:tags imported:memory-md -->"));
+        assert_eq!((renamed.prominence, renamed.curation_reason.as_deref()), (NodeProminence::Reduced, Some("why")));
+        assert!(store.get_embedding(REPO, id).unwrap().is_some());
+        assert!(store.edges_from(REPO, id).unwrap().iter().any(|e| e.dst_id == other && e.relation == EdgeRelation::SimilarTo));
+        assert_eq!(store.find_node(REPO, NodeKind::Note, Some("vault:a-readable-title.md"), Some("A readable title"), None).unwrap().map(|n| n.id), Some(id));
+        assert!(store.find_node(REPO, NodeKind::Note, Some("vault:old-slug.md"), Some("old-slug"), None).unwrap().is_none());
     }
 
     #[test]

@@ -67,6 +67,59 @@ pub fn add_note(repo_path: &Path, title: &str, body: &str, note_type: Option<age
 /// it even without `with_embeddings`, and every check runs before the
 /// first write.
 #[allow(clippy::too_many_arguments)]
+/// A note title's file name stem: lowercase, every run of non-alphanumeric
+/// characters one `-`. A note lives at `vault:<slug>.md`, so the slug is
+/// half its natural key (the title is the other half).
+pub fn slug(title: &str) -> String {
+    let dashed = title.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect::<String>();
+    dashed.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-")
+}
+
+/// Renames a gotcha, decision or note in place: a new title and the
+/// `vault:<slug>.md` path that goes with it, keeping its id, edges, tags,
+/// curation and vector. The vector stays valid because notes are embedded
+/// from their body alone (`add_note_with`, `link_similar_backfill`), never
+/// their title; imported memories carry their description in the body.
+///
+/// The note's file under `notes_dir` moves too, with its frontmatter title
+/// rewritten: a rescan re-ingests every file, and a file left at the old
+/// name would bring the old node back. Refused when another node already
+/// holds the new key, or a different file already sits at the new path.
+/// Returns false when the note already has this title.
+pub fn retitle_note(store: &dyn agentops_graph::GraphStore, repo: &str, notes_dir: &Path, node_id: i64, title: &str) -> Result<bool> {
+    let title = title.trim();
+    anyhow::ensure!(!title.is_empty(), "a note's title can't be empty");
+    let node = store.get_node(repo, node_id)?.ok_or_else(|| anyhow::anyhow!("no node {node_id}"))?;
+    anyhow::ensure!(agentops_graph::similarity::MEMORY_KINDS.contains(&node.kind), "only gotchas, decisions and notes are retitled, not a {}", node.kind.as_db_str());
+    let old_rel = node.path.as_deref().and_then(|p| p.strip_prefix("vault:")).map(std::path::PathBuf::from);
+    let new_rel = match old_rel.as_ref().and_then(|r| r.parent()).filter(|d| !d.as_os_str().is_empty()) {
+        Some(dir) => dir.join(format!("{}.md", slug(title))),
+        None => std::path::PathBuf::from(format!("{}.md", slug(title))),
+    };
+    let new_path = format!("vault:{}", new_rel.to_string_lossy());
+    if node.name.as_deref() == Some(title) && node.path.as_deref() == Some(new_path.as_str()) {
+        return Ok(false);
+    }
+    if let Some(holder) = store.find_node(repo, node.kind, Some(&new_path), Some(title), node.container.as_deref())?.filter(|n| n.id != node_id) {
+        anyhow::bail!("node {} already has the title {title:?}", holder.id);
+    }
+
+    let new_file = notes_dir.join(&new_rel);
+    let old_file = old_rel.map(|r| notes_dir.join(r)).filter(|f| f.exists());
+    if new_file.exists() && old_file.as_ref() != Some(&new_file) {
+        anyhow::bail!("{} already exists", new_file.display());
+    }
+    if let Some(old_file) = old_file {
+        let content = std::fs::read_to_string(&old_file)?;
+        std::fs::write(&new_file, agentops_notes::with_frontmatter_title(&content, title))?;
+        if old_file != new_file {
+            std::fs::remove_file(&old_file)?;
+        }
+    }
+    store.rename_node(repo, node_id, Some(&new_path), title)?;
+    Ok(true)
+}
+
 pub fn add_note_with(repo_path: &Path, title: &str, body: &str, note_type: Option<agentops_notes::NoteType>, tags: &[String], notes_path_override: Option<&Path>, with_embeddings: bool, mode: AddMode) -> Result<AddNoteResult> {
     use agentops_graph::similarity::{similar_memories, DUPLICATE_MIN_SCORE, SIMILAR_K, SIMILAR_MIN_SCORE};
     let store = crate::store::open_store(repo_path)?;
@@ -83,8 +136,7 @@ pub fn add_note_with(repo_path: &Path, title: &str, body: &str, note_type: Optio
     };
 
     let notes_dir = agentops_notes::resolve_notes_path(repo_path, notes_path_override);
-    let slug = title.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect::<String>();
-    let slug = slug.split('-').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-");
+    let slug = slug(title);
     let file_path = notes_dir.join(format!("{slug}.md"));
 
     // Everything below up to the first write only reads. The note's own
@@ -257,6 +309,42 @@ mod tests {
         let gotchas = agentops_graph::GraphStore::nodes_by_kind(&store, &repo, agentops_graph::NodeKind::Gotcha).unwrap();
         assert_eq!(gotchas.len(), 1);
         assert_eq!(gotchas[0].name.as_deref(), Some("Token bug"));
+    }
+
+    #[test]
+    fn retitle_note_moves_the_file_keeps_the_node_and_a_rescan_never_brings_the_old_one_back() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        let tags = vec!["imported:memory-md".to_string()];
+        let written = add_note(dir.path(), "project-old-slug", "Shipped the thing on Tuesday.", Some(agentops_notes::NoteType::Knowledge), &tags, None, false).unwrap();
+        let id = written.node_id.unwrap();
+        let other = add_note(dir.path(), "Another note", "Unrelated.", Some(agentops_notes::NoteType::Knowledge), &[], None, false).unwrap().node_id.unwrap();
+        let notes_dir = agentops_notes::resolve_notes_path(dir.path(), None);
+        let repo = repo_name(dir.path());
+        {
+            let store = SqliteGraphStore::open(&graph_db_path(dir.path())).unwrap();
+            store.add_edge(&repo, id, other, agentops_graph::EdgeRelation::SimilarTo).unwrap();
+            assert!(retitle_note(&store, &repo, &notes_dir, id, "Shipped the thing on Tuesday").unwrap());
+            assert!(!retitle_note(&store, &repo, &notes_dir, id, "Shipped the thing on Tuesday").unwrap(), "same title again is a no-op");
+            let err = retitle_note(&store, &repo, &notes_dir, other, "Shipped the thing on Tuesday").unwrap_err().to_string();
+            assert!(err.contains(&format!("node {id}")), "a taken key is refused: {err}");
+        }
+        assert!(!notes_dir.join("project-old-slug.md").exists());
+        let moved = std::fs::read_to_string(notes_dir.join("shipped-the-thing-on-tuesday.md")).unwrap();
+        assert!(moved.contains("title: \"Shipped the thing on Tuesday\"") && moved.contains("Shipped the thing on Tuesday."), "{moved}");
+
+        // A full rescan re-ingests every note file: still one node, same id.
+        crate::scan::scan_and_persist(dir.path(), false).unwrap();
+        let store = SqliteGraphStore::open(&graph_db_path(dir.path())).unwrap();
+        let notes = store.nodes_by_kind(&repo, agentops_graph::NodeKind::Note).unwrap();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let renamed = store.get_node(&repo, id).unwrap().unwrap();
+        assert_eq!(renamed.name.as_deref(), Some("Shipped the thing on Tuesday"));
+        assert_eq!(agentops_notes::tags_of(renamed.content.as_deref().unwrap_or_default()), tags);
+        assert!(store.edges_from(&repo, id).unwrap().iter().any(|e| e.dst_id == other));
+        // Adding it again under the new title finds it, as a re-import does.
+        let again = add_note_with(dir.path(), "Shipped the thing on Tuesday", "Shipped the thing on Tuesday.", Some(agentops_notes::NoteType::Knowledge), &tags, None, true, AddMode::DryRun).unwrap();
+        assert!(again.already_exists && again.node_id == Some(id), "re-adding under the new title must find node {id}");
     }
 
     #[test]
