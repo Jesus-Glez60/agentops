@@ -59,8 +59,8 @@ pub fn handle(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value) 
 /// `handle` and never loads it (ADR 0052).
 pub fn handle_with(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     match event {
-        "posttooluse" => post_tool_use(store, repo, payload).map(|()| None),
-        "posttoolusefailure" => post_tool_use_failure(store, repo, payload).map(|()| None),
+        "posttooluse" => post_tool_use(store, repo, payload, embedder).map(|()| None),
+        "posttoolusefailure" => post_tool_use_failure(store, repo, payload, embedder).map(|()| None),
         "userpromptsubmit" => user_prompt_submit(store, repo, payload, embedder),
         "sessionstart" => session_start(store, repo, payload),
         "pretooluse" => pre_tool_use(store, repo, payload),
@@ -122,7 +122,7 @@ struct PostToolUsePayload {
     tool_response: Value,
 }
 
-fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<()> {
+fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
     let session_id = session_id(payload);
     let raw = payload;
     let payload: PostToolUsePayload = serde_json::from_value(payload.clone()).context("parsing PostToolUse payload")?;
@@ -132,8 +132,17 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<
     // Most calls match nothing here, and that's fine: unlike the MCP tools'
     // own event recording, there's no catch-all "activity" fallback: not
     // every tool call is guide-worthy.
-    if let Some((event_kind, description)) = recorded_post_tool_event(raw, &payload.tool_name, &payload.tool_input) {
-        store.record_session_event_in(repo, session_id, &payload.tool_name, &description, None, event_kind, agent_id(raw))?;
+    let recorded = recorded_post_tool_event(raw, &payload.tool_name, &payload.tool_input);
+    if let Some((event_kind, description)) = &recorded {
+        store.record_session_event_in(repo, session_id, &payload.tool_name, description, None, event_kind, agent_id(raw))?;
+    }
+
+    // A file read or edited inside the repo is a work cue (milestone 3b).
+    // Its first heading comes from a read's result; the content itself is
+    // never stored.
+    if let (Some((FILE_READ | "file_modified", _)), Some(path)) = (&recorded, rel_path(raw)) {
+        let heading = matches!(payload.tool_name.as_str(), "Read" | "NotebookRead" | "Bash").then(|| agentops_retrieval::work_recall::first_heading(&render_tool_response(&payload.tool_response))).flatten();
+        work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::File { path: path.to_string(), heading }, embedder)?;
     }
 
     let text = render_tool_response(&payload.tool_response);
@@ -309,6 +318,18 @@ fn render_tool_response(value: &Value) -> String {
 // PostToolUseFailure
 // ---------------------------------------------------------------------
 
+/// Resolves a work cue and records what it reached as one `work_cue` event
+/// in the payload's context (nothing when it reached nothing).
+fn work_cue(store: &dyn GraphStore, repo: &str, payload: &Value, cue: &agentops_retrieval::work_recall::WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
+    use agentops_retrieval::work_recall::{resolve_cue, CueSources};
+    let candidates = resolve_cue(store, repo, cue, CueSources::All, embedder)?;
+    if !candidates.is_empty() {
+        let scores = crate::work_recall::cue_scores(&candidates);
+        store.record_session_event_in(repo, session_id(payload), "cue", &crate::work_recall::format_cue(&scores), None, crate::work_recall::WORK_CUE, agent_id(payload))?;
+    }
+    Ok(())
+}
+
 /// Claude Code's docs (as fetched) confirm `tool_name`/`tool_input` but
 /// don't spell out the exact failure-details field name for this event --
 /// `error` is a best-effort guess. Defaults to `Value::Null` if the real
@@ -321,13 +342,18 @@ struct PostToolUseFailurePayload {
     error: Value,
 }
 
-fn post_tool_use_failure(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<()> {
+fn post_tool_use_failure(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
     let session_id = session_id(payload);
+    let raw = payload;
     let payload: PostToolUseFailurePayload = serde_json::from_value(payload.clone()).context("parsing PostToolUseFailure payload")?;
     let description = render_tool_response(&payload.error);
     let capped = cap(&description, DEFAULT_CHAR_BUDGET, 0);
     let redacted = agentops_security::redact(&capped.text);
-    store.record_session_event(repo, session_id, &payload.tool_name, &redacted.text, None, "error")?;
+    store.record_session_event_in(repo, session_id, &payload.tool_name, &redacted.text, None, "error", agent_id(raw))?;
+    // The error is a work cue, unless the user interrupted the call.
+    if !raw.get("is_interrupt").and_then(|v| v.as_bool()).unwrap_or(false) {
+        work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::Error { text: redacted.text }, embedder)?;
+    }
     Ok(())
 }
 
@@ -407,6 +433,18 @@ fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, parts: &mut V
     Ok(())
 }
 
+/// A plan-mode or default-mode prompt is a work cue too (milestone 3b): its
+/// seed seeds the main context's activation, so recall during work carries
+/// on from what the prompt was about.
+fn record_prompt_cue(store: &dyn GraphStore, repo: &str, session_id: &str, seed: &[(agentops_retrieval::RecallPointer, f64)]) -> Result<()> {
+    if seed.is_empty() {
+        return Ok(());
+    }
+    let scores: Vec<(i64, f64)> = seed.iter().map(|(p, score)| (p.node_id, *score)).collect();
+    store.record_session_event(repo, session_id, "prompt", &crate::work_recall::format_cue(&scores), None, crate::work_recall::WORK_CUE)?;
+    Ok(())
+}
+
 /// Records the prompt, then injects context:
 /// - always: pinned notes (sticky pins re-injected on every turn, the
 ///   "combat context drift" mechanism -- a pin is a standing directive);
@@ -449,11 +487,13 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embed
         parts.push(plan_flow_directive(agentops_path(payload, repo)));
         // The whole seed, even pointers shown earlier in the session: the
         // plan is built from this, and earlier context may be compacted.
-        let seed = agentops_retrieval::recall_seed_with(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default(), embedder)?;
-        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
+        let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default(), embedder)?;
+        record_prompt_cue(store, repo, session_id, &seed)?;
+        push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     } else {
-        let seed = agentops_retrieval::recall_seed_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &injected_ids(&events), embedder)?;
-        push_seed(store, repo, session_id, &mut parts, &seed, PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
+        let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &injected_ids(&events), embedder)?;
+        record_prompt_cue(store, repo, session_id, &seed)?;
+        push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     }
     if parts.is_empty() {
         return Ok(None);
@@ -652,6 +692,11 @@ fn session_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<
     let Some(session_id) = payload.get("session_id").and_then(|v| v.as_str()) else {
         return Ok(None);
     };
+    // Earlier work-time injections left the context with the compaction:
+    // they may be shown again, and activation starts over (milestone 3b).
+    if source == Some("compact") {
+        store.record_session_event(repo, session_id, "SessionStart", "compact", None, crate::work_recall::CONTEXT_RESET)?;
+    }
     let guide = crate::session_guide::build(store, repo, session_id)?;
     let guide = if guide.is_empty() { crate::session_guide::build_repo_briefing(store, repo)? } else { guide };
     // Sticky pins are a standing directive, prepended ahead of the
@@ -743,6 +788,36 @@ mod tests {
         assert_eq!(got, [(FILE_READ, "Read", "src/a.rs", None), (FILE_READ, "Bash", "docs/b.md", Some("agent-1")), (SEARCH, "Grep", "fn handle", None), (SEARCH, "Glob", "**/*.md", None)], "a read outside the repo is not recorded");
         assert!(events.iter().all(|e| !e.description.contains("SECRET FILE BODY")));
         assert!(store.nodes_by_kind(&repo, NodeKind::ToolOutput).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_errors_and_prompts_record_work_cues_per_context_and_compaction_resets_the_main_one() {
+        use crate::work_recall::{context_events, parse_cue, CONTEXT_RESET, WORK_CUE};
+        let (_dir, store, repo) = store();
+        let release = gotcha(store.as_ref(), &repo, "Release tagging needs the changelog bumped first", "Tagging a release fails unless the changelog entry exists.");
+        let psql = gotcha(store.as_ref(), &repo, "psql role postgres missing on CI", "psql fails: role postgres does not exist on the CI database.");
+        let read = json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/docs/release.md"}, "tool_response": {"type": "text", "text": "# Release checklist: tagging and changelog\n..."}, "session_id": "s", REL_PATH_FIELD: "docs/release.md" });
+        handle(store.as_ref(), &repo, "posttooluse", &read).unwrap();
+        handle(store.as_ref(), &repo, "posttoolusefailure", &json!({ "tool_name": "Bash", "error": "Exit code 2\npsql: error: FATAL: role \"postgres\" does not exist", "session_id": "s", "agent_id": "agent-a" })).unwrap();
+        handle(store.as_ref(), &repo, "posttoolusefailure", &json!({ "tool_name": "Bash", "error": "psql: error: role postgres does not exist", "is_interrupt": true, "session_id": "s" })).unwrap();
+        let events = store.session_events(&repo, "s").unwrap();
+        let main_cues: Vec<Vec<(i64, f64)>> = context_events(&events, None).iter().filter(|e| e.event_kind == WORK_CUE).map(|e| parse_cue(&e.description)).collect();
+        assert_eq!(main_cues.len(), 1, "the read is a cue; the interrupted call isn't: {events:?}");
+        assert_eq!(main_cues[0][0].0, release, "the heading from the read's result reaches the doc's gotcha");
+        let sub_cues: Vec<&agentops_graph::SessionEvent> = context_events(&events, Some("agent-a")).into_iter().filter(|e| e.event_kind == WORK_CUE).collect();
+        assert_eq!(parse_cue(&sub_cues[0].description)[0].0, psql, "the subagent's error cue is the subagent's");
+        assert!(events.iter().all(|e| !e.description.contains("tagging and changelog\n")), "no content stored");
+
+        handle(store.as_ref(), &repo, "sessionstart", &json!({ "session_id": "s", "source": "compact" })).unwrap();
+        let events = store.session_events(&repo, "s").unwrap();
+        assert!(events.iter().any(|e| e.event_kind == CONTEXT_RESET));
+        assert!(context_events(&events, None).iter().all(|e| e.event_kind != WORK_CUE), "after compaction the main context starts over");
+        assert_eq!(context_events(&events, Some("agent-a")).iter().filter(|e| e.event_kind == WORK_CUE).count(), 1, "a subagent's context doesn't");
+
+        handle(store.as_ref(), &repo, "userpromptsubmit", &json!({ "session_id": "s", "prompt": "the release tagging changelog step", "permission_mode": "default" })).unwrap();
+        let events = store.session_events(&repo, "s").unwrap();
+        let prompt_cue = context_events(&events, None).into_iter().find(|e| e.event_kind == WORK_CUE).expect("the prompt is a cue");
+        assert_eq!(parse_cue(&prompt_cue.description)[0].0, release);
     }
 
     #[test]

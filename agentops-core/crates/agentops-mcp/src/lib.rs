@@ -17,6 +17,7 @@ mod store;
 mod sync_docs;
 mod tools;
 mod watch;
+pub mod work_recall;
 
 pub use docgen::generate_docs;
 pub use init::{ensure_gitignore_entries, init_agents_md, InitResult};
