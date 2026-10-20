@@ -126,7 +126,7 @@ pub fn recall_seed(store: &dyn GraphStore, repo: &str, query: &str, limit: usize
         .map(|(id, c)| {
             let cues = c.reasons.len() + usize::from(c.reasons.iter().any(|r| r.starts_with("affects")));
             let score = if c.prominence == NodeProminence::Reduced { c.score * 0.5 } else { c.score };
-            Ranked { id, cues, score, kind: c.kind, title: c.title, reasons: c.reasons }
+            Ranked { id, cues, score, hop: false, kind: c.kind, title: c.title, reasons: c.reasons }
         })
         .collect();
     sort_ranked(&mut ranked);
@@ -156,21 +156,28 @@ struct Ranked {
     id: i64,
     cues: usize,
     score: f64,
+    /// Reached only through a `SimilarTo` hop, not on its own cues.
+    hop: bool,
     kind: NodeKind,
     title: String,
     reasons: Vec<String>,
 }
 
-/// Strongest first: cues, then score, then id as a stable tiebreak.
+/// Strongest first: cues, then a direct match before a hop neighbour, then
+/// score, then id as a stable tiebreak.
 fn sort_ranked(ranked: &mut [Ranked]) {
-    ranked.sort_by(|a, b| b.cues.cmp(&a.cues).then(b.score.total_cmp(&a.score)).then(a.id.cmp(&b.id)));
+    ranked.sort_by(|a, b| b.cues.cmp(&a.cues).then(a.hop.cmp(&b.hop)).then(b.score.total_cmp(&a.score)).then(a.id.cmp(&b.id)));
 }
 
 /// One `SimilarTo` hop from each memory that made it on its own cues
 /// (ADR 0051), so a memory that names no symbol and shares no keyword can
 /// still come up beside the one it resembles. A neighbour inherits its
-/// source's strength: the same cue count, and `source score × cosine ×
-/// HOP_FACTOR` (halved again if it's reduced). Edges keep no score, so the
+/// source's strength, one step down: one cue fewer than its source, losing
+/// ties to direct matches, scored `source score × cosine × HOP_FACTOR`
+/// (halved again if it's reduced). So it beats a direct hit with fewer cues
+/// but never one with as many, and never its own source. Inheriting the full
+/// cue count let neighbours of a 3-cue match push out the 2-cue direct hits
+/// that were the answer (eval 13/20 → 11/20). Edges keep no score, so the
 /// cosine comes from the two stored vectors; a neighbour without one isn't
 /// reached. Each source reaches at most `HOP_MAX_PER_SOURCE` neighbours,
 /// its closest. A node reached directly and by a hop, or by two hops, keeps
@@ -194,11 +201,12 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
                 break;
             }
             let reason = format!("similar to \"{title}\"");
+            let hop_cues = cues.saturating_sub(1);
             if let Some(&i) = position.get(&target) {
                 taken += 1;
                 let r = &mut ranked[i];
-                if (cues, score * cosine * HOP_FACTOR) > (r.cues, r.score) {
-                    (r.cues, r.score) = (cues, score * cosine * HOP_FACTOR);
+                if (hop_cues, score * cosine * HOP_FACTOR) > (r.cues, r.score) {
+                    (r.cues, r.score) = (hop_cues, score * cosine * HOP_FACTOR);
                 }
                 if !r.reasons.contains(&reason) {
                     r.reasons.push(reason);
@@ -215,7 +223,7 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
             }
             taken += 1;
             position.insert(target, ranked.len());
-            ranked.push(Ranked { id: target, cues, score: hop_score, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
+            ranked.push(Ranked { id: target, cues: hop_cues, score: hop_score, hop: true, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
         }
     }
     sort_ranked(ranked);
@@ -345,17 +353,19 @@ mod tests {
     }
 
     #[test]
-    fn a_neighbour_inherits_its_sources_strength_beats_a_weaker_direct_hit_but_never_its_source() {
+    fn a_neighbour_inherits_its_sources_strength_one_step_down() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
-        let source = note(&store, NodeKind::Gotcha, "Webhook signature deploy failure", "webhook signature deploy");
-        let weaker = note(&store, NodeKind::Decision, "Webhook signature rotation", "webhook signature");
+        let source = note(&store, NodeKind::Gotcha, "Webhook signature deploy rollback", "webhook signature deploy rollback");
+        let equal = note(&store, NodeKind::Decision, "Webhook signature deploy order", "webhook signature deploy");
+        let weaker = note(&store, NodeKind::Note, "Webhook signature rotation", "webhook signature");
         let neighbour = note(&store, NodeKind::Note, "Rotate the app secret", "nothing shared");
         link(&store, source, neighbour);
         store.set_embedding("r", source, &vector(0.0)).unwrap();
         store.set_embedding("r", neighbour, &vector(0.1)).unwrap();
-        let seed = recall_seed(&store, "r", "webhook signature deploy", 8, &HashSet::new()).unwrap();
-        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![source, neighbour, weaker], "3 cues inherited beat 2 direct: {seed:?}");
-        assert_eq!(seed[1].reason, "similar to \"Webhook signature deploy failure\"");
+        let seed = recall_seed(&store, "r", "webhook signature deploy rollback", 8, &HashSet::new()).unwrap();
+        // 4 cues, then a 3-cue direct hit, then the 3-cue (inherited) neighbour, then 2 cues.
+        assert_eq!(seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), vec![source, equal, neighbour, weaker], "{seed:?}");
+        assert_eq!(seed[2].reason, "similar to \"Webhook signature deploy rollback\"");
     }
 
     #[test]
