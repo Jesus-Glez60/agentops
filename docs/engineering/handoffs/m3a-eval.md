@@ -23,6 +23,7 @@ Scores from `agentops recall-eval --remote --repeat 5` (`agentops-cli/src/recall
 | 3. Reverted to one cue (kept: cosine score, cap, determinism) | `c68d349` | 13/20 (65%), 13 exact, 0 equivalent | – | 0.414 | 65 / 85 | 0/20 |
 | 4. Recall by meaning on the server | `1aab7ff` | 14/20 (70%), 14 exact, 0 equivalent | 4/5 | 0.446 | 102 / 127 | 0/20 |
 | 5. Threshold 0.82 + prune (run on the server) | `197d892` | 15/20 (75%), 15 exact, 0 equivalent | 4/5 | 0.472 | 101 / 125 | 0/20 |
+| 6. Embed and link memories on reindex (final) | `f17850c` | 15/20 (75%), 15 exact, 0 equivalent | 4/5 | 0.475 | 101 / 124 | 0/20 |
 
 Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 
@@ -77,6 +78,30 @@ Retrieval is unchanged from the baseline. The graph has gained notes since then,
 | c18 | 3 | exact | 3 |  |
 | c19 | 1 | exact | 1 |  |
 | c20 | – | miss | 10 | noise |
+
+## Final: 15/20, one short of the target
+
+All other measured targets are met:
+- 4/5 of milestone 2's prompts.
+- p95 124 ms (limit 298).
+- 0 dense timeouts in 100 runs.
+- 0% of memories unlinked.
+
+The five misses:
+
+| Case | Category | Deep rank | Signal it had |
+| --- | --- | --- | --- |
+| m2-3 | ranking | 33 | two common words |
+| c06 | ranking | 25 | two common words |
+| c07 | ranking | 28 | two common words |
+| c12 | ranking | 17 | two common words |
+| c14 | vocabulary | – | none |
+
+None of the five is in the dense candidates. Full hybrid search over every kind (`/local-search`) ranks them 29, 55, 69 or not at all, so BGE-small doesn't place them near their prompts either. Tuning `DENSE_TOP_K` or `DENSE_MIN_SCORE` is unlikely to recover them (**unverified**: not run).
+
+The four ranking misses each share two common words with the prompt and lose to many other two-word matches. Per-keyword rarity (IDF) weighting addresses exactly that. The spec keeps it out of scope "unless the evaluation shows the target can't be met without it", which is what this shows.
+
+**Item 6 check:** on the server, note 169218 was written with no vector (`similarity` returned `{}`). After one `POST /repos/{id}/index` it had a vector and a `SimilarTo` pair with node 79052, with no manual step (F58).
 
 ## Item 5 notes
 
