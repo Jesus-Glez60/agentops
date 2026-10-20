@@ -234,6 +234,38 @@ pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, cl
     Ok(summary)
 }
 
+/// Embeds every gotcha, decision and note in `repo` that has content but no
+/// vector, and returns their ids. Already-embedded memories are skipped.
+pub fn embed_missing_memories(store: &dyn agentops_graph::GraphStore, repo: &str) -> Result<Vec<i64>> {
+    let mut embedded = Vec::new();
+    for &kind in agentops_graph::similarity::MEMORY_KINDS {
+        for node in store.nodes_by_kind(repo, kind)? {
+            if let (None, Some(content)) = (store.get_embedding(repo, node.id)?, node.content.as_deref()) {
+                store.set_embedding(repo, node.id, &agentops_embeddings::LocalEmbedder.embed(content)?)?;
+                embedded.push(node.id);
+            }
+        }
+    }
+    Ok(embedded)
+}
+
+/// What the hosted reindex runs after persisting (F58): embeds the memories
+/// that have no vector and links only those (`similarity::link_new`, never
+/// reinforcing), so a note added on the server gets its vector and
+/// `SimilarTo` edges without a manual backfill. Returns how many it
+/// embedded and the edges it made.
+pub fn embed_and_link_new(store: &dyn agentops_graph::GraphStore, repo: &str) -> Result<(usize, agentops_graph::similarity::LinkSummary)> {
+    let ids = embed_missing_memories(store, repo)?;
+    let mut total = agentops_graph::similarity::LinkSummary::default();
+    for &id in &ids {
+        let one = agentops_graph::similarity::link_new(store, repo, id)?;
+        total.linked.extend(one.linked);
+        total.edges_created += one.edges_created;
+        total.edges_dropped += one.edges_dropped;
+    }
+    Ok((ids.len(), total))
+}
+
 /// The similarity backfill (milestone 2, ADR 0051): embeds every gotcha,
 /// decision and note that has no vector yet, creates the missing
 /// `SimilarTo` edges (never reinforcing existing ones), and returns a plain
@@ -247,15 +279,7 @@ pub fn ingest_notes_dir(repo_path: &Path, notes_path_override: Option<&Path>, cl
 pub fn link_similar_backfill(store: &dyn agentops_graph::GraphStore, repo: &str, prune: bool) -> Result<String> {
     use agentops_graph::similarity;
     use std::fmt::Write as _;
-    let mut embedded = 0;
-    for &kind in similarity::MEMORY_KINDS {
-        for node in store.nodes_by_kind(repo, kind)? {
-            if let (None, Some(content)) = (store.get_embedding(repo, node.id)?, node.content.as_deref()) {
-                store.set_embedding(repo, node.id, &agentops_embeddings::LocalEmbedder.embed(content)?)?;
-                embedded += 1;
-            }
-        }
-    }
+    let embedded = embed_missing_memories(store, repo)?.len();
     let mut out = String::new();
     let share = |n: usize, total: usize| if total == 0 { 0.0 } else { 100.0 * n as f64 / total as f64 };
     if prune {
@@ -357,6 +381,24 @@ mod tests {
         // Adding it again under the new title finds it, as a re-import does.
         let again = add_note_with(dir.path(), "Shipped the thing on Tuesday", "Shipped the thing on Tuesday.", Some(agentops_notes::NoteType::Knowledge), &tags, None, true, AddMode::DryRun).unwrap();
         assert!(again.already_exists && again.node_id == Some(id), "re-adding under the new title must find node {id}");
+    }
+
+    #[test]
+    fn embed_and_link_new_embeds_and_links_only_the_memories_without_a_vector() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let add = |name: &str| agentops_graph::upsert_node(&store, agentops_graph::NewNode { kind: NodeKind::Note, repo: "r".into(), path: Some(format!("vault:{name}.md")), name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some("The deploy rolls back when the health check fails twice.".into()) }).unwrap();
+        let embedded = add("embedded");
+        let fresh = add("fresh");
+        let vector = agentops_embeddings::LocalEmbedder.embed("The deploy rolls back when the health check fails twice.").unwrap();
+        store.set_embedding("r", embedded, &vector).unwrap();
+
+        let (n, links) = embed_and_link_new(&store, "r").unwrap();
+        assert_eq!(n, 1);
+        assert!(store.get_embedding("r", fresh).unwrap().is_some());
+        assert_eq!(store.get_embedding("r", embedded).unwrap().unwrap(), vector, "an embedded memory is left alone");
+        assert_eq!(links.edges_created, 2, "linked both ways to its near-copy: {links:?}");
+        let (again, _) = embed_and_link_new(&store, "r").unwrap();
+        assert_eq!(again, 0, "incremental: nothing left to embed");
     }
 
     #[test]

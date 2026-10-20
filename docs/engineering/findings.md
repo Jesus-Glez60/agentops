@@ -444,7 +444,7 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 - Status: found 2026-10-17 planning the milestone 2 backfill.
 - `indexing.rs` calls `persist(.., false)`, so the note-embedding pass (and since `e4e8fef` its `link_all_similar`) never runs on the hosted server; notes get vectors only when written by `add_note` with embeddings. 51 of 357 memories had none until the backfill.
-- Open. Workaround: `agentops-server link-similar <repo>` inside the app container (`bf5f702`).
+- **Resolved** in milestone 3a item 6. After persisting, the reindex job's knowledge-nodes stage calls `embed_and_link_new`. It embeds every memory that has no vector and creates only that memory's missing `SimilarTo` edges. Already-embedded memories are skipped, and a failure is logged without failing the job. The backfill is no longer a manual step.
 
 ### F59. Hooks routed by the shell's cwd and wrote to stray local graphs
 

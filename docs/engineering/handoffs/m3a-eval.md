@@ -22,6 +22,7 @@ Scores from `agentops recall-eval --remote --repeat 5` (`agentops-cli/src/recall
 | 3c. + one cue fewer | `4699cdb` | 11/20 (55%), 11 exact, 0 equivalent | – | 0.396 | 62 / 93 | 0/20 |
 | 3. Reverted to one cue (kept: cosine score, cap, determinism) | `c68d349` | 13/20 (65%), 13 exact, 0 equivalent | – | 0.414 | 65 / 85 | 0/20 |
 | 4. Recall by meaning on the server | `1aab7ff` | 14/20 (70%), 14 exact, 0 equivalent | 4/5 | 0.446 | 102 / 127 | 0/20 |
+| 5. Threshold 0.82 + prune (run on the server) | `197d892` | 15/20 (75%), 15 exact, 0 equivalent | 4/5 | 0.472 | 101 / 125 | 0/20 |
 
 Target: at least 16/20, at least 4/5 m2 cases, and p95 within 148 + 150 ms.
 
@@ -76,6 +77,16 @@ Retrieval is unchanged from the baseline. The graph has gained notes since then,
 | c18 | 3 | exact | 3 |  |
 | c19 | 1 | exact | 1 |  |
 | c20 | – | miss | 10 | noise |
+
+## Item 5 notes
+
+The server ran `agentops-server link-similar <repo> --prune` on 2026-10-20 over 365 memories:
+- 709 pairs below 0.82 were pruned.
+- 94 floor pairs (at or above 0.75) were kept or added.
+- The follow-up link pass created 72 edges.
+- Memories with no edge of any kind: 0 of 365 (0.0%) before and 0 (0.0%) after, against the 5% limit.
+- Candidate-pair cosine distribution: 17 at 0.90–0.95, 115 at 0.85–0.90, 640 at 0.80–0.85, 1,296 at 0.75–0.80.
+- The dense timeout fired 0 times in 100 runs.
 
 ## Item 4 notes
 

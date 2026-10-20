@@ -374,6 +374,23 @@ async fn run_job(deps: IndexingDeps, tenant: String, job_id: String, connection:
 
     start_stage!(STAGE_ORDER[5]);
     log!("knowledge nodes created ({} files, {} pruned)", summary.files, summary.pruned_files);
+    // Memories get vectors and SimilarTo edges here (F58): persist runs
+    // without embeddings, so a note added on the server would otherwise
+    // stay unembedded and unlinked until a manual backfill. Incremental:
+    // only memories without a vector. Never fails the job. The Postgres
+    // store must not be opened on a runtime thread (gotcha 54054).
+    let local_for_memories = local_path.clone();
+    match tokio::task::spawn_blocking(move || -> anyhow::Result<(usize, usize)> {
+        let store = agentops_mcp::open_store(&local_for_memories)?;
+        let (embedded, links) = agentops_mcp::embed_and_link_new(store.as_ref(), &agentops_mcp::repo_name(&local_for_memories))?;
+        Ok((embedded, links.edges_created))
+    })
+    .await
+    {
+        Ok(Ok((embedded, edges))) => log!("embedded {embedded} memories that had no vector, created {edges} SimilarTo edges"),
+        Ok(Err(e)) => log!("embedding new memories failed (the job continues): {e:#}"),
+        Err(e) => log!("embedding new memories panicked (the job continues): {e}"),
+    }
     finish_stage!(STAGE_ORDER[5], None, None);
 
     // Stage 7: embeddings generated -- reuses /search/index's own internals

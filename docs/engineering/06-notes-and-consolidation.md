@@ -131,6 +131,8 @@ When a repo is connected to a hosted server, notes go through hosted `/mcp` or `
 
 Hosted `add_note` writes its Markdown file to the connection's notes folder beside the checkout, `<repo_checkouts_dir>/.notes/<connection_id>--<tenant>` (`notes_dir_for_checkout`), and its node into the shared store. Every indexing job deletes and re-clones the checkout, then points the clone's `.agentops/config.json` at that folder (`point_checkout_at_notes`), so the every-scan re-match ("Note linking" in [04-indexing-pipeline.md](04-indexing-pipeline.md)) sees hosted notes too, including notes added before the first index (ADR 0045; fixed for `findings.md` F30). Removing a repository or an org removes the folder.
 
+Every indexing job also embeds the memories that have no vector yet and links them (`agentops_mcp::embed_and_link_new`, run in the knowledge-nodes stage, F58). A note added on the server without embeddings gets its vector and `SimilarTo` edges at the next reindex. The step is incremental, and a failure is logged but never fails the job.
+
 Hosted `/mcp` refuses `notes_path`, so hosted notes always land in the connection's own notes folder (`HOSTED_FORBIDDEN_ARGS`, fixed in `17a0407`; `findings.md` F31).
 
 ### Local-file guard

@@ -100,6 +100,13 @@ pub fn link_similar(store: &dyn GraphStore, repo: &str, node_id: i64) -> Result<
     link(store, repo, node_id, true)
 }
 
+/// `link_similar` without reinforcing: creates `node_id`'s missing edges
+/// and leaves existing ones as they are. For a memory that just got its
+/// first vector outside an explicit write (the hosted reindex).
+pub fn link_new(store: &dyn GraphStore, repo: &str, node_id: i64) -> Result<LinkSummary> {
+    link(store, repo, node_id, false)
+}
+
 /// `link_similar` for every embedded memory in the repo. `reinforce: false`
 /// only creates missing edges and leaves existing ones as they are: a
 /// rescan re-reads every note, and that alone shouldn't strengthen an
