@@ -86,6 +86,8 @@ Rarity weighting raised MRR from 0.475 to 0.506 and moved two missed targets up 
 
 ## Final: 15/20, one short of the target
 
+This section is from item 6's run (`f17850c`), before IDF. After IDF (`f001b01`), the four ranking misses sit at deep ranks 34 (m2-3), 13 (c06), 24 (c07) and 17 (c12), and c14 is still a vocabulary miss. The report uses those final numbers.
+
 All other measured targets are met:
 - 4/5 of milestone 2's prompts.
 - p95 124 ms (limit 298).

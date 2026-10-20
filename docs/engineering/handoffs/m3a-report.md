@@ -56,6 +56,7 @@ Change in hit rate per item: 0b re-baseline −1 (graph drift; m2-2 moved from r
 **Cases still missing, by category** (`miss_category` and the analysis in `m3a-eval.md`):
 
 - **Ranking: 4** (m2-3, c06, c07, c12; deep ranks 34, 13, 24, 17). Each matches two common words and loses to many other two-word matches. None is in the dense candidates, and `/local-search` hybrid search ranks them 29, 55, 69 or not at all, so BGE-small doesn't place them near their prompts either. IDF lifted two of them but none into the seed.
+- m2-3 was a vocabulary miss at the re-baseline (`e5e165f`) and has been a ranking miss since item 1, whose retitle gave its memory words that match the prompt. The deep ranks above are from the final IDF run (`f001b01`). `m3a-eval.md`'s "Final" section shows item 6's run, before IDF.
 - **Vocabulary: 1** (c14). Not in recall's candidate pool by keyword or by meaning.
 - **Noise: 0**, **missing memory: 0** (unrecallable targets are refused up front).
 
@@ -120,7 +121,7 @@ These are lower bounds, not tool-call counts: plain Reads and Greps are never re
 | `docs/engineering/handoffs/m2-report.md` | 0 | 1 |
 | `docs/engineering/handoffs/m3a-eval.md`, `spikes/m2-memory.md`, `05-retrieval.md`, `agentops-mcp/tests/hooks_never_load_the_model.rs` | 0 | 0 |
 
-Code files are well reached through `Affects`. Docs files are reached by neither route.
+The two columns are independent counts, and a memory can appear in both. A file reached by neither has 0 in both. Code files are well reached through `Affects`. Docs files are reached by neither route.
 
 **PostToolUse hook latency** (an `Edit` payload, 20 runs each, 2026-10-20):
 - Remote, from this machine: p50 22 ms, p95 49 ms.

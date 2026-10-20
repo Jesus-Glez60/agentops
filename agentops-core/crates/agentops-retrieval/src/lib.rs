@@ -248,6 +248,12 @@ pub fn shortest_path(neighborhood: &agentops_graph::BoundedNeighborhood, seed_id
 /// its own list doesn't overwhelm the fused ranking.
 const RRF_K: f32 = 60.0;
 
+/// Reciprocal rank fusion's share for a 0-based `rank`, with `RRF_K`.
+/// Shared by `search_hybrid` and the recall seed's keyword/dense fusion.
+pub(crate) fn rrf(rank: usize) -> f64 {
+    1.0 / (f64::from(RRF_K) + rank as f64 + 1.0)
+}
+
 /// Relations `personalized_pagerank`'s bounded-neighborhood fetch follows --
 /// `Affects`/`References` are this codebase's plasticity-bearing edges (see
 /// `agentops_graph::effective_weight`); `DependsOn`/`Documents` are
@@ -385,7 +391,7 @@ pub fn search_hybrid(store: &dyn GraphStore, embedder: &dyn Embedder, repo: &str
     let exact = ExactCandidateSource.search(store, repo, query, kind, fetch_k)?;
 
     let rank_of = |ids: &[i64], id: i64| -> Option<usize> { ids.iter().position(|&x| x == id) };
-    let rrf = |rank: Option<usize>| -> f32 { rank.map(|r| 1.0 / (RRF_K + r as f32 + 1.0)).unwrap_or(0.0) };
+    let rrf = |rank: Option<usize>| -> f32 { rank.map(|r| rrf(r) as f32).unwrap_or(0.0) };
 
     let mut all_ids: Vec<i64> = dense.iter().chain(lexical.iter()).chain(exact.iter()).copied().collect();
     all_ids.sort_unstable();

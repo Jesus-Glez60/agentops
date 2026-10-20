@@ -59,8 +59,6 @@ pub const DENSE_TOP_K: usize = 20;
 /// over it, the dense half is dropped. Keeps a remote hook's p95 well
 /// under its 1 s target.
 pub const DENSE_TIMEOUT_MS: u64 = 250;
-/// Reciprocal rank fusion constant, as in `search_hybrid`.
-const RRF_K: f64 = 60.0;
 
 /// One recalled node, as a pointer the agent can follow.
 #[derive(Debug, Clone, PartialEq)]
@@ -236,13 +234,13 @@ fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Res
 }
 
 /// Replaces `ranked`'s order with the reciprocal rank fusion of it and
-/// `dense` (k = `RRF_K`). Fused scores are comparable across both lists, so
+/// `dense` (`crate::rrf`, the same fusion as `search_hybrid`). Fused scores are comparable across both lists, so
 /// cue counts no longer lead: every candidate gets one, the same as a hop
 /// neighbour, which then ranks after them on the tie and by its fused
 /// score among other neighbours. A reduced memory's dense share is
 /// halved, as its keyword rank already was.
 fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
-    let rrf = |rank: usize| 1.0 / (RRF_K + rank as f64 + 1.0);
+    let rrf = crate::rrf;
     let mut fused: HashMap<i64, Ranked> = ranked.drain(..).enumerate().map(|(i, r)| (r.id, Ranked { strength: FUSED_STRENGTH, score: rrf(i), ..r })).collect();
     for (i, (node, cosine)) in dense.into_iter().enumerate() {
         let share = rrf(i) * if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
