@@ -233,6 +233,9 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
         WorkCue::Error { .. } if sources == CueSources::AffectsOnly => {}
         WorkCue::Error { text } => {
             let query = clean_error(text);
+            if query.trim().is_empty() {
+                return Ok(Vec::new());
+            }
             merged.extend(recall_scored_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().map(|(pointer, score)| {
                 let score = if pointer.kind == NodeKind::Gotcha { score * ERROR_GOTCHA_BOOST } else { score };
                 WorkCandidate { pointer, score }
@@ -240,6 +243,29 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
         }
     }
     Ok(merged.sorted())
+}
+
+/// Cue events activation looks back over: roughly the current stretch of
+/// work.
+pub const ACTIVATION_WINDOW: usize = 20;
+/// What a cue's contribution keeps per later cue: one 10 cues back counts
+/// about 20%.
+pub const ACTIVATION_DECAY: f64 = 0.85;
+
+/// Session activation (milestone 3b, ADR 0053): for each memory, the sum
+/// over the last `window` cues (oldest first in `cues`, each a list of
+/// `(node id, score)`) of its score times `decay` raised to the cue's age,
+/// the newest cue being age 0. A memory several recent cues reached
+/// outranks one a single old cue did.
+pub fn activation(cues: &[Vec<(i64, f64)>], window: usize, decay: f64) -> HashMap<i64, f64> {
+    let mut out: HashMap<i64, f64> = HashMap::new();
+    for (age, cue) in cues.iter().rev().take(window).enumerate() {
+        let weight = decay.powi(age as i32);
+        for &(id, score) in cue {
+            *out.entry(id).or_default() += score * weight;
+        }
+    }
+    out
 }
 
 /// Candidates by node id, each keeping its best score and the reason that
@@ -380,6 +406,15 @@ pub fn first_heading(text: &str) -> Option<String> {
     None
 }
 
+/// `line` without a leading `Exit code N` (Bash's first line, or the
+/// start of a flattened error).
+fn strip_exit_code(line: &str) -> &str {
+    match line.strip_prefix("Exit code") {
+        Some(rest) => rest.trim_start().trim_start_matches(|c: char| c.is_ascii_digit()).trim_start_matches([' ', '|']),
+        None => line,
+    }
+}
+
 /// An error's text as a recall query: its error lines first (those with
 /// an `ERROR_KEYWORDS` word), then the rest. Paths are cut to their file
 /// name, and line numbers, hex hashes, timestamps and bare numbers are
@@ -402,7 +437,7 @@ pub fn clean_error(text: &str) -> String {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let lines: Vec<String> = text.lines().filter(|l| !l.trim_start().starts_with("Exit code")).map(clean_line).filter(|l| !l.is_empty()).collect();
+    let lines: Vec<String> = text.lines().map(|l| strip_exit_code(l.trim_start())).map(clean_line).filter(|l| !l.is_empty()).collect();
     let is_error = |l: &String| {
         let lower = l.to_lowercase();
         ERROR_KEYWORDS.iter().any(|k| lower.contains(k))
@@ -493,6 +528,8 @@ mod tests {
 
     #[test]
     fn an_error_is_cleaned_to_its_telling_words_and_boosts_gotchas() {
+        assert_eq!(clean_error("Exit code 7 | curl: (7) Failed to connect"), "curl Failed to connect");
+        assert_eq!(clean_error("Exit code 1"), "");
         let cleaned = clean_error("Exit code 1\nwarning: unused import at /Users/x/repo/src/main.rs:7:17\nerror[E0425]: cannot find value `foo` in this scope, commit 9db16a7c, at 2026-10-20T18:13:38");
         assert!(cleaned.starts_with("error[E0425] cannot find value `foo`"), "{cleaned}");
         assert!(cleaned.contains("main.rs"), "a path keeps its file name: {cleaned}");
@@ -527,6 +564,19 @@ mod tests {
         assert_eq!(q, "hooks.rs Hook handlers handle");
         assert_eq!(file_query("deploy/compose/docker-compose.yml", None, &[]), "docker-compose.yml compose");
         assert!(file_query(&"x".repeat(400), None, &[]).chars().count() <= FILE_CUE_TEXT_MAX);
+    }
+
+    #[test]
+    fn a_memory_three_recent_cues_reached_outranks_one_a_single_cue_reached_ten_cues_ago() {
+        let (recent, old) = (1, 2);
+        let mut cues: Vec<Vec<(i64, f64)>> = vec![vec![(old, 1.0)]];
+        cues.extend(std::iter::repeat_n(vec![(99, 0.1)], 6));
+        cues.extend([vec![(recent, 0.5)], vec![], vec![(recent, 0.5)], vec![(recent, 0.5)]]);
+        let a = activation(&cues, ACTIVATION_WINDOW, ACTIVATION_DECAY);
+        assert!(a[&recent] > a[&old], "{a:?}");
+        assert!((a[&old] - ACTIVATION_DECAY.powi(10)).abs() < 1e-9, "ten cues back: {}", a[&old]);
+        let windowed = activation(&cues, 5, ACTIVATION_DECAY);
+        assert!(!windowed.contains_key(&old), "outside the window");
     }
 
     #[test]

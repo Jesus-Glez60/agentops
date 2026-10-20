@@ -102,7 +102,8 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
 /// - Keywords: the share of the query's rarity weight the memory matched
 ///   (all of its keywords is 1.0).
 /// - An `Affects` edge from a named symbol: 1.0.
-/// - Recall by meaning: the cosine, when higher.
+/// - Recall by meaning: the cosine rescaled from `DENSE_MIN_SCORE`..1 to
+///   0..1, when higher.
 /// - A hop neighbour: its source's confidence × cosine × `HOP_FACTOR`.
 ///
 /// A reduced memory's confidence is halved, like its score.
@@ -265,11 +266,19 @@ fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
         let reason = format!("close in meaning ({cosine:.2})");
         let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, confidence: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), reasons: Vec::new() });
         entry.score += rrf(i) * reduced;
-        entry.confidence = entry.confidence.max(f64::from(cosine) * reduced);
+        entry.confidence = entry.confidence.max(dense_confidence(cosine) * reduced);
         entry.reasons.push(reason);
     }
     ranked.extend(fused.into_values());
     sort_ranked(ranked);
+}
+
+/// A cosine as confidence: 0 at `DENSE_MIN_SCORE` (barely related, the
+/// least that counts) up to 1 for the same text. Raw cosines bunch between
+/// 0.55 and 0.8, so an unrelated query (an empty one, measured) still
+/// scored as if it had matched half its words.
+fn dense_confidence(cosine: f32) -> f64 {
+    ((f64::from(cosine) - f64::from(DENSE_MIN_SCORE)) / (1.0 - f64::from(DENSE_MIN_SCORE))).clamp(0.0, 1.0)
 }
 
 /// What a neighbour reached over `SimilarTo` keeps of its source's score,
