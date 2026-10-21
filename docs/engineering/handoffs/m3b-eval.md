@@ -151,3 +151,13 @@ Rules 1–3 of revision 1: only a file's first cue per context injects (`00f4186
 - **Rules 1–3 halved the volume** (1,505 → 798 pointers). The median is still 38,659 characters against the 3,000 target. The threshold has to do the rest.
 - **The main session reaches 50** because errors still inject past its 30 ceiling. No subagent passed 8.
 - **Prompt-time `recall-eval` is at 13/20** (MRR 0.446, two runs), below the 15/20 contract. c15 (rank 4 → 10) and c20 (2 → past 8) dropped. [Certain] No code reached by prompt recall changed apart from `b4f2c4a`'s refactor, which only adds a field. [Likely] Notes added to the graph since the 15/20 run changed the keyword rarity weights. Neither case's new top 10 contains a note newer than milestone 3a. **Open.**
+
+### After removing the resolver's hop (`c27179c`, author's call), and the combined check
+
+| Sources | Hits | File | Error | Characters, 5 sessions (median) | Pointers (all / main / from errors) | Most in a subagent |
+| --- | --- | --- | --- | --- | --- | --- |
+| All, no hop | 10/20 | 6 | 4 | 235,512 (39,017) | 796 / 178 / 170 | 8 |
+| No hop, no file-as-query | 10/20 | 6 | 4 | 172,910 (30,545) | 720 / 158 / 158 | 8 |
+
+- **File-as-query adds no hit even with the hop gone.** The only rank that moves is f09 (13 → unreached), already a miss. Removing it saves 62,602 characters (27%) over the five sessions.
+- **The cases move by ±1 between runs with no code change on their path.** e05 went from unreached (`52650fc`) to rank 3 (`c27179c`) with the error path unchanged; one note (240297) was added in between. Its target now matches two keywords. [Guessing] It sits at the edge of the per-keyword candidate cut (`PER_QUERY`), so graph growth or ties in text ranking move it. 9/20 and 10/20 are the same result.
