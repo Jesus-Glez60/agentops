@@ -411,7 +411,7 @@ mod tests {
         process("posttooluse", false, &payload(dir.path(), json!({ "tool_name": "Read", "tool_input": {"file_path": path}, "tool_response": "fn a() {}" }))).unwrap();
         let store = agentops_mcp::open_store(dir.path()).unwrap();
         let events = store.session_events(&agentops_mcp::repo_name(dir.path()), "sess-1").unwrap();
-        assert_eq!(events.iter().map(|e| (e.event_kind.as_str(), e.description.as_str())).collect::<Vec<_>>(), [("file_read", "a.rs")]);
+        assert_eq!(events.iter().filter(|e| e.event_kind != agentops_mcp::work_recall::WORK_CUE).map(|e| (e.event_kind.as_str(), e.description.as_str())).collect::<Vec<_>>(), [("file_read", "a.rs")]);
     }
 
     #[test]
