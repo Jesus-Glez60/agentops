@@ -32,6 +32,11 @@ pub const INJECT_MIN_SCORE: f64 = 0.6;
 /// Work-time pointers one context gets at most; past it only error cues
 /// inject. Caps the worst case at a few thousand characters per context.
 pub const MAX_INJECTED_PER_CONTEXT: usize = 30;
+/// Work-time pointers one subagent gets at most, error cues included, over
+/// its whole life (a subagent never compacts as far as hooks can see). It
+/// already has a `SubagentStart` seed, and subagents carried 87% of the
+/// replayed volume (milestone 3b revision 1).
+pub const SUBAGENT_MAX_INJECTED: usize = 8;
 /// Everything a `SubagentStart` hook injects; same as the session guide.
 pub const SUBAGENT_SEED_BUDGET: usize = 2000;
 /// The pinned block (milestone 2): its own budget, added on top of

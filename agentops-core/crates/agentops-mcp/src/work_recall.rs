@@ -24,7 +24,7 @@ use agentops_graph::{GraphStore, SessionEvent};
 use agentops_retrieval::work_recall::{activation, resolve_cue, CueSources, WorkCandidate, WorkCue, ACTIVATION_DECAY, ACTIVATION_WINDOW};
 use anyhow::Result;
 
-use crate::budget::{INJECT_MIN_SCORE, MAX_INJECTED_PER_CONTEXT, WORK_RECALL_BUDGET, WORK_RECALL_MAX_ITEMS};
+use crate::budget::{INJECT_MIN_SCORE, MAX_INJECTED_PER_CONTEXT, SUBAGENT_MAX_INJECTED, WORK_RECALL_BUDGET, WORK_RECALL_MAX_ITEMS};
 use crate::hooks::RECALL_INJECTED;
 
 /// `tool_name` of a work-time `recall_injected` event, which the
@@ -137,16 +137,23 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     if !settings.enabled {
         return Ok(None);
     }
-    // Past the ceiling, only an error still speaks. The ceiling spans the
-    // whole context, compactions included.
+    // Past the ceiling, only an error still speaks in the main session; a
+    // subagent stops at `SUBAGENT_MAX_INJECTED`, errors included. The
+    // ceiling spans the whole context, compactions included.
     let whole: Vec<&SessionEvent> = events.iter().filter(|e| e.agent_id.as_deref() == agent_id).collect();
-    if matches!(cue, WorkCue::File { .. }) && work_injected(&whole) >= MAX_INJECTED_PER_CONTEXT {
+    let injected = work_injected(&whole);
+    let room = match agent_id {
+        Some(_) => SUBAGENT_MAX_INJECTED.saturating_sub(injected),
+        None if matches!(cue, WorkCue::File { .. }) && injected >= MAX_INJECTED_PER_CONTEXT => 0,
+        None => WORK_RECALL_MAX_ITEMS,
+    };
+    if room == 0 {
         return Ok(None);
     }
     let shown = shown_ids(&context);
     let mut picks: Vec<(&WorkCandidate, f64)> = candidates.iter().map(|c| (c, activated.get(&c.pointer.node_id).copied().unwrap_or(0.0))).filter(|(c, a)| *a >= settings.min_score && !shown.contains(&c.pointer.node_id)).collect();
     picks.sort_by(|a, b| b.1.total_cmp(&a.1));
-    picks.truncate(WORK_RECALL_MAX_ITEMS);
+    picks.truncate(WORK_RECALL_MAX_ITEMS.min(room));
     if picks.is_empty() {
         return Ok(None);
     }
@@ -431,6 +438,21 @@ mod tests {
         let mut off = MemoryLog::default();
         assert_eq!(on_cue(&store, "r", &mut off, None, &release_cue(), None, Settings { enabled: false, ..LOW }).unwrap(), None);
         assert!(off.0.iter().any(|e| e.event_kind == WORK_CUE), "the cue is still recorded");
+    }
+
+    #[test]
+    fn a_subagent_stops_at_its_own_ceiling_errors_included() {
+        let (store, _) = setup();
+        let psql = gotcha(&store, "r", "psql role postgres missing on CI", "psql fails: role postgres does not exist on the CI database.");
+        let mut log = MemoryLog::default();
+        let almost = (0..SUBAGENT_MAX_INJECTED as i64 - 1).map(|i| (1000 + i).to_string()).collect::<Vec<_>>().join(",");
+        log.record(WORK_RECALL_TOOL, &format!("ids {almost}"), RECALL_INJECTED, Some("agent-a")).unwrap();
+        gotcha(&store, "r", "Release notes list the tag", "Release tagging: the notes list the changelog tag.");
+        let shown = on_cue(&store, "r", &mut log, Some("agent-a"), &release_cue(), None, LOW).unwrap().expect("one slot left");
+        assert_eq!(shown.shown.len(), 1, "never past the ceiling: {shown:?}");
+        let error = WorkCue::Error { text: "psql: error: FATAL: role \"postgres\" does not exist".into() };
+        assert_eq!(on_cue(&store, "r", &mut log, Some("agent-a"), &error, None, LOW).unwrap(), None, "a subagent's ceiling holds for errors too");
+        assert_eq!(on_cue(&store, "r", &mut log, None, &error, None, LOW).unwrap().unwrap().shown[0].0.node_id, psql, "the main session has its own");
     }
 
     #[test]
