@@ -105,3 +105,49 @@ More tuning against 20 single-target cases would mostly fit these cases. The rep
 - **What 1.5 would give**, estimated from the 0.6 run by filtering on activation (the shown sets would differ, so this is approximate): about 340–3,600 characters per session, near the 3,000 median target. Nearly every error cue would then be silent, since an error cue alone tops out at 1.0.
 
 The author labels a stratified sample before `INJECT_MIN_SCORE` is set: 79 pointers at 1.5 or above, 94 from error cues, and 100 random ones from 1.0–1.5.
+
+## Revision 1: rerun and ablation (2026-10-20, deployed `52650fc`)
+
+Rules 1–3 of revision 1: only a file's first cue per context injects (`00f4186`); a subagent stops at 8 pointers, errors included (`30ee906`); an error cue keeps only memories a keyword or a named symbol matched (`b4f2c4a`). Ablation switches: `52650fc`. All rows below come from the same deploy, so the "All" row is the post-rule-3 measurement.
+
+### Cases
+
+`agentops work-recall-eval --remote --repeat 3 --sources S`
+
+| Sources | Hits | File | Error | MRR | p95 ms |
+| --- | --- | --- | --- | --- | --- |
+| Before revision 1 (`b783df4`) | 10/20 | 6 | 4 | 0.375 | 169 |
+| All (rules 1–3) | **9/20** | 6 | 3 | 0.367 | 190 |
+| Without `Affects` | 9/20 | 6 | 3 | 0.367 | 166 |
+| Without path mentions | 9/20 | 6 | 3 | 0.375 | 219 |
+| Without file-as-query | 9/20 | 6 | 3 | 0.367 | 116 |
+| Without the resolver's `SimilarTo` hop | 9/20 | 6 | 3 | 0.367 | 213 |
+
+- **Rule 3 cost one error hit.** e05 (rank 5 before) and e07 (rank 7) now reach nothing: their targets came by meaning only. No hit was lost elsewhere.
+- **No source adds a hit on its own.** Without mentions, f01 gains (4 → 1) and f05 loses (1 → 5). Every other case keeps its rank under every switch. The file hits f02–f07 are reached by more than one source, so switching one off at a time doesn't show a single source's share. **Unverified:** what switching off mentions and file-as-query together would do. The `Affects`-only baseline is 0/20.
+
+### Replay at 0.6
+
+`agentops work-recall-eval --remote --replay <5 sessions> --min-score 0.6 --sources S`
+
+| Sources | Characters per session (median, range) | Pointers (all / main / from errors) | Most in a subagent / in the main session |
+| --- | --- | --- | --- |
+| Before revision 1 (`823bbf4`) | – (43,926 – 180,631) | 1,505 / 199 / – | – / 62 |
+| All (rules 1–3) | **38,659** (26,793 – 84,089) | 798 / 176 / 156 | 8 / 50 |
+| Without `Affects` | 39,516 | 767 / 167 / 151 | 8 / 48 |
+| Without path mentions | 39,723 | 734 / 164 / 158 | 8 / 50 |
+| Without file-as-query | 31,125 | 737 / 167 / 148 | 8 / 44 |
+| Without the hop | 37,517 | 792 / 178 / 158 | 8 / 51 |
+
+### What each source adds (All minus Without)
+
+| Source | Case hits | Characters (5 sessions) | Pointers |
+| --- | --- | --- | --- |
+| `Affects` (dampened) | 0 | −8,613 (others fill its slots) | +31 |
+| Path mentions | 0 (f01 −, f05 +) | +2,548 | +64 |
+| File as query | 0 | **+55,324** | +61 |
+| Resolver's `SimilarTo` hop | 0 | +3,940 | +6 |
+
+- **Rules 1–3 halved the volume** (1,505 → 798 pointers). The median is still 38,659 characters against the 3,000 target. The threshold has to do the rest.
+- **The main session reaches 50** because errors still inject past its 30 ceiling. No subagent passed 8.
+- **Prompt-time `recall-eval` is at 13/20** (MRR 0.446, two runs), below the 15/20 contract. c15 (rank 4 → 10) and c20 (2 → past 8) dropped. [Certain] No code reached by prompt recall changed apart from `b4f2c4a`'s refactor, which only adds a field. [Likely] Notes added to the graph since the 15/20 run changed the keyword rarity weights. Neither case's new top 10 contains a note newer than milestone 3a. **Open.**
