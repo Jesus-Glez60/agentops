@@ -244,7 +244,7 @@ enum Command {
         /// no_affects or no_mentions (cases and replay).
         #[arg(long)]
         sources: Option<String>,
-        /// With --replay: also write a labelling sample of about N pointers
+        /// With --replay: also write a stratified labelling sample of N pointers
         /// (.context/work-recall-eval/to-label.{jsonl,md}).
         #[arg(long)]
         sample: Option<usize>,

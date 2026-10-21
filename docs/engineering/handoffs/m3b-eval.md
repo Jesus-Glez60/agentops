@@ -161,3 +161,13 @@ Rules 1–3 of revision 1: only a file's first cue per context injects (`00f4186
 
 - **File-as-query adds no hit even with the hop gone.** The only rank that moves is f09 (13 → unreached), already a miss. Removing it saves 62,602 characters (27%) over the five sessions.
 - **The cases move by ±1 between runs with no code change on their path.** e05 went from unreached (`52650fc`) to rank 3 (`c27179c`) with the error path unchanged; one note (240297) was added in between. Its target now matches two keywords. [Guessing] It sits at the edge of the per-keyword candidate cut (`PER_QUERY`), so graph growth or ties in text ranking move it. 9/20 and 10/20 are the same result.
+
+### Final source set: `Affects` and path mentions (`7774597`), and the labelling sample
+
+| | Cases | File | Error | MRR | p95 ms | Characters, 5 sessions (median) | Pointers (all / main / from errors) | Most in a subagent |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `Affects` + mentions, rules 1–3 | 9/20 | 6 | 3 | 0.367 | 112 | 172,061 (30,648) | 715 / 158 / 140 | 8 |
+
+- The replay ran twice and gave the same numbers both times.
+- **Labelling sample:** 100 of the 715 pointers, stratified by the author's choice: 40 from error cues, 40 main-session file cues, 20 subagent file cues. Each group is drawn in a fixed pseudo-random order (`work-recall-eval --replay … --sample 100`, written to `.context/work-recall-eval/to-label.{jsonl,md}`). Errors and main-session pointers alone came to 256, so "all of them" and "about 100" couldn't both hold. Reweight each group's noise share by its size (140 / 116 / 459) to estimate it for all 715.
+- **Prompt-time `recall-eval` is down to 12/20** (MRR 0.421). c09 dropped from rank 2 to past 8. No retrieval or graph code changed between this run and the 13/20 one (`git log 6c992d1..7774597` over those paths is empty). Only one note was added to the graph in between. [Likely] Graph growth wears prompt-time recall down at about one case per few notes. **Open.**

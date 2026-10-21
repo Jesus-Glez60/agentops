@@ -485,20 +485,34 @@ struct LabelLine {
     label: String,
 }
 
-/// About `n` pointers to label (milestone 3b revision 1): every one from an
-/// error cue, every main-session one, then subagent file-cue pointers in a
-/// fixed pseudo-random order (`DefaultHasher::new()` has fixed keys) up to
-/// `n`. If errors and the main session alone pass `n`, all are kept.
+/// `n` pointers to label (milestone 3b revision 1, author's call): 40%
+/// from error cues, 40% from the main session's file cues, 20% from
+/// subagents' file cues, each group in a fixed pseudo-random order
+/// (`DefaultHasher::new()` has fixed keys). A group short of its share is
+/// topped up from the others' leftovers, in the same order.
 fn sample(labels: &[LabelLine], n: usize) -> Vec<&LabelLine> {
     use std::hash::{Hash, Hasher};
-    let (mut picked, mut rest): (Vec<&LabelLine>, Vec<&LabelLine>) = labels.iter().partition(|l| l.cue == ERROR_CUE || l.context == "main");
-    rest.sort_by_key(|l| {
+    let order = |l: &&LabelLine| {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         (&l.session, &l.context, l.step, l.node_id).hash(&mut h);
         h.finish()
-    });
+    };
+    let mut groups: [Vec<&LabelLine>; 3] = Default::default();
+    for l in labels {
+        groups[if l.cue == ERROR_CUE { 0 } else if l.context == "main" { 1 } else { 2 }].push(l);
+    }
+    let quotas = [n * 2 / 5, n * 2 / 5, n - 2 * (n * 2 / 5)];
+    let mut picked = Vec::new();
+    let mut leftovers = Vec::new();
+    for (group, quota) in groups.iter_mut().zip(quotas) {
+        group.sort_by_key(order);
+        let cut = quota.min(group.len());
+        picked.extend(group.drain(..cut));
+        leftovers.append(group);
+    }
+    leftovers.sort_by_key(order);
     let room = n.saturating_sub(picked.len());
-    picked.extend(rest.into_iter().take(room));
+    picked.extend(leftovers.into_iter().take(room));
     picked
 }
 
@@ -596,8 +610,9 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
         let picked = sample(&labels, n);
         std::fs::write(dir.join("to-label.jsonl"), picked.iter().map(|l| serde_json::to_string(l).unwrap_or_default()).collect::<Vec<_>>().join("\n") + "\n")?;
         std::fs::write(dir.join("to-label.md"), sample_markdown(&picked))?;
-        let (errors, main) = (picked.iter().filter(|l| l.cue == ERROR_CUE).count(), picked.iter().filter(|l| l.context == "main" && l.cue != ERROR_CUE).count());
-        println!("Labelling sample: {} pointers ({errors} from errors, {main} more from the main session, {} random subagent ones){}: {}", picked.len(), picked.len() - errors - main, if picked.len() > n { format!(", over {n} because errors and the main session alone pass it") } else { String::new() }, dir.join("to-label.md").display());
+        let errors = picked.iter().filter(|l| l.cue == ERROR_CUE).count();
+        let main = picked.iter().filter(|l| l.context == "main" && l.cue != ERROR_CUE).count();
+        println!("Labelling sample: {} of {} pointers ({errors} from errors, {main} main-session file cues, {} subagent file cues): {}", picked.len(), labels.len(), picked.len() - errors - main, dir.join("to-label.md").display());
     }
     write_result(path, "replay", &json!({ "min_score": min_score, "sources": sources, "sessions": summaries.values().collect::<Vec<_>>() }))
 }
@@ -660,15 +675,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_labelling_sample_keeps_errors_and_the_main_session_then_a_fixed_random_rest() {
+    fn the_labelling_sample_is_stratified_fixed_and_tops_up_a_short_group() {
         let line = |context: &str, cue: &str, node_id: i64| LabelLine { session: "s".into(), context: context.into(), step: node_id as usize, cue: cue.into(), node_id, kind: "gotcha".into(), title: "t | x".into(), activation: 1.0, label: String::new() };
-        let mut labels = vec![line("main", "src/a.rs", 1), line("agent-a", ERROR_CUE, 2)];
-        labels.extend((10..40).map(|id| line("agent-a", "src/b.rs", id)));
-        let picked = sample(&labels, 10);
-        assert_eq!(picked.len(), 10);
-        assert!(picked.iter().any(|l| l.node_id == 1) && picked.iter().any(|l| l.node_id == 2), "errors and main always in");
-        assert_eq!(picked.iter().map(|l| l.node_id).collect::<Vec<_>>(), sample(&labels, 10).iter().map(|l| l.node_id).collect::<Vec<_>>(), "the same sample every run");
-        assert_eq!(sample(&labels[..2], 1).len(), 2, "errors and main are never cut");
+        let mut labels: Vec<LabelLine> = (0..60).map(|id| line("agent-a", ERROR_CUE, id)).collect();
+        labels.extend((100..160).map(|id| line("main", "src/a.rs", id)));
+        labels.extend((200..205).map(|id| line("agent-a", "src/b.rs", id)));
+        let picked = sample(&labels, 100);
+        assert_eq!(picked.len(), 100);
+        let count = |f: &dyn Fn(&LabelLine) -> bool| picked.iter().filter(|l| f(l)).count();
+        assert_eq!(count(&|l| l.context != "main" && l.cue != ERROR_CUE), 5, "the short subagent group gives all it has");
+        assert_eq!(count(&|l| l.cue == ERROR_CUE) + count(&|l| l.context == "main"), 95, "the rest is topped up from the others");
+        assert!(count(&|l| l.cue == ERROR_CUE) >= 40 && count(&|l| l.context == "main") >= 40);
+        assert_eq!(picked.iter().map(|l| l.node_id).collect::<Vec<_>>(), sample(&labels, 100).iter().map(|l| l.node_id).collect::<Vec<_>>(), "the same sample every run");
         assert!(sample_markdown(&picked).contains("t / x"), "a title can't break the table");
     }
 
