@@ -494,11 +494,45 @@ struct LabelLine {
     cue: String,
     node_id: i64,
     kind: String,
+    /// For the `.md` view only; the file stays under `.context/`.
+    title: String,
     activation: f64,
     label: String,
 }
 
-fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score: Option<f64>, sources: CueSources) -> Result<()> {
+/// About `n` pointers to label (milestone 3b revision 1): every one from an
+/// error cue, every main-session one, then subagent file-cue pointers in a
+/// fixed pseudo-random order (`DefaultHasher::new()` has fixed keys) up to
+/// `n`. If errors and the main session alone pass `n`, all are kept.
+fn sample(labels: &[LabelLine], n: usize) -> Vec<&LabelLine> {
+    use std::hash::{Hash, Hasher};
+    let (mut picked, mut rest): (Vec<&LabelLine>, Vec<&LabelLine>) = labels.iter().partition(|l| l.cue == ERROR_CUE || l.context == "main");
+    rest.sort_by_key(|l| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (&l.session, &l.context, l.step, l.node_id).hash(&mut h);
+        h.finish()
+    });
+    let room = n.saturating_sub(picked.len());
+    picked.extend(rest.into_iter().take(room));
+    picked
+}
+
+/// The labelling sample as a Markdown table, numbered as in the `.jsonl`.
+fn sample_markdown(sample: &[&LabelLine]) -> String {
+    let mut out = String::from("# Work-time recall labels (local only, git-ignored)\n\nFill the `label` column in `to-label.jsonl` (useful / neutral / noise), or reply with the numbers, e.g. `noise: 3, 7-9; useful: 1, 4`.\n\nContext `main` = the main session; `sub` = a subagent. Cue = the file it opened, or (error).\n\n| n | ctx | cue | memory (id) | act |\n|---|---|---|---|---|\n");
+    for (i, l) in sample.iter().enumerate() {
+        let ctx = if l.context == "main" { "main" } else { "sub" };
+        let cue = if l.cue == ERROR_CUE { l.cue.clone() } else { format!("`{}`", l.cue) };
+        let title: String = l.title.replace('|', "/").chars().take(100).collect();
+        out.push_str(&format!("| {} | {ctx} | {cue} | [{}] {title} ({}) | {:.2} |\n", i + 1, l.kind, l.node_id, l.activation));
+    }
+    out
+}
+
+/// The `cue` of a labelling line for an error cue.
+const ERROR_CUE: &str = "(error)";
+
+fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score: Option<f64>, sources: CueSources, sample_size: Option<usize>) -> Result<()> {
     let transcripts = read_transcripts(path, None, None, Some(sessions))?;
     for prefix in sessions {
         if !transcripts.iter().any(|t| t.session_id.starts_with(prefix.as_str())) {
@@ -551,10 +585,10 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
                 shown_here += injection.shown.len();
                 let cue = match &injection.cue {
                     WorkCue::File { path, .. } => path.clone(),
-                    WorkCue::Error { .. } => "(error)".to_string(),
+                    WorkCue::Error { .. } => ERROR_CUE.to_string(),
                 };
-                for (node_id, kind, _title, _reason, activation) in injection.shown {
-                    labels.push(LabelLine { session: t.session_id.clone(), context: t.agent_id.clone().unwrap_or_else(|| "main".into()), step: chunk_no * REPLAY_CHUNK + injection.step, cue: cue.clone(), node_id, kind, activation, label: String::new() });
+                for (node_id, kind, title, _reason, activation) in injection.shown {
+                    labels.push(LabelLine { session: t.session_id.clone(), context: t.agent_id.clone().unwrap_or_else(|| "main".into()), step: chunk_no * REPLAY_CHUNK + injection.step, cue: cue.clone(), node_id, kind, title, activation, label: String::new() });
                 }
             }
         }
@@ -573,6 +607,13 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
     let labels_file = dir.join(format!("labels-{}.jsonl", unix_secs()));
     std::fs::write(&labels_file, labels.iter().map(|l| serde_json::to_string(l).unwrap_or_default()).collect::<Vec<_>>().join("\n") + "\n")?;
     println!("Labelling file ({} pointers): {}", labels.len(), labels_file.display());
+    if let Some(n) = sample_size {
+        let picked = sample(&labels, n);
+        std::fs::write(dir.join("to-label.jsonl"), picked.iter().map(|l| serde_json::to_string(l).unwrap_or_default()).collect::<Vec<_>>().join("\n") + "\n")?;
+        std::fs::write(dir.join("to-label.md"), sample_markdown(&picked))?;
+        let (errors, main) = (picked.iter().filter(|l| l.cue == ERROR_CUE).count(), picked.iter().filter(|l| l.context == "main" && l.cue != ERROR_CUE).count());
+        println!("Labelling sample: {} pointers ({errors} from errors, {main} more from the main session, {} random subagent ones){}: {}", picked.len(), picked.len() - errors - main, if picked.len() > n { format!(", over {n} because errors and the main session alone pass it") } else { String::new() }, dir.join("to-label.md").display());
+    }
     write_result(path, "replay", &json!({ "min_score": min_score, "sources": sources, "sessions": summaries.values().collect::<Vec<_>>() }))
 }
 
@@ -596,6 +637,7 @@ pub(crate) struct Options<'a> {
     pub(crate) replay: &'a [String],
     pub(crate) min_score: Option<f64>,
     pub(crate) sources: Option<&'a str>,
+    pub(crate) sample: Option<usize>,
 }
 
 pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
@@ -608,7 +650,7 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
         None => CueSources::All,
     };
     if !options.replay.is_empty() {
-        return replay(path, &root, options.replay, options.remote, options.min_score, sources);
+        return replay(path, &root, options.replay, options.remote, options.min_score, sources, options.sample);
     }
     let cases_file = options.cases.map(Path::to_path_buf).unwrap_or_else(|| path.join(".context").join("work-recall-eval.jsonl"));
     let cases = read_cases(&cases_file)?;
@@ -632,6 +674,19 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_labelling_sample_keeps_errors_and_the_main_session_then_a_fixed_random_rest() {
+        let line = |context: &str, cue: &str, node_id: i64| LabelLine { session: "s".into(), context: context.into(), step: node_id as usize, cue: cue.into(), node_id, kind: "gotcha".into(), title: "t | x".into(), activation: 1.0, label: String::new() };
+        let mut labels = vec![line("main", "src/a.rs", 1), line("agent-a", ERROR_CUE, 2)];
+        labels.extend((10..40).map(|id| line("agent-a", "src/b.rs", id)));
+        let picked = sample(&labels, 10);
+        assert_eq!(picked.len(), 10);
+        assert!(picked.iter().any(|l| l.node_id == 1) && picked.iter().any(|l| l.node_id == 2), "errors and main always in");
+        assert_eq!(picked.iter().map(|l| l.node_id).collect::<Vec<_>>(), sample(&labels, 10).iter().map(|l| l.node_id).collect::<Vec<_>>(), "the same sample every run");
+        assert_eq!(sample(&labels[..2], 1).len(), 2, "errors and main are never cut");
+        assert!(sample_markdown(&picked).contains("t / x"), "a title can't break the table");
+    }
 
     fn write(dir: &Path, name: &str, lines: &[Value]) -> PathBuf {
         let p = dir.join(name);

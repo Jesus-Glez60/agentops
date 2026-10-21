@@ -244,6 +244,10 @@ enum Command {
         /// no_affects, no_mentions, no_file_query or no_hop (cases and replay).
         #[arg(long)]
         sources: Option<String>,
+        /// With --replay: also write a labelling sample of about N pointers
+        /// (.context/work-recall-eval/to-label.{jsonl,md}).
+        #[arg(long)]
+        sample: Option<usize>,
     },
     /// Dense-vector search over embedded symbols/gotchas/decisions/notes —
     /// requires having scanned/added notes with --with-embeddings first.
@@ -769,7 +773,7 @@ fn main() -> Result<()> {
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
         Command::LinkSimilar { path, prune } => link_similar(&path, prune),
         Command::RecallEval { path, remote, cases, mode, repeat } => recall_eval::run(&path, remote, cases.as_deref(), mode, repeat),
-        Command::WorkRecallEval { path, remote, cases, baseline, repeat, sizing, replay, min_score, sources } => work_recall_eval::run(&path, work_recall_eval::Options { remote, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref() }),
+        Command::WorkRecallEval { path, remote, cases, baseline, repeat, sizing, replay, min_score, sources, sample } => work_recall_eval::run(&path, work_recall_eval::Options { remote, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample }),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
