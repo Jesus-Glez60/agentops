@@ -1473,8 +1473,8 @@ mod tests {
         let resp = app.clone().oneshot(replay(&owner_token, json!({ "events": reply["events"], "steps": [steps[0]], "min_score": 0.1 }))).await.unwrap();
         assert!(body_json(resp).await["injections"].as_array().unwrap().is_empty());
         // The ablation's sources reach the replay (their effect is tested in agentops-retrieval).
-        let resp = app.clone().oneshot(replay(&owner_token, json!({ "steps": [steps[0]], "min_score": 0.1, "sources": "no_hop" }))).await.unwrap();
-        assert_eq!(body_json(resp).await["injections"][0]["shown"][0][0], json!(gotcha), "without the hop, Affects still reaches it");
+        let resp = app.clone().oneshot(replay(&owner_token, json!({ "steps": [steps[0]], "min_score": 0.1, "sources": "no_mentions" }))).await.unwrap();
+        assert_eq!(body_json(resp).await["injections"][0]["shown"][0][0], json!(gotcha), "without mentions, Affects still reaches it");
         let resp = app.clone().oneshot(replay(&owner_token, json!({ "steps": [steps[0]], "sources": "no_such_source" }))).await.unwrap();
         assert!(resp.status().is_client_error(), "an unknown source is refused");
         assert!(graph.session_events_for_repo(&repo, None).unwrap().is_empty(), "a replay records nothing in the store");

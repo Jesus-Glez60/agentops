@@ -17,10 +17,10 @@
 //!    and graph locally, plus meaning on the server). Its score is recall's
 //!    confidence.
 //!
-//! Sources 1 and 2 then get the prompt seed's `SimilarTo` hop: at most
-//! `HOP_MAX_PER_SOURCE` neighbours each, scored source × cosine ×
-//! `HOP_FACTOR`. Source 3 already hops inside recall. A memory reached
-//! several ways keeps its best score.
+//! Sources 1 and 2 get no `SimilarTo` hop of their own: it added no case
+//! hit and about 4k characters per five replayed sessions (milestone 3b
+//! revision 1 ablation, `m3b-eval.md`). Source 3 still hops inside recall.
+//! A memory reached several ways keeps its best score.
 //!
 //! An error cue is the failed call's text, cleaned of paths, line numbers,
 //! hashes and timestamps, through the same recall, keeping only what a
@@ -39,10 +39,9 @@ use agentops_embeddings::Embedder;
 use agentops_graph::{EdgeRelation, GraphStore, NodeKind, NodeProminence};
 use anyhow::Result;
 
-use crate::recall::{closest_similar, HOP_MAX_PER_SOURCE};
 use crate::recall::affects_confidence_for;
 use crate::recall::recall_ranked_with;
-use crate::{recall_scored_with, RecallPointer, HOP_FACTOR, RECALL_KINDS};
+use crate::{recall_scored_with, RecallPointer, RECALL_KINDS};
 
 /// Score of a memory whose text names the file's repo-relative path.
 pub const MENTION_PATH_SCORE: f64 = 0.9;
@@ -97,9 +96,6 @@ pub enum CueSources {
     NoMentions,
     /// Without source 3, the file itself as a query.
     NoFileQuery,
-    /// Without the `SimilarTo` hop from sources 1 and 2 (recall's own hop
-    /// inside source 3 stays: it is prompt-time recall's).
-    NoHop,
 }
 
 /// A memory a cue reached, with the score activation sums (item 3).
@@ -240,10 +236,6 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
                 if sources != CueSources::NoMentions {
                     merged.extend(mention_candidates(store, repo, path)?);
                 }
-                if sources != CueSources::NoHop {
-                    let sourced: Vec<WorkCandidate> = merged.sorted();
-                    merged.extend(hop_candidates(store, repo, &sourced)?);
-                }
                 if sources != CueSources::NoFileQuery {
                     let query = file_query(path, heading.as_deref(), &symbols);
                     merged.extend(recall_scored_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().map(|(pointer, score)| WorkCandidate { pointer, score }));
@@ -373,27 +365,6 @@ fn mention_candidates(store: &dyn GraphStore, repo: &str, path: &str) -> Result<
     if name != path && store.count_files_named(repo, name)? == 1 {
         let seen: HashSet<i64> = out.iter().map(|c| c.pointer.node_id).collect();
         out.extend(store.nodes_mentioning(repo, name, RECALL_KINDS, PER_SOURCE)?.into_iter().filter(|n| recallable(n) && !seen.contains(&n.id)).map(|n| candidate(n, MENTION_NAME_SCORE, format!("mentions `{name}`"))));
-    }
-    Ok(out)
-}
-
-/// One `SimilarTo` hop from each source-1/2 candidate, at most
-/// `HOP_MAX_PER_SOURCE` neighbours each, closest first.
-fn hop_candidates(store: &dyn GraphStore, repo: &str, sources: &[WorkCandidate]) -> Result<Vec<WorkCandidate>> {
-    let mut out = Vec::new();
-    for source in sources {
-        let mut taken = 0;
-        for (cosine, target) in closest_similar(store, repo, source.pointer.node_id)? {
-            if taken == HOP_MAX_PER_SOURCE {
-                break;
-            }
-            let Some(neighbour) = store.get_node(repo, target)? else { continue };
-            if !recallable(&neighbour) {
-                continue;
-            }
-            taken += 1;
-            out.push(candidate(neighbour, source.score * cosine * HOP_FACTOR, format!("similar to \"{}\"", source.pointer.title)));
-        }
     }
     Ok(out)
 }
@@ -593,19 +564,11 @@ mod tests {
         store.add_edge("r", affects, symbol, EdgeRelation::Affects).unwrap();
         let mention = memory(&store, NodeKind::Gotcha, "Rounding in one place", "src/billing_ledger.rs rounds once, at posting.");
         let query = memory(&store, NodeKind::Note, "Ledger currency precision", "billing ledger amounts carry four decimals.");
-        let hop = memory(&store, NodeKind::Note, "Audit export cadence", "Exports run nightly.");
-        let mut v = vec![0.0; agentops_embeddings::EMBEDDING_DIM];
-        v[0] = 1.0;
-        for id in [affects, hop] {
-            store.set_embedding("r", id, &v).unwrap();
-        }
-        store.add_edge("r", affects, hop, EdgeRelation::SimilarTo).unwrap();
         let cue = WorkCue::File { path: path.into(), heading: Some("Currency precision".into()) };
         let reached = |sources| -> HashSet<i64> { resolve_cue(&store, "r", &cue, sources, None).unwrap().into_iter().map(|c| c.pointer.node_id).collect() };
         let all = reached(CueSources::All);
-        assert!([affects, mention, query, hop].iter().all(|id| all.contains(id)), "each source reaches its memory: {all:?}");
-        // Without Affects, its hop neighbours go too: the hop starts from it.
-        for (sources, gone) in [(CueSources::NoAffects, vec![affects, hop]), (CueSources::NoMentions, vec![mention]), (CueSources::NoFileQuery, vec![query]), (CueSources::NoHop, vec![hop])] {
+        assert!([affects, mention, query].iter().all(|id| all.contains(id)), "each source reaches its memory: {all:?}");
+        for (sources, gone) in [(CueSources::NoAffects, vec![affects]), (CueSources::NoMentions, vec![mention]), (CueSources::NoFileQuery, vec![query])] {
             let without = reached(sources);
             let expected: HashSet<i64> = all.iter().copied().filter(|id| !gone.contains(id)).collect();
             assert_eq!(without, expected, "{sources:?}");

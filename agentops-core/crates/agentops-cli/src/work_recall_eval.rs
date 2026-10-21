@@ -646,7 +646,7 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
         return sizing(path, &root);
     }
     let sources: CueSources = match options.sources {
-        Some(s) => serde_json::from_value(json!(s)).with_context(|| format!("--sources {s}: expected all, no_affects, no_mentions, no_file_query or no_hop"))?,
+        Some(s) => serde_json::from_value(json!(s)).with_context(|| format!("--sources {s}: expected all, no_affects, no_mentions or no_file_query"))?,
         None => CueSources::All,
     };
     if !options.replay.is_empty() {
