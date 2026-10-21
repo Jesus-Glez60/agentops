@@ -817,6 +817,9 @@ pub(crate) struct WorkRecallReplayBody {
     steps: Vec<agentops_mcp::work_recall::ReplayStep>,
     #[serde(default)]
     min_score: Option<f64>,
+    /// Cue sources for the ablation (milestone 3b revision 1); all by default.
+    #[serde(default)]
+    sources: agentops_retrieval::work_recall::CueSources,
 }
 
 /// `POST /repos/{id}/work-recall/replay` -- runs a chunk of a past
@@ -843,6 +846,7 @@ pub(crate) async fn work_recall_replay_json(State(state): State<AppState>, user:
         if let Some(min) = body.min_score {
             settings.min_score = min;
         }
+        settings.sources = body.sources;
         let injections = agentops_mcp::work_recall::replay(store.as_ref(), &repo, &mut log, &body.steps, Some(&SERVER_EMBEDDER), settings)?;
         Ok(Some(json!({ "events": log.to_logged(), "injections": injections })))
     })
@@ -1468,6 +1472,11 @@ mod tests {
         // The returned log carries on: the next chunk doesn't show it again.
         let resp = app.clone().oneshot(replay(&owner_token, json!({ "events": reply["events"], "steps": [steps[0]], "min_score": 0.1 }))).await.unwrap();
         assert!(body_json(resp).await["injections"].as_array().unwrap().is_empty());
+        // The ablation's sources reach the replay (their effect is tested in agentops-retrieval).
+        let resp = app.clone().oneshot(replay(&owner_token, json!({ "steps": [steps[0]], "min_score": 0.1, "sources": "no_hop" }))).await.unwrap();
+        assert_eq!(body_json(resp).await["injections"][0]["shown"][0][0], json!(gotcha), "without the hop, Affects still reaches it");
+        let resp = app.clone().oneshot(replay(&owner_token, json!({ "steps": [steps[0]], "sources": "no_such_source" }))).await.unwrap();
+        assert!(resp.status().is_client_error(), "an unknown source is refused");
         assert!(graph.session_events_for_repo(&repo, None).unwrap().is_empty(), "a replay records nothing in the store");
 
         let resp = app.clone().oneshot(replay(&other_token, json!({ "steps": [] }))).await.unwrap();

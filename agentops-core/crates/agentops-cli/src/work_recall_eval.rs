@@ -360,7 +360,7 @@ fn validate(backend: &Backend, cases: &[Case]) -> Result<()> {
     Ok(())
 }
 
-fn evaluate(backend: &Backend, cases: &[Case], baseline: Option<Baseline>, repeat: usize) -> Result<(Vec<CaseResult>, Summary)> {
+fn evaluate(backend: &Backend, cases: &[Case], baseline: Option<Baseline>, repeat: usize, sources: CueSources) -> Result<(Vec<CaseResult>, Summary)> {
     let limit = agentops_mcp::budget::WORK_RECALL_MAX_ITEMS;
     let mut results = Vec::new();
     let mut latencies = Vec::new();
@@ -372,7 +372,7 @@ fn evaluate(backend: &Backend, cases: &[Case], baseline: Option<Baseline>, repea
             ranked = match baseline {
                 Some(Baseline::Prompt) => backend.deep(cue_text(&case.cue))?.into_iter().map(|p| p.node_id).collect(),
                 Some(Baseline::Affects) => resolve(backend, &case.cue, CueSources::AffectsOnly)?,
-                None => resolve(backend, &case.cue, CueSources::All)?,
+                None => resolve(backend, &case.cue, sources)?,
             };
             runs.push(started.elapsed().as_secs_f64() * 1000.0);
         }
@@ -498,7 +498,7 @@ struct LabelLine {
     label: String,
 }
 
-fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score: Option<f64>) -> Result<()> {
+fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score: Option<f64>, sources: CueSources) -> Result<()> {
     let transcripts = read_transcripts(path, None, None, Some(sessions))?;
     for prefix in sessions {
         if !transcripts.iter().any(|t| t.session_id.starts_with(prefix.as_str())) {
@@ -528,7 +528,7 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
         for (chunk_no, chunk) in steps.chunks(REPLAY_CHUNK).enumerate() {
             let injections: Vec<ReplayInjection> = match (&marker, &local) {
                 (Some(marker), _) => {
-                    let reply = remote_send_within(marker, "work-recall/replay", Some(&json!({ "events": events, "steps": chunk, "min_score": min_score })), REPLAY_TIMEOUT)?;
+                    let reply = remote_send_within(marker, "work-recall/replay", Some(&json!({ "events": events, "steps": chunk, "min_score": min_score, "sources": sources })), REPLAY_TIMEOUT)?;
                     events = serde_json::from_value(reply["events"].clone()).context("reading the replay's events")?;
                     serde_json::from_value(reply["injections"].clone()).context("reading the replay's injections")?
                 }
@@ -538,6 +538,7 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
                     if let Some(min) = min_score {
                         settings.min_score = min;
                     }
+                    settings.sources = sources;
                     let out = agentops_mcp::work_recall::replay(store.as_ref(), repo, &mut log, chunk, None, settings)?;
                     events = log.to_logged();
                     out
@@ -572,7 +573,7 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
     let labels_file = dir.join(format!("labels-{}.jsonl", unix_secs()));
     std::fs::write(&labels_file, labels.iter().map(|l| serde_json::to_string(l).unwrap_or_default()).collect::<Vec<_>>().join("\n") + "\n")?;
     println!("Labelling file ({} pointers): {}", labels.len(), labels_file.display());
-    write_result(path, "replay", &json!({ "min_score": min_score, "sessions": summaries.values().collect::<Vec<_>>() }))
+    write_result(path, "replay", &json!({ "min_score": min_score, "sources": sources, "sessions": summaries.values().collect::<Vec<_>>() }))
 }
 
 // ---------------------------------------------------------------------
@@ -594,6 +595,7 @@ pub(crate) struct Options<'a> {
     pub(crate) sizing: bool,
     pub(crate) replay: &'a [String],
     pub(crate) min_score: Option<f64>,
+    pub(crate) sources: Option<&'a str>,
 }
 
 pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
@@ -601,8 +603,12 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
     if options.sizing {
         return sizing(path, &root);
     }
+    let sources: CueSources = match options.sources {
+        Some(s) => serde_json::from_value(json!(s)).with_context(|| format!("--sources {s}: expected all, no_affects, no_mentions, no_file_query or no_hop"))?,
+        None => CueSources::All,
+    };
     if !options.replay.is_empty() {
-        return replay(path, &root, options.replay, options.remote, options.min_score);
+        return replay(path, &root, options.replay, options.remote, options.min_score, sources);
     }
     let cases_file = options.cases.map(Path::to_path_buf).unwrap_or_else(|| path.join(".context").join("work-recall-eval.jsonl"));
     let cases = read_cases(&cases_file)?;
@@ -613,14 +619,14 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
     };
     let cases = with_headings(&root, cases);
     validate(&backend, &cases)?;
-    let (results, summary) = evaluate(&backend, &cases, options.baseline, options.repeat.max(1))?;
+    let (results, summary) = evaluate(&backend, &cases, options.baseline, options.repeat.max(1), sources)?;
     let label = match options.baseline {
         Some(Baseline::Affects) => "baseline: Affects lookup only",
         Some(Baseline::Prompt) => "baseline: cue text through prompt-time recall",
         None => "work-time recall",
     };
-    print!("{}", render(&results, &summary, label));
-    write_result(path, "cases", &json!({ "remote": options.remote, "baseline": options.baseline, "cases": results, "summary": summary }))
+    print!("{}", render(&results, &summary, &format!("{label} (sources: {})", options.sources.unwrap_or("all"))));
+    write_result(path, "cases", &json!({ "remote": options.remote, "baseline": options.baseline, "sources": sources, "cases": results, "summary": summary }))
 }
 
 #[cfg(test)]

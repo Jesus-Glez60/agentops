@@ -83,13 +83,23 @@ pub enum WorkCue {
     },
 }
 
-/// Which cue sources run. `AffectsOnly` is the baseline.
+/// Which cue sources run. `AffectsOnly` is the baseline; each `No*` turns
+/// one file-cue source off, for the ablation (milestone 3b revision 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CueSources {
     #[default]
     All,
     AffectsOnly,
+    /// Without source 1, the file's `Affects`-linked memories.
+    NoAffects,
+    /// Without source 2, path mentions.
+    NoMentions,
+    /// Without source 3, the file itself as a query.
+    NoFileQuery,
+    /// Without the `SimilarTo` hop from sources 1 and 2 (recall's own hop
+    /// inside source 3 stays: it is prompt-time recall's).
+    NoHop,
 }
 
 /// A memory a cue reached, with the score activation sums (item 3).
@@ -223,15 +233,21 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
         WorkCue::File { path, .. } if is_skipped(path) => {}
         WorkCue::File { path, heading } => {
             let symbols: Vec<agentops_graph::Node> = store.nodes_in_file(repo, path)?.into_iter().filter(|n| n.kind == NodeKind::Symbol).collect();
-            let direct = affects_candidates(store, repo, &symbols)?;
-            merged.extend(direct.iter().cloned());
-            if sources == CueSources::All {
-                let mentions = mention_candidates(store, repo, path)?;
-                merged.extend(mentions.iter().cloned());
-                let sourced: Vec<WorkCandidate> = merged.sorted();
-                merged.extend(hop_candidates(store, repo, &sourced)?);
-                let query = file_query(path, heading.as_deref(), &symbols);
-                merged.extend(recall_scored_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().map(|(pointer, score)| WorkCandidate { pointer, score }));
+            if sources != CueSources::NoAffects {
+                merged.extend(affects_candidates(store, repo, &symbols)?);
+            }
+            if sources != CueSources::AffectsOnly {
+                if sources != CueSources::NoMentions {
+                    merged.extend(mention_candidates(store, repo, path)?);
+                }
+                if sources != CueSources::NoHop {
+                    let sourced: Vec<WorkCandidate> = merged.sorted();
+                    merged.extend(hop_candidates(store, repo, &sourced)?);
+                }
+                if sources != CueSources::NoFileQuery {
+                    let query = file_query(path, heading.as_deref(), &symbols);
+                    merged.extend(recall_scored_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().map(|(pointer, score)| WorkCandidate { pointer, score }));
+                }
             }
         }
         WorkCue::Error { .. } if sources == CueSources::AffectsOnly => {}
@@ -564,6 +580,36 @@ mod tests {
         let score = |id| found.iter().find(|c| c.pointer.node_id == id).map(|c| c.score);
         assert!(score(gotcha).unwrap() > score(decision).unwrap_or(0.0), "{found:?}");
         assert!(resolve_cue(&store, "r", &WorkCue::Error { text: "psql: error".into() }, CueSources::AffectsOnly, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn each_ablation_switch_drops_exactly_its_source() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let path = "src/billing_ledger.rs";
+        // A plain-word symbol: an identifier-shaped one would let the file query
+        // reach the Affects memory too, by naming it.
+        let symbol = node(&store, NodeKind::Symbol, path, "reconcile");
+        let affects = memory(&store, NodeKind::Decision, "Entries are append-only", "Never update entries once written.");
+        store.add_edge("r", affects, symbol, EdgeRelation::Affects).unwrap();
+        let mention = memory(&store, NodeKind::Gotcha, "Rounding in one place", "src/billing_ledger.rs rounds once, at posting.");
+        let query = memory(&store, NodeKind::Note, "Ledger currency precision", "billing ledger amounts carry four decimals.");
+        let hop = memory(&store, NodeKind::Note, "Audit export cadence", "Exports run nightly.");
+        let mut v = vec![0.0; agentops_embeddings::EMBEDDING_DIM];
+        v[0] = 1.0;
+        for id in [affects, hop] {
+            store.set_embedding("r", id, &v).unwrap();
+        }
+        store.add_edge("r", affects, hop, EdgeRelation::SimilarTo).unwrap();
+        let cue = WorkCue::File { path: path.into(), heading: Some("Currency precision".into()) };
+        let reached = |sources| -> HashSet<i64> { resolve_cue(&store, "r", &cue, sources, None).unwrap().into_iter().map(|c| c.pointer.node_id).collect() };
+        let all = reached(CueSources::All);
+        assert!([affects, mention, query, hop].iter().all(|id| all.contains(id)), "each source reaches its memory: {all:?}");
+        // Without Affects, its hop neighbours go too: the hop starts from it.
+        for (sources, gone) in [(CueSources::NoAffects, vec![affects, hop]), (CueSources::NoMentions, vec![mention]), (CueSources::NoFileQuery, vec![query]), (CueSources::NoHop, vec![hop])] {
+            let without = reached(sources);
+            let expected: HashSet<i64> = all.iter().copied().filter(|id| !gone.contains(id)).collect();
+            assert_eq!(without, expected, "{sources:?}");
+        }
     }
 
     #[test]

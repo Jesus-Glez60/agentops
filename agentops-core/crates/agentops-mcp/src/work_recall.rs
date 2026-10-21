@@ -79,16 +79,18 @@ pub struct Injection {
     pub shown: Vec<(agentops_retrieval::RecallPointer, f64)>,
 }
 
-/// The threshold and the off switch, which the replay varies.
+/// The threshold, the off switch and the cue sources, which the replay
+/// varies (the sources only for the ablation; the hook always runs all).
 #[derive(Debug, Clone, Copy)]
 pub struct Settings {
     pub min_score: f64,
     pub enabled: bool,
+    pub sources: CueSources,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { min_score: INJECT_MIN_SCORE, enabled: true }
+        Settings { min_score: INJECT_MIN_SCORE, enabled: true, sources: CueSources::All }
     }
 }
 
@@ -122,7 +124,7 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
             return Ok(None);
         }
     }
-    let candidates = resolve_cue(store, repo, cue, CueSources::All, embedder)?;
+    let candidates = resolve_cue(store, repo, cue, settings.sources, embedder)?;
     if candidates.is_empty() {
         // A file that reached nothing is still recorded, so a re-read of it
         // is skipped above rather than resolved again.
@@ -369,7 +371,7 @@ mod tests {
         WorkCue::File { path: "docs/release.md".into(), heading: Some("Release tagging changelog".into()) }
     }
 
-    const LOW: Settings = Settings { min_score: 0.1, enabled: true };
+    const LOW: Settings = Settings { min_score: 0.1, enabled: true, sources: CueSources::All };
 
     #[test]
     fn a_memory_shown_once_is_never_shown_again_in_that_context_until_compaction() {
@@ -459,7 +461,7 @@ mod tests {
     fn below_the_threshold_nothing_is_shown() {
         let (store, _) = setup();
         let mut log = MemoryLog::default();
-        assert_eq!(on_cue(&store, "r", &mut log, None, &release_cue(), None, Settings { min_score: 10.0, enabled: true }).unwrap(), None);
+        assert_eq!(on_cue(&store, "r", &mut log, None, &release_cue(), None, Settings { min_score: 10.0, ..LOW }).unwrap(), None);
         assert!(log.0.iter().all(|e| e.event_kind != RECALL_INJECTED), "silence records no injection");
     }
 
