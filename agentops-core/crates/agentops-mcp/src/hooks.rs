@@ -811,7 +811,8 @@ mod tests {
         read("Grep", json!({"pattern": "fn handle", "path": "src"}), json!({}));
         read("Glob", json!({"pattern": "**/*.md"}), json!({}));
         let events = store.session_events(&repo, "s").unwrap();
-        let got: Vec<(&str, &str, &str, Option<&str>)> = events.iter().map(|e| (e.event_kind.as_str(), e.tool_name.as_str(), e.description.as_str(), e.agent_id.as_deref())).collect();
+        // Work cues (an empty one per file that reached nothing) are another test's subject.
+        let got: Vec<(&str, &str, &str, Option<&str>)> = events.iter().filter(|e| e.event_kind != crate::work_recall::WORK_CUE).map(|e| (e.event_kind.as_str(), e.tool_name.as_str(), e.description.as_str(), e.agent_id.as_deref())).collect();
         assert_eq!(got, [(FILE_READ, "Read", "src/a.rs", None), (FILE_READ, "Bash", "docs/b.md", Some("agent-1")), (SEARCH, "Grep", "fn handle", None), (SEARCH, "Glob", "**/*.md", None)], "a read outside the repo is not recorded");
         assert!(events.iter().all(|e| !e.description.contains("SECRET FILE BODY")));
         assert!(store.nodes_by_kind(&repo, NodeKind::ToolOutput).unwrap().is_empty());

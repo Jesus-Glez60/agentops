@@ -14,13 +14,15 @@ The spec asks for activation to be **derived, not stored**: computed from `sessi
 
 ## Decision
 
-- **Store each cue's scores; derive activation from them.** A cue that reaches any memory records one `work_cue` session event. Its description holds the cue's top `WORK_CUE_KEEP` (10) candidates as `id:score`, best first. A cue that reaches nothing records nothing.
+- **Store each cue's scores; derive activation from them.** A cue that reaches any memory records one `work_cue` session event. Its description holds the cue's top `WORK_CUE_KEEP` (10) candidates as `id:score`, best first. A file cue that reaches nothing records an empty one; an error cue that reaches nothing records nothing.
   - **Activation formula.** A memory's activation is the sum, over the context's last `ACTIVATION_WINDOW` (20) `work_cue` events plus the cue being handled, of its score × `ACTIVATION_DECAY` (0.85) raised to the cue's age (the newest cue is age 0). This is `agentops_retrieval::work_recall::activation`, a pure function, wrapped by `agentops_mcp::work_recall::context_activation`.
   - Still no new table. Approved by the author at the timing gate, 2026-10-20.
 - **One activation per context.** `session_events.agent_id` (nullable; `NULL` means the main session) keeps the contexts apart (`work_recall::context_events`).
 - **Compaction resets the main context.** `SessionStart` with `source: compact` records a `context_reset` event, and the main context counts only events after its latest one. A subagent's context never resets, because Claude Code sends no signal when a subagent compacts.
 - **The prompt counts as a cue.** A plan-mode or default-mode prompt records a `work_cue` from its recall seed's confidences (`recall_scored_with`). Work-time recall then carries on from what the prompt was about.
 - **Scores are comparable across cues** (`05-retrieval.md`, "Recall during work"): recall's confidence, `Affects` dampened by how many memories a file or symbol reaches, and path mentions at 0.9 or 0.7.
+
+- **A re-read moves activation but never injects** (milestone 3b revision 1, 2026-10-20). A file cued again in the same context re-records its earlier `work_cue` description, so activation still counts it once at its newest position, and nothing is shown. Only a file's first cue in a context can inject.
 
 ## Alternatives considered
 

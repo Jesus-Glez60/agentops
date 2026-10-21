@@ -156,9 +156,10 @@ Every pointer sent is recorded as a `recall_injected` event (`ids 1,2,3`), so or
 
 Milestone 3b (`agentops_mcp::work_recall`). The file the agent opens or edits, and the errors it hits, recall memories without any tool call, in the main session and in subagents.
 
-- **Cue.** Each file read or edited inside the repo, and each failed call, is a cue. `resolve_cue` turns it into scored candidates ([05-retrieval.md](05-retrieval.md), "Recall during work"). A cue that reaches anything records a `work_cue` event (`id:score`, top 10).
+- **Cue.** Each file read or edited inside the repo, and each failed call, is a cue. `resolve_cue` turns it into scored candidates ([05-retrieval.md](05-retrieval.md), "Recall during work"). A cue that reaches anything records a `work_cue` event (`id:score`, top 10). A file cue that reaches nothing records an empty one.
 - **Activation.** Each context has its own activation, summed over its last 20 cues with decay 0.85 ([ADR 0053](adr/0053-session-activation-from-recorded-cues.md)). A context is the main session or one subagent (`agent_id`). A plan- or default-mode prompt counts as a cue in the main context.
 - **What gets shown.** At most `WORK_RECALL_MAX_ITEMS` (3) memories that this cue reached and whose activation is at least `INJECT_MIN_SCORE`, within `WORK_RECALL_BUDGET` (800 characters). They go out as `PostToolUse`/`PostToolUseFailure` `additionalContext` under a header naming the cue: the file you opened, or "after this error".
+- **Only a file's first cue injects.** A re-read or a later edit of a file already cued in this context re-records that file's earlier candidates (it adds activation) and shows nothing, without resolving the file again. A compaction re-arms the main context. Before this rule, re-reading a hub file drained its mention list three pointers at a time (gotcha 235636, milestone 3b revision 1).
 - **Never twice in a context.** A memory already shown in this context (prompt seed, subagent seed, earlier injection) is skipped; a compaction resets the main context. Parallel tool calls can still race (F71).
 - **A ceiling.** After `MAX_INJECTED_PER_CONTEXT` (30) work-time pointers in a context, only error cues inject.
 - **Silence is normal.** A cue that shows nothing records no `recall_injected`.

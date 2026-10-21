@@ -8,7 +8,9 @@
 //! session activation from the context's recent `work_cue` events (ADR
 //! 0053), and show at most `WORK_RECALL_MAX_ITEMS` memories the cue reached
 //! whose activation is at least `INJECT_MIN_SCORE`, never one this context
-//! has already been shown. Most cues show nothing.
+//! has already been shown. Most cues show nothing. Only a file's first cue
+//! in a context can show anything: a re-read or a later edit re-records
+//! the earlier candidates for activation and stops there.
 //!
 //! **A context** is the main session, or one subagent (`agent_id`): each
 //! has its own context window, so each has its own activation. The main
@@ -105,14 +107,31 @@ fn work_injected(context: &[&SessionEvent]) -> usize {
 /// maybe show (see the module docs). `None` when nothing is shown; with
 /// the off switch set, the cue is still resolved and recorded.
 pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_id: Option<&str>, cue: &WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>, settings: Settings) -> Result<Option<Injection>> {
-    let candidates = resolve_cue(store, repo, cue, CueSources::All, embedder)?;
-    if candidates.is_empty() {
-        return Ok(None);
-    }
-    let scores = cue_scores(&candidates);
     let key = cue_key(cue);
     let events = log.events()?;
     let context = context_events(&events, agent_id);
+    // Only a file's first cue in a context injects (milestone 3b revision
+    // 1): a re-read or a later edit moves the file's candidates to the
+    // newest position for activation and shows nothing, without resolving
+    // again. Before this, each re-read of a hub file drained its mention
+    // list three pointers at a time (gotcha 235636).
+    if let WorkCue::File { .. } = cue {
+        if let Some(earlier) = context.iter().rev().find(|e| e.event_kind == WORK_CUE && e.tool_name == key) {
+            let description = earlier.description.clone();
+            log.record(&key, &description, WORK_CUE, agent_id)?;
+            return Ok(None);
+        }
+    }
+    let candidates = resolve_cue(store, repo, cue, CueSources::All, embedder)?;
+    if candidates.is_empty() {
+        // A file that reached nothing is still recorded, so a re-read of it
+        // is skipped above rather than resolved again.
+        if let WorkCue::File { .. } = cue {
+            log.record(&key, "", WORK_CUE, agent_id)?;
+        }
+        return Ok(None);
+    }
+    let scores = cue_scores(&candidates);
     let activated = context_activation(&context, &key, &scores);
     log.record(&key, &format_cue(&scores), WORK_CUE, agent_id)?;
     if !settings.enabled {
@@ -357,6 +376,34 @@ mod tests {
 
         log.record("SessionStart", "compact", CONTEXT_RESET, None).unwrap();
         assert!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().is_some(), "after compaction it can be");
+    }
+
+    #[test]
+    fn only_a_files_first_cue_in_a_context_injects_until_compaction() {
+        let (store, _) = setup();
+        let mut log = MemoryLog::default();
+        assert!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().is_some());
+        // A new memory naming the file arrives; a re-read or an edit of the
+        // same file still shows nothing, and is recorded for activation.
+        let later = gotcha(&store, "r", "Release changelog needs a date", "docs/release.md: the changelog entry needs a release date.");
+        let edit = WorkCue::File { path: "docs/release.md".into(), heading: None };
+        assert_eq!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap(), None, "a re-read never injects");
+        assert_eq!(on_cue(&store, "r", &mut log, None, &edit, None, LOW).unwrap(), None, "nor does a later edit");
+        assert_eq!(log.0.iter().filter(|e| e.event_kind == WORK_CUE && e.tool_name == "file:docs/release.md").count(), 3, "each cue still counts for activation");
+
+        log.record("SessionStart", "compact", CONTEXT_RESET, None).unwrap();
+        let after = on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().expect("the first cue after compaction injects");
+        assert!(after.shown.iter().any(|(p, _)| p.node_id == later), "{after:?}");
+    }
+
+    #[test]
+    fn a_file_that_reached_nothing_is_not_resolved_again() {
+        let (store, _) = setup();
+        let mut log = MemoryLog::default();
+        let nothing = WorkCue::File { path: "src/unrelated_widget.rs".into(), heading: None };
+        assert_eq!(on_cue(&store, "r", &mut log, None, &nothing, None, LOW).unwrap(), None);
+        gotcha(&store, "r", "Unrelated widget panics", "src/unrelated_widget.rs panics on empty input.");
+        assert_eq!(on_cue(&store, "r", &mut log, None, &nothing, None, LOW).unwrap(), None, "the earlier empty cue counts as the file's first");
     }
 
     #[test]
