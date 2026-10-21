@@ -179,13 +179,15 @@ Milestone 3b, `agentops-retrieval/src/work_recall.rs`. A work cue is a file the 
 | 2. A memory naming only the file name, when no other file has that name (`count_files_named`) | `MENTION_NAME_SCORE` 0.7 |
 | One `SimilarTo` hop from sources 1-2, at most `HOP_MAX_PER_SOURCE` | source × cosine × `HOP_FACTOR` |
 | 3. The file as a query: name, non-generic parent directory, first heading, top-level symbols, at most `FILE_CUE_TEXT_MAX` characters | recall's confidence |
-| An error cue, cleaned (see below) | recall's confidence; gotchas × `ERROR_GOTCHA_BOOST`, capped at 1.0 |
+| An error cue, cleaned (see below) | recall's confidence, for memories a keyword or a named symbol matched only; gotchas × `ERROR_GOTCHA_BOOST`, capped at 1.0 |
 
 **Recall's confidence** (`recall_scored_with`) is recall's comparable score: the share of the query's rarity weight that a memory matched, capped at 0.5 for a one-keyword query; `affects_confidence_for` for a named symbol's `Affects` edge; and the cosine rescaled so that `DENSE_MIN_SCORE` is 0 and 1.0 is 1, when that scores higher. A hop neighbour gets its source's confidence × cosine × `HOP_FACTOR`, and a reduced memory gets half. It doesn't change recall's order, so `recall_seed_with` returns the same pointers as before.
 
 **How sources combine.** Path mentions are a substring search, not a full-text query, because the two stores combine full-text words differently (SQLite ORs them, Postgres ANDs them). A memory reached several ways keeps its best score. Ties break on arrival order (sources in trust order, each in its own rank), never on node id.
 
 **Cleaning an error cue.** Lines carrying `ERROR_KEYWORDS` come first. A path is cut to its file name; line:column suffixes, hex hashes, timestamps and `Exit code N` lines are dropped. The result is at most `ERROR_CUE_TEXT_MAX` characters.
+
+**An error needs a keyword match** (milestone 3b revision 1). An error cue keeps only memories that a keyword or an exactly named symbol reached (`recall_ranked_with`'s `lexical`). Recall by meaning and the `SimilarTo` hop can re-rank those but never add one on their own. Without this, a self-explanatory git error injected three unrelated memories by meaning at cosine 0.76–0.77 (gotcha 235643). Prompt-time recall is unchanged.
 
 **What is never a cue.** Paths on `WORK_CUE_SKIP` (`.git/`, `.context/`, `target/`, `node_modules/`, `.next/`, lockfiles).
 

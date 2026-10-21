@@ -109,6 +109,22 @@ pub fn recall_seed_with(store: &dyn GraphStore, repo: &str, query: &str, limit: 
 ///
 /// A reduced memory's confidence is halved, like its score.
 pub fn recall_scored_with(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<(RecallPointer, f64)>> {
+    Ok(recall_ranked_with(store, repo, query, limit, exclude, embedder)?.into_iter().map(|s| (s.pointer, s.confidence)).collect())
+}
+
+/// One `recall_ranked_with` result.
+pub(crate) struct Scored {
+    pub pointer: RecallPointer,
+    pub confidence: f64,
+    /// A keyword or an exactly named symbol reached it, not only meaning or
+    /// a `SimilarTo` hop. An error cue keeps only these (milestone 3b
+    /// revision 1).
+    pub lexical: bool,
+}
+
+/// `recall_scored_with`, each result also saying whether it matched
+/// lexically.
+pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<Scored>> {
     // The prompt is embedded on its own thread while the keyword queries
     // run, so a stalled embed can be abandoned at the deadline.
     let pending = embedder.map(|embedder| {
@@ -234,8 +250,9 @@ pub fn recall_scored_with(store: &dyn GraphStore, repo: &str, query: &str, limit
         .into_iter()
         .take(limit)
         .map(|r| {
+            let lexical = r.reasons.iter().any(|x| x.starts_with('"') || x.starts_with("affects"));
             let reason = if r.reasons.iter().all(|x| x.starts_with('"')) { format!("matched {}", r.reasons.join(", ")) } else { r.reasons.join("; ") };
-            (RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason }, r.confidence)
+            Scored { pointer: RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason }, confidence: r.confidence, lexical }
         })
         .collect())
 }
@@ -684,6 +701,25 @@ mod tests {
         assert_eq!(seed[0].title, "Webhook signature deploy failure", "matched by words and by meaning: {seed:?}");
         assert!(seed[0].reason.contains("close in meaning"), "{seed:?}");
         assert_eq!(seed.len(), 3, "{seed:?}");
+    }
+
+    #[test]
+    fn only_keyword_and_symbol_matches_are_lexical() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let worded = note(&store, NodeKind::Gotcha, "Webhook signature deploy failure", "webhook signature deploy");
+        let named = note(&store, NodeKind::Decision, "Tags dropped on import", "only the body is kept");
+        let symbol = note(&store, NodeKind::Symbol, "ingest_vault", "fn ingest_vault() {}");
+        store.add_edge("r", named, symbol, EdgeRelation::Affects).unwrap();
+        let meaning = note(&store, NodeKind::Note, "Cache eviction order", "nothing in common");
+        link(&store, worded, meaning);
+        for (id, tilt) in [(worded, 0.0), (meaning, 0.1)] {
+            store.set_embedding("r", id, &vector(tilt)).unwrap();
+        }
+        let ranked = recall_ranked_with(&store, "r", "webhook deploy ingest_vault", 8, &HashSet::new(), Some(&FIXED)).unwrap();
+        let lexical = |id: i64| ranked.iter().find(|s| s.pointer.node_id == id).map(|s| s.lexical);
+        assert_eq!(lexical(worded), Some(true), "keywords, and close in meaning too");
+        assert_eq!(lexical(named), Some(true), "affects the named symbol");
+        assert_eq!(lexical(meaning), Some(false), "reached by meaning and a hop only");
     }
 
     #[test]

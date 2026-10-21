@@ -23,8 +23,10 @@
 //! several ways keeps its best score.
 //!
 //! An error cue is the failed call's text, cleaned of paths, line numbers,
-//! hashes and timestamps, through the same recall. Gotchas get
-//! `ERROR_GOTCHA_BOOST`, up to 1.0. Ties break on arrival order, never on
+//! hashes and timestamps, through the same recall, keeping only what a
+//! keyword or a named symbol matched: meaning and the `SimilarTo` hop may
+//! re-rank those but never add one. Gotchas get `ERROR_GOTCHA_BOOST`, up
+//! to 1.0. Ties break on arrival order, never on
 //! node id.
 //!
 //! [`CueSources::AffectsOnly`] stops after source 1: what an agent gets
@@ -39,6 +41,7 @@ use anyhow::Result;
 
 use crate::recall::{closest_similar, HOP_MAX_PER_SOURCE};
 use crate::recall::affects_confidence_for;
+use crate::recall::recall_ranked_with;
 use crate::{recall_scored_with, RecallPointer, HOP_FACTOR, RECALL_KINDS};
 
 /// Score of a memory whose text names the file's repo-relative path.
@@ -237,9 +240,13 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
             if query.trim().is_empty() {
                 return Ok(Vec::new());
             }
-            merged.extend(recall_scored_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().map(|(pointer, score)| {
-                let score = if pointer.kind == NodeKind::Gotcha { (score * ERROR_GOTCHA_BOOST).min(1.0).max(score) } else { score };
-                WorkCandidate { pointer, score }
+            // Only what a keyword (or a named symbol) matched: meaning may
+            // re-rank those but never adds one, since a self-explanatory
+            // error otherwise pulled in unrelated memories by meaning alone
+            // (gotcha 235643, milestone 3b revision 1).
+            merged.extend(recall_ranked_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().filter(|s| s.lexical).map(|s| {
+                let score = if s.pointer.kind == NodeKind::Gotcha { (s.confidence * ERROR_GOTCHA_BOOST).min(1.0).max(s.confidence) } else { s.confidence };
+                WorkCandidate { pointer: s.pointer, score }
             }));
         }
     }
@@ -557,6 +564,23 @@ mod tests {
         let score = |id| found.iter().find(|c| c.pointer.node_id == id).map(|c| c.score);
         assert!(score(gotcha).unwrap() > score(decision).unwrap_or(0.0), "{found:?}");
         assert!(resolve_cue(&store, "r", &WorkCue::Error { text: "psql: error".into() }, CueSources::AffectsOnly, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_error_keeps_only_what_a_keyword_matched() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let matched = memory(&store, NodeKind::Gotcha, "Postgres role missing", "psql fails with role postgres does not exist on the CI box.");
+        let neighbour = memory(&store, NodeKind::Note, "CI database bootstrap order", "Seed users before migrations.");
+        let mut v = vec![0.0; agentops_embeddings::EMBEDDING_DIM];
+        v[0] = 1.0;
+        store.set_embedding("r", matched, &v).unwrap();
+        store.set_embedding("r", neighbour, &v).unwrap();
+        store.add_edge("r", matched, neighbour, EdgeRelation::SimilarTo).unwrap();
+        store.add_edge("r", neighbour, matched, EdgeRelation::SimilarTo).unwrap();
+        let prompt_time = recall_scored_with(&store, "r", "psql role postgres does not exist", 8, &HashSet::new(), None).unwrap();
+        assert!(prompt_time.iter().any(|(p, _)| p.node_id == neighbour), "prompt recall still hops: {prompt_time:?}");
+        let found = resolve_cue(&store, "r", &WorkCue::Error { text: "psql: error: FATAL: role \"postgres\" does not exist".into() }, CueSources::All, None).unwrap();
+        assert_eq!(found.iter().map(|c| c.pointer.node_id).collect::<Vec<_>>(), [matched], "a hop neighbour never rides in on an error: {found:?}");
     }
 
     #[test]
