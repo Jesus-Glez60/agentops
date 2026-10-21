@@ -363,12 +363,12 @@ mod tests {
 
     fn setup() -> (agentops_graph::SqliteGraphStore, i64) {
         let store = agentops_graph::SqliteGraphStore::open_in_memory().unwrap();
-        let id = gotcha(&store, "r", "Release tagging needs the changelog bumped", "Tagging a release fails unless the changelog entry exists.");
+        let id = gotcha(&store, "r", "Release tagging needs the changelog bumped", "Tagging a release fails unless docs/release.md has the changelog entry.");
         (store, id)
     }
 
     fn release_cue() -> WorkCue {
-        WorkCue::File { path: "docs/release.md".into(), heading: Some("Release tagging changelog".into()) }
+        WorkCue::File { path: "docs/release.md".into() }
     }
 
     const LOW: Settings = Settings { min_score: 0.1, enabled: true, sources: CueSources::All };
@@ -395,7 +395,7 @@ mod tests {
         // A new memory naming the file arrives; a re-read or an edit of the
         // same file still shows nothing, and is recorded for activation.
         let later = gotcha(&store, "r", "Release changelog needs a date", "docs/release.md: the changelog entry needs a release date.");
-        let edit = WorkCue::File { path: "docs/release.md".into(), heading: None };
+        let edit = WorkCue::File { path: "docs/release.md".into() };
         assert_eq!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap(), None, "a re-read never injects");
         assert_eq!(on_cue(&store, "r", &mut log, None, &edit, None, LOW).unwrap(), None, "nor does a later edit");
         assert_eq!(log.0.iter().filter(|e| e.event_kind == WORK_CUE && e.tool_name == "file:docs/release.md").count(), 3, "each cue still counts for activation");
@@ -409,7 +409,7 @@ mod tests {
     fn a_file_that_reached_nothing_is_not_resolved_again() {
         let (store, _) = setup();
         let mut log = MemoryLog::default();
-        let nothing = WorkCue::File { path: "src/unrelated_widget.rs".into(), heading: None };
+        let nothing = WorkCue::File { path: "src/unrelated_widget.rs".into() };
         assert_eq!(on_cue(&store, "r", &mut log, None, &nothing, None, LOW).unwrap(), None);
         gotcha(&store, "r", "Unrelated widget panics", "src/unrelated_widget.rs panics on empty input.");
         assert_eq!(on_cue(&store, "r", &mut log, None, &nothing, None, LOW).unwrap(), None, "the earlier empty cue counts as the file's first");
@@ -449,7 +449,7 @@ mod tests {
         let mut log = MemoryLog::default();
         let almost = (0..SUBAGENT_MAX_INJECTED as i64 - 1).map(|i| (1000 + i).to_string()).collect::<Vec<_>>().join(",");
         log.record(WORK_RECALL_TOOL, &format!("ids {almost}"), RECALL_INJECTED, Some("agent-a")).unwrap();
-        gotcha(&store, "r", "Release notes list the tag", "Release tagging: the notes list the changelog tag.");
+        gotcha(&store, "r", "Release notes list the tag", "docs/release.md: the notes list the changelog tag.");
         let shown = on_cue(&store, "r", &mut log, Some("agent-a"), &release_cue(), None, LOW).unwrap().expect("one slot left");
         assert_eq!(shown.shown.len(), 1, "never past the ceiling: {shown:?}");
         let error = WorkCue::Error { text: "psql: error: FATAL: role \"postgres\" does not exist".into() };

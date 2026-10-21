@@ -11,16 +11,12 @@
 //! 2. memories whose text mentions the file's repo-relative path
 //!    (`MENTION_PATH_SCORE`), or its bare file name when no other file in
 //!    the repo has that name (`MENTION_NAME_SCORE`);
-//! 3. the file itself as a query: its name, parent directory, first
-//!    heading and top-level symbols, at most `FILE_CUE_TEXT_MAX`
-//!    characters, through prompt recall (`recall_scored_with`: keywords
-//!    and graph locally, plus meaning on the server). Its score is recall's
-//!    confidence.
 //!
-//! Sources 1 and 2 get no `SimilarTo` hop of their own: it added no case
-//! hit and about 4k characters per five replayed sessions (milestone 3b
-//! revision 1 ablation, `m3b-eval.md`). Source 3 still hops inside recall.
-//! A memory reached several ways keeps its best score.
+//! A memory reached both ways keeps its best score. Two more sources were
+//! removed after the milestone 3b revision 1 ablation (`m3b-eval.md`),
+//! since neither added a case hit: a `SimilarTo` hop from these candidates
+//! (about 4k characters over five replayed sessions) and the file itself
+//! as a query through prompt recall (62k characters).
 //!
 //! An error cue is the failed call's text, cleaned of paths, line numbers,
 //! hashes and timestamps, through the same recall, keeping only what a
@@ -41,15 +37,13 @@ use anyhow::Result;
 
 use crate::recall::affects_confidence_for;
 use crate::recall::recall_ranked_with;
-use crate::{recall_scored_with, RecallPointer, RECALL_KINDS};
+use crate::{RecallPointer, RECALL_KINDS};
 
 /// Score of a memory whose text names the file's repo-relative path.
 pub const MENTION_PATH_SCORE: f64 = 0.9;
 /// Score of a memory naming only the file's name, when that name is unique
 /// in the repo (a bare `lib.rs` never counts: milestone 3a overcount).
 pub const MENTION_NAME_SCORE: f64 = 0.7;
-/// Longest file-as-query text: path, heading and a few symbol names.
-pub const FILE_CUE_TEXT_MAX: usize = 300;
 /// Longest cleaned error text sent to recall.
 pub const ERROR_CUE_TEXT_MAX: usize = 300;
 /// A gotcha matching an error counts this much more, up to a score of 1.0:
@@ -58,24 +52,17 @@ pub const ERROR_CUE_TEXT_MAX: usize = 300;
 pub const ERROR_GOTCHA_BOOST: f64 = 1.5;
 /// Candidates taken from each source before merging.
 const PER_SOURCE: usize = 20;
-/// Top-level symbol names a file-as-query includes.
-const FILE_CUE_SYMBOLS: usize = 6;
-/// Directory names too generic to say anything about a file.
-const GENERIC_DIRS: &[&str] = &["src", "lib", "crates", "apps", "app", "components", "packages", "tests", "test", "bin", "agentops-core", "docs"];
 /// Words that mark the important lines of an error (shared with
 /// `agentops_mcp::budget`'s JSON compressor).
 pub const ERROR_KEYWORDS: [&str; 5] = ["error", "fail", "exception", "panic", "fatal"];
 
-/// What a work cue is: a file the agent read or edited (repo-relative
-/// path, plus the first heading of its content when the hook saw it), or
-/// the text of a failed tool call.
+/// What a work cue is: a file the agent read or edited (its repo-relative
+/// path), or the text of a failed tool call.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum WorkCue {
     File {
         path: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        heading: Option<String>,
     },
     Error {
         text: String,
@@ -94,8 +81,6 @@ pub enum CueSources {
     NoAffects,
     /// Without source 2, path mentions.
     NoMentions,
-    /// Without source 3, the file itself as a query.
-    NoFileQuery,
 }
 
 /// A memory a cue reached, with the score activation sums (item 3).
@@ -220,26 +205,20 @@ fn single_word(text: &str) -> Option<String> {
 }
 
 /// Candidates for `cue`, best score first (then id). A skipped path has
-/// none; an error cue has none under `AffectsOnly`. `embedder` adds
-/// recall by meaning to the query-based sources; only the server passes
-/// one (ADR 0052).
+/// none; an error cue has none under `AffectsOnly`. `embedder` lets
+/// recall by meaning re-rank an error cue's keyword matches; only the
+/// server passes one (ADR 0052).
 pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: CueSources, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<WorkCandidate>> {
     let mut merged = Merged::default();
     match cue {
-        WorkCue::File { path, .. } if is_skipped(path) => {}
-        WorkCue::File { path, heading } => {
+        WorkCue::File { path } if is_skipped(path) => {}
+        WorkCue::File { path } => {
             let symbols: Vec<agentops_graph::Node> = store.nodes_in_file(repo, path)?.into_iter().filter(|n| n.kind == NodeKind::Symbol).collect();
             if sources != CueSources::NoAffects {
                 merged.extend(affects_candidates(store, repo, &symbols)?);
             }
-            if sources != CueSources::AffectsOnly {
-                if sources != CueSources::NoMentions {
-                    merged.extend(mention_candidates(store, repo, path)?);
-                }
-                if sources != CueSources::NoFileQuery {
-                    let query = file_query(path, heading.as_deref(), &symbols);
-                    merged.extend(recall_scored_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().map(|(pointer, score)| WorkCandidate { pointer, score }));
-                }
+            if !matches!(sources, CueSources::AffectsOnly | CueSources::NoMentions) {
+                merged.extend(mention_candidates(store, repo, path)?);
             }
         }
         WorkCue::Error { .. } if sources == CueSources::AffectsOnly => {}
@@ -369,50 +348,6 @@ fn mention_candidates(store: &dyn GraphStore, repo: &str, path: &str) -> Result<
     Ok(out)
 }
 
-/// The file as a query: its name, its parent directory unless that's
-/// generic, its first heading, and up to `FILE_CUE_SYMBOLS` top-level
-/// symbol names, cut to `FILE_CUE_TEXT_MAX` characters.
-pub fn file_query(path: &str, heading: Option<&str>, symbols: &[agentops_graph::Node]) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    let mut segments = path.rsplit('/');
-    if let Some(name) = segments.next() {
-        parts.push(name.to_string());
-    }
-    if let Some(dir) = segments.next().filter(|d| !GENERIC_DIRS.contains(d)) {
-        parts.push(dir.to_string());
-    }
-    if let Some(heading) = heading {
-        parts.push(heading.to_string());
-    }
-    parts.extend(symbols.iter().filter(|s| s.container.is_none()).filter_map(|s| s.name.clone()).take(FILE_CUE_SYMBOLS));
-    let text = parts.join(" ");
-    text.chars().take(FILE_CUE_TEXT_MAX).collect()
-}
-
-/// The first heading of a file's text: a Markdown `#` heading or a
-/// leading comment (`//!`, `//`, `#`, `--`, `/*`), with its markers
-/// stripped. Blank lines and a shebang are skipped; code before any comment
-/// means there's no heading.
-pub fn first_heading(text: &str) -> Option<String> {
-    for line in text.lines().take(20) {
-        // A Read result as the model sees it numbers its lines
-        // (`     1\t# Title`, `1→# Title`).
-        let line = line.trim_start();
-        let line = match line.find(|c: char| !c.is_ascii_digit()) {
-            Some(i) if i > 0 => line[i..].strip_prefix('\t').or_else(|| line[i..].strip_prefix('→')).unwrap_or(line),
-            _ => line,
-        };
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("#!") || line == "---" {
-            continue;
-        }
-        let stripped = ["//!", "///", "//", "#", "--", "/*", "*"].iter().find_map(|m| line.strip_prefix(m))?;
-        let heading = stripped.trim_start_matches('#').trim().trim_end_matches("*/").trim();
-        return (!heading.is_empty()).then(|| heading.chars().take(120).collect());
-    }
-    None
-}
-
 /// `line` without a leading `Exit code N` (Bash's first line, or the
 /// start of a flattened error).
 fn strip_exit_code(line: &str) -> &str {
@@ -475,7 +410,7 @@ mod tests {
         let gotcha = node(&store, NodeKind::Gotcha, "vault:g", "g");
         let symbol = node(&store, NodeKind::Symbol, "target/gen.rs", "f");
         store.add_edge("r", gotcha, symbol, EdgeRelation::Affects).unwrap();
-        assert!(resolve_cue(&store, "r", &WorkCue::File { path: "target/gen.rs".into(), heading: None }, CueSources::All, None).unwrap().is_empty());
+        assert!(resolve_cue(&store, "r", &WorkCue::File { path: "target/gen.rs".into() }, CueSources::All, None).unwrap().is_empty());
     }
 
     #[test]
@@ -503,12 +438,12 @@ mod tests {
     }
 
     #[test]
-    fn a_doc_with_no_affects_link_gets_candidates_from_the_file_as_a_query() {
+    fn a_doc_with_no_affects_link_gets_candidates_from_a_path_mention() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         file(&store, "docs/release.md");
-        let target = memory(&store, NodeKind::Gotcha, "Tagging a release needs the changelog bumped first", "Release tagging fails unless the changelog entry exists.");
+        let target = memory(&store, NodeKind::Gotcha, "Tagging a release needs the changelog bumped first", "Release tagging fails unless docs/release.md has the changelog entry.");
         memory(&store, NodeKind::Gotcha, "Unrelated", "Webhooks retry three times.");
-        let cue = WorkCue::File { path: "docs/release.md".into(), heading: Some("Release checklist: tagging and changelog".into()) };
+        let cue = WorkCue::File { path: "docs/release.md".into() };
         assert!(resolve_cue(&store, "r", &cue, CueSources::AffectsOnly, None).unwrap().is_empty(), "no Affects link");
         let found = resolve_cue(&store, "r", &cue, CueSources::All, None).unwrap();
         assert_eq!(ids(&found).first(), Some(&target), "{found:?}");
@@ -557,18 +492,15 @@ mod tests {
     fn each_ablation_switch_drops_exactly_its_source() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let path = "src/billing_ledger.rs";
-        // A plain-word symbol: an identifier-shaped one would let the file query
-        // reach the Affects memory too, by naming it.
         let symbol = node(&store, NodeKind::Symbol, path, "reconcile");
         let affects = memory(&store, NodeKind::Decision, "Entries are append-only", "Never update entries once written.");
         store.add_edge("r", affects, symbol, EdgeRelation::Affects).unwrap();
         let mention = memory(&store, NodeKind::Gotcha, "Rounding in one place", "src/billing_ledger.rs rounds once, at posting.");
-        let query = memory(&store, NodeKind::Note, "Ledger currency precision", "billing ledger amounts carry four decimals.");
-        let cue = WorkCue::File { path: path.into(), heading: Some("Currency precision".into()) };
+        let cue = WorkCue::File { path: path.into() };
         let reached = |sources| -> HashSet<i64> { resolve_cue(&store, "r", &cue, sources, None).unwrap().into_iter().map(|c| c.pointer.node_id).collect() };
         let all = reached(CueSources::All);
-        assert!([affects, mention, query].iter().all(|id| all.contains(id)), "each source reaches its memory: {all:?}");
-        for (sources, gone) in [(CueSources::NoAffects, vec![affects]), (CueSources::NoMentions, vec![mention]), (CueSources::NoFileQuery, vec![query])] {
+        assert!([affects, mention].iter().all(|id| all.contains(id)), "each source reaches its memory: {all:?}");
+        for (sources, gone) in [(CueSources::NoAffects, vec![affects]), (CueSources::NoMentions, vec![mention])] {
             let without = reached(sources);
             let expected: HashSet<i64> = all.iter().copied().filter(|id| !gone.contains(id)).collect();
             assert_eq!(without, expected, "{sources:?}");
@@ -586,32 +518,10 @@ mod tests {
         store.set_embedding("r", neighbour, &v).unwrap();
         store.add_edge("r", matched, neighbour, EdgeRelation::SimilarTo).unwrap();
         store.add_edge("r", neighbour, matched, EdgeRelation::SimilarTo).unwrap();
-        let prompt_time = recall_scored_with(&store, "r", "psql role postgres does not exist", 8, &HashSet::new(), None).unwrap();
+        let prompt_time = crate::recall_scored_with(&store, "r", "psql role postgres does not exist", 8, &HashSet::new(), None).unwrap();
         assert!(prompt_time.iter().any(|(p, _)| p.node_id == neighbour), "prompt recall still hops: {prompt_time:?}");
         let found = resolve_cue(&store, "r", &WorkCue::Error { text: "psql: error: FATAL: role \"postgres\" does not exist".into() }, CueSources::All, None).unwrap();
         assert_eq!(found.iter().map(|c| c.pointer.node_id).collect::<Vec<_>>(), [matched], "a hop neighbour never rides in on an error: {found:?}");
-    }
-
-    #[test]
-    fn the_first_heading_is_a_markdown_heading_or_a_leading_comment() {
-        assert_eq!(first_heading("\n# Release checklist\n\nbody").as_deref(), Some("Release checklist"));
-        assert_eq!(first_heading("#!/bin/sh\n# Installs the CLI\nset -e").as_deref(), Some("Installs the CLI"));
-        assert_eq!(first_heading("//! Cue resolution for recall\nuse x;").as_deref(), Some("Cue resolution for recall"));
-        assert_eq!(first_heading("fn main() {}\n// later").as_deref(), None);
-        assert_eq!(first_heading("     1\t# Release checklist\n     2\tbody").as_deref(), Some("Release checklist"));
-        assert_eq!(first_heading("1→//! Hooks\n2→use x;").as_deref(), Some("Hooks"));
-    }
-
-    #[test]
-    fn the_file_query_names_the_file_its_directory_heading_and_symbols() {
-        let store = SqliteGraphStore::open_in_memory().unwrap();
-        let path = "agentops-core/crates/agentops-mcp/src/hooks.rs";
-        node(&store, NodeKind::Symbol, path, "handle");
-        upsert_node(&store, NewNode { kind: NodeKind::Symbol, repo: "r".into(), path: Some(path.into()), name: Some("inner".into()), container: Some("Outer".into()), start_line: None, end_line: None, content: None }).unwrap();
-        let q = file_query(path, Some("Hook handlers"), &store.nodes_in_file("r", path).unwrap());
-        assert_eq!(q, "hooks.rs Hook handlers handle");
-        assert_eq!(file_query("deploy/compose/docker-compose.yml", None, &[]), "docker-compose.yml compose");
-        assert!(file_query(&"x".repeat(400), None, &[]).chars().count() <= FILE_CUE_TEXT_MAX);
     }
 
     #[test]
@@ -647,7 +557,7 @@ mod tests {
         store.add_edge("r", both, g, EdgeRelation::Affects).unwrap();
         store.add_edge("r", one, g, EdgeRelation::Affects).unwrap();
         store.add_edge("r", other, elsewhere, EdgeRelation::Affects).unwrap();
-        let got = resolve_cue(&store, "r", &WorkCue::File { path: "src/a.rs".into(), heading: None }, CueSources::AffectsOnly, None).unwrap();
+        let got = resolve_cue(&store, "r", &WorkCue::File { path: "src/a.rs".into() }, CueSources::AffectsOnly, None).unwrap();
         assert_eq!(got.iter().map(|c| c.pointer.node_id).collect::<Vec<_>>(), vec![both, one]);
         assert_eq!(got[0].pointer.reason, "affects `f`, `g`");
     }

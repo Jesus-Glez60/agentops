@@ -29,7 +29,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use agentops_mcp::work_recall::{ReplayInjection, ReplayStep};
-use agentops_retrieval::work_recall::first_heading;
 
 use crate::recall_eval::{percentile, remote_send, remote_send_within, unix_secs, Backend, DEEP_LIMIT};
 use crate::remote_marker::read_remote_marker;
@@ -162,7 +161,7 @@ pub(crate) fn cue_of(call: &ToolCall, root: &Path) -> Option<WorkCue> {
     // The hook's own path logic; a transcript keeps no per-call cwd, so a
     // relative path is taken from the repo root.
     let path = crate::hook_capture::touched_rel_path(&json!({ "tool_input": call.input }), root, root)?;
-    (!is_skipped(&path)).then_some(WorkCue::File { path, heading: None })
+    (!is_skipped(&path)).then_some(WorkCue::File { path })
 }
 
 // ---------------------------------------------------------------------
@@ -312,20 +311,6 @@ fn cue_text(cue: &WorkCue) -> &str {
     }
 }
 
-/// Each file case's first heading, read from the working tree the way the
-/// hook takes it from a `Read`'s result.
-fn with_headings(root: &Path, cases: Vec<Case>) -> Vec<Case> {
-    cases
-        .into_iter()
-        .map(|mut case| {
-            if let WorkCue::File { path, heading: heading @ None } = &mut case.cue {
-                *heading = std::fs::read_to_string(root.join(&*path)).ok().and_then(|text| agentops_retrieval::work_recall::first_heading(&text));
-            }
-            case
-        })
-        .collect()
-}
-
 fn read_cases(file: &Path) -> Result<Vec<Case>> {
     let text = std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
     let cases: Vec<Case> = text.lines().filter(|l| !l.trim().is_empty()).enumerate().map(|(i, l)| serde_json::from_str(l).with_context(|| format!("{} line {}", file.display(), i + 1))).collect::<Result<_>>()?;
@@ -418,8 +403,8 @@ const REPLAY_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// One transcript as replay steps, in order: user prompts (main session
 /// only), compactions, and a cue per tool call when its result arrives,
-/// which is when `PostToolUse` fires. A read's heading comes from its
-/// result; an error is redacted, as the hook redacts it.
+/// which is when `PostToolUse` fires. An error is redacted, as the hook
+/// redacts it.
 pub(crate) fn read_steps(path: &Path, root: &Path, agent_id: Option<&str>) -> Result<Vec<ReplayStep>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut calls: HashMap<String, (String, Value)> = HashMap::new();
@@ -456,7 +441,7 @@ pub(crate) fn read_steps(path: &Path, root: &Path, agent_id: Option<&str>) -> Re
                     }
                     let call = ToolCall { tool: tool.clone(), input: input.clone(), failed: block.get("is_error").and_then(Value::as_bool).unwrap_or(false), result: result_text(block.get("content").unwrap_or(&Value::Null)) };
                     let cue = match cue_of(&call, root) {
-                        Some(WorkCue::File { path, .. }) => WorkCue::File { path, heading: matches!(call.tool.as_str(), "Read" | "NotebookRead" | "Bash").then(|| first_heading(&call.result)).flatten() },
+                        Some(cue @ WorkCue::File { .. }) => cue,
                         Some(WorkCue::Error { text }) => WorkCue::Error { text: agentops_security::redact(&text).text },
                         None => continue,
                     };
@@ -646,7 +631,7 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
         return sizing(path, &root);
     }
     let sources: CueSources = match options.sources {
-        Some(s) => serde_json::from_value(json!(s)).with_context(|| format!("--sources {s}: expected all, no_affects, no_mentions or no_file_query"))?,
+        Some(s) => serde_json::from_value(json!(s)).with_context(|| format!("--sources {s}: expected all, no_affects or no_mentions"))?,
         None => CueSources::All,
     };
     if !options.replay.is_empty() {
@@ -659,7 +644,6 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
     } else {
         Backend::Local { store: agentops_mcp::open_store(path)?, repo: agentops_mcp::repo_name(path) }
     };
-    let cases = with_headings(&root, cases);
     validate(&backend, &cases)?;
     let (results, summary) = evaluate(&backend, &cases, options.baseline, options.repeat.max(1), sources)?;
     let label = match options.baseline {
@@ -723,7 +707,7 @@ mod tests {
     #[test]
     fn cues_follow_what_the_hook_will_see() {
         let root = Path::new("/r");
-        let file = |p: &str| Some(WorkCue::File { path: p.into(), heading: None });
+        let file = |p: &str| Some(WorkCue::File { path: p.into() });
         assert_eq!(cue_of(&call("Read", json!({"file_path": "/r/src/a.rs"}), false, ""), root), file("src/a.rs"));
         assert_eq!(cue_of(&call("Edit", json!({"file_path": "/r/docs/b.md"}), false, ""), root), file("docs/b.md"));
         assert_eq!(cue_of(&call("Bash", json!({"command": "sed -n 1,9p /r/c.toml"}), false, ""), root), file("c.toml"));
@@ -758,10 +742,10 @@ mod tests {
         let shape: Vec<String> = steps.iter().map(|s| match s {
             ReplayStep::Prompt { prompt, plan } => format!("prompt:{prompt}:{plan}"),
             ReplayStep::Compact => "compact".into(),
-            ReplayStep::Cue { cue: WorkCue::File { path, heading }, .. } => format!("file:{path}:{}", heading.clone().unwrap_or_default()),
+            ReplayStep::Cue { cue: WorkCue::File { path }, .. } => format!("file:{path}"),
             ReplayStep::Cue { cue: WorkCue::Error { text }, .. } => format!("error:{}", text.lines().count()),
         }).collect();
-        assert_eq!(shape, ["prompt:tag the release:true", "file:docs/release.md:Release checklist", "compact", "error:2"]);
+        assert_eq!(shape, ["prompt:tag the release:true", "file:docs/release.md", "compact", "error:2"]);
         let sub = read_steps(&path, root, Some("agent-a")).unwrap();
         assert!(sub.iter().all(|s| matches!(s, ReplayStep::Cue { agent_id: Some(_), .. })), "a subagent has no prompts or compactions of its own");
     }

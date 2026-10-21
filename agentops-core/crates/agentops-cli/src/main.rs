@@ -241,7 +241,7 @@ enum Command {
         #[arg(long)]
         min_score: Option<f64>,
         /// Run with one file-cue source off, for the ablation: all,
-        /// no_affects, no_mentions or no_file_query (cases and replay).
+        /// no_affects or no_mentions (cases and replay).
         #[arg(long)]
         sources: Option<String>,
         /// With --replay: also write a labelling sample of about N pointers

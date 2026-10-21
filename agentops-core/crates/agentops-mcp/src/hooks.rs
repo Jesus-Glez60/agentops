@@ -137,13 +137,11 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: 
         store.record_session_event_in(repo, session_id, &payload.tool_name, description, None, event_kind, agent_id(raw))?;
     }
 
-    // A file read or edited inside the repo is a work cue (milestone 3b).
-    // Its first heading comes from a read's result; the content itself is
-    // never stored.
+    // A file read or edited inside the repo is a work cue (milestone 3b),
+    // by its path; the content is never read for it or stored.
     let mut injected = None;
     if let (Some((FILE_READ | "file_modified", _)), Some(path)) = (&recorded, rel_path(raw)) {
-        let heading = matches!(payload.tool_name.as_str(), "Read" | "NotebookRead" | "Bash").then(|| agentops_retrieval::work_recall::first_heading(&read_text(&payload.tool_response))).flatten();
-        injected = work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::File { path: path.to_string(), heading }, embedder)?;
+        injected = work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::File { path: path.to_string() }, embedder)?;
     }
     let output = injected.map(|context| hook_output("PostToolUse", Some(&context), None));
 
@@ -336,15 +334,6 @@ fn render_tool_response(value: &Value) -> String {
 fn work_cue(store: &dyn GraphStore, repo: &str, payload: &Value, cue: &agentops_retrieval::work_recall::WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<String>> {
     let mut log = crate::work_recall::StoreLog { store, repo, session_id: session_id(payload) };
     Ok(crate::work_recall::on_cue(store, repo, &mut log, agent_id(payload), cue, embedder, work_recall_settings(payload))?.map(|i| i.context))
-}
-
-/// The text a read returned, for its first heading. `PostToolUse` passes
-/// the tool's structured output (hooks reference): for `Read` the file's
-/// content sits under `file.content` (**unverified** against a recorded
-/// payload), for Bash under `stdout`; anything else goes through
-/// `render_tool_response`.
-fn read_text(response: &Value) -> String {
-    response.pointer("/file/content").or_else(|| response.get("stdout")).and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| render_tool_response(response))
 }
 
 /// Claude Code's docs (as fetched) confirm `tool_name`/`tool_input` but
@@ -822,7 +811,7 @@ mod tests {
     fn reads_errors_and_prompts_record_work_cues_per_context_and_compaction_resets_the_main_one() {
         use crate::work_recall::{context_events, parse_cue, CONTEXT_RESET, WORK_CUE};
         let (_dir, store, repo) = store();
-        let release = gotcha(store.as_ref(), &repo, "Release tagging needs the changelog bumped first", "Tagging a release fails unless the changelog entry exists.");
+        let release = gotcha(store.as_ref(), &repo, "Release tagging needs the changelog bumped first", "Tagging a release fails unless docs/release.md has the changelog entry.");
         let psql = gotcha(store.as_ref(), &repo, "psql role postgres missing on CI", "psql fails: role postgres does not exist on the CI database.");
         let read = json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/docs/release.md"}, "tool_response": {"type": "text", "text": "# Release checklist: tagging and changelog\n..."}, "session_id": "s", REL_PATH_FIELD: "docs/release.md" });
         handle(store.as_ref(), &repo, "posttooluse", &read).unwrap();
@@ -831,7 +820,7 @@ mod tests {
         let events = store.session_events(&repo, "s").unwrap();
         let main_cues: Vec<Vec<(i64, f64)>> = context_events(&events, None).iter().filter(|e| e.event_kind == WORK_CUE).map(|e| parse_cue(&e.description)).collect();
         assert_eq!(main_cues.len(), 1, "the read is a cue; the interrupted call isn't: {events:?}");
-        assert_eq!(main_cues[0][0].0, release, "the heading from the read's result reaches the doc's gotcha");
+        assert_eq!(main_cues[0][0].0, release, "the read's path reaches the doc's gotcha");
         let sub_cues: Vec<&agentops_graph::SessionEvent> = context_events(&events, Some("agent-a")).into_iter().filter(|e| e.event_kind == WORK_CUE).collect();
         assert_eq!(parse_cue(&sub_cues[0].description)[0].0, psql, "the subagent's error cue is the subagent's");
         assert!(events.iter().all(|e| !e.description.contains("tagging and changelog\n")), "no content stored");
@@ -851,7 +840,7 @@ mod tests {
     #[test]
     fn with_the_off_switch_nothing_is_injected_and_reads_are_still_recorded() {
         let (_dir, store, repo) = store();
-        gotcha(store.as_ref(), &repo, "Release tagging needs the changelog bumped first", "Tagging a release fails unless the changelog entry exists.");
+        gotcha(store.as_ref(), &repo, "Release tagging needs the changelog bumped first", "Tagging a release fails unless docs/release.md has the changelog entry.");
         let read = |session: &str, off: bool| {
             let mut payload = json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/docs/release.md"}, "tool_response": {"type": "text", "file": {"content": "# Release tagging changelog checklist"}}, "session_id": session, REL_PATH_FIELD: "docs/release.md" });
             if off {
