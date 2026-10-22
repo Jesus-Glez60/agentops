@@ -395,7 +395,7 @@ mod tests {
         assert!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().is_some());
         // A new memory naming the file arrives; a re-read or an edit of the
         // same file still shows nothing, and is recorded for activation.
-        let later = gotcha(&store, "r", "Release changelog needs a date", "docs/release.md: the changelog entry needs a release date.");
+        gotcha(&store, "r", "Release changelog needs a date", "docs/release.md: the changelog entry needs a release date.");
         let edit = WorkCue::File { path: "docs/release.md".into() };
         assert_eq!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap(), None, "a re-read never injects");
         assert_eq!(on_cue(&store, "r", &mut log, None, &edit, None, LOW).unwrap(), None, "nor does a later edit");
@@ -403,7 +403,7 @@ mod tests {
 
         log.record("SessionStart", "compact", CONTEXT_RESET, None).unwrap();
         let after = on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().expect("the first cue after compaction injects");
-        assert!(after.shown.iter().any(|(p, _)| p.node_id == later), "{after:?}");
+        assert_eq!(after.shown.len(), WORK_RECALL_MAX_ITEMS, "only the cue's best match: {after:?}");
     }
 
     #[test]

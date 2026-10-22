@@ -20,8 +20,9 @@ pub const PLAN_SEED_MAX_ITEMS: usize = 8;
 /// New recall pointers on an ordinary (non-plan) prompt.
 pub const DEFAULT_SEED_MAX_ITEMS: usize = 5;
 /// Most recall pointers one work cue (a file read or edited, an error)
-/// injects (milestone 3b): a glance, not a briefing.
-pub const WORK_RECALL_MAX_ITEMS: usize = 3;
+/// injects (milestone 3b): its best match only. The author's volume ceiling
+/// (revision 2), chosen over 3 knowing it loses cases ranked 2nd or 3rd.
+pub const WORK_RECALL_MAX_ITEMS: usize = 1;
 /// Everything one work cue may inject: about 3 pointers, small enough to
 /// add to many tool results.
 pub const WORK_RECALL_BUDGET: usize = 800;
