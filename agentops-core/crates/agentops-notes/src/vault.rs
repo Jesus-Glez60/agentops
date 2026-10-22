@@ -95,26 +95,32 @@ pub fn heuristic_score(body: &str) -> (NoteType, bool) {
     }
 }
 
-/// Title words that announce a status ("X shipped", "Y implemented")
+/// Title phrases that record progress ("X shipped", "Y implemented", a
+/// milestone "finished" or "piloted", "requirements for" a next feature)
 /// rather than a cause, rule or warning. Titles only, never bodies: bodies
 /// use these words in passing (the same reason `import_memory`'s stale
-/// check reads only one-line summaries).
-const STATUS_WORDS: &[&str] = &["shipped", "implemented", "complete", "completed", "made public", "live verified", "fully wired", "rebuilt"];
+/// check reads only one-line summaries). Single words like "session",
+/// "plan" or "milestone" were tried against all 390 memory titles and
+/// rejected: they caught real decisions (2026-10-22).
+const PROGRESS_WORDS: &[&str] = &["shipped", "implemented", "complete", "completed", "made public", "live verified", "fully wired", "rebuilt", "finished", "piloted", "requirements for"];
 
 /// A memory's class from its kind and title alone (ADR 0054):
-/// `(Status, true)` when a decision's or note's title announces a status
-/// in whole words, else `(Durable, false)`, meaning unsure, for an
-/// LLM-assisted classifier to settle. A gotcha is never classed status by
-/// words: it's a warning even when its title says what shipped ("... --
-/// hook_capture.rs shipped assuming the latter"), and hiding one costs
-/// more than showing a stale note. Whole words, so "incomplete" and
-/// "Completeness" don't count (the backfill's first dry run, 2026-10-22).
-/// Only status is ever read from words; experimental and temporal need a
-/// judgment or an explicit `add_note` argument.
+/// `(Progress, true)` when a decision's or note's title records progress
+/// in whole words, or starts a session summary ("Session 5 ..."), else
+/// `(Durable, false)`, meaning unsure, for an LLM-assisted classifier to
+/// settle. A gotcha is never classed progress by words: it's a warning
+/// even when its title says what shipped ("... -- hook_capture.rs shipped
+/// assuming the latter"), and hiding one costs more than showing a stale
+/// note. Whole words, so "incomplete" and "Completeness" don't count (the
+/// backfill's first dry run, 2026-10-22). Only progress is ever read from
+/// words; experimental and temporal need a judgment or an explicit
+/// `add_note` argument.
 pub fn heuristic_class(kind: NodeKind, title: &str) -> (agentops_graph::MemoryClass, bool) {
-    let words = format!(" {} ", title.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "));
-    if kind != NodeKind::Gotcha && STATUS_WORDS.iter().any(|w| words.contains(&format!(" {w} "))) {
-        (agentops_graph::MemoryClass::Status, true)
+    let tokens: Vec<String> = title.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_string).collect();
+    let words = format!(" {} ", tokens.join(" "));
+    let session_summary = tokens.windows(2).any(|w| w[0] == "session" && w[1].chars().all(|c| c.is_ascii_digit()));
+    if kind != NodeKind::Gotcha && (session_summary || PROGRESS_WORDS.iter().any(|w| words.contains(&format!(" {w} ")))) {
+        (agentops_graph::MemoryClass::Progress, true)
     } else {
         (agentops_graph::MemoryClass::Durable, false)
     }
@@ -453,12 +459,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_a_status_title_is_classed_status_by_words() {
+    fn only_a_progress_title_is_classed_progress_by_words() {
         use agentops_graph::MemoryClass;
-        for title in ["Documentation Viewer: shipped end-to-end, 2026-08-13", "agentops-cli implemented 2026-08-10", "Phase 2/3 live-verified against this repo"] {
-            assert_eq!(heuristic_class(NodeKind::Note, title), (MemoryClass::Status, true), "{title}");
+        for title in ["Documentation Viewer: shipped end-to-end, 2026-08-13", "agentops-cli implemented 2026-08-10", "Phase 2/3 live-verified against this repo", "Session 5 full design-parity redesign", "Milestone 3a finished at 15/20", "Confirmed requirements for the next feature"] {
+            assert_eq!(heuristic_class(NodeKind::Note, title), (MemoryClass::Progress, true), "{title}");
         }
-        for title in ["SQLite UPDATE silently no-ops when row doesn't exist", "ink color ramp was incomplete", "the real cost driver is Completeness-checker's tool calls"] {
+        for title in ["SQLite UPDATE silently no-ops when row doesn't exist", "ink color ramp was incomplete", "the real cost driver is Completeness-checker's tool calls", "Module 6 session correlation is protocol-native via session_id", "audit-plan council design: one chair"] {
             assert_eq!(heuristic_class(NodeKind::Note, title), (MemoryClass::Durable, false), "{title}");
         }
         assert_eq!(heuristic_class(NodeKind::Gotcha, "tool_response is an object, not a string -- hook_capture.rs shipped assuming the latter"), (MemoryClass::Durable, false), "a gotcha stays a warning");

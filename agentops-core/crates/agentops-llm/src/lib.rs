@@ -731,18 +731,25 @@ impl agentops_notes::NoteClassifier for LlmAssistedClassifier<'_> {
     }
 }
 
+/// How much of a memory's body the class judge reads: its opening says
+/// what kind of memory it is, and a short prompt keeps a free-tier
+/// provider's tokens-per-minute budget (Groq: 12k) good for many calls.
+const CLASSIFY_BODY_MAX: usize = 1_500;
+
 /// A memory's class (ADR 0054), and for a temporal one the date it ends
-/// when the text names one. The title heuristic settles a status title
-/// with no call; anything else costs one bounded Anthropic call, since
-/// experimental and temporal need a judgment words can't make.
-pub fn classify_memory_class(config: &AnthropicConfig, kind: agentops_graph::NodeKind, title: &str, body: &str) -> Result<(agentops_graph::MemoryClass, Option<String>)> {
+/// when the text names one. The title heuristic settles a progress title
+/// with no call; anything else costs one bounded call to `config`'s
+/// provider, since experimental, temporal and progress worded without the
+/// heuristic's phrases need a judgment words can't make.
+pub fn classify_memory_class(config: &LlmConfig, kind: agentops_graph::NodeKind, title: &str, body: &str) -> Result<(agentops_graph::MemoryClass, Option<String>)> {
     if let (class, true) = agentops_notes::heuristic_class(kind, title) {
         return Ok((class, None));
     }
+    let body: String = body.chars().take(CLASSIFY_BODY_MAX).collect();
     let prompt = format!(
         "Classify this project memory by what kind of truth it holds, as exactly one of:\n\
          - durable: a cause, rule, warning or reason that stays true until the code changes.\n\
-         - status: only announces that something shipped, was built or was completed, with no rule or warning an agent needs.\n\
+         - progress: records where the work stands (something shipped, was built or completed; a session, phase or milestone summary; a plan, roadmap or requirements for upcoming work), with no rule or warning an agent needs when changing code.\n\
          - experimental: a trial or provisional choice that may be reverted.\n\
          - temporal: true only for a period (a workaround until a fix, a freeze until a date).\n\n\
          Title: {title}\n\n{body}\n\n\
@@ -765,6 +772,25 @@ fn parse_memory_class(reply: &str) -> (agentops_graph::MemoryClass, Option<Strin
         .flatten()
         .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-');
     (class, until)
+}
+
+/// Groq's OpenAI-compatible chat endpoint.
+pub const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
+/// Groq's default model for the class judge: the strongest one its free
+/// tier offers (30 requests and 12k tokens a minute).
+pub const GROQ_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
+
+/// An `LlmConfig` for Groq with `api_key`, on `model` or
+/// `GROQ_DEFAULT_MODEL`. A short `max_tokens`: its callers want one word.
+pub fn groq_config(api_key: &str, model: Option<String>) -> LlmConfig {
+    LlmConfig {
+        api_key: api_key.to_string(),
+        model: model.unwrap_or_else(|| GROQ_DEFAULT_MODEL.to_string()),
+        max_tokens: 32,
+        api_url: GROQ_API_URL.to_string(),
+        provider: Provider::OpenAiCompatible { name: "groq".into(), json_mode: JsonMode::JsonSchemaStrict },
+        usage_sink: None,
+    }
 }
 
 /// Three audience-tuned work summaries for one task's activity — Phase 6b
@@ -1283,7 +1309,7 @@ mod tests {
     #[test]
     fn a_memory_class_reply_is_read_strictly_and_defaults_to_durable() {
         use agentops_graph::MemoryClass;
-        assert_eq!(parse_memory_class("status"), (MemoryClass::Status, None));
+        assert_eq!(parse_memory_class("progress"), (MemoryClass::Progress, None));
         assert_eq!(parse_memory_class(" Experimental.\n"), (MemoryClass::Experimental, None));
         assert_eq!(parse_memory_class("temporal 2026-12-01"), (MemoryClass::Temporal, Some("2026-12-01".into())));
         assert_eq!(parse_memory_class("temporal"), (MemoryClass::Temporal, None));

@@ -874,9 +874,9 @@ const CLASSIFY_PAGE_MAX: usize = 50;
 
 /// `POST /repos/{id}/memories/classify` -- proposes a class for a page of
 /// the repo's gotchas, decisions and notes (ADR 0054), writing nothing.
-/// A status title is settled by its words; the rest by one LLM call each
-/// when the tenant has an Anthropic credential, else they stay durable and
-/// `judge` says so. `agentops classify-memories` pages through it, shows
+/// A progress title is settled by its words; the rest by one LLM call each
+/// when the tenant has an Anthropic or Groq credential
+/// (`resolve_judge_config`), else they stay durable and `judge` says so. `agentops classify-memories` pages through it, shows
 /// the author the proposals, and only then assigns them.
 pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<ClassifyMemoriesBody>) -> (StatusCode, Json<Value>) {
     let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
@@ -885,7 +885,7 @@ pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: 
     };
     let llm = {
         let credentials = state.credentials.lock().unwrap();
-        crate::resolve_anthropic_config(&credentials, state.secrets.as_ref(), &tenant).ok()
+        crate::resolve_judge_config(&credentials, state.secrets.as_ref(), &tenant)
     };
     let limit = body.limit.unwrap_or(CLASSIFY_PAGE_MAX).min(CLASSIFY_PAGE_MAX);
 
@@ -911,7 +911,8 @@ pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: 
             };
             proposals.push(json!({ "node_id": node.id, "kind": node.kind.as_db_str(), "title": title, "current": node.memory_class.as_db_str(), "memory_class": class.as_db_str(), "class_until": until }));
         }
-        Ok(Some(json!({ "total": total, "offset": body.offset, "judge": if llm.is_some() { "llm" } else { "heuristic" }, "proposals": proposals })))
+        let judge = llm.as_ref().map(|c| c.provider.name().to_string()).unwrap_or_else(|| "heuristic".to_string());
+        Ok(Some(json!({ "total": total, "offset": body.offset, "judge": judge, "proposals": proposals })))
     })
     .await;
 
@@ -1643,20 +1644,20 @@ mod tests {
         let reply = body_json(resp).await;
         assert_eq!((reply["total"].clone(), reply["judge"].clone()), (json!(2), json!("heuristic")), "{reply}");
         let proposed = |id: i64| reply["proposals"].as_array().unwrap().iter().find(|p| p["node_id"] == json!(id)).unwrap()["memory_class"].clone();
-        assert_eq!((proposed(shipped), proposed(rule)), (json!("status"), json!("durable")));
+        assert_eq!((proposed(shipped), proposed(rule)), (json!("progress"), json!("durable")));
         assert_eq!(class_of(shipped), agentops_graph::MemoryClass::Durable, "classify writes nothing");
 
-        for bad in [json!([{ "node_id": shipped, "memory_class": "obsolete" }]), json!([{ "node_id": shipped, "memory_class": "status", "class_until": "2026-12-01" }]), json!([{ "node_id": shipped, "memory_class": "status" }, { "node_id": symbol, "memory_class": "status" }])] {
+        for bad in [json!([{ "node_id": shipped, "memory_class": "obsolete" }]), json!([{ "node_id": shipped, "memory_class": "progress", "class_until": "2026-12-01" }]), json!([{ "node_id": shipped, "memory_class": "progress" }, { "node_id": symbol, "memory_class": "progress" }])] {
             let resp = app.clone().oneshot(send(&owner_token, "class", json!({ "assign": bad }))).await.unwrap();
             assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
         }
         assert_eq!(class_of(shipped), agentops_graph::MemoryClass::Durable, "a refused batch writes nothing");
 
-        let resp = app.clone().oneshot(send(&owner_token, "class", json!({ "assign": [{ "node_id": shipped, "memory_class": "status" }] }))).await.unwrap();
+        let resp = app.clone().oneshot(send(&owner_token, "class", json!({ "assign": [{ "node_id": shipped, "memory_class": "progress" }] }))).await.unwrap();
         assert_eq!(body_json(resp).await["assigned"], json!(1));
-        assert_eq!(class_of(shipped), agentops_graph::MemoryClass::Status);
+        assert_eq!(class_of(shipped), agentops_graph::MemoryClass::Progress);
 
-        let resp = app.oneshot(send(&other_token, "class", json!({ "assign": [{ "node_id": rule, "memory_class": "status" }] }))).await.unwrap();
+        let resp = app.oneshot(send(&other_token, "class", json!({ "assign": [{ "node_id": rule, "memory_class": "progress" }] }))).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
     }
 

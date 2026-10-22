@@ -46,7 +46,11 @@ struct Page {
     proposals: Vec<Proposal>,
 }
 
-pub(crate) fn run(path: &Path, apply: bool) -> Result<()> {
+/// `per_minute`: judge at most this many memories a minute, for a
+/// free-tier provider's rate limit (Groq: 30 requests a minute); each page
+/// is that size, with a minute between pages. `None` pages at the
+/// server's maximum with no pause.
+pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>) -> Result<()> {
     let marker = read_remote_marker(path).with_context(|| format!("classify-memories runs against the server; {} has no .context/agentops-remote.json", path.display()))?;
     let dir = path.join(".context");
     let saved = dir.join("classify-memories.json");
@@ -67,7 +71,10 @@ pub(crate) fn run(path: &Path, apply: bool) -> Result<()> {
     let mut proposals = Vec::new();
     let mut judge;
     loop {
-        let page: Page = serde_json::from_value(remote_send_within(&marker, "memories/classify", Some(&json!({ "offset": proposals.len() })), PAGE_TIMEOUT)?)?;
+        if per_minute.is_some() && !proposals.is_empty() {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+        let page: Page = serde_json::from_value(remote_send_within(&marker, "memories/classify", Some(&json!({ "offset": proposals.len(), "limit": per_minute })), PAGE_TIMEOUT)?)?;
         judge = page.judge;
         let got = page.proposals.len();
         proposals.extend(page.proposals);

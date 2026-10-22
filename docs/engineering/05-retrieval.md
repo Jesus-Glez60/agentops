@@ -193,7 +193,7 @@ So a doc or config file with no `Affects` link now reaches memories only through
 
 **An error needs a keyword match** (milestone 3b revision 1). An error cue keeps only memories that a keyword or an exactly named symbol reached (`recall_ranked_with`'s `lexical`). Recall by meaning and the `SimilarTo` hop can re-rank those but never add one on their own. Without this, a self-explanatory git error injected three unrelated memories by meaning at cosine 0.76–0.77 (gotcha 235643). Prompt-time recall is unchanged.
 
-**Memory classes** (milestone 3b revision 2, ADR 0054). A `status` memory reaches a file cue only through an `Affects` link, never through a mention, an error or a prompt. A `temporal` one drops out on its `class_until` date. An `experimental` one is recalled and labelled. The check sits where each memory enters: `recall_ranked_with` for prompts, subagent seeds and errors, and `work_recall`'s `recallable` for files.
+**Memory classes** (milestone 3b revision 2, ADR 0054). A `progress` memory (shipped, a summary, a plan) never reaches recall, from any cue. A `temporal` one drops out on its `class_until` date. An `experimental` one is recalled and labelled. The check sits where each memory enters: `recall_ranked_with` for prompts, subagent seeds and errors, and `work_recall`'s `recallable` for files.
 
 **What is never a cue.** Paths on `WORK_CUE_SKIP` (`.git/`, `.context/`, `target/`, `node_modules/`, `.next/`, lockfiles).
 

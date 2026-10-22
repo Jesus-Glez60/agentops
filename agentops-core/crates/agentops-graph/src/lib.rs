@@ -174,9 +174,10 @@ pub fn prominence_label(prominence: NodeProminence) -> Option<&'static str> {
 /// What kind of truth a memory holds, which decides where recall may show
 /// it (milestone 3b revision 2, ADR 0054). Orthogonal to prominence:
 /// prominence is a person's curation, the class is what the memory is.
-/// `Status` ("X shipped") goes stale as later builds land and was most of
-/// work-time recall's noise, so it's recalled only from a file it's
-/// `Affects`-linked to. `Temporal` holds until `class_until`. Every class
+/// `Progress` records where the work stands ("X shipped", a session or
+/// milestone summary, a plan, requirements); it goes stale as later builds
+/// land and was most of work-time recall's noise, so recall never shows
+/// it. `Temporal` holds until `class_until`. Every class
 /// stays in search and `list_gotchas`; none is a resolved or hidden state
 /// (decision 54003). Stored as free TEXT like `NodeProminence`, so an
 /// unknown value reads as `Durable`.
@@ -184,7 +185,7 @@ pub fn prominence_label(prominence: NodeProminence) -> Option<&'static str> {
 pub enum MemoryClass {
     #[default]
     Durable,
-    Status,
+    Progress,
     Experimental,
     Temporal,
 }
@@ -193,7 +194,7 @@ impl MemoryClass {
     pub fn as_db_str(&self) -> &'static str {
         match self {
             MemoryClass::Durable => "durable",
-            MemoryClass::Status => "status",
+            MemoryClass::Progress => "progress",
             MemoryClass::Experimental => "experimental",
             MemoryClass::Temporal => "temporal",
         }
@@ -201,7 +202,8 @@ impl MemoryClass {
 
     pub fn from_db_str(s: &str) -> Self {
         match s {
-            "status" => MemoryClass::Status,
+            // "status" is the name revision 2 first shipped with.
+            "progress" | "status" => MemoryClass::Progress,
             "experimental" => MemoryClass::Experimental,
             "temporal" => MemoryClass::Temporal,
             _ => MemoryClass::Durable,
@@ -211,12 +213,13 @@ impl MemoryClass {
     /// Whether recall may show a memory of this class. `today` and `until`
     /// are UTC `YYYY-MM-DD`; a temporal memory is shown while
     /// `today < until`, so one superseded today (`until = today`) is gone
-    /// at once. `via_affects_file` is true only when the memory was reached
-    /// through an `Affects` link from the file being worked on.
-    pub fn recallable_at(&self, today: &str, until: Option<&str>, via_affects_file: bool) -> bool {
+    /// at once. A progress memory never is, from any cue: the labels
+    /// scored even the ones `Affects`-linked to the opened file 2 and 4
+    /// out of 10 (2026-10-22).
+    pub fn recallable_at(&self, today: &str, until: Option<&str>) -> bool {
         match self {
             MemoryClass::Durable | MemoryClass::Experimental => true,
-            MemoryClass::Status => via_affects_file,
+            MemoryClass::Progress => false,
             MemoryClass::Temporal => until.is_none_or(|u| today < u),
         }
     }
@@ -225,7 +228,7 @@ impl MemoryClass {
     pub fn label(&self) -> Option<&'static str> {
         match self {
             MemoryClass::Experimental => Some("experimental"),
-            MemoryClass::Durable | MemoryClass::Status | MemoryClass::Temporal => None,
+            MemoryClass::Durable | MemoryClass::Progress | MemoryClass::Temporal => None,
         }
     }
 }
@@ -1539,19 +1542,19 @@ mod tests {
 
     #[test]
     fn each_memory_class_follows_its_recall_rule() {
-        for class in [MemoryClass::Durable, MemoryClass::Status, MemoryClass::Experimental, MemoryClass::Temporal] {
+        for class in [MemoryClass::Durable, MemoryClass::Progress, MemoryClass::Experimental, MemoryClass::Temporal] {
             assert_eq!(MemoryClass::from_db_str(class.as_db_str()), class);
         }
+        assert_eq!(MemoryClass::from_db_str("status"), MemoryClass::Progress, "the first name still reads");
         assert_eq!(MemoryClass::from_db_str("whatever"), MemoryClass::Durable);
         let today = "2026-10-21";
-        assert!(MemoryClass::Durable.recallable_at(today, None, false));
-        assert!(MemoryClass::Experimental.recallable_at(today, None, false));
-        assert!(!MemoryClass::Status.recallable_at(today, None, false), "a status note never reaches recall on its own");
-        assert!(MemoryClass::Status.recallable_at(today, None, true), "only from a file it affects");
-        assert!(MemoryClass::Temporal.recallable_at(today, None, false));
-        assert!(MemoryClass::Temporal.recallable_at(today, Some("2026-10-22"), false));
-        assert!(!MemoryClass::Temporal.recallable_at(today, Some(today), false), "superseded today is gone today");
-        assert!(!MemoryClass::Temporal.recallable_at(today, Some("2026-09-01"), true));
+        assert!(MemoryClass::Durable.recallable_at(today, None));
+        assert!(MemoryClass::Experimental.recallable_at(today, None));
+        assert!(!MemoryClass::Progress.recallable_at(today, None), "progress never reaches recall");
+        assert!(MemoryClass::Temporal.recallable_at(today, None));
+        assert!(MemoryClass::Temporal.recallable_at(today, Some("2026-10-22")));
+        assert!(!MemoryClass::Temporal.recallable_at(today, Some(today)), "superseded today is gone today");
+        assert!(!MemoryClass::Temporal.recallable_at(today, Some("2026-09-01")));
     }
 
     #[test]

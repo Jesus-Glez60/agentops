@@ -394,6 +394,8 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
         "ALTER TABLE nodes ADD COLUMN memory_class TEXT NOT NULL DEFAULT 'durable';
         ALTER TABLE nodes ADD COLUMN class_until TEXT;",
     ),
+    // The class first shipped as "status"; it's "progress" now (ADR 0054).
+    M::up("UPDATE nodes SET memory_class = 'progress' WHERE memory_class = 'status';"),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -1694,12 +1696,23 @@ mod tests {
         assert_eq!((after_rescan.memory_class, after_rescan.class_until.as_deref()), (MemoryClass::Temporal, Some("2026-11-01")));
     }
 
+    /// A graph.db holding the class's first name reads it as progress.
+    #[test]
+    fn a_status_class_from_before_the_rename_becomes_progress() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 1).unwrap();
+        conn.execute("INSERT INTO nodes (kind, repo, name, memory_class) VALUES ('note', 'repo-a', 'old', 'status')", []).unwrap();
+        migrations().to_latest(&mut conn).unwrap();
+        let class: String = conn.query_row("SELECT memory_class FROM nodes", [], |r| r.get(0)).unwrap();
+        assert_eq!(class, "progress");
+    }
+
     /// A graph.db from before the class columns: the migration adds them to
     /// a table that already has rows, and every old node reads as durable.
     #[test]
     fn a_database_from_before_memory_classes_reads_every_node_as_durable() {
         let mut conn = Connection::open_in_memory().unwrap();
-        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 1).unwrap();
+        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 2).unwrap();
         conn.execute("INSERT INTO nodes (kind, repo, name) VALUES ('gotcha', 'repo-a', 'old')", []).unwrap();
         migrations().to_latest(&mut conn).unwrap();
         let (class, until): (String, Option<String>) = conn.query_row("SELECT memory_class, class_until FROM nodes", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();

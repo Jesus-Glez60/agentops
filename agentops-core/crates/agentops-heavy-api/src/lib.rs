@@ -511,6 +511,18 @@ pub(crate) fn resolve_anthropic_config(credentials: &agentops_integrations::Cred
     Ok(config)
 }
 
+/// The model a cheap judgment (the memory-class backfill) runs on: the
+/// tenant's Anthropic credential when it has one, else its Groq credential
+/// (`POST /integrations/groq`, on `AGENTOPS_GROQ_MODEL` or
+/// `agentops_llm::GROQ_DEFAULT_MODEL`), else `None`.
+pub(crate) fn resolve_judge_config(credentials: &agentops_integrations::CredentialStore, secrets: &dyn SecretsProvider, tenant: &str) -> Option<agentops_llm::LlmConfig> {
+    if let Ok(config) = resolve_anthropic_config(credentials, secrets, tenant) {
+        return Some(config);
+    }
+    let groq = credentials.get_credential(secrets, tenant, "groq").ok().flatten()?;
+    Some(agentops_llm::groq_config(&groq.secret, std::env::var("AGENTOPS_GROQ_MODEL").ok()))
+}
+
 /// Loads the embedding model in the background with one dummy embed, so
 /// the first prompt hook doesn't pay the load inside its dense-recall
 /// budget (`DENSE_TIMEOUT_MS`). Never blocks: a prompt that arrives first
@@ -1460,6 +1472,20 @@ mod tests {
 
         assert_eq!(resolve_firecrawl_key(&credentials, secrets.as_ref(), "tenant-a").unwrap(), Some("fc-tenant-a-key".to_string()));
         assert_eq!(resolve_firecrawl_key(&credentials, secrets.as_ref(), "tenant-b").unwrap(), None, "tenant-b stored nothing and must never see tenant-a's key");
+    }
+
+    #[test]
+    fn the_class_judge_prefers_anthropic_then_groq_then_nothing() {
+        let credentials = agentops_integrations::CredentialStore::open_in_memory().unwrap();
+        let secrets: Arc<dyn SecretsProvider + Send + Sync> = Arc::new(EnvSecretsProvider::from_hex(&"33".repeat(32)).unwrap());
+        let store = |tenant: &str, provider: &str, secret: &str| credentials.store_credential(secrets.as_ref(), tenant, agentops_integrations::NewCredential { provider, auth_type: agentops_integrations::AuthType::ApiKey, secret, refresh_token: None, expires_at: None }).unwrap();
+        assert!(resolve_judge_config(&credentials, secrets.as_ref(), "tenant-a").is_none(), "no key: the title words judge");
+        store("tenant-a", "groq", "gsk-a");
+        let groq = resolve_judge_config(&credentials, secrets.as_ref(), "tenant-a").unwrap();
+        assert_eq!((groq.provider.name(), groq.api_url.as_str(), groq.api_key.as_str()), ("groq", agentops_llm::GROQ_API_URL, "gsk-a"));
+        store("tenant-a", "anthropic", "sk-a");
+        assert_eq!(resolve_judge_config(&credentials, secrets.as_ref(), "tenant-a").unwrap().provider.name(), "anthropic");
+        assert!(resolve_judge_config(&credentials, secrets.as_ref(), "tenant-b").is_none(), "never another tenant's key");
     }
 
     #[test]

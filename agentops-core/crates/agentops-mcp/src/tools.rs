@@ -117,7 +117,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "skip_duplicates": { "type": "boolean", "description": "Don't write a near-copy of an existing memory; reinforce that memory instead." },
                         "session_id": { "type": "string" },
                         "notes_path": { "type": "string", "description": "Override the notes folder (local servers only; refused on a hosted server)." },
-                        "memory_class": { "type": "string", "enum": ["durable", "status", "experimental", "temporal"], "description": "What kind of truth it holds; omit to classify from the title. status: only announces something shipped (recalled only from a file it affects). experimental: provisional. temporal: true until class_until." },
+                        "memory_class": { "type": "string", "enum": ["durable", "progress", "experimental", "temporal"], "description": "What kind of truth it holds; omit to classify from the title. progress: records where the work stands (shipped, a session or milestone summary, a plan or requirements); never recalled. experimental: provisional. temporal: true until class_until." },
                         "class_until": { "type": "string", "description": "For temporal: the UTC date (YYYY-MM-DD) it stops being recalled." },
                         "supersedes": { "type": "array", "items": { "type": "integer" }, "description": "Node ids this note replaces; they stop being recalled today." },
                     },
@@ -128,12 +128,12 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "set_memory_class",
-            description: "Sets a gotcha/decision/note's class: durable, status (only announces something shipped; recalled only from a file it affects), experimental (shown, labelled) or temporal (recalled until class_until, a UTC YYYY-MM-DD date). The fix for a memory the classifier got wrong. Search and list_gotchas still show every class.",
+            description: "Sets a gotcha/decision/note's class: durable, progress (records where the work stands: shipped, a summary, a plan; never recalled), experimental (shown, labelled) or temporal (recalled until class_until, a UTC YYYY-MM-DD date). The fix for a memory the classifier got wrong. Search and list_gotchas still show every class.",
             // Same reasoning as `add_note`: curating the knowledge base is
             // neither destructive nor costly.
             access: AccessMode::Advisor,
             annotations: WRITE_IDEMPOTENT,
-            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "id": { "type": "integer" }, "memory_class": { "type": "string", "enum": ["durable", "status", "experimental", "temporal"] }, "class_until": { "type": "string" } }, "required": ["path", "id", "memory_class"] }),
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "id": { "type": "integer" }, "memory_class": { "type": "string", "enum": ["durable", "progress", "experimental", "temporal"] }, "class_until": { "type": "string" } }, "required": ["path", "id", "memory_class"] }),
             handler: tool_set_memory_class,
         },
         ToolSpec {
@@ -760,7 +760,7 @@ fn parse_memory_class_args(args: &Value) -> anyhow::Result<Option<(agentops_grap
         return Ok(None);
     };
     let class = MemoryClass::from_db_str(name);
-    anyhow::ensure!(class.as_db_str() == name, "invalid memory_class '{name}', expected durable, status, experimental or temporal");
+    anyhow::ensure!(class.as_db_str() == name, "invalid memory_class '{name}', expected durable, progress, experimental or temporal");
     if let Some(date) = &until {
         anyhow::ensure!(class == MemoryClass::Temporal, "class_until only applies to a temporal memory");
         let b = date.as_bytes();
@@ -1411,7 +1411,7 @@ mod tests {
         let id_of = |title: &str| store.nodes_by_kind(&repo, NodeKind::Note).unwrap().into_iter().chain(store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap()).find(|n| n.name.as_deref() == Some(title)).unwrap();
 
         call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token refresh shipped", "body": "verify_token refresh is live." })).unwrap();
-        assert_eq!(id_of("Token refresh shipped").memory_class, MemoryClass::Status, "a status title is classed by its words");
+        assert_eq!(id_of("Token refresh shipped").memory_class, MemoryClass::Progress, "a progress title is classed by its words");
 
         let old = id_of("Token refresh shipped").id;
         let r = call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token TTL workaround", "body": "verify_token has a workaround for a bug until the fix.", "memory_class": "temporal", "class_until": "2026-12-01", "supersedes": [old] })).unwrap();
@@ -1425,7 +1425,7 @@ mod tests {
         assert!(!fixed.is_error, "{:?}", fixed.content);
         assert_eq!(store.get_node(&repo, old).unwrap().unwrap().memory_class, MemoryClass::Durable);
 
-        for bad in [json!({ "memory_class": "obsolete" }), json!({ "memory_class": "status", "class_until": "2026-12-01" }), json!({ "memory_class": "temporal", "class_until": "next week" })] {
+        for bad in [json!({ "memory_class": "obsolete" }), json!({ "memory_class": "progress", "class_until": "2026-12-01" }), json!({ "memory_class": "temporal", "class_until": "next week" })] {
             let mut args = json!({ "path": path, "title": "Never written", "body": "x" });
             args.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
             assert!(call_tool(AccessMode::Full, "add_note", &args).unwrap().is_error, "{bad}");

@@ -161,11 +161,10 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         strength: f64,
     }
     let mut candidates: HashMap<i64, Candidate> = HashMap::new();
-    // A memory's class is checked where it enters: a status note never
-    // reaches a prompt or an error (no file is being worked on), a temporal
-    // one only before its date (ADR 0054).
+    // A memory's class is checked where it enters: a progress note never
+    // reaches recall, a temporal one only before its date (ADR 0054).
     let today = agentops_graph::utc_today();
-    let class_ok = |node: &Node| node.memory_class.recallable_at(&today, node.class_until.as_deref(), false);
+    let class_ok = |node: &Node| node.memory_class.recallable_at(&today, node.class_until.as_deref());
     let mut add = |node: &Node, score: f64, reason: String, weight: f64| {
         if !class_ok(node) {
             return;

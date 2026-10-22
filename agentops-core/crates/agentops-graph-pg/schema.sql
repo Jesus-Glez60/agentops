@@ -191,6 +191,8 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 -- row_to_node reads them with no ::text cast; set only by set_memory_class.
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS memory_class TEXT NOT NULL DEFAULT 'durable';
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS class_until TEXT;
+-- The class first shipped as "status"; it's "progress" now. Idempotent.
+UPDATE nodes SET memory_class = 'progress' WHERE memory_class = 'status';
 
 -- Sticky-pin context: NodeProminence::Pinned is a free-TEXT value (no CHECK
 -- constraint on this column, unlike kind/relation -- see the widening note
