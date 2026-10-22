@@ -43,6 +43,8 @@ impl Proposal {
 struct Page {
     total: usize,
     judge: String,
+    #[serde(default)]
+    judge_errors: Vec<serde_json::Value>,
     proposals: Vec<Proposal>,
 }
 
@@ -70,12 +72,17 @@ pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>) -> Result
 
     let mut proposals = Vec::new();
     let mut judge;
+    let mut errors = 0;
     loop {
         if per_minute.is_some() && !proposals.is_empty() {
             std::thread::sleep(Duration::from_secs(60));
         }
         let page: Page = serde_json::from_value(remote_send_within(&marker, "memories/classify", Some(&json!({ "offset": proposals.len(), "limit": per_minute })), PAGE_TIMEOUT)?)?;
         judge = page.judge;
+        for e in &page.judge_errors {
+            eprintln!("judge failed on node {}, used the title words: {}", e["node_id"], e["error"]);
+        }
+        errors += page.judge_errors.len();
         let got = page.proposals.len();
         proposals.extend(page.proposals);
         eprintln!("classified {} of {}", proposals.len(), page.total);
@@ -88,7 +95,7 @@ pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>) -> Result
     let labels = read_labels(&path.join(".context/work-recall-eval/to-label.jsonl"));
     let md = dir.join("classify-memories.md");
     std::fs::write(&md, report(&proposals, &judge, &labels))?;
-    println!("Proposed classes for {} memories (judge: {judge}): {}\nNothing was written. Review it, then rerun with --apply.", proposals.len(), md.display());
+    println!("Proposed classes for {} memories (judge: {judge}, {errors} judged by title words after a failed call): {}\nNothing was written. Review it, then rerun with --apply.", proposals.len(), md.display());
     Ok(())
 }
 

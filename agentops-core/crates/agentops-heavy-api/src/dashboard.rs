@@ -903,16 +903,25 @@ pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: 
         memories.sort_by_key(|n| n.id);
         let total = memories.len();
         let mut proposals = Vec::new();
+        // A failed judgment (rate limit, a provider error) falls back to the
+        // title words for that memory and is reported, so one bad call
+        // doesn't abort a paced run over the whole repo.
+        let mut judge_errors = Vec::new();
         for node in memories.into_iter().skip(body.offset).take(limit) {
             let title = node.name.clone().unwrap_or_default();
-            let (class, until) = match &llm {
-                Some(config) => agentops_llm::classify_memory_class(config, node.kind, &title, node.content.as_deref().unwrap_or(""))?,
+            let judged = llm.as_ref().map(|config| agentops_llm::classify_memory_class(config, node.kind, &title, node.content.as_deref().unwrap_or("")));
+            let (class, until) = match judged {
+                Some(Ok(verdict)) => verdict,
+                Some(Err(e)) => {
+                    judge_errors.push(json!({ "node_id": node.id, "error": e.to_string() }));
+                    (agentops_notes::heuristic_class(node.kind, &title).0, None)
+                }
                 None => (agentops_notes::heuristic_class(node.kind, &title).0, None),
             };
             proposals.push(json!({ "node_id": node.id, "kind": node.kind.as_db_str(), "title": title, "current": node.memory_class.as_db_str(), "memory_class": class.as_db_str(), "class_until": until }));
         }
         let judge = llm.as_ref().map(|c| c.provider.name().to_string()).unwrap_or_else(|| "heuristic".to_string());
-        Ok(Some(json!({ "total": total, "offset": body.offset, "judge": judge, "proposals": proposals })))
+        Ok(Some(json!({ "total": total, "offset": body.offset, "judge": judge, "judge_errors": judge_errors, "proposals": proposals })))
     })
     .await;
 

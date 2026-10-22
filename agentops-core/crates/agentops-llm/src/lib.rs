@@ -776,17 +776,21 @@ fn parse_memory_class(reply: &str) -> (agentops_graph::MemoryClass, Option<Strin
 
 /// Groq's OpenAI-compatible chat endpoint.
 pub const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
-/// Groq's default model for the class judge: the strongest one its free
-/// tier offers (30 requests and 12k tokens a minute).
-pub const GROQ_DEFAULT_MODEL: &str = "llama-3.3-70b-versatile";
+/// Groq's default model for the class judge. `llama-3.3-70b-versatile`
+/// became sales-only for new accounts ("model_not_found", 2026-10-22);
+/// `openai/gpt-oss-120b` is on the developer tier (250k tokens and 1k
+/// requests a minute).
+pub const GROQ_DEFAULT_MODEL: &str = "openai/gpt-oss-120b";
 
 /// An `LlmConfig` for Groq with `api_key`, on `model` or
-/// `GROQ_DEFAULT_MODEL`. A short `max_tokens`: its callers want one word.
+/// `GROQ_DEFAULT_MODEL`. Its callers want one word, but gpt-oss reasons
+/// before answering and that counts against `max_tokens`, so the cap
+/// leaves room for it.
 pub fn groq_config(api_key: &str, model: Option<String>) -> LlmConfig {
     LlmConfig {
         api_key: api_key.to_string(),
         model: model.unwrap_or_else(|| GROQ_DEFAULT_MODEL.to_string()),
-        max_tokens: 32,
+        max_tokens: 512,
         api_url: GROQ_API_URL.to_string(),
         provider: Provider::OpenAiCompatible { name: "groq".into(), json_mode: JsonMode::JsonSchemaStrict },
         usage_sink: None,
