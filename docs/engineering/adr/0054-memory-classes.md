@@ -26,7 +26,7 @@ What a memory *is* decides whether it should be recalled, independently of how s
   - `add_note` takes `memory_class`, `class_until` and `supersedes` (ids that end today).
   - Without one, a decision's or note's title that records progress is classed `progress` (`agentops_notes::heuristic_class`, whole title words and phrases; never a gotcha).
   - The `set_memory_class` MCP tool corrects a wrong class.
-  - `agentops classify-memories` backfills existing memories: it proposes classes (an LLM judgment when the tenant has an Anthropic or, failing that, a Groq credential; `--per-minute` paces a free tier), the author reviews them, and `--apply` writes exactly what was reviewed.
+  - `agentops classify-memories` backfills existing memories: it proposes classes from the title words, or also from an LLM with `--llm` (Anthropic, else Groq; `--per-minute` paces a free tier), the author reviews them, and `--apply` writes exactly what was reviewed. The LLM is opt-in because on the labelled memories the title words hid no useful memory, while Groq and Haiku hid 3–5 each, mostly gotchas whose bodies narrate a fix (`handoffs/m3b-eval.md`).
 
 ## Amendment, 2026-10-22: `status` became `progress`
 

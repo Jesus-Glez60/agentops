@@ -57,7 +57,9 @@ struct Page {
 /// then a minute's pause hit Groq's limit on 228 of 391, 2026-10-22).
 /// `None` pages at the server's maximum with no pause. `retry_failed`
 /// re-judges only the saved proposals whose judge call failed.
-pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>, retry_failed: bool) -> Result<()> {
+/// `llm`: also ask the tenant's LLM, as proposals to review; off by
+/// default, since the title words were more accurate on the labels.
+pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>, retry_failed: bool, llm: bool) -> Result<()> {
     let marker = read_remote_marker(path).with_context(|| format!("classify-memories runs against the server; {} has no .context/agentops-remote.json", path.display()))?;
     let dir = path.join(".context");
     let saved = dir.join("classify-memories.json");
@@ -78,7 +80,7 @@ pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>, retry_fai
     let pause = per_minute.map(|n| Duration::from_secs_f64(60.0 / n.max(1) as f64));
     let limit = per_minute.map(|_| 1);
     let fetch = |offset: usize| -> Result<Page> {
-        let mut page: Page = serde_json::from_value(remote_send_within(&marker, "memories/classify", Some(&json!({ "offset": offset, "limit": limit })), PAGE_TIMEOUT)?)?;
+        let mut page: Page = serde_json::from_value(remote_send_within(&marker, "memories/classify", Some(&json!({ "offset": offset, "limit": limit, "llm": llm })), PAGE_TIMEOUT)?)?;
         for e in &page.judge_errors {
             eprintln!("judge failed on node {}, used the title words: {}", e["node_id"], e["error"]);
             if let Some(p) = page.proposals.iter_mut().find(|p| e["node_id"].as_i64() == Some(p.node_id)) {

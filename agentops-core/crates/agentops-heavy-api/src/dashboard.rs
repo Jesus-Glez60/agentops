@@ -864,6 +864,11 @@ pub(crate) async fn work_recall_replay_json(State(state): State<AppState>, user:
 pub(crate) struct ClassifyMemoriesBody {
     #[serde(default)]
     offset: usize,
+    /// Ask the tenant's LLM too. Off by default: on the labelled memories
+    /// the title words hid no useful memory while Groq and Haiku hid 3-5,
+    /// so an LLM only proposes, for a person to review (2026-10-22).
+    #[serde(default)]
+    llm: bool,
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -874,9 +879,10 @@ const CLASSIFY_PAGE_MAX: usize = 50;
 
 /// `POST /repos/{id}/memories/classify` -- proposes a class for a page of
 /// the repo's gotchas, decisions and notes (ADR 0054), writing nothing.
-/// A progress title is settled by its words; the rest by one LLM call each
-/// when the tenant has an Anthropic or Groq credential
-/// (`resolve_judge_config`), else they stay durable and `judge` says so. `agentops classify-memories` pages through it, shows
+/// A progress title is settled by its words, the rest stay durable. With
+/// `llm: true`, the rest get one LLM call each when the tenant has an
+/// Anthropic or Groq credential (`resolve_judge_config`); `judge` says
+/// which decided. `agentops classify-memories` pages through it, shows
 /// the author the proposals, and only then assigns them.
 pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<ClassifyMemoriesBody>) -> (StatusCode, Json<Value>) {
     let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
@@ -885,7 +891,7 @@ pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: 
     };
     let llm = {
         let credentials = state.credentials.lock().unwrap();
-        crate::resolve_judge_config(&credentials, state.secrets.as_ref(), &tenant)
+        if body.llm { crate::resolve_judge_config(&credentials, state.secrets.as_ref(), &tenant) } else { None }
     };
     let limit = body.limit.unwrap_or(CLASSIFY_PAGE_MAX).min(CLASSIFY_PAGE_MAX);
 
