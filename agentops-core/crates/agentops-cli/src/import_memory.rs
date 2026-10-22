@@ -210,6 +210,11 @@ pub(crate) struct LocalSink {
 impl Sink for LocalSink {
     fn add_note(&self, title: &str, body: &str, note_type: Option<NoteType>, tags: &[String], mode: AddMode) -> Result<NoteOutcome> {
         let r = agentops_mcp::add_note_with(&self.repo, title, body, note_type, tags, None, true, mode)?;
+        // The remote sink's add_note classes the note server-side; the
+        // local one does it here, the same way (ADR 0054).
+        if let (true, Some(id)) = (r.written, r.node_id) {
+            agentops_mcp::apply_memory_class(&self.repo, id, title, None, &[])?;
+        }
         Ok(NoteOutcome { note_type: note_type_str(r.note_type).into(), node_id: r.node_id, written: r.written, already_exists: r.already_exists, duplicate_of: r.duplicate_of.map(|(id, _)| id), similar_to: r.similar_to.iter().map(|(id, _)| *id).collect() })
     }
 

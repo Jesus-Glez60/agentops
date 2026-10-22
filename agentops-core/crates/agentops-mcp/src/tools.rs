@@ -117,11 +117,24 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "skip_duplicates": { "type": "boolean", "description": "Don't write a near-copy of an existing memory; reinforce that memory instead." },
                         "session_id": { "type": "string" },
                         "notes_path": { "type": "string", "description": "Override the notes folder (local servers only; refused on a hosted server)." },
+                        "memory_class": { "type": "string", "enum": ["durable", "status", "experimental", "temporal"], "description": "What kind of truth it holds; omit to classify from the title. status: only announces something shipped (recalled only from a file it affects). experimental: provisional. temporal: true until class_until." },
+                        "class_until": { "type": "string", "description": "For temporal: the UTC date (YYYY-MM-DD) it stops being recalled." },
+                        "supersedes": { "type": "array", "items": { "type": "integer" }, "description": "Node ids this note replaces; they stop being recalled today." },
                     },
                     "required": ["path", "title", "body"],
                 })
             },
             handler: tool_add_note,
+        },
+        ToolSpec {
+            name: "set_memory_class",
+            description: "Sets a gotcha/decision/note's class: durable, status (only announces something shipped; recalled only from a file it affects), experimental (shown, labelled) or temporal (recalled until class_until, a UTC YYYY-MM-DD date). The fix for a memory the classifier got wrong. Search and list_gotchas still show every class.",
+            // Same reasoning as `add_note`: curating the knowledge base is
+            // neither destructive nor costly.
+            access: AccessMode::Advisor,
+            annotations: WRITE_IDEMPOTENT,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "id": { "type": "integer" }, "memory_class": { "type": "string", "enum": ["durable", "status", "experimental", "temporal"] }, "class_until": { "type": "string" } }, "required": ["path", "id", "memory_class"] }),
+            handler: tool_set_memory_class,
         },
         ToolSpec {
             name: "ingest_notes",
@@ -736,6 +749,38 @@ fn tool_scan_repo(args: &Value) -> anyhow::Result<String> {
     ))
 }
 
+/// `memory_class` and `class_until` from a tool call, `None` when no class
+/// was given. An unknown class, a date that isn't `YYYY-MM-DD`, or a date
+/// on anything but a temporal class is refused.
+fn parse_memory_class_args(args: &Value) -> anyhow::Result<Option<(agentops_graph::MemoryClass, Option<String>)>> {
+    use agentops_graph::MemoryClass;
+    let until = get_str(args, "class_until").map(str::to_string);
+    let Some(name) = get_str(args, "memory_class") else {
+        anyhow::ensure!(until.is_none(), "class_until needs memory_class \"temporal\"");
+        return Ok(None);
+    };
+    let class = MemoryClass::from_db_str(name);
+    anyhow::ensure!(class.as_db_str() == name, "invalid memory_class '{name}', expected durable, status, experimental or temporal");
+    if let Some(date) = &until {
+        anyhow::ensure!(class == MemoryClass::Temporal, "class_until only applies to a temporal memory");
+        let b = date.as_bytes();
+        anyhow::ensure!(b.len() == 10 && b[4] == b'-' && b[7] == b'-' && date.chars().filter(char::is_ascii_digit).count() == 8, "class_until must be YYYY-MM-DD, got '{date}'");
+    }
+    Ok(Some((class, until)))
+}
+
+fn tool_set_memory_class(args: &Value) -> anyhow::Result<String> {
+    let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
+    let id = args.get("id").and_then(Value::as_i64).ok_or_else(|| anyhow::anyhow!("missing required 'id'"))?;
+    let (class, until) = parse_memory_class_args(args)?.ok_or_else(|| anyhow::anyhow!("missing required 'memory_class'"))?;
+    let store = crate::store::open_store(Path::new(path_str))?;
+    let repo = crate::scan::repo_name(Path::new(path_str));
+    let node = store.get_node(&repo, id)?.ok_or_else(|| anyhow::anyhow!("no node {id}"))?;
+    anyhow::ensure!(agentops_graph::similarity::MEMORY_KINDS.contains(&node.kind), "only gotchas, decisions and notes have a class, not a {}", node.kind.as_db_str());
+    store.set_memory_class(&repo, id, class, until.as_deref())?;
+    Ok(format!("Node {id} is now {}{}.", class.as_db_str(), until.map(|u| format!(" until {u}")).unwrap_or_default()))
+}
+
 fn tool_add_note(args: &Value) -> anyhow::Result<String> {
     let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
     let title = get_str(args, "title").ok_or_else(|| anyhow::anyhow!("missing required 'title'"))?;
@@ -751,6 +796,10 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
         None => None,
         Some(other) => anyhow::bail!("invalid note_type '{other}', expected gotcha, decision, or knowledge"),
     };
+
+    // Checked before anything is written, so a bad class writes nothing.
+    let explicit_class = parse_memory_class_args(args)?;
+    let supersedes: Vec<i64> = args.get("supersedes").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
 
     let mode = if get_bool(args, "dry_run") {
         crate::notes::AddMode::DryRun
@@ -770,6 +819,9 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
     // "Decisions" section) — everything else stays the generic "activity"
     // this call already recorded before that guide existed.
     let event_kind = if result.note_type == agentops_notes::NoteType::Decision { "decision" } else { "activity" };
+    if let (true, Some(id)) = (result.written, result.node_id) {
+        crate::notes::apply_memory_class(Path::new(path_str), id, title, explicit_class, &supersedes)?;
+    }
     if result.written {
         maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"), None, event_kind)?;
     }
@@ -1342,6 +1394,43 @@ mod tests {
 
         let gotchas_result = call_tool(AccessMode::Full, "list_gotchas", &json!({ "path": path })).unwrap();
         assert!(gotchas_result.content[0].text.contains("Token bug"));
+    }
+
+    /// ADR 0054: a note's class comes from the caller when given, else from
+    /// its title; `supersedes` ends the old memory today; a wrong class is
+    /// fixed with `set_memory_class`; a bad class writes nothing.
+    #[test]
+    fn add_note_sets_a_memory_class_and_set_memory_class_corrects_it() {
+        use agentops_graph::MemoryClass;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("auth.py"), "def verify_token():\n    pass\n").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        call_tool(AccessMode::Full, "scan_repo", &json!({ "path": path })).unwrap();
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let id_of = |title: &str| store.nodes_by_kind(&repo, NodeKind::Note).unwrap().into_iter().chain(store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap()).find(|n| n.name.as_deref() == Some(title)).unwrap();
+
+        call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token refresh shipped", "body": "verify_token refresh is live." })).unwrap();
+        assert_eq!(id_of("Token refresh shipped").memory_class, MemoryClass::Status, "a status title is classed by its words");
+
+        let old = id_of("Token refresh shipped").id;
+        let r = call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Token TTL workaround", "body": "verify_token has a workaround for a bug until the fix.", "memory_class": "temporal", "class_until": "2026-12-01", "supersedes": [old] })).unwrap();
+        assert!(!r.is_error, "{:?}", r.content);
+        let new = id_of("Token TTL workaround");
+        assert_eq!((new.memory_class, new.class_until.as_deref()), (MemoryClass::Temporal, Some("2026-12-01")));
+        let superseded = store.get_node(&repo, old).unwrap().unwrap();
+        assert_eq!((superseded.memory_class, superseded.class_until), (MemoryClass::Temporal, Some(agentops_graph::utc_today())));
+
+        let fixed = call_tool(AccessMode::Advisor, "set_memory_class", &json!({ "path": path, "id": old, "memory_class": "durable" })).unwrap();
+        assert!(!fixed.is_error, "{:?}", fixed.content);
+        assert_eq!(store.get_node(&repo, old).unwrap().unwrap().memory_class, MemoryClass::Durable);
+
+        for bad in [json!({ "memory_class": "obsolete" }), json!({ "memory_class": "status", "class_until": "2026-12-01" }), json!({ "memory_class": "temporal", "class_until": "next week" })] {
+            let mut args = json!({ "path": path, "title": "Never written", "body": "x" });
+            args.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+            assert!(call_tool(AccessMode::Full, "add_note", &args).unwrap().is_error, "{bad}");
+        }
+        assert!(!dir.path().join(".agentops/notes/never-written.md").exists() && store.nodes_by_kind(&repo, NodeKind::Note).unwrap().iter().all(|n| n.name.as_deref() != Some("Never written")), "a refused class writes nothing");
     }
 
     /// Codebrain-2's actual payoff: a gotcha recorded against a symbol must

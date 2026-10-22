@@ -731,6 +731,42 @@ impl agentops_notes::NoteClassifier for LlmAssistedClassifier<'_> {
     }
 }
 
+/// A memory's class (ADR 0054), and for a temporal one the date it ends
+/// when the text names one. The title heuristic settles a status title
+/// with no call; anything else costs one bounded Anthropic call, since
+/// experimental and temporal need a judgment words can't make.
+pub fn classify_memory_class(config: &AnthropicConfig, title: &str, body: &str) -> Result<(agentops_graph::MemoryClass, Option<String>)> {
+    if let (class, true) = agentops_notes::heuristic_class(title) {
+        return Ok((class, None));
+    }
+    let prompt = format!(
+        "Classify this project memory by what kind of truth it holds, as exactly one of:\n\
+         - durable: a cause, rule, warning or reason that stays true until the code changes.\n\
+         - status: only announces that something shipped, was built or was completed, with no rule or warning an agent needs.\n\
+         - experimental: a trial or provisional choice that may be reverted.\n\
+         - temporal: true only for a period (a workaround until a fix, a freeze until a date).\n\n\
+         Title: {title}\n\n{body}\n\n\
+         Reply with one word. For temporal, add the end date if the text names one, as `temporal YYYY-MM-DD`."
+    );
+    let result = call_anthropic(config, "classify_memory_class", &prompt)?;
+    Ok(parse_memory_class(&result.text))
+}
+
+/// `classify_memory_class`'s reply: the first class word, and a
+/// `YYYY-MM-DD` after `temporal`. Anything unreadable is durable, the
+/// class that hides nothing.
+fn parse_memory_class(reply: &str) -> (agentops_graph::MemoryClass, Option<String>) {
+    use agentops_graph::MemoryClass;
+    let lower = reply.trim().to_lowercase();
+    let word = lower.split_whitespace().next().unwrap_or("").trim_matches(|c: char| !c.is_ascii_alphabetic());
+    let class = MemoryClass::from_db_str(word);
+    let until = (class == MemoryClass::Temporal)
+        .then(|| lower.split_whitespace().nth(1).map(|d| d.trim_matches(|c: char| !(c.is_ascii_digit() || c == '-')).to_string()))
+        .flatten()
+        .filter(|d| d.len() == 10 && d.as_bytes()[4] == b'-' && d.as_bytes()[7] == b'-');
+    (class, until)
+}
+
 /// Three audience-tuned work summaries for one task's activity — Phase 6b
 /// Extension 2. Delimiter-tagged single-call response (`TECHNICAL:` /
 /// `NON_TECHNICAL:` / `CLIENT_FRIENDLY:`), parsed back out below — one
@@ -1242,6 +1278,17 @@ mod tests {
         assert_eq!(result.text, "This function verifies a token.");
         assert_eq!(result.input_tokens, 42);
         assert_eq!(result.output_tokens, 7);
+    }
+
+    #[test]
+    fn a_memory_class_reply_is_read_strictly_and_defaults_to_durable() {
+        use agentops_graph::MemoryClass;
+        assert_eq!(parse_memory_class("status"), (MemoryClass::Status, None));
+        assert_eq!(parse_memory_class(" Experimental.\n"), (MemoryClass::Experimental, None));
+        assert_eq!(parse_memory_class("temporal 2026-12-01"), (MemoryClass::Temporal, Some("2026-12-01".into())));
+        assert_eq!(parse_memory_class("temporal"), (MemoryClass::Temporal, None));
+        assert_eq!(parse_memory_class("temporal until next week"), (MemoryClass::Temporal, None));
+        assert_eq!(parse_memory_class("I think it's status"), (MemoryClass::Durable, None), "an unclear reply hides nothing");
     }
 
     #[tokio::test]

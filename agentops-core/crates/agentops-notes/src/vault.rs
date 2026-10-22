@@ -95,6 +95,26 @@ pub fn heuristic_score(body: &str) -> (NoteType, bool) {
     }
 }
 
+/// Title words that announce a status ("X shipped", "Y implemented")
+/// rather than a cause, rule or warning. Titles only, never bodies: bodies
+/// use these words in passing (the same reason `import_memory`'s stale
+/// check reads only one-line summaries).
+const STATUS_WORDS: &[&str] = &["shipped", "implemented", "complete", "completed", "made public", "live-verified", "fully wired", "rebuilt"];
+
+/// A memory's class from its title alone (ADR 0054): `(Status, true)` when
+/// the title announces a status, else `(Durable, false)`, meaning
+/// unsure, for an LLM-assisted classifier to settle. Only status is ever
+/// read from words; experimental and temporal need a judgment or an
+/// explicit `add_note` argument.
+pub fn heuristic_class(title: &str) -> (agentops_graph::MemoryClass, bool) {
+    let lower = title.to_lowercase();
+    if STATUS_WORDS.iter().any(|w| lower.contains(w)) {
+        (agentops_graph::MemoryClass::Status, true)
+    } else {
+        (agentops_graph::MemoryClass::Durable, false)
+    }
+}
+
 /// The default, no-network classifier — used whenever frontmatter and
 /// folder name both give no signal, and no LLM-assisted classifier is
 /// configured (or the heuristic is confident enough not to need one).
@@ -426,6 +446,17 @@ pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], mat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_status_title_is_classed_status_by_words() {
+        use agentops_graph::MemoryClass;
+        for title in ["Documentation Viewer: shipped end-to-end, 2026-08-13", "agentops-cli implemented 2026-08-10", "Repository Connection & Management: shipped, live-verified end to end"] {
+            assert_eq!(heuristic_class(title), (MemoryClass::Status, true), "{title}");
+        }
+        for title in ["SQLite UPDATE silently no-ops when row doesn't exist", "Personal API keys carry no tenant"] {
+            assert_eq!(heuristic_class(title), (MemoryClass::Durable, false), "{title}");
+        }
+    }
     use agentops_graph::SqliteGraphStore;
 
     fn write_note(dir: &Path, rel_path: &str, content: &str) {

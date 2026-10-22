@@ -21,7 +21,7 @@ pub mod work_recall;
 
 pub use docgen::generate_docs;
 pub use init::{ensure_gitignore_entries, init_agents_md, InitResult};
-pub use notes::{add_note, add_note_with, embed_and_link_new, embed_missing_memories, ingest_notes_dir, link_similar_backfill, retitle_note, AddMode, AddNoteResult};
+pub use notes::{add_note, add_note_with, apply_memory_class, embed_and_link_new, embed_missing_memories, ingest_notes_dir, link_similar_backfill, retitle_note, AddMode, AddNoteResult};
 pub use protocol::{CallToolResult, ContentBlock, ToolAnnotations, ToolDefinition};
 pub use scan::{enrich_with_macro_expansions, graph_db_path, persist, persist_with_lsp, repo_name, scan_and_persist, scan_and_persist_with_lsp, ScanPersistSummary};
 pub use agentops_graph_pg::PostgresGraphStore;

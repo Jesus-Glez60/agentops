@@ -197,6 +197,23 @@ pub fn add_note_with(repo_path: &Path, title: &str, body: &str, note_type: Optio
     Ok(AddNoteResult { file_path, note_type, edges_written: summary.edges_written, edges_reinforced: summary.edges_reinforced, node_id, written: true, already_exists: existing.is_some(), duplicate_of, similar_to })
 }
 
+/// Sets a just-written note's class (ADR 0054): the caller's `explicit`
+/// class when given, else the title heuristic's. Every id in `supersedes`
+/// becomes temporal, ending today, so recall drops it at once. Returns the
+/// class set.
+pub fn apply_memory_class(repo_path: &Path, node_id: i64, title: &str, explicit: Option<(agentops_graph::MemoryClass, Option<String>)>, supersedes: &[i64]) -> Result<agentops_graph::MemoryClass> {
+    let store = crate::store::open_store(repo_path)?;
+    let repo = repo_name(repo_path);
+    let (class, until) = explicit.unwrap_or_else(|| (agentops_notes::heuristic_class(title).0, None));
+    store.set_memory_class(&repo, node_id, class, until.as_deref())?;
+    let today = agentops_graph::utc_today();
+    for &old in supersedes.iter().filter(|&&id| id != node_id) {
+        anyhow::ensure!(store.get_node(&repo, old)?.is_some(), "supersedes: no node {old}");
+        store.set_memory_class(&repo, old, agentops_graph::MemoryClass::Temporal, Some(&today))?;
+    }
+    Ok(class)
+}
+
 /// Walks the repo's resolved notes folder and ingests every note found —
 /// `classifier`/`matcher` are caller-chosen (heuristic by default; an
 /// LLM-assisted variant for callers willing to pay for it, e.g.
