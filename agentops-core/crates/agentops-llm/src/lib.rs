@@ -756,7 +756,18 @@ pub fn classify_memory_class(config: &LlmConfig, kind: agentops_graph::NodeKind,
          Reply with one word. For temporal, add the end date if the text names one, as `temporal YYYY-MM-DD`."
     );
     let result = call_anthropic(config, "classify_memory_class", &prompt)?;
-    Ok(parse_memory_class(&result.text))
+    Ok(gotcha_never_progress(kind, parse_memory_class(&result.text)))
+}
+
+/// A gotcha is permanent knowledge (decision 54003): a judge reading "X
+/// was fixed" as progress would hide it. The Groq pass did that to 16
+/// gotchas, among them every memory labelled useful that it would have
+/// hidden (2026-10-22). The title heuristic already never classes one.
+fn gotcha_never_progress(kind: agentops_graph::NodeKind, verdict: (agentops_graph::MemoryClass, Option<String>)) -> (agentops_graph::MemoryClass, Option<String>) {
+    match verdict {
+        (agentops_graph::MemoryClass::Progress, _) if kind == agentops_graph::NodeKind::Gotcha => (agentops_graph::MemoryClass::Durable, None),
+        other => other,
+    }
 }
 
 /// `classify_memory_class`'s reply: the first class word, and a
@@ -1319,6 +1330,10 @@ mod tests {
         assert_eq!(parse_memory_class("temporal"), (MemoryClass::Temporal, None));
         assert_eq!(parse_memory_class("temporal until next week"), (MemoryClass::Temporal, None));
         assert_eq!(parse_memory_class("I think it's status"), (MemoryClass::Durable, None), "an unclear reply hides nothing");
+        use agentops_graph::NodeKind;
+        assert_eq!(gotcha_never_progress(NodeKind::Gotcha, (MemoryClass::Progress, None)), (MemoryClass::Durable, None), "a gotcha stays a warning");
+        assert_eq!(gotcha_never_progress(NodeKind::Note, (MemoryClass::Progress, None)), (MemoryClass::Progress, None));
+        assert_eq!(gotcha_never_progress(NodeKind::Gotcha, (MemoryClass::Experimental, None)), (MemoryClass::Experimental, None));
     }
 
     #[tokio::test]
