@@ -471,7 +471,7 @@ struct ReplaySession {
 /// One labelling line: an injection's pointer with its cue. Node ids and
 /// paths only, no memory text (the author labels it `useful`, `neutral`
 /// or `noise`).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LabelLine {
     session: String,
     context: String,
@@ -514,6 +514,13 @@ fn sample(labels: &[LabelLine], n: usize) -> Vec<&LabelLine> {
     let room = n.saturating_sub(picked.len());
     picked.extend(leftovers.into_iter().take(room));
     picked
+}
+
+/// Node ids with a non-empty label in a labelling `.jsonl`, or `None` when
+/// the file can't be read.
+fn read_labelled_ids(file: &Path) -> Option<HashSet<i64>> {
+    let text = std::fs::read_to_string(file).ok()?;
+    Some(text.lines().filter_map(|l| serde_json::from_str::<LabelLine>(l).ok()).filter(|l| !l.label.is_empty()).map(|l| l.node_id).collect())
 }
 
 /// The labelling sample as a Markdown table, numbered as in the `.jsonl`.
@@ -607,7 +614,23 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
     std::fs::write(&labels_file, labels.iter().map(|l| serde_json::to_string(l).unwrap_or_default()).collect::<Vec<_>>().join("\n") + "\n")?;
     println!("Labelling file ({} pointers): {}", labels.len(), labels_file.display());
     if let Some(n) = sample_size {
-        let picked = sample(&labels, n);
+        // A sample already labelled is kept as `labelled-<time>.jsonl`, and
+        // no memory labelled in any earlier sample is drawn again, so a new
+        // sample is held out from what earlier rules were fitted on
+        // (milestone 3b revision 2).
+        let current = dir.join("to-label.jsonl");
+        if read_labelled_ids(&current).is_some_and(|ids| !ids.is_empty()) {
+            std::fs::rename(&current, dir.join(format!("labelled-{}.jsonl", unix_secs())))?;
+        }
+        let mut seen = HashSet::new();
+        for entry in std::fs::read_dir(&dir)?.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("labelled-") {
+                seen.extend(read_labelled_ids(&entry.path()).unwrap_or_default());
+            }
+        }
+        let fresh: Vec<LabelLine> = labels.iter().filter(|l| !seen.contains(&l.node_id)).cloned().collect();
+        println!("Held out: {} of {} pointers reach a memory labelled before; the sample draws from the other {}.", labels.len() - fresh.len(), labels.len(), fresh.len());
+        let picked = sample(&fresh, n);
         std::fs::write(dir.join("to-label.jsonl"), picked.iter().map(|l| serde_json::to_string(l).unwrap_or_default()).collect::<Vec<_>>().join("\n") + "\n")?;
         std::fs::write(dir.join("to-label.md"), sample_markdown(&picked))?;
         let errors = picked.iter().filter(|l| l.cue == ERROR_CUE).count();
@@ -673,6 +696,16 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_labelled_rows_count_as_labelled() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("to-label.jsonl");
+        let line = |id: i64, label: &str| serde_json::to_string(&LabelLine { session: "s".into(), context: "main".into(), step: 1, cue: "a.rs".into(), node_id: id, kind: "note".into(), title: "t".into(), activation: 1.0, label: label.into() }).unwrap();
+        std::fs::write(&file, format!("{}\n{}\n", line(1, "noise"), line(2, ""))).unwrap();
+        assert_eq!(read_labelled_ids(&file), Some(HashSet::from([1])));
+        assert_eq!(read_labelled_ids(&dir.path().join("missing.jsonl")), None);
+    }
 
     #[test]
     fn the_labelling_sample_is_stratified_fixed_and_tops_up_a_short_group() {
