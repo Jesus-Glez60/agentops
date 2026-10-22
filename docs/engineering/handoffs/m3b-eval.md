@@ -231,3 +231,24 @@ Cases and `recall-eval` moved by one, within the drift recorded in revision 1. *
 - **Progress memories never helped.** All 8 rows whose memory is (or now would be) `progress` scored 2–4, including two shown through an `Affects` link from the opened file. That is why the class became `progress` with no exception (ADR 0054 amendment).
 - **Without them, noise is 6 of 92 (6.5%).** Four of the six are situational gotchas, tied to one machine or a rare setup (rsync to the server, the deploy setup, an SSH host alias), reached through one shared keyword on an unrelated error. A class doesn't describe them; a stronger match for situational memories might. Open.
 - **Spec targets on this sample:** noise ≤ 30% and at least a third useful both hold. The median volume (17,672 against 3,000) does not.
+
+## Final state (`684e36a`, 2026-10-22): 40 progress memories, no `Affects` exception
+
+| Cases | File | Error | MRR | p95 ms | Characters, 5 sessions (median) | Pointers | Prompt-time `recall-eval` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 8/20 | 5 | 3 | 0.317 | 127 | 106,452 (17,717) | 703 | 12/20, MRR 0.395 |
+
+- **f05 is lost by design.** Its target (190997) is classed `progress`.
+- **e04 is drift**: rank 3 → unranked, with its target unclassed.
+- In `recall-eval`, c09 dropped from rank 3, which is drift (it flipped before). c17's target (104436) is `progress`, but c17 was already a miss.
+
+**Who should class a memory.** The same 241 memories, the same prompt, both samples' labels:
+
+| Judge | Useful hidden | Neutral hidden | Noise caught | Noise missed | Gotchas → progress |
+| --- | --- | --- | --- | --- | --- |
+| Title words (never a gotcha) | 0 | 7 | 25 | 5 | 0 |
+| Groq `openai/gpt-oss-120b` + bodies | 3 | 10 | 26 | 4 | 14 |
+| Haiku, titles only | 1 | 6 | 21 | 9 | 5 |
+| Haiku + bodies | 5 | 14 | 27 | 3 | 19 |
+
+The Haiku runs were subagents. The first reported success after reading titles only (20 tool calls for 241 memories), and one batch of the second ignored the bodies it fetched. Both were caught by checking tool-call counts, and recorded body lengths and opening text against the real memories. The batch was rerun. So the title words stay the only automatic classifier, and `classify-memories --llm` only proposes.
