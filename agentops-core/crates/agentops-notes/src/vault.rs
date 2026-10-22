@@ -99,16 +99,21 @@ pub fn heuristic_score(body: &str) -> (NoteType, bool) {
 /// rather than a cause, rule or warning. Titles only, never bodies: bodies
 /// use these words in passing (the same reason `import_memory`'s stale
 /// check reads only one-line summaries).
-const STATUS_WORDS: &[&str] = &["shipped", "implemented", "complete", "completed", "made public", "live-verified", "fully wired", "rebuilt"];
+const STATUS_WORDS: &[&str] = &["shipped", "implemented", "complete", "completed", "made public", "live verified", "fully wired", "rebuilt"];
 
-/// A memory's class from its title alone (ADR 0054): `(Status, true)` when
-/// the title announces a status, else `(Durable, false)`, meaning
-/// unsure, for an LLM-assisted classifier to settle. Only status is ever
-/// read from words; experimental and temporal need a judgment or an
-/// explicit `add_note` argument.
-pub fn heuristic_class(title: &str) -> (agentops_graph::MemoryClass, bool) {
-    let lower = title.to_lowercase();
-    if STATUS_WORDS.iter().any(|w| lower.contains(w)) {
+/// A memory's class from its kind and title alone (ADR 0054):
+/// `(Status, true)` when a decision's or note's title announces a status
+/// in whole words, else `(Durable, false)`, meaning unsure, for an
+/// LLM-assisted classifier to settle. A gotcha is never classed status by
+/// words: it's a warning even when its title says what shipped ("... --
+/// hook_capture.rs shipped assuming the latter"), and hiding one costs
+/// more than showing a stale note. Whole words, so "incomplete" and
+/// "Completeness" don't count (the backfill's first dry run, 2026-10-22).
+/// Only status is ever read from words; experimental and temporal need a
+/// judgment or an explicit `add_note` argument.
+pub fn heuristic_class(kind: NodeKind, title: &str) -> (agentops_graph::MemoryClass, bool) {
+    let words = format!(" {} ", title.to_lowercase().split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(" "));
+    if kind != NodeKind::Gotcha && STATUS_WORDS.iter().any(|w| words.contains(&format!(" {w} "))) {
         (agentops_graph::MemoryClass::Status, true)
     } else {
         (agentops_graph::MemoryClass::Durable, false)
@@ -450,12 +455,13 @@ mod tests {
     #[test]
     fn only_a_status_title_is_classed_status_by_words() {
         use agentops_graph::MemoryClass;
-        for title in ["Documentation Viewer: shipped end-to-end, 2026-08-13", "agentops-cli implemented 2026-08-10", "Repository Connection & Management: shipped, live-verified end to end"] {
-            assert_eq!(heuristic_class(title), (MemoryClass::Status, true), "{title}");
+        for title in ["Documentation Viewer: shipped end-to-end, 2026-08-13", "agentops-cli implemented 2026-08-10", "Phase 2/3 live-verified against this repo"] {
+            assert_eq!(heuristic_class(NodeKind::Note, title), (MemoryClass::Status, true), "{title}");
         }
-        for title in ["SQLite UPDATE silently no-ops when row doesn't exist", "Personal API keys carry no tenant"] {
-            assert_eq!(heuristic_class(title), (MemoryClass::Durable, false), "{title}");
+        for title in ["SQLite UPDATE silently no-ops when row doesn't exist", "ink color ramp was incomplete", "the real cost driver is Completeness-checker's tool calls"] {
+            assert_eq!(heuristic_class(NodeKind::Note, title), (MemoryClass::Durable, false), "{title}");
         }
+        assert_eq!(heuristic_class(NodeKind::Gotcha, "tool_response is an object, not a string -- hook_capture.rs shipped assuming the latter"), (MemoryClass::Durable, false), "a gotcha stays a warning");
     }
     use agentops_graph::SqliteGraphStore;
 

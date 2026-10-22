@@ -204,7 +204,8 @@ pub fn add_note_with(repo_path: &Path, title: &str, body: &str, note_type: Optio
 pub fn apply_memory_class(repo_path: &Path, node_id: i64, title: &str, explicit: Option<(agentops_graph::MemoryClass, Option<String>)>, supersedes: &[i64]) -> Result<agentops_graph::MemoryClass> {
     let store = crate::store::open_store(repo_path)?;
     let repo = repo_name(repo_path);
-    let (class, until) = explicit.unwrap_or_else(|| (agentops_notes::heuristic_class(title).0, None));
+    let kind = store.get_node(&repo, node_id)?.map(|n| n.kind).unwrap_or(NodeKind::Note);
+    let (class, until) = explicit.unwrap_or_else(|| (agentops_notes::heuristic_class(kind, title).0, None));
     store.set_memory_class(&repo, node_id, class, until.as_deref())?;
     let today = agentops_graph::utc_today();
     for &old in supersedes.iter().filter(|&&id| id != node_id) {

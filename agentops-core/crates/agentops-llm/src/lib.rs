@@ -735,8 +735,8 @@ impl agentops_notes::NoteClassifier for LlmAssistedClassifier<'_> {
 /// when the text names one. The title heuristic settles a status title
 /// with no call; anything else costs one bounded Anthropic call, since
 /// experimental and temporal need a judgment words can't make.
-pub fn classify_memory_class(config: &AnthropicConfig, title: &str, body: &str) -> Result<(agentops_graph::MemoryClass, Option<String>)> {
-    if let (class, true) = agentops_notes::heuristic_class(title) {
+pub fn classify_memory_class(config: &AnthropicConfig, kind: agentops_graph::NodeKind, title: &str, body: &str) -> Result<(agentops_graph::MemoryClass, Option<String>)> {
+    if let (class, true) = agentops_notes::heuristic_class(kind, title) {
         return Ok((class, None));
     }
     let prompt = format!(

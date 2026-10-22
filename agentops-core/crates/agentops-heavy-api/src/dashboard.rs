@@ -906,8 +906,8 @@ pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: 
         for node in memories.into_iter().skip(body.offset).take(limit) {
             let title = node.name.clone().unwrap_or_default();
             let (class, until) = match &llm {
-                Some(config) => agentops_llm::classify_memory_class(config, &title, node.content.as_deref().unwrap_or(""))?,
-                None => (agentops_notes::heuristic_class(&title).0, None),
+                Some(config) => agentops_llm::classify_memory_class(config, node.kind, &title, node.content.as_deref().unwrap_or(""))?,
+                None => (agentops_notes::heuristic_class(node.kind, &title).0, None),
             };
             proposals.push(json!({ "node_id": node.id, "kind": node.kind.as_db_str(), "title": title, "current": node.memory_class.as_db_str(), "memory_class": class.as_db_str(), "class_until": until }));
         }
