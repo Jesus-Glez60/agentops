@@ -30,6 +30,8 @@ use crate::hooks::RECALL_INJECTED;
 /// `tool_name` of a work-time `recall_injected` event, which the
 /// per-context ceiling counts (prompt and subagent seeds don't).
 pub const WORK_RECALL_TOOL: &str = "work_recall";
+/// First line of every work-time injection, file or error.
+pub const WORK_RECALL_HEADER: &str = "AgentOps recall; `fetch_content` <id> for the full text:";
 
 /// A session's event log as work-time recall reads and writes it: the
 /// store for a live hook, memory for `work-recall-eval --replay`, so the
@@ -165,14 +167,13 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     let now_shown = shown_ids(&context_events(&log.events()?, agent_id));
     picks.retain(|(c, _)| !now_shown.contains(&c.pointer.node_id));
 
-    let header = match cue {
-        WorkCue::File { path, .. } => format!("AgentOps recall, from the file you opened (`{path}`); `fetch_content` with the id returns the full text:"),
-        WorkCue::Error { .. } => "AgentOps recall, after this error; `fetch_content` with the id returns the full text:".to_string(),
-    };
-    let mut text = header;
+    // The header rides on the tool call that triggered it, so it needn't
+    // name the file or the error again; the lines skip the match reasons.
+    // Together that halves each injection (milestone 3b revision 2).
+    let mut text = WORK_RECALL_HEADER.to_string();
     let mut shown_now = Vec::new();
     for (candidate, activation) in picks {
-        let line = candidate.pointer.render();
+        let line = candidate.pointer.render_short();
         if text.chars().count() + 1 + line.chars().count() > WORK_RECALL_BUDGET {
             break;
         }
@@ -379,7 +380,7 @@ mod tests {
         let mut log = MemoryLog::default();
         let first = on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().expect("shown");
         assert_eq!(first.shown.iter().map(|(p, _)| p.node_id).collect::<Vec<_>>(), [id]);
-        assert!(first.context.contains(&format!("(id {id})")) && first.context.contains("`docs/release.md`"));
+        assert!(first.context.starts_with(WORK_RECALL_HEADER) && first.context.ends_with(&format!("(id {id})")), "short lines, no reason: {}", first.context);
         assert!(first.context.chars().count() <= WORK_RECALL_BUDGET);
         assert_eq!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap(), None, "never twice");
 

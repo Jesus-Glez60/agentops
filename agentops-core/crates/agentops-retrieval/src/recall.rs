@@ -75,6 +75,12 @@ impl RecallPointer {
     pub fn render(&self) -> String {
         format!("- [{}] {} (id {}) — {}", self.kind.as_db_str(), self.title, self.node_id, self.reason)
     }
+
+    /// `render` without the reason: `- [gotcha] Title (id 42)`. Work-time
+    /// recall uses it, where the reasons were half of every injection.
+    pub fn render_short(&self) -> String {
+        format!("- [{}] {} (id {})", self.kind.as_db_str(), self.title, self.node_id)
+    }
 }
 
 /// Up to `limit` pointers for `query` in `repo`, best first, skipping any
