@@ -860,6 +860,127 @@ pub(crate) async fn work_recall_replay_json(State(state): State<AppState>, user:
     }
 }
 
+#[derive(Deserialize)]
+pub(crate) struct ClassifyMemoriesBody {
+    #[serde(default)]
+    offset: usize,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// Most memories one classify request judges: each may cost an LLM call,
+/// so the CLI pages through a repo instead of holding one request open.
+const CLASSIFY_PAGE_MAX: usize = 50;
+
+/// `POST /repos/{id}/memories/classify` -- proposes a class for a page of
+/// the repo's gotchas, decisions and notes (ADR 0054), writing nothing.
+/// A status title is settled by its words; the rest by one LLM call each
+/// when the tenant has an Anthropic credential, else they stay durable and
+/// `judge` says so. `agentops classify-memories` pages through it, shows
+/// the author the proposals, and only then assigns them.
+pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<ClassifyMemoriesBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let llm = {
+        let credentials = state.credentials.lock().unwrap();
+        crate::resolve_anthropic_config(&credentials, state.secrets.as_ref(), &tenant).ok()
+    };
+    let limit = body.limit.unwrap_or(CLASSIFY_PAGE_MAX).min(CLASSIFY_PAGE_MAX);
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        let mut memories = Vec::new();
+        for &kind in agentops_graph::similarity::MEMORY_KINDS {
+            memories.extend(store.nodes_by_kind(&repo, kind)?);
+        }
+        memories.sort_by_key(|n| n.id);
+        let total = memories.len();
+        let mut proposals = Vec::new();
+        for node in memories.into_iter().skip(body.offset).take(limit) {
+            let title = node.name.clone().unwrap_or_default();
+            let (class, until) = match &llm {
+                Some(config) => agentops_llm::classify_memory_class(config, &title, node.content.as_deref().unwrap_or(""))?,
+                None => (agentops_notes::heuristic_class(&title).0, None),
+            };
+            proposals.push(json!({ "node_id": node.id, "kind": node.kind.as_db_str(), "title": title, "current": node.memory_class.as_db_str(), "memory_class": class.as_db_str(), "class_until": until }));
+        }
+        Ok(Some(json!({ "total": total, "offset": body.offset, "judge": if llm.is_some() { "llm" } else { "heuristic" }, "proposals": proposals })))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(reply))) => (StatusCode::OK, Json(reply)),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MemoryClassAssignment {
+    node_id: i64,
+    memory_class: String,
+    #[serde(default)]
+    class_until: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AssignMemoryClassesBody {
+    assign: Vec<MemoryClassAssignment>,
+}
+
+/// `POST /repos/{id}/memories/class` -- sets the classes the author
+/// approved, exactly as listed: a class the store doesn't know, or an id
+/// that isn't a memory in this repo, refuses the whole batch before any
+/// write. Replies `{assigned}`.
+pub(crate) async fn assign_memory_classes_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<AssignMemoryClassesBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    for a in &body.assign {
+        let class = agentops_graph::MemoryClass::from_db_str(&a.memory_class);
+        if class.as_db_str() != a.memory_class || (a.class_until.is_some() && class != agentops_graph::MemoryClass::Temporal) {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": format!("node {}: invalid memory_class {:?} / class_until {:?}", a.node_id, a.memory_class, a.class_until) })));
+        }
+    }
+
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Result<usize, String>>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        for a in &body.assign {
+            let is_memory = store.get_node(&repo, a.node_id)?.is_some_and(|n| agentops_graph::similarity::MEMORY_KINDS.contains(&n.kind));
+            if !is_memory {
+                return Ok(Some(Err(format!("node {} is not a memory in this repo", a.node_id))));
+            }
+        }
+        for a in &body.assign {
+            store.set_memory_class(&repo, a.node_id, agentops_graph::MemoryClass::from_db_str(&a.memory_class), a.class_until.as_deref())?;
+        }
+        Ok(Some(Ok(body.assign.len())))
+    })
+    .await;
+
+    match result {
+        Ok(Ok(Some(Ok(assigned)))) => (StatusCode::OK, Json(json!({ "assigned": assigned }))),
+        Ok(Ok(Some(Err(e)))) => (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({ "error": e }))),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// `GET /repos/{id}/docs` -- mirrors `agentops-api`'s `docs_json` cache-hit/
 /// miss logic exactly (persisted `doc_pages` row if present, else a
 /// heuristic-only page built on the fly, never persisted from here).
@@ -1482,6 +1603,60 @@ mod tests {
         let resp = app.clone().oneshot(replay(&other_token, json!({ "steps": [] }))).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND);
         let resp = app.oneshot(post(&other_token, json!({ "cue": { "kind": "file", "path": "src/hooks.rs" } }))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
+    }
+
+    /// ADR 0054's backfill: classify proposes and writes nothing; class
+    /// writes exactly what it's sent, refusing a bad batch before any write.
+    #[tokio::test]
+    async fn memory_classes_are_proposed_without_writing_then_assigned_as_sent() {
+        let (store, secrets) = test_state();
+        let checkouts_dir = tempfile::tempdir().unwrap();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (other, other_token) = signup(&accounts, "other@example.com");
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        teams.add_member(&owner.tenant, owner.id, "admin").unwrap();
+        teams.add_member(&other.tenant, other.id, "admin").unwrap();
+        let connection_id = seed_active_indexed_connection(checkouts_dir.path(), &store, secrets.as_ref(), &owner.tenant, "widgets");
+        let path = crate::indexing::checkout_path(checkouts_dir.path(), &owner.tenant, &connection_id);
+        let repo = agentops_mcp::repo_name(&path);
+        let (shipped, rule, symbol) = {
+            let graph = agentops_mcp::open_store(&path).unwrap();
+            let node = |kind, path: &str, name: &str| agentops_graph::upsert_node(graph.as_ref(), agentops_graph::NewNode { kind, repo: repo.clone(), path: Some(path.into()), name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some(name.into()) }).unwrap();
+            (node(agentops_graph::NodeKind::Note, "vault:a.md", "Widgets screen shipped end-to-end"), node(agentops_graph::NodeKind::Gotcha, "vault:b.md", "Widget ids are per tenant"), node(agentops_graph::NodeKind::Symbol, "src/w.rs", "widget"))
+        };
+        let app = crate::build_router(store, secrets, None, None, None, std::path::PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), agentops_repo_access::indexing_store::IndexingStore::open_in_memory().unwrap(), checkouts_dir.path().to_path_buf(), None);
+        let send = |token: &str, rest: &str, body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri(format!("/repos/{connection_id}/memories/{rest}"))
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let class_of = |id| agentops_mcp::open_store(&path).unwrap().get_node(&repo, id).unwrap().unwrap().memory_class;
+
+        let resp = app.clone().oneshot(send(&owner_token, "classify", json!({}))).await.unwrap();
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let reply = body_json(resp).await;
+        assert_eq!((reply["total"].clone(), reply["judge"].clone()), (json!(2), json!("heuristic")), "{reply}");
+        let proposed = |id: i64| reply["proposals"].as_array().unwrap().iter().find(|p| p["node_id"] == json!(id)).unwrap()["memory_class"].clone();
+        assert_eq!((proposed(shipped), proposed(rule)), (json!("status"), json!("durable")));
+        assert_eq!(class_of(shipped), agentops_graph::MemoryClass::Durable, "classify writes nothing");
+
+        for bad in [json!([{ "node_id": shipped, "memory_class": "obsolete" }]), json!([{ "node_id": shipped, "memory_class": "status", "class_until": "2026-12-01" }]), json!([{ "node_id": shipped, "memory_class": "status" }, { "node_id": symbol, "memory_class": "status" }])] {
+            let resp = app.clone().oneshot(send(&owner_token, "class", json!({ "assign": bad }))).await.unwrap();
+            assert_eq!(resp.status(), axum::http::StatusCode::UNPROCESSABLE_ENTITY, "{bad}");
+        }
+        assert_eq!(class_of(shipped), agentops_graph::MemoryClass::Durable, "a refused batch writes nothing");
+
+        let resp = app.clone().oneshot(send(&owner_token, "class", json!({ "assign": [{ "node_id": shipped, "memory_class": "status" }] }))).await.unwrap();
+        assert_eq!(body_json(resp).await["assigned"], json!(1));
+        assert_eq!(class_of(shipped), agentops_graph::MemoryClass::Status);
+
+        let resp = app.oneshot(send(&other_token, "class", json!({ "assign": [{ "node_id": rule, "memory_class": "status" }] }))).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::NOT_FOUND, "another tenant must never reach the owner's store");
     }
 

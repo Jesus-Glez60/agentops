@@ -9,6 +9,7 @@
 //! follow-up (see the plan).
 
 mod hook_capture;
+mod classify_memories;
 mod compress_output;
 mod librarian;
 mod import_memory;
@@ -145,6 +146,17 @@ enum Command {
         /// Embed every ingested note so it's findable via `search`.
         #[arg(long)]
         with_embeddings: bool,
+    },
+    /// Gives this repo's existing gotchas, decisions and notes a memory
+    /// class (durable, status, experimental, temporal; ADR 0054) on the
+    /// server it's connected to. Dry run by default: saves the proposals to
+    /// `.context/classify-memories.{json,md}`. `--apply` writes exactly the
+    /// saved proposals.
+    ClassifyMemories {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        apply: bool,
     },
     /// Imports a Claude Code auto-memory directory (MEMORY.md and one file
     /// per entry) into AgentOps: into this repo's server connection when it
@@ -774,6 +786,7 @@ fn main() -> Result<()> {
         Command::LinkSimilar { path, prune } => link_similar(&path, prune),
         Command::RecallEval { path, remote, cases, mode, repeat } => recall_eval::run(&path, remote, cases.as_deref(), mode, repeat),
         Command::WorkRecallEval { path, remote, cases, baseline, repeat, sizing, replay, min_score, sources, sample } => work_recall_eval::run(&path, work_recall_eval::Options { remote, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample }),
+        Command::ClassifyMemories { path, apply } => classify_memories::run(&path, apply),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)

@@ -295,6 +295,8 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/recall", post(dashboard::recall_json))
         .route("/repos/{id}/work-recall", post(dashboard::work_recall_json))
         .route("/repos/{id}/work-recall/replay", post(dashboard::work_recall_replay_json))
+        .route("/repos/{id}/memories/classify", post(dashboard::classify_memories_json))
+        .route("/repos/{id}/memories/class", post(dashboard::assign_memory_classes_json))
         .route("/libraries", get(libraries_http::list_libraries_json))
         .route("/libraries/tools/{name}", post(libraries_http::call_library_tool_json))
         .route("/libraries/{slug}", get(libraries_http::get_library_json));
@@ -496,7 +498,7 @@ pub(crate) fn resolve_firecrawl_key(credentials: &agentops_integrations::Credent
 
 /// Same vault-only resolution as `resolve_linear_config`, for
 /// `agentops_llm::AnthropicConfig`.
-fn resolve_anthropic_config(credentials: &agentops_integrations::CredentialStore, secrets: &dyn SecretsProvider, tenant: &str) -> anyhow::Result<agentops_llm::AnthropicConfig> {
+pub(crate) fn resolve_anthropic_config(credentials: &agentops_integrations::CredentialStore, secrets: &dyn SecretsProvider, tenant: &str) -> anyhow::Result<agentops_llm::AnthropicConfig> {
     let cred = credentials
         .get_credential(secrets, tenant, "anthropic")?
         .ok_or_else(|| anyhow::anyhow!("no Anthropic credential stored for tenant {tenant:?} — add one via POST /integrations/anthropic"))?;
