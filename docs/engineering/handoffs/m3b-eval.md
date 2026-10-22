@@ -207,3 +207,27 @@ Work-time pointers lost their match reasons, and the header no longer names the 
 | Short lines | 106,903 (18,235) | 734 |
 
 −38% in total and −40% at the median. Shorter lines let a few more pointers fit `WORK_RECALL_BUDGET`, so the pointer count rose slightly.
+
+## Revision 2: classes applied, and the held-out sample (2026-10-22)
+
+After the backfill (30 memories classed `status`, now `progress`; title words only, since the tenant had no LLM credential), same five sessions at 0.6:
+
+| | Cases | Characters, 5 sessions (median) | Pointers | Prompt-time `recall-eval` |
+| --- | --- | --- | --- | --- |
+| Short lines (`b3ce492`) | 9/20 | 106,903 (18,235) | 734 | 12/20 |
+| + 30 classed memories (`8b6f2e2`) | 10/20 | 105,322 (17,672) | 706 | 13/20 |
+
+Cases and `recall-eval` moved by one, within the drift recorded in revision 1. **The class barely moved volume:** each cue shows up to `WORK_RECALL_MAX_ITEMS`, so the next candidate fills a dropped memory's slot. The class lowers noise; only a cap lowers volume.
+
+**Held-out sample.** 100 pointers, drawn only from memories never labelled before (`work-recall-eval --sample`, which now keeps the labelled file and excludes its memories): 418 of 706 pointers reached an already-labelled memory, so the sample covers the other 288. The author scored each 1–10 (7–10 useful, 4–6 neutral, 1–3 noise):
+
+| Group | Rows | Useful | Neutral | Noise | Mean score |
+| --- | --- | --- | --- | --- | --- |
+| Errors | 40 | 17 | 18 | 5 | 6.0 |
+| Main-session file cues | 32 | 13 | 16 | 3 | 5.9 |
+| Subagent file cues | 28 | 13 | 12 | 3 | 6.0 |
+| **All** | **100** | **43** | **46** | **11** | |
+
+- **Progress memories never helped.** All 8 rows whose memory is (or now would be) `progress` scored 2–4, including two shown through an `Affects` link from the opened file. That is why the class became `progress` with no exception (ADR 0054 amendment).
+- **Without them, noise is 6 of 92 (6.5%).** Four of the six are situational gotchas, tied to one machine or a rare setup (rsync to the server, the deploy setup, an SSH host alias), reached through one shared keyword on an unrelated error. A class doesn't describe them; a stronger match for situational memories might. Open.
+- **Spec targets on this sample:** noise ≤ 30% and at least a third useful both hold. The median volume (17,672 against 3,000) does not.
