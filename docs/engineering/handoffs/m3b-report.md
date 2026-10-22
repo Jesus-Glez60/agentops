@@ -2,18 +2,18 @@
 
 **Final, 2026-10-22.** It covers the milestone 3b spec, revision 1 (2026-10-20) and revision 2 (memory classes, 2026-10-21/22). Facts only, each tied to a commit, path or command output; anything not verified is marked **unverified**. **No memory text, prompts or paths from other projects:** this repo is public, so cases appear as ids and memories as node ids.
 
-**Result: work-time recall is live and its noise is low. It misses the hit-rate and volume targets, and the volume target can't be met without a decision only the author can make.**
+**Result: work-time recall is live and its noise is low. It misses the hit-rate target. The volume target was replaced by the author (2026-10-22) with the noise and useful targets plus a ceiling of 1 pointer per cue, which costs cases.**
 
 | Target | Result | |
 | --- | --- | --- |
-| Cue cases ≥ 14/20, ≥ 7/10 per half | **8/20** (file 5, error 3) | **Not met** |
-| Replay median ≤ 3,000 characters per session | **17,717** (106,452 over 5 sessions, 703 pointers) | **Not met**: needs the decision in §6 |
+| Cue cases ≥ 14/20, ≥ 7/10 per half | **5/20** at 1 per cue (file 3, error 2); 8/20 at 3 | **Not met** |
+| ~~Replay median ≤ 3,000 characters per session~~ | Replaced by the author: noise and useful targets plus 1 pointer per cue. Measured **12,479** (82,395 over 5 sessions, 453 pointers) | Replaced (§6) |
 | Noise ≤ 30% of what's injected | **11%** on the held-out sample; 6.5% without progress memories | Met |
 | At least a third useful | **43%** | Met |
-| Remote p95 < 300 ms | **127 ms** (cases, `--repeat 3`) | Met |
+| Remote p95 < 300 ms | **113 ms** (cases, `--repeat 3`) | Met |
 | Prompt-time `recall-eval` | **12/20**, MRR 0.395 (m3a ended at 15/20) | Below m3a; drift, open (§6) |
 
-Two of the 10 → 8 lost cases are explained: f05's target is now a progress memory, which is never recalled by design (§2), and e04 is run-to-run drift (gotcha 244815).
+Two of the 10 → 8 lost cases are explained: f05's target is now a progress memory, which is never recalled by design (§2), and e04 is run-to-run drift (gotcha 244815). The 8 → 5 drop is the ceiling: f02, f04 and e06 ranked their target 2nd or 3rd.
 
 ## 1. What shipped
 
@@ -65,7 +65,7 @@ All on `main`, deployed by the push-to-main autodeploy. The last code commit is 
 | **Two cue sources removed**: the resolver's `SimilarTo` hop and file-as-query. This supersedes the spec's decision that a doc with no `Affects` link uses the file itself as the query; such a doc now reaches memories only through mentions of its path | The author, 2026-10-21 (after the ablation) |
 | **`INJECT_MIN_SCORE` left at 0.6.** The spec expected the labels to set it; the sweep showed no threshold separates noise from useful (§2) | The author, 2026-10-21 |
 | **Memory classes added** (ADR 0054), with `progress` never recalled, the `Affects` exception dropped after the held-out labels, and the LLM judge opt-in | The author, 2026-10-21/22 |
-| **The volume target is not met.** Classes cut noise, not volume: the next candidate fills a dropped memory's slot | **Open: the author's decision** (§6) |
+| **The volume target (3,000 median) is replaced** by the noise and useful targets plus `WORK_RECALL_MAX_ITEMS` 1 (`785d282`). Cases fall from 8/20 to 5/20 | The author, 2026-10-22 (§6) |
 
 ## 2. Evaluation
 
@@ -80,10 +80,12 @@ All on `main`, deployed by the push-to-main autodeploy. The last code commit is 
 | Revision 1 rules | `52650fc` | 9/20 | – | – | – | – |
 | Revision 1 final sources | `7774597` | 9/20 | 6 | 3 | 0.367 | 112 |
 | Revision 2, 30 memories classed | `8b6f2e2` | 10/20 | 6 | 4 | 0.383 | 112 |
-| **Final** (40 progress, no `Affects` exception) | `684e36a` | **8/20** | 5 | 3 | 0.317 | 127 |
+| 40 progress, no `Affects` exception | `684e36a` | 8/20 | 5 | 3 | 0.317 | 127 |
+| **Final**: 1 pointer per cue | `785d282` | **5/20** | 3 | 2 | 0.250 | 113 |
 
 - **f05 lost by design.** Its target (190997) is a milestone summary, now `progress`. The case set was drawn before the class existed, so it treats a progress memory as the answer.
 - **e04 lost to drift** (rank 3 → unranked; its target isn't classed). Runs swing ±1 with no code change (gotcha 244815).
+- **f02, f04, e06 lost to the ceiling**: their targets ranked 2nd or 3rd. The cut-off is `WORK_RECALL_MAX_ITEMS`, so the case metric follows the ceiling.
 - **Not tuned against the cases**, as the revision asks.
 
 ### Replay
@@ -96,11 +98,13 @@ The same 5 sessions, every context, `INJECT_MIN_SCORE` 0.6.
 | Revision 1 rules | – | 798 |
 | Revision 1 final sources (`7774597`) | 172,061 (30,648) | 715 |
 | Short lines (`b3ce492`) | 106,903 (18,235) | 734 |
-| **Final** (`684e36a`) | **106,452 (17,717)** | **703** |
+| 40 progress (`684e36a`) | 106,452 (17,717) | 703 |
+| **Final**: 1 pointer per cue (`785d282`) | **82,395 (12,479)** | **453** |
 
 - Short lines account for nearly all the cut from 30,648 to 17,717.
 - Classes removed about 30 pointers, but `WORK_RECALL_MAX_ITEMS` refills each cue's slots from the next candidates. So **classes lower noise, not volume.**
-- 3,000 characters at the current line length is about 25 pointers per session, against 140 today.
+- 1 pointer per cue cut 36% of pointers but 30% of characters: each injection still carries its header, now about a third of the volume.
+- **The label mix didn't change.** Joining each pointer with its memory's existing label (a proxy: the label came from another cue): 56% useful / 7% noise at 1 per cue, against 58% / 7% at 3. Rank 1 isn't measurably better than ranks 2–3; the ceiling shows fewer memories, not better ones.
 
 ### Labels
 
@@ -147,7 +151,7 @@ Still true from that session:
 | Constant | Value | Supported by the evaluation? |
 | --- | --- | --- |
 | `INJECT_MIN_SCORE` | 0.6 | Yes, as the floor: no higher value improves the noise/useful trade (sweep, §2) |
-| `WORK_RECALL_MAX_ITEMS` | 3 | The case metric's cut-off. It decides volume, since freed slots refill (§6) |
+| `WORK_RECALL_MAX_ITEMS` | 1 | The author's ceiling (`785d282`, was 3). Also the case metric's cut-off. It decides volume, since freed slots refill (§6) |
 | `WORK_RECALL_BUDGET` | 800 characters | Not binding now that lines are short |
 | `MAX_INJECTED_PER_CONTEXT` | 30 | Main session; errors may exceed it |
 | `SUBAGENT_MAX_INJECTED` | 8 | Revision 1, rule 2; errors included. No subagent passed it in the replay |
@@ -217,10 +221,7 @@ Neither is measured yet.
 
 ## 6. Open issues
 
-**The volume target needs your decision.** At 703 pointers and a median of 17,717 characters, the 3,000 target means about 25 pointers per session, about 1/6 of today. Labels put 43% of pointers at useful, so any cut that size drops useful memories. Options:
-1. **Cap pointers per session** (main plus subagents), e.g. 25. That meets the target and drops useful memories in order of activation.
-2. **Lower `WORK_RECALL_MAX_ITEMS`** from 3 to 1 per cue. It roughly thirds the volume and keeps each cue's best match. It still won't reach 3,000 alone.
-3. **Replace the volume target** with the noise and useful targets (both met) plus a looser ceiling you set.
+**The volume target is replaced (the author, 2026-10-22).** At 703 pointers the 3,000 median meant about 25 pointers per session, and 43% of pointers were useful, so meeting it would drop useful memories. Of the three options (a per-session cap, 1 per cue, replacing the target), the author chose to replace it with the noise and useful targets plus a ceiling of 1 pointer per cue. Measured at `785d282`: median 12,479 characters, 453 pointers, cases 8/20 → 5/20, label mix unchanged (§2). Undoing it is the one constant.
 
 **New since the draft:**
 - **Situational gotchas are the remaining noise.** 4 of the 6 noisy held-out rows are true but tied to one machine or a rare setup, reached through one shared keyword. A class can't describe them; a stronger match for such memories might.

@@ -252,3 +252,16 @@ Cases and `recall-eval` moved by one, within the drift recorded in revision 1. *
 | Haiku + bodies | 5 | 14 | 27 | 3 | 19 |
 
 The Haiku runs were subagents. The first reported success after reading titles only (20 tool calls for 241 memories), and one batch of the second ignored the bodies it fetched. Both were caught by checking tool-call counts, and recorded body lengths and opening text against the real memories. The batch was rerun. So the title words stay the only automatic classifier, and `classify-memories --llm` only proposes.
+
+## Volume ceiling (`785d282`, 2026-10-22): 1 pointer per cue
+
+The author replaced the 3,000-character median with the noise and useful targets plus `WORK_RECALL_MAX_ITEMS` 1.
+
+| Cases | File | Error | MRR | p95 ms | Characters, 5 sessions (median) | Pointers |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5/20 | 3 | 2 | 0.250 | 113 | 82,395 (12,479) | 453 |
+
+- f02, f04 and e06 had their target at rank 2 or 3 in the `684e36a` run; recomputing that run at a cut-off of 1 gave the same 5/20 before deploying.
+- Headers now make up about a third of the volume: one per injection, 453 injections.
+- Label mix by memory (a proxy, joining each pointer with its memory's existing label): 56% useful, 37% neutral, 7% noise, against 58/35/7 at 3 per cue. 53 of the 453 pointers reached unlabelled memories.
+
