@@ -171,3 +171,39 @@ Rules 1–3 of revision 1: only a file's first cue per context injects (`00f4186
 - The replay ran twice and gave the same numbers both times.
 - **Labelling sample:** 100 of the 715 pointers, stratified by the author's choice: 40 from error cues, 40 main-session file cues, 20 subagent file cues. Each group is drawn in a fixed pseudo-random order (`work-recall-eval --replay … --sample 100`, written to `.context/work-recall-eval/to-label.{jsonl,md}`). Errors and main-session pointers alone came to 256, so "all of them" and "about 100" couldn't both hold. Reweight each group's noise share by its size (140 / 116 / 459) to estimate it for all 715.
 - **Prompt-time `recall-eval` is down to 12/20** (MRR 0.421). c09 dropped from rank 2 to past 8. No retrieval or graph code changed between this run and the 13/20 one (`git log 6c992d1..7774597` over those paths is empty). Only one note was added to the graph in between. [Likely] Graph growth wears prompt-time recall down at about one case per few notes. **Open.**
+
+## Labels (revision 1 sample, 2026-10-21)
+
+The author labelled all 100 rows, five at a time. Weighted by group size (140 / 116 / 459):
+
+| Group (pointers) | Useful | Neutral | Noise |
+| --- | --- | --- | --- |
+| Errors (140) | 35% | 17.5% | 47.5% |
+| Main-session file cues (116) | 75% | 12.5% | 12.5% |
+| Subagent file cues (459) | 45% | 40% | 15% |
+| **All 715** | **48%** | **31%** | **21%** |
+
+**Activation doesn't separate noise from useful.** On errors, useful rows score 0.61–1.31 and noise rows 0.62–1.91. The threshold sweep, weighted:
+
+| `INJECT_MIN_SCORE` | Pointers kept | Noise among kept | Useful kept |
+| --- | --- | --- | --- |
+| 0.6 (current) | 100% | 21% | 100% |
+| 0.7 | 94% | 20% | 93% |
+| 0.75 | 63% | 25% | 51% |
+| 0.9 | 45% | 17% | 39% |
+| 1.0 | 20% | 24% | 17% |
+
+So the threshold stays at 0.6.
+
+**What the noise is.** Nearly every noise row is a status-only memory, one that announces that something shipped, was implemented or was completed, or summarises a session or plan, with no cause, rule or warning. Such memories go stale as later builds land. The same memory was useful from a file it concerns and noise elsewhere in three cases. A title pattern fitted on these rows would drop 23 noise, 4 neutral and 1 useful row; it is an in-sample fit, so it isn't a measurement. Recorded as gotcha 253842. Revision 2 (ADR 0054) acts on it with memory classes.
+
+## Revision 2, step 1: short work-time lines (`b3ce492`)
+
+Work-time pointers lost their match reasons, and the header no longer names the file or the error. Same five sessions, 0.6, `Affects` + mentions:
+
+| | Characters, 5 sessions (median) | Pointers |
+| --- | --- | --- |
+| Before (`7774597`) | 172,061 (30,648) | 715 |
+| Short lines | 106,903 (18,235) | 734 |
+
+−38% in total and −40% at the median. Shorter lines let a few more pointers fit `WORK_RECALL_BUDGET`, so the pointer count rose slightly.

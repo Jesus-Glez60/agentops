@@ -59,6 +59,7 @@ Decisions with a recorded reason, one file each. A record exists only when its "
 | [0051](0051-similarity-edges-between-memories.md) | Similarity edges between memories | Milestone 2 |
 | [0052](0052-the-server-may-embed-the-prompt-in-a-hook.md) | The server may embed the prompt in a hook | Milestone 3a |
 | [0053](0053-session-activation-from-recorded-cues.md) | Session activation from recorded cues | Milestone 3b |
+| [0054](0054-memory-classes.md) | Memory classes | Milestone 3b |
 
 ## Pending: rationale not recorded
 
