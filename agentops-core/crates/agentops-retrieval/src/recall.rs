@@ -34,7 +34,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use agentops_embeddings::Embedder;
-use agentops_graph::{EdgeRelation, GraphStore, Node, NodeKind, NodeProminence};
+use agentops_graph::{EdgeRelation, GraphStore, MemoryClass, Node, NodeKind, NodeProminence};
 use anyhow::Result;
 
 /// The node kinds recall points at: memories, never code. Generated doc
@@ -68,18 +68,24 @@ pub struct RecallPointer {
     pub title: String,
     /// Why it matched: the keywords it matched, or the symbol it affects.
     pub reason: String,
+    /// Its class; an experimental one is labelled in the line.
+    pub memory_class: MemoryClass,
 }
 
 impl RecallPointer {
     /// One line: `- [gotcha] Title (id 42) — matched "hook", "remote"`.
     pub fn render(&self) -> String {
-        format!("- [{}] {} (id {}) — {}", self.kind.as_db_str(), self.title, self.node_id, self.reason)
+        format!("- [{}] {}{} (id {}) — {}", self.kind.as_db_str(), self.title, self.label(), self.node_id, self.reason)
     }
 
     /// `render` without the reason: `- [gotcha] Title (id 42)`. Work-time
     /// recall uses it, where the reasons were half of every injection.
     pub fn render_short(&self) -> String {
-        format!("- [{}] {} (id {})", self.kind.as_db_str(), self.title, self.node_id)
+        format!("- [{}] {}{} (id {})", self.kind.as_db_str(), self.title, self.label(), self.node_id)
+    }
+
+    fn label(&self) -> String {
+        self.memory_class.label().map(|l| format!(" — {l}")).unwrap_or_default()
     }
 }
 
@@ -149,13 +155,22 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         kind: NodeKind,
         title: String,
         prominence: NodeProminence,
+        memory_class: MemoryClass,
         reasons: Vec<String>,
         /// Sum of the rarity weights of the distinct cues it matched.
         strength: f64,
     }
     let mut candidates: HashMap<i64, Candidate> = HashMap::new();
-    let mut add = |id: i64, kind: NodeKind, title: Option<&str>, prominence: NodeProminence, score: f64, reason: String, weight: f64| {
-        let c = candidates.entry(id).or_insert_with(|| Candidate { score: 0.0, kind, title: title.unwrap_or("(untitled)").to_string(), prominence, reasons: Vec::new(), strength: 0.0 });
+    // A memory's class is checked where it enters: a status note never
+    // reaches a prompt or an error (no file is being worked on), a temporal
+    // one only before its date (ADR 0054).
+    let today = agentops_graph::utc_today();
+    let class_ok = |node: &Node| node.memory_class.recallable_at(&today, node.class_until.as_deref(), false);
+    let mut add = |node: &Node, score: f64, reason: String, weight: f64| {
+        if !class_ok(node) {
+            return;
+        }
+        let c = candidates.entry(node.id).or_insert_with(|| Candidate { score: 0.0, kind: node.kind, title: node.name.as_deref().unwrap_or("(untitled)").to_string(), prominence: node.prominence, memory_class: node.memory_class, reasons: Vec::new(), strength: 0.0 });
         c.score += score;
         if !c.reasons.contains(&reason) {
             c.reasons.push(reason);
@@ -185,7 +200,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         query_weight += weight;
         for &kind in RECALL_KINDS {
             for (rank, (node, _)) in store.search_lexical(repo, keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
-                add(node.id, node.kind, node.name.as_deref(), node.prominence, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""), weight);
+                add(&node, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""), weight);
             }
         }
     }
@@ -219,7 +234,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
             for note in notes {
                 let best = affects_confidence.entry(note.id).or_insert(0.0);
                 *best = best.max(confidence);
-                add(note.id, note.kind, note.name.as_deref(), note.prominence, 1.0, format!("affects `{identifier}`"), symbol_weight);
+                add(&note, 1.0, format!("affects `{identifier}`"), symbol_weight);
             }
         }
     }
@@ -228,6 +243,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
     let single_keyword_cap = if keywords.len() >= 2 { 1.0 } else { 0.5 };
     let enough = |c: &Candidate| c.reasons.iter().any(|r| r.starts_with("affects")) || c.reasons.len() >= min_keyword_matches;
     let shown = |id: &i64, prominence: NodeProminence| !exclude.contains(id) && prominence != NodeProminence::Pinned && prominence.recallable();
+    let shown_node = |node: &Node| shown(&node.id, node.prominence) && class_ok(node);
     // The rarity-weighted strength of what a node matched comes first: rank
     // fusion runs per kind, so every kind's top hit scores alike, and a
     // gotcha matching three keywords must beat a decision matching two
@@ -239,26 +255,26 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
             let reduced = if c.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
             let keyword = if query_weight == 0.0 { 0.0 } else { (c.strength / query_weight).min(1.0) * single_keyword_cap };
             let confidence = affects_confidence.get(&id).copied().unwrap_or(0.0).max(keyword);
-            Ranked { id, strength: c.strength, score: c.score * reduced, confidence: confidence * reduced, hop: false, kind: c.kind, title: c.title, reasons: c.reasons }
+            Ranked { id, strength: c.strength, score: c.score * reduced, confidence: confidence * reduced, hop: false, kind: c.kind, title: c.title, memory_class: c.memory_class, reasons: c.reasons }
         })
         .collect();
     sort_ranked(&mut ranked);
     // A hop neighbour weighs like one hit on the prompt's weakest word.
     let mut hop_strength = weakest;
     if let Some((rx, started)) = pending {
-        if let Some(dense) = dense_candidates(store, repo, &rx, started, &shown)? {
+        if let Some(dense) = dense_candidates(store, repo, &rx, started, &shown_node)? {
             fuse(&mut ranked, dense);
             hop_strength = FUSED_STRENGTH;
         }
     }
-    hop(store, repo, &mut ranked, &shown, hop_strength)?;
+    hop(store, repo, &mut ranked, &shown_node, hop_strength)?;
     Ok(ranked
         .into_iter()
         .take(limit)
         .map(|r| {
             let lexical = r.reasons.iter().any(|x| x.starts_with('"') || x.starts_with("affects"));
             let reason = if r.reasons.iter().all(|x| x.starts_with('"')) { format!("matched {}", r.reasons.join(", ")) } else { r.reasons.join("; ") };
-            Scored { pointer: RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason }, confidence: r.confidence, lexical }
+            Scored { pointer: RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason, memory_class: r.memory_class }, confidence: r.confidence, lexical }
         })
         .collect())
 }
@@ -266,7 +282,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
 /// The memories closest in meaning to the prompt, best first (cosine, then
 /// id), or `None` when embedding plus the search overran
 /// `DENSE_TIMEOUT_MS` or the embed failed. Each case is logged.
-fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Result<Vec<f32>>, Duration)>, started: Instant, shown: &dyn Fn(&i64, NodeProminence) -> bool) -> Result<Option<Vec<(Node, f32)>>> {
+fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Result<Vec<f32>>, Duration)>, started: Instant, shown: &dyn Fn(&Node) -> bool) -> Result<Option<Vec<(Node, f32)>>> {
     let budget = Duration::from_millis(DENSE_TIMEOUT_MS);
     let (embedding, embed_time) = match rx.recv_timeout(budget.saturating_sub(started.elapsed())) {
         Ok((Ok(embedding), took)) => (embedding, took),
@@ -286,7 +302,7 @@ fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Res
         eprintln!("agentops: dense recall timeout: embedding plus search took {} ms; keyword recall only", total.as_millis());
         return Ok(None);
     }
-    Ok(Some(nearest.into_iter().filter(|(node, score)| *score >= DENSE_MIN_SCORE && RECALL_KINDS.contains(&node.kind) && shown(&node.id, node.prominence)).collect()))
+    Ok(Some(nearest.into_iter().filter(|(node, score)| *score >= DENSE_MIN_SCORE && RECALL_KINDS.contains(&node.kind) && shown(node)).collect()))
 }
 
 /// Replaces `ranked`'s order with the reciprocal rank fusion of it and
@@ -301,7 +317,7 @@ fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
     for (i, (node, cosine)) in dense.into_iter().enumerate() {
         let reduced = if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
         let reason = format!("close in meaning ({cosine:.2})");
-        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, confidence: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), reasons: Vec::new() });
+        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, confidence: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), memory_class: node.memory_class, reasons: Vec::new() });
         entry.score += rrf(i) * reduced;
         entry.confidence = entry.confidence.max(dense_confidence(cosine) * reduced);
         entry.reasons.push(reason);
@@ -355,6 +371,7 @@ struct Ranked {
     hop: bool,
     kind: NodeKind,
     title: String,
+    memory_class: MemoryClass,
     reasons: Vec<String>,
 }
 
@@ -379,7 +396,7 @@ fn sort_ranked(ranked: &mut [Ranked]) {
 /// its closest. A node reached directly and by a hop, or by two hops, keeps
 /// the stronger of them and every reason. Sources are walked strongest
 /// first, so the result never depends on map order.
-fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&i64, NodeProminence) -> bool, hop_strength: f64) -> Result<()> {
+fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn Fn(&Node) -> bool, hop_strength: f64) -> Result<()> {
     let mut position: HashMap<i64, usize> = ranked.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
     let sources: Vec<(i64, f64, f64, String)> = ranked.iter().map(|r| (r.id, r.score, r.confidence, r.title.clone())).collect();
     for (source_id, score, confidence, title) in sources {
@@ -404,13 +421,13 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
                 continue;
             }
             let Some(neighbour) = store.get_node(repo, target)? else { continue };
-            if !RECALL_KINDS.contains(&neighbour.kind) || !shown(&neighbour.id, neighbour.prominence) {
+            if !RECALL_KINDS.contains(&neighbour.kind) || !shown(&neighbour) {
                 continue;
             }
             let reduced = if neighbour.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
             taken += 1;
             position.insert(target, ranked.len());
-            ranked.push(Ranked { id: target, strength: hop_strength, score: score * cosine * HOP_FACTOR * reduced, confidence: confidence * cosine * HOP_FACTOR * reduced, hop: true, kind: neighbour.kind, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
+            ranked.push(Ranked { id: target, strength: hop_strength, score: score * cosine * HOP_FACTOR * reduced, confidence: confidence * cosine * HOP_FACTOR * reduced, hop: true, kind: neighbour.kind, memory_class: neighbour.memory_class, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
         }
     }
     sort_ranked(ranked);

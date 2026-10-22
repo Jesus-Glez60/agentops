@@ -293,14 +293,16 @@ impl Merged {
 }
 
 /// Whether recall may point at `node`: a memory, not pinned (the pin block
-/// shows those), and not needs-review.
-fn recallable(node: &agentops_graph::Node) -> bool {
-    RECALL_KINDS.contains(&node.kind) && node.prominence.recallable() && node.prominence != NodeProminence::Pinned
+/// shows those), not needs-review, and allowed by its class. A status
+/// memory is allowed only through an `Affects` link from the file being
+/// worked on (`via_affects_file`), never through a mention (ADR 0054).
+fn recallable(node: &agentops_graph::Node, today: &str, via_affects_file: bool) -> bool {
+    RECALL_KINDS.contains(&node.kind) && node.prominence.recallable() && node.prominence != NodeProminence::Pinned && node.memory_class.recallable_at(today, node.class_until.as_deref(), via_affects_file)
 }
 
 fn candidate(node: agentops_graph::Node, score: f64, reason: String) -> WorkCandidate {
     let score = if node.prominence == NodeProminence::Reduced { score * 0.5 } else { score };
-    WorkCandidate { pointer: RecallPointer { node_id: node.id, kind: node.kind, title: node.name.unwrap_or_else(|| "(untitled)".to_string()), reason }, score }
+    WorkCandidate { pointer: RecallPointer { node_id: node.id, kind: node.kind, title: node.name.unwrap_or_else(|| "(untitled)".to_string()), reason, memory_class: node.memory_class }, score }
 }
 
 /// Source 1: memories with an `Affects` edge to one of `symbols` (the
@@ -324,10 +326,11 @@ fn affects_candidates(store: &dyn GraphStore, repo: &str, symbols: &[agentops_gr
         }
     }
     let score = affects_confidence_for(order.len());
+    let today = agentops_graph::utc_today();
     let mut out = Vec::new();
     for id in order {
         let Some(note) = store.get_node(repo, id)? else { continue };
-        if !recallable(&note) {
+        if !recallable(&note, &today, true) {
             continue;
         }
         let reason = format!("affects {}", affected[&id].iter().map(|s| format!("`{s}`")).collect::<Vec<_>>().join(", "));
@@ -339,11 +342,12 @@ fn affects_candidates(store: &dyn GraphStore, repo: &str, symbols: &[agentops_gr
 /// Source 2: memories whose text names `path`, or its file name when that
 /// name is unique among the repo's files.
 fn mention_candidates(store: &dyn GraphStore, repo: &str, path: &str) -> Result<Vec<WorkCandidate>> {
-    let mut out: Vec<WorkCandidate> = store.nodes_mentioning(repo, path, RECALL_KINDS, PER_SOURCE)?.into_iter().filter(recallable).map(|n| candidate(n, MENTION_PATH_SCORE, format!("mentions `{path}`"))).collect();
+    let today = agentops_graph::utc_today();
+    let mut out: Vec<WorkCandidate> = store.nodes_mentioning(repo, path, RECALL_KINDS, PER_SOURCE)?.into_iter().filter(|n| recallable(n, &today, false)).map(|n| candidate(n, MENTION_PATH_SCORE, format!("mentions `{path}`"))).collect();
     let name = path.rsplit('/').next().unwrap_or(path);
     if name != path && store.count_files_named(repo, name)? == 1 {
         let seen: HashSet<i64> = out.iter().map(|c| c.pointer.node_id).collect();
-        out.extend(store.nodes_mentioning(repo, name, RECALL_KINDS, PER_SOURCE)?.into_iter().filter(|n| recallable(n) && !seen.contains(&n.id)).map(|n| candidate(n, MENTION_NAME_SCORE, format!("mentions `{name}`"))));
+        out.extend(store.nodes_mentioning(repo, name, RECALL_KINDS, PER_SOURCE)?.into_iter().filter(|n| recallable(n, &today, false) && !seen.contains(&n.id)).map(|n| candidate(n, MENTION_NAME_SCORE, format!("mentions `{name}`"))));
     }
     Ok(out)
 }
@@ -392,7 +396,7 @@ pub fn clean_error(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentops_graph::{upsert_node, NewNode, SqliteGraphStore};
+    use agentops_graph::{upsert_node, MemoryClass, NewNode, SqliteGraphStore};
 
     fn node(store: &SqliteGraphStore, kind: NodeKind, path: &str, name: &str) -> i64 {
         upsert_node(store, NewNode { kind, repo: "r".into(), path: Some(path.into()), name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some(name.into()) }).unwrap()
@@ -522,6 +526,38 @@ mod tests {
         assert!(prompt_time.iter().any(|(p, _)| p.node_id == neighbour), "prompt recall still hops: {prompt_time:?}");
         let found = resolve_cue(&store, "r", &WorkCue::Error { text: "psql: error: FATAL: role \"postgres\" does not exist".into() }, CueSources::All, None).unwrap();
         assert_eq!(found.iter().map(|c| c.pointer.node_id).collect::<Vec<_>>(), [matched], "a hop neighbour never rides in on an error: {found:?}");
+    }
+
+    /// ADR 0054: a status memory reaches recall only through an `Affects`
+    /// link from the file being worked on; a temporal one only before its
+    /// date; an experimental one always, labelled.
+    #[test]
+    fn each_memory_class_reaches_only_the_cues_its_rule_allows() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let path = "src/billing_ledger.rs";
+        let symbol = node(&store, NodeKind::Symbol, path, "reconcile");
+        let status = memory(&store, NodeKind::Note, "Ledger reconcile shipped", "Ledger reconcile shipped; src/billing_ledger.rs postgres role check added.");
+        store.add_edge("r", status, symbol, EdgeRelation::Affects).unwrap();
+        let mentioned_status = memory(&store, NodeKind::Note, "Ledger export shipped", "Export from src/billing_ledger.rs shipped.");
+        let expired = memory(&store, NodeKind::Gotcha, "Ledger rounding workaround", "src/billing_ledger.rs rounds twice until the fix.");
+        let experimental = memory(&store, NodeKind::Decision, "Try posting in batches", "src/billing_ledger.rs posts in batches for now.");
+        store.set_memory_class("r", status, MemoryClass::Status, None).unwrap();
+        store.set_memory_class("r", mentioned_status, MemoryClass::Status, None).unwrap();
+        store.set_memory_class("r", expired, MemoryClass::Temporal, Some("2020-01-01")).unwrap();
+        store.set_memory_class("r", experimental, MemoryClass::Experimental, None).unwrap();
+
+        let found = resolve_cue(&store, "r", &WorkCue::File { path: path.into() }, CueSources::All, None).unwrap();
+        let reached = ids(&found);
+        assert!(reached.contains(&status), "a status memory reaches the file it affects: {found:?}");
+        assert!(!reached.contains(&mentioned_status), "never through a mention");
+        assert!(!reached.contains(&expired), "a temporal memory past its date is gone");
+        let marked = found.iter().find(|c| c.pointer.node_id == experimental).expect("experimental is shown");
+        assert!(marked.pointer.render_short().contains("Try posting in batches — experimental (id"), "{}", marked.pointer.render_short());
+
+        let error = resolve_cue(&store, "r", &WorkCue::Error { text: "ledger reconcile shipped postgres role check".into() }, CueSources::All, None).unwrap();
+        assert!(!ids(&error).contains(&status), "never from an error: {error:?}");
+        let prompt = crate::recall_scored_with(&store, "r", "ledger reconcile shipped postgres role check", 8, &HashSet::new(), None).unwrap();
+        assert!(prompt.iter().all(|(p, _)| p.node_id != status), "never from a prompt: {prompt:?}");
     }
 
     #[test]
