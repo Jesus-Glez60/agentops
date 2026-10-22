@@ -45,7 +45,7 @@
 //! the real deployment's actual Postgres server core count/storage.
 
 use agentops_embeddings::EMBEDDING_DIM;
-use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
+use agentops_graph::{rank_notes_by_weight, Edge, EdgeRelation, GraphStore, NaturalKey, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, MemoryClass, Node, NodeKind, NodeProminence, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -178,6 +178,8 @@ fn row_to_node(row: &tokio_postgres::Row) -> Node {
         // backend yet -- see schema.sql's own note. `None` makes recency
         // ranking a no-op here rather than reading a wrong/absent column.
         last_touched_at: None,
+        memory_class: MemoryClass::from_db_str(row.get::<_, &str>("memory_class")),
+        class_until: row.get("class_until"),
     }
 }
 
@@ -431,6 +433,14 @@ impl GraphStore for PostgresGraphStore {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
             client.execute("UPDATE nodes SET curated = $5, prominence = $1, curation_reason = $2 WHERE repo = $3 AND id = $4", &[&prominence.as_db_str(), &reason, &repo, &node_id, &(prominence != NodeProminence::NeedsReview)]).await?;
+            Ok(())
+        })
+    }
+
+    fn set_memory_class(&self, repo: &str, node_id: i64, class: MemoryClass, until: Option<&str>) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("UPDATE nodes SET memory_class = $1, class_until = $2 WHERE repo = $3 AND id = $4", &[&class.as_db_str(), &until, &repo, &node_id]).await?;
             Ok(())
         })
     }
@@ -1862,6 +1872,22 @@ mod tests {
         assert_eq!(after_rescan.prominence, NodeProminence::Reduced, "a rescan must not silently reset a curated gotcha's prominence back to Full");
 
         store.delete_nodes("pg-repo-review", &[id]).unwrap();
+    }
+
+    #[test]
+    fn set_memory_class_survives_a_subsequent_rescan() {
+        let store = require_store!();
+        let n = node("pg-repo-class", NodeKind::Note, None, Some("Feature X shipped"));
+        let id = upsert_node(&store, n.clone()).unwrap();
+        let fresh = store.get_node("pg-repo-class", id).unwrap().unwrap();
+        assert_eq!((fresh.memory_class, fresh.class_until), (MemoryClass::Durable, None));
+
+        store.set_memory_class("pg-repo-class", id, MemoryClass::Temporal, Some("2026-11-01")).unwrap();
+        upsert_node(&store, n).unwrap();
+        let after_rescan = store.get_node("pg-repo-class", id).unwrap().unwrap();
+        assert_eq!((after_rescan.memory_class, after_rescan.class_until.as_deref()), (MemoryClass::Temporal, Some("2026-11-01")), "read back, not only written");
+
+        store.delete_nodes("pg-repo-class", &[id]).unwrap();
     }
 
     /// Regression test for the exact reasoning `schema.sql` documents:

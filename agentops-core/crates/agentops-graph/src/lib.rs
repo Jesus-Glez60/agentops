@@ -171,6 +171,87 @@ pub fn prominence_label(prominence: NodeProminence) -> Option<&'static str> {
     }
 }
 
+/// What kind of truth a memory holds, which decides where recall may show
+/// it (milestone 3b revision 2, ADR 0054). Orthogonal to prominence:
+/// prominence is a person's curation, the class is what the memory is.
+/// `Status` ("X shipped") goes stale as later builds land and was most of
+/// work-time recall's noise, so it's recalled only from a file it's
+/// `Affects`-linked to. `Temporal` holds until `class_until`. Every class
+/// stays in search and `list_gotchas`; none is a resolved or hidden state
+/// (decision 54003). Stored as free TEXT like `NodeProminence`, so an
+/// unknown value reads as `Durable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum MemoryClass {
+    #[default]
+    Durable,
+    Status,
+    Experimental,
+    Temporal,
+}
+
+impl MemoryClass {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            MemoryClass::Durable => "durable",
+            MemoryClass::Status => "status",
+            MemoryClass::Experimental => "experimental",
+            MemoryClass::Temporal => "temporal",
+        }
+    }
+
+    pub fn from_db_str(s: &str) -> Self {
+        match s {
+            "status" => MemoryClass::Status,
+            "experimental" => MemoryClass::Experimental,
+            "temporal" => MemoryClass::Temporal,
+            _ => MemoryClass::Durable,
+        }
+    }
+
+    /// Whether recall may show a memory of this class. `today` and `until`
+    /// are UTC `YYYY-MM-DD`; a temporal memory is shown while
+    /// `today < until`, so one superseded today (`until = today`) is gone
+    /// at once. `via_affects_file` is true only when the memory was reached
+    /// through an `Affects` link from the file being worked on.
+    pub fn recallable_at(&self, today: &str, until: Option<&str>, via_affects_file: bool) -> bool {
+        match self {
+            MemoryClass::Durable | MemoryClass::Experimental => true,
+            MemoryClass::Status => via_affects_file,
+            MemoryClass::Temporal => until.is_none_or(|u| today < u),
+        }
+    }
+
+    /// The text label a pointer carries for this class, or `None`.
+    pub fn label(&self) -> Option<&'static str> {
+        match self {
+            MemoryClass::Experimental => Some("experimental"),
+            MemoryClass::Durable | MemoryClass::Status | MemoryClass::Temporal => None,
+        }
+    }
+}
+
+/// Today's date in UTC as `YYYY-MM-DD`, the form `class_until` is stored
+/// and compared in.
+pub fn utc_today() -> String {
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    civil_date((secs / 86_400) as i64)
+}
+
+/// `YYYY-MM-DD` for a count of days since 1970-01-01 (Hinnant's
+/// days-to-civil; no date crate is in the workspace).
+fn civil_date(days: i64) -> String {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 /// Ranking-only multiplier for a `Reduced`-prominence node's relevance
 /// score -- 1.0 (no change) for `Full`/`Pinned`. Never apply this to a
 /// value that's also displayed as a "real" number (raw cosine similarity,
@@ -311,6 +392,12 @@ pub struct Node {
     /// deliberately returns `None` rather than a wrong/stale value —
     /// `None` makes recency ranking a no-op there, not a crash or a lie.
     pub last_touched_at: Option<String>,
+    /// What kind of truth this memory holds (`MemoryClass`), and for a
+    /// `Temporal` one the UTC date it stops being recalled. Like curation,
+    /// set only through `set_memory_class`, never by `upsert_node`, so a
+    /// rescan keeps it.
+    pub memory_class: MemoryClass,
+    pub class_until: Option<String>,
 }
 
 /// A single Core Modules grouping for the Documentation Viewer -- either
@@ -867,6 +954,11 @@ pub trait GraphStore {
     /// `NeedsReview` leaves `curated` false: no person has looked at the
     /// node yet, which is the point of the state.
     fn set_curation(&self, repo: &str, node_id: i64, prominence: NodeProminence, reason: Option<&str>) -> Result<()>;
+    /// Sets a memory's class and, for `Temporal`, the date it ends. A
+    /// separate mutator for the same reason as `set_curation`: every
+    /// rescan and note ingest goes through `upsert_node`, which must never
+    /// reset it.
+    fn set_memory_class(&self, repo: &str, node_id: i64, class: MemoryClass, until: Option<&str>) -> Result<()>;
     /// Changes a node's kind in place (id, edges, embedding and curation
     /// kept): the Gotchas workspace's "set kind" on a `NeedsReview` memory.
     /// A vault-backed note's file must be rewritten to the same kind by the
@@ -1444,6 +1536,31 @@ pub fn prune_stale_nodes(store: &dyn GraphStore, repo: &str, kind: NodeKind, kee
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn each_memory_class_follows_its_recall_rule() {
+        for class in [MemoryClass::Durable, MemoryClass::Status, MemoryClass::Experimental, MemoryClass::Temporal] {
+            assert_eq!(MemoryClass::from_db_str(class.as_db_str()), class);
+        }
+        assert_eq!(MemoryClass::from_db_str("whatever"), MemoryClass::Durable);
+        let today = "2026-10-21";
+        assert!(MemoryClass::Durable.recallable_at(today, None, false));
+        assert!(MemoryClass::Experimental.recallable_at(today, None, false));
+        assert!(!MemoryClass::Status.recallable_at(today, None, false), "a status note never reaches recall on its own");
+        assert!(MemoryClass::Status.recallable_at(today, None, true), "only from a file it affects");
+        assert!(MemoryClass::Temporal.recallable_at(today, None, false));
+        assert!(MemoryClass::Temporal.recallable_at(today, Some("2026-10-22"), false));
+        assert!(!MemoryClass::Temporal.recallable_at(today, Some(today), false), "superseded today is gone today");
+        assert!(!MemoryClass::Temporal.recallable_at(today, Some("2026-09-01"), true));
+    }
+
+    #[test]
+    fn civil_date_counts_days_from_the_epoch() {
+        assert_eq!(civil_date(0), "1970-01-01");
+        assert_eq!(civil_date(11_016), "2000-02-29");
+        assert_eq!(civil_date(20_747), "2026-10-21");
+        assert_eq!(utc_today().len(), 10);
+    }
 
     #[test]
     fn node_kind_parse_accepts_every_kind_and_rejects_unknown_ones() {

@@ -2009,6 +2009,8 @@ mod tests {
                 curated: false,
                 prominence: agentops_graph::NodeProminence::Full,
                 curation_reason: None,
+                memory_class: agentops_graph::MemoryClass::Durable,
+                class_until: None,
                 last_touched_at: None,
             }
         }

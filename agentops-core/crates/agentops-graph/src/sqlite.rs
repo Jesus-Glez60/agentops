@@ -18,7 +18,7 @@ use rusqlite_migration::{Migrations, M};
 
 use agentops_embeddings::EMBEDDING_DIM;
 
-use crate::{Edge, EdgeRelation, GraphStore, Node, NodeKind, NodeProminence, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
+use crate::{Edge, EdgeRelation, GraphStore, MemoryClass, Node, NodeKind, NodeProminence, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 
@@ -387,6 +387,13 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     // Milestone 3b: which context (subagent) an event came from. Nullable,
     // no default, so it adds cleanly to a non-empty table.
     M::up("ALTER TABLE session_events ADD COLUMN agent_id TEXT;"),
+    // Milestone 3b revision 2 (ADR 0054): a memory's class and, for a
+    // temporal one, its end date. Constant default, so it adds cleanly to
+    // a non-empty table; every existing node reads as durable.
+    M::up(
+        "ALTER TABLE nodes ADD COLUMN memory_class TEXT NOT NULL DEFAULT 'durable';
+        ALTER TABLE nodes ADD COLUMN class_until TEXT;",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -434,6 +441,8 @@ impl SqliteGraphStore {
             prominence: NodeProminence::from_db_str(&prominence),
             curation_reason: row.get("curation_reason")?,
             last_touched_at: row.get("last_touched_at")?,
+            memory_class: MemoryClass::from_db_str(&row.get::<_, String>("memory_class")?),
+            class_until: row.get("class_until")?,
         })
     }
 
@@ -655,6 +664,14 @@ impl GraphStore for SqliteGraphStore {
         self.conn.execute(
             "UPDATE nodes SET curated = ?5, prominence = ?1, curation_reason = ?2 WHERE repo = ?3 AND id = ?4",
             rusqlite::params![prominence.as_db_str(), reason, repo, node_id, prominence != NodeProminence::NeedsReview],
+        )?;
+        Ok(())
+    }
+
+    fn set_memory_class(&self, repo: &str, node_id: i64, class: MemoryClass, until: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE nodes SET memory_class = ?1, class_until = ?2 WHERE repo = ?3 AND id = ?4",
+            rusqlite::params![class.as_db_str(), until, repo, node_id],
         )?;
         Ok(())
     }
@@ -1661,6 +1678,32 @@ mod tests {
         let after_rescan = store.get_node("repo-a", id).unwrap().unwrap();
         assert_eq!(after_rescan.prominence, NodeProminence::Reduced, "a rescan must not silently reset a curated gotcha's prominence back to Full");
         assert_eq!(after_rescan.curation_reason.as_deref(), Some("only affects old Linux envs"));
+    }
+
+    #[test]
+    fn set_memory_class_survives_a_subsequent_rescan() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let n = node("repo-a", NodeKind::Note, None, Some("Feature X shipped"));
+        let id = upsert_node(&store, n.clone()).unwrap();
+        let fresh = store.get_node("repo-a", id).unwrap().unwrap();
+        assert_eq!((fresh.memory_class, fresh.class_until), (MemoryClass::Durable, None));
+
+        store.set_memory_class("repo-a", id, MemoryClass::Temporal, Some("2026-11-01")).unwrap();
+        upsert_node(&store, n).unwrap();
+        let after_rescan = store.get_node("repo-a", id).unwrap().unwrap();
+        assert_eq!((after_rescan.memory_class, after_rescan.class_until.as_deref()), (MemoryClass::Temporal, Some("2026-11-01")));
+    }
+
+    /// A graph.db from before the class columns: the migration adds them to
+    /// a table that already has rows, and every old node reads as durable.
+    #[test]
+    fn a_database_from_before_memory_classes_reads_every_node_as_durable() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 1).unwrap();
+        conn.execute("INSERT INTO nodes (kind, repo, name) VALUES ('gotcha', 'repo-a', 'old')", []).unwrap();
+        migrations().to_latest(&mut conn).unwrap();
+        let (class, until): (String, Option<String>) = conn.query_row("SELECT memory_class, class_until FROM nodes", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((MemoryClass::from_db_str(&class), until), (MemoryClass::Durable, None));
     }
 
     /// Regression test for the other confirmed lifecycle pitfall: pruning a

@@ -186,6 +186,12 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curated BOOLEAN NOT NULL DEFAULT fals
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS prominence TEXT NOT NULL DEFAULT 'full';
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 
+-- Milestone 3b revision 2 (ADR 0054): a memory's class and, for a temporal
+-- one, its end date (UTC YYYY-MM-DD). Plain TEXT, like prominence, so
+-- row_to_node reads them with no ::text cast; set only by set_memory_class.
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS memory_class TEXT NOT NULL DEFAULT 'durable';
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS class_until TEXT;
+
 -- Sticky-pin context: NodeProminence::Pinned is a free-TEXT value (no CHECK
 -- constraint on this column, unlike kind/relation -- see the widening note
 -- below), so it needs no schema change beyond this index. `nodes_pinned`

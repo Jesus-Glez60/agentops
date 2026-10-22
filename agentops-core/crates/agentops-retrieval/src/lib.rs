@@ -976,7 +976,7 @@ mod tests {
     }
 
     fn symbol_node_for_test() -> Node {
-        Node { id: 1, kind: NodeKind::Symbol, repo: "demo".into(), path: None, name: None, container: None, start_line: None, end_line: None, content: None, curated: false, prominence: agentops_graph::NodeProminence::Full, curation_reason: None, last_touched_at: None }
+        Node { id: 1, kind: NodeKind::Symbol, repo: "demo".into(), path: None, name: None, container: None, start_line: None, end_line: None, content: None, curated: false, prominence: agentops_graph::NodeProminence::Full, curation_reason: None, last_touched_at: None, memory_class: agentops_graph::MemoryClass::Durable, class_until: None }
     }
 
     /// SQLite's `CURRENT_TIMESTAMP` shape ("YYYY-MM-DD HH:MM:SS", UTC) at
