@@ -31,6 +31,10 @@ pub(crate) struct Proposal {
     memory_class: String,
     #[serde(default)]
     class_until: Option<String>,
+    /// The judge call failed and the title words decided instead;
+    /// `--retry-failed` asks the judge again.
+    #[serde(default)]
+    fallback: bool,
 }
 
 impl Proposal {
@@ -48,11 +52,12 @@ struct Page {
     proposals: Vec<Proposal>,
 }
 
-/// `per_minute`: judge at most this many memories a minute, for a
-/// free-tier provider's rate limit (Groq: 30 requests a minute); each page
-/// is that size, with a minute between pages. `None` pages at the
-/// server's maximum with no pause.
-pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>) -> Result<()> {
+/// `per_minute`: judge at most this many memories a minute, one at a time
+/// and evenly spaced, for a free-tier provider's rate limit (a burst of 50
+/// then a minute's pause hit Groq's limit on 228 of 391, 2026-10-22).
+/// `None` pages at the server's maximum with no pause. `retry_failed`
+/// re-judges only the saved proposals whose judge call failed.
+pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>, retry_failed: bool) -> Result<()> {
     let marker = read_remote_marker(path).with_context(|| format!("classify-memories runs against the server; {} has no .context/agentops-remote.json", path.display()))?;
     let dir = path.join(".context");
     let saved = dir.join("classify-memories.json");
@@ -70,32 +75,62 @@ pub(crate) fn run(path: &Path, apply: bool, per_minute: Option<usize>) -> Result
         return Ok(());
     }
 
-    let mut proposals = Vec::new();
-    let mut judge;
-    let mut errors = 0;
-    loop {
-        if per_minute.is_some() && !proposals.is_empty() {
-            std::thread::sleep(Duration::from_secs(60));
-        }
-        let page: Page = serde_json::from_value(remote_send_within(&marker, "memories/classify", Some(&json!({ "offset": proposals.len(), "limit": per_minute })), PAGE_TIMEOUT)?)?;
-        judge = page.judge;
+    let pause = per_minute.map(|n| Duration::from_secs_f64(60.0 / n.max(1) as f64));
+    let limit = per_minute.map(|_| 1);
+    let fetch = |offset: usize| -> Result<Page> {
+        let mut page: Page = serde_json::from_value(remote_send_within(&marker, "memories/classify", Some(&json!({ "offset": offset, "limit": limit })), PAGE_TIMEOUT)?)?;
         for e in &page.judge_errors {
             eprintln!("judge failed on node {}, used the title words: {}", e["node_id"], e["error"]);
+            if let Some(p) = page.proposals.iter_mut().find(|p| e["node_id"].as_i64() == Some(p.node_id)) {
+                p.fallback = true;
+            }
         }
-        errors += page.judge_errors.len();
-        let got = page.proposals.len();
-        proposals.extend(page.proposals);
-        eprintln!("classified {} of {}", proposals.len(), page.total);
-        if got == 0 || proposals.len() >= page.total {
-            break;
+        Ok(page)
+    };
+
+    let mut judge = String::new();
+    let mut proposals: Vec<Proposal> = Vec::new();
+    if retry_failed {
+        proposals = serde_json::from_str(&std::fs::read_to_string(&saved).with_context(|| format!("nothing to retry; no {}", saved.display()))?)?;
+        let failed: Vec<usize> = (0..proposals.len()).filter(|&i| proposals[i].fallback).collect();
+        for (n, &i) in failed.iter().enumerate() {
+            if n > 0 {
+                std::thread::sleep(pause.unwrap_or_default());
+            }
+            // The server lists memories by id, as the saved file does, so
+            // position i is the same memory unless one was added meanwhile.
+            let page = fetch(i)?;
+            judge = page.judge;
+            match page.proposals.into_iter().next() {
+                Some(p) if p.node_id == proposals[i].node_id => proposals[i] = p,
+                _ => eprintln!("memory {} moved since the dry run; rerun it in full", proposals[i].node_id),
+            }
+            eprintln!("retried {} of {}", n + 1, failed.len());
+        }
+    } else {
+        loop {
+            if !proposals.is_empty() {
+                if let Some(pause) = pause {
+                    std::thread::sleep(pause);
+                }
+            }
+            let page = fetch(proposals.len())?;
+            judge = page.judge;
+            let got = page.proposals.len();
+            proposals.extend(page.proposals);
+            eprintln!("classified {} of {}", proposals.len(), page.total);
+            if got == 0 || proposals.len() >= page.total {
+                break;
+            }
         }
     }
+    let errors = proposals.iter().filter(|p| p.fallback).count();
     std::fs::create_dir_all(&dir)?;
     std::fs::write(&saved, serde_json::to_string_pretty(&proposals)?)?;
     let labels = read_labels(&path.join(".context/work-recall-eval/to-label.jsonl"));
     let md = dir.join("classify-memories.md");
     std::fs::write(&md, report(&proposals, &judge, &labels))?;
-    println!("Proposed classes for {} memories (judge: {judge}, {errors} judged by title words after a failed call): {}\nNothing was written. Review it, then rerun with --apply.", proposals.len(), md.display());
+    println!("Proposed classes for {} memories (judge: {judge}, {errors} judged by title words after a failed call{}): {}\nNothing was written. Review it, then rerun with --apply.", proposals.len(), if errors > 0 { "; --retry-failed asks again" } else { "" }, md.display());
     Ok(())
 }
 
@@ -147,7 +182,7 @@ mod tests {
     use super::*;
 
     fn p(id: i64, title: &str, current: &str, class: &str) -> Proposal {
-        Proposal { node_id: id, kind: "note".into(), title: title.into(), current: current.into(), memory_class: class.into(), class_until: None }
+        Proposal { node_id: id, kind: "note".into(), title: title.into(), current: current.into(), memory_class: class.into(), class_until: None, fallback: false }
     }
 
     #[test]
