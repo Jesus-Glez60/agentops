@@ -92,7 +92,7 @@ fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "add_note",
-            description: "Writes a new note (gotcha/decision/knowledge) to the repo's notes folder and ingests it into the graph in one step — the write-back tool for an agent that just learned something worth remembering. Omit note_type to let it be classified automatically. Set with_embeddings to make it findable via semantic_search (and linked to similar memories). dry_run classifies and compares the note against existing memories without writing anything; skip_duplicates writes it unless it nearly copies an existing memory. Either one adds a final `result: {json}` line with node_id, written, already_exists, duplicate_of and similar_to. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
+            description: "Writes a new note (gotcha/decision/knowledge) to the repo's notes folder and ingests it into the graph in one step — the write-back tool for an agent that just learned something worth remembering. Omit note_type to let it be classified automatically. Set with_embeddings to make it findable via semantic_search (and linked to similar memories). dry_run classifies and compares the note against existing memories without writing anything; skip_duplicates writes it unless it nearly copies an existing memory. Every call ends with a `result: {json}` line with node_id, written, already_exists, duplicate_of and similar_to. Pass session_id to correlate this call into a cross-tool activity feed (see get_session).",
             // `Advisor`, not `Full` -- deliberately available in both access
             // modes, unlike every other write tool. Advisor mode exists to
             // block destructive/costly actions (bulk rescans, paid LLM
@@ -832,9 +832,8 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
     } else {
         format!("Dry run: would write {} ({type_str}). Nothing was written.", result.file_path.display())
     };
-    if mode == crate::notes::AddMode::Write {
-        return Ok(text);
-    }
+    // Every mode ends with this line; the PostToolUse hook reads `node_id`
+    // from it to count the note as shown in this session (milestone 3c).
     let structured = json!({
         "note_type": type_str,
         "node_id": result.node_id,
@@ -856,7 +855,9 @@ fn tool_ingest_notes(args: &Value) -> anyhow::Result<String> {
 
     let notes_dir = agentops_notes::resolve_notes_path(Path::new(path_str), explicit_notes_path.as_deref());
     maybe_record_session_event(Path::new(path_str), args, "ingest_notes", &format!("ingested {} note(s) from {}", summary.notes_written, notes_dir.display()), None, "activity")?;
-    Ok(format!("Ingested {} note(s) from {}, wrote {} edge(s), reinforced {}.", summary.notes_written, notes_dir.display(), summary.edges_written, summary.edges_reinforced))
+    // `written_ids` are the notes this call created or changed, which the
+    // PostToolUse hook counts as shown in this session (milestone 3c).
+    Ok(format!("Ingested {} note(s) from {}, wrote {} edge(s), reinforced {}.\nresult: {}", summary.notes_written, notes_dir.display(), summary.edges_written, summary.edges_reinforced, json!({ "written_ids": summary.written_ids })))
 }
 
 fn tool_init_agents_md(args: &Value) -> anyhow::Result<String> {

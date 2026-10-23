@@ -102,6 +102,23 @@ pub fn shown_ids(context: &[&SessionEvent]) -> HashSet<i64> {
     context.iter().filter(|e| e.event_kind == RECALL_INJECTED).flat_map(|e| crate::hooks::parse_injected(&e.description)).collect()
 }
 
+/// Node ids the session wrote (`memory_written`, recorded by the
+/// PostToolUse hook for `add_note`, `ingest_notes` and `set_memory_class`).
+/// They count as shown in every context of the session, subagents' and
+/// after a compaction too: the author doesn't need them recalled (milestone
+/// 3c, gotcha 235716).
+pub fn written_ids(events: &[SessionEvent]) -> HashSet<i64> {
+    events.iter().filter(|e| e.event_kind == crate::hooks::MEMORY_WRITTEN).flat_map(|e| crate::hooks::parse_injected(&e.description)).collect()
+}
+
+/// What recall must not show `agent_id`'s context again: `shown_ids` of
+/// the context plus the session's `written_ids`.
+pub fn excluded_ids(events: &[SessionEvent], agent_id: Option<&str>) -> HashSet<i64> {
+    let mut ids = shown_ids(&context_events(events, agent_id));
+    ids.extend(written_ids(events));
+    ids
+}
+
 /// Work-time pointers this context has had, for `MAX_INJECTED_PER_CONTEXT`.
 fn work_injected(context: &[&SessionEvent]) -> usize {
     context.iter().filter(|e| e.event_kind == RECALL_INJECTED && e.tool_name == WORK_RECALL_TOOL).map(|e| crate::hooks::parse_injected(&e.description).len()).sum()
@@ -154,7 +171,7 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     if room == 0 {
         return Ok(None);
     }
-    let shown = shown_ids(&context);
+    let shown = excluded_ids(&events, agent_id);
     let mut picks: Vec<(&WorkCandidate, f64)> = candidates.iter().map(|c| (c, activated.get(&c.pointer.node_id).copied().unwrap_or(0.0))).filter(|(c, a)| *a >= settings.min_score && !shown.contains(&c.pointer.node_id)).collect();
     picks.sort_by(|a, b| b.1.total_cmp(&a.1));
     picks.truncate(WORK_RECALL_MAX_ITEMS.min(room));
@@ -164,7 +181,7 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     // A parallel tool call may have shown one of these meanwhile
     // (PostToolUse runs concurrently); this narrows that race, it can't
     // close it (findings.md).
-    let now_shown = shown_ids(&context_events(&log.events()?, agent_id));
+    let now_shown = excluded_ids(&log.events()?, agent_id);
     picks.retain(|(c, _)| !now_shown.contains(&c.pointer.node_id));
 
     // The header rides on the tool call that triggered it, so it needn't
@@ -309,7 +326,7 @@ impl MemoryLog {
 pub fn on_prompt(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, prompt: &str, plan: bool, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
     use crate::budget::{DEFAULT_SEED_MAX_ITEMS, PLAN_SEED_MAX_ITEMS};
     let events = log.events()?;
-    let exclude = if plan { HashSet::new() } else { shown_ids(&context_events(&events, None)) };
+    let exclude = if plan { written_ids(&events) } else { excluded_ids(&events, None) };
     let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, if plan { PLAN_SEED_MAX_ITEMS } else { DEFAULT_SEED_MAX_ITEMS }, &exclude, embedder)?;
     if seed.is_empty() {
         return Ok(());

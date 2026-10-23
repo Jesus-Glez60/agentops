@@ -78,7 +78,7 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     match event {
-        "posttooluse" => recorded_post_tool_event(payload, tool_name, &tool_input).is_some() || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
+        "posttooluse" => recorded_post_tool_event(payload, tool_name, &tool_input).is_some() || MEMORY_WRITE_TOOLS.contains(&tool_name) || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
         "pretooluse" => tool_name == "ExitPlanMode" || is_memory_write(tool_name, &tool_input) || detect_secret_exposure(tool_name, &tool_input).is_some(),
         "userpromptsubmit" => payload.get("prompt").and_then(|v| v.as_str()).is_some_and(|p| !p.trim().is_empty() && !is_task_notification(p)),
         "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
@@ -135,6 +135,14 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: 
     let recorded = recorded_post_tool_event(raw, &payload.tool_name, &payload.tool_input);
     if let Some((event_kind, description)) = &recorded {
         store.record_session_event_in(repo, session_id, &payload.tool_name, description, None, event_kind, agent_id(raw))?;
+    }
+    // A memory this session wrote counts as shown in all of its contexts
+    // (milestone 3c): the author doesn't need it recalled (gotcha 235716).
+    if MEMORY_WRITE_TOOLS.contains(&payload.tool_name.as_str()) {
+        let ids = memory_write_ids(&payload.tool_input, &payload.tool_response);
+        if !ids.is_empty() {
+            store.record_session_event_in(repo, session_id, &payload.tool_name, &format!("ids {}", ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")), None, MEMORY_WRITTEN, agent_id(raw))?;
+        }
     }
 
     // A file read or edited inside the repo is a work cue (milestone 3b),
@@ -292,6 +300,33 @@ pub const FLOW_SKILL: &str = "flow_skill";
 /// requires in every planning episode.
 const RECALL_TOOLS: &[&str] = &["mcp__agentops__related_context", "mcp__agentops__get_symbol", "mcp__agentops__list_gotchas", "mcp__agentops__fetch_content", "mcp__agentops__get_session_guide"];
 const FLOW_SKILLS: &[&str] = &["plan", "library-docs", "audit-plan"];
+
+/// The agentops tools that write a memory, and the `event_kind` their
+/// PostToolUse records with the node ids written (description: `ids
+/// 1,2,3`, as `recall_injected`).
+const MEMORY_WRITE_TOOLS: &[&str] = &["mcp__agentops__add_note", "mcp__agentops__ingest_notes", "mcp__agentops__set_memory_class"];
+pub const MEMORY_WRITTEN: &str = "memory_written";
+
+/// The node ids a memory-write tool call wrote: `set_memory_class`'s `id`
+/// argument, else the reply's final `result: {json}` line (`node_id` from
+/// `add_note`, `written_ids` from `ingest_notes`). Empty when nothing was
+/// written, e.g. a dry run or a duplicate.
+fn memory_write_ids(tool_input: &Value, tool_response: &Value) -> Vec<i64> {
+    if let Some(id) = tool_input.get("id").and_then(Value::as_i64) {
+        return vec![id];
+    }
+    // An MCP tool's response may arrive as a list of content blocks.
+    let text = match tool_response {
+        Value::Array(blocks) => blocks.iter().map(render_tool_response).collect::<Vec<_>>().join("\n"),
+        other => render_tool_response(other),
+    };
+    let Some(result) = text.lines().rev().find_map(|l| l.strip_prefix("result: ")).and_then(|l| serde_json::from_str::<Value>(l).ok()) else { return Vec::new() };
+    if result.get("written").and_then(Value::as_bool) == Some(false) {
+        return Vec::new();
+    }
+    let ids = result.get("written_ids").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_i64).collect());
+    ids.unwrap_or_else(|| result.get("node_id").and_then(Value::as_i64).into_iter().collect())
+}
 
 /// A plain substring check, not a regex — no new dependency needed for
 /// something this simple.
@@ -494,13 +529,14 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embed
         parts.push(plan_flow_directive(agentops_path(payload, repo)));
         // The whole seed, even pointers shown earlier in the session: the
         // plan is built from this, and earlier context may be compacted.
-        let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &Default::default(), embedder)?;
+        // Only memories the session wrote itself stay out.
+        let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &crate::work_recall::written_ids(&events), embedder)?;
         record_prompt_cue(store, repo, session_id, &seed)?;
         push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     } else {
         // What the main context has been shown; a subagent's injections
         // went to its own context (milestone 3b).
-        let shown = crate::work_recall::shown_ids(&crate::work_recall::context_events(&events, None));
+        let shown = crate::work_recall::excluded_ids(&events, None);
         let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &shown, embedder)?;
         record_prompt_cue(store, repo, session_id, &seed)?;
         push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
@@ -673,7 +709,8 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder:
         parts.push(pinned);
     }
     if let Some(prompt) = last_prompt(store, repo, session_id(payload))? {
-        let seed = agentops_retrieval::recall_seed_with(store, repo, &prompt, PLAN_SEED_MAX_ITEMS, &Default::default(), embedder)?;
+        let written = crate::work_recall::written_ids(&store.session_events(repo, session_id(payload))?);
+        let seed = agentops_retrieval::recall_seed_with(store, repo, &prompt, PLAN_SEED_MAX_ITEMS, &written, embedder)?;
         if !seed.is_empty() {
             // Shown in the subagent's own context, so its work-time recall
             // doesn't repeat it; the main session can still be shown these.
@@ -784,6 +821,44 @@ mod tests {
         assert!(is_relevant("userpromptsubmit", &json!({ "prompt": "hi" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<task-notification>x" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<agent-message from=\"a1\">\n[Subagent hand-back] report\n</agent-message>" })));
+    }
+
+    #[test]
+    fn memory_write_ids_reads_the_result_line_or_set_memory_class_id_and_write_tools_are_relevant() {
+        let reply = |text: &str| json!([{ "type": "text", "text": text }]);
+        assert_eq!(memory_write_ids(&json!({}), &reply("Wrote x.md (gotcha).\nresult: {\"node_id\":7,\"written\":true}")), vec![7]);
+        assert!(memory_write_ids(&json!({}), &reply("Not written: it nearly copies node 3.\nresult: {\"node_id\":null,\"written\":false}")).is_empty(), "a duplicate");
+        assert!(memory_write_ids(&json!({}), &reply("Dry run: would write x.md.\nresult: {\"node_id\":9,\"written\":false}")).is_empty(), "a dry run");
+        assert_eq!(memory_write_ids(&json!({}), &json!({ "type": "text", "text": "Ingested 40 note(s).\nresult: {\"written_ids\":[4,5]}" })), vec![4, 5]);
+        assert_eq!(memory_write_ids(&json!({ "path": "r", "id": 12, "memory_class": "durable" }), &reply("Classed 12 durable.")), vec![12]);
+        assert!(memory_write_ids(&json!({}), &reply("an error, no result line")).is_empty());
+        for tool in MEMORY_WRITE_TOOLS {
+            assert!(is_relevant("posttooluse", &json!({ "tool_name": tool, "tool_input": {}, "tool_response": "ok" })), "{tool} must reach the server");
+        }
+    }
+
+    #[test]
+    fn a_memory_the_session_wrote_is_never_recalled_in_that_session_but_is_in_a_fresh_one() {
+        let (_dir, store, repo) = store();
+        let id = gotcha(store.as_ref(), &repo, "Release tagging needs the changelog bumped first", "Tagging a release fails unless docs/release.md has the changelog entry.");
+        let wrote = json!({ "tool_name": "mcp__agentops__add_note", "tool_input": { "path": repo }, "tool_response": [{ "type": "text", "text": format!("Wrote x.md (gotcha) and ingested it.\nresult: {{\"node_id\":{id},\"written\":true}}") }], "session_id": "s" });
+        handle(store.as_ref(), &repo, "posttooluse", &wrote).unwrap();
+        let shows = |out: String| out.contains(&format!("(id {id})"));
+        let read = |session: &str, agent: Option<&str>| {
+            let mut payload = json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/docs/release.md"}, "tool_response": {"type": "text", "text": "# Release checklist"}, "session_id": session, REL_PATH_FIELD: "docs/release.md" });
+            if let Some(agent) = agent {
+                payload["agent_id"] = json!(agent);
+            }
+            context(handle(store.as_ref(), &repo, "posttooluse", &payload).unwrap())
+        };
+        assert!(!shows(read("s", None)), "a file cue in the main context");
+        assert!(!shows(read("s", Some("a1"))), "a subagent's file cue");
+        assert!(!shows(prompt(store.as_ref(), &repo, "the release tagging changelog step", "default")), "a prompt seed");
+        assert!(!shows(prompt(store.as_ref(), &repo, "plan the release tagging changelog step", "plan")), "a plan-mode seed");
+        assert!(!shows(context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a2" })).unwrap())), "a subagent's seed");
+        handle(store.as_ref(), &repo, "sessionstart", &json!({ "session_id": "s", "source": "compact" })).unwrap();
+        assert!(!shows(read("s", None)), "after a compaction");
+        assert!(shows(read("fresh", None)), "a fresh session is shown it");
     }
 
     #[test]

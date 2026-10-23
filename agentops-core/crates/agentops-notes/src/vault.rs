@@ -349,6 +349,10 @@ pub struct IngestSummary {
     pub notes_written: usize,
     pub edges_written: usize,
     pub edges_reinforced: usize,
+    /// Node ids of the notes this ingest created or whose content it
+    /// changed. `notes_written` counts every note seen, unchanged ones
+    /// included (each is upserted in place).
+    pub written_ids: Vec<i64>,
 }
 
 /// Starts the line `ingest_vault` appends to a note's node content to carry
@@ -430,6 +434,9 @@ pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], mat
 
     for note in notes {
         let vault_path = format!("vault:{}", note.source_path.to_string_lossy());
+        let content = content_with_tags(&note.body, &note.tags);
+        let before = store.find_node(repo, note.note_type.node_kind(), Some(&vault_path), Some(&note.title), None)?;
+        let changed = before.is_none_or(|n| n.content.as_deref() != Some(content.as_str()));
         let note_id = upsert_node(
             store,
             NewNode {
@@ -440,10 +447,13 @@ pub fn ingest_vault(store: &dyn GraphStore, repo: &str, notes: &[VaultNote], mat
                 container: None,
                 start_line: None,
                 end_line: None,
-                content: Some(content_with_tags(&note.body, &note.tags)),
+                content: Some(content),
             },
         )?;
         summary.notes_written += 1;
+        if changed {
+            summary.written_ids.push(note_id);
+        }
 
         let targets = matcher.match_symbols(store, repo, &note.body)?;
         let connected = connect_many(store, repo, note_id, &targets, EdgeRelation::Affects, bump_confirmed_at)?;
@@ -500,6 +510,21 @@ mod tests {
         let node = store.nodes_by_kind("demo", agentops_graph::NodeKind::Gotcha).unwrap().remove(0);
         assert_eq!(tags_of(node.content.as_deref().unwrap()), vec!["zoho", "crm"]);
         assert!(node.content.unwrap().starts_with("Body text here."));
+    }
+
+    #[test]
+    fn ingest_vault_lists_only_new_and_changed_notes_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        write_note(dir.path(), "gotchas/a.md", "---\ntitle: \"A\"\ntype: gotcha\n---\n\nFirst body.\n");
+        write_note(dir.path(), "gotchas/b.md", "---\ntitle: \"B\"\ntype: gotcha\n---\n\nSecond body.\n");
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let ingest = || ingest_vault(&store, "demo", &walk_vault(dir.path(), &HeuristicClassifier).unwrap(), &WordBoundaryMatcher::default(), false).unwrap();
+        assert_eq!(ingest().written_ids.len(), 2, "both are new");
+        let again = ingest();
+        assert_eq!((again.notes_written, again.written_ids.len()), (2, 0), "an unchanged note is upserted but not written");
+        write_note(dir.path(), "gotchas/b.md", "---\ntitle: \"B\"\ntype: gotcha\n---\n\nSecond body, edited.\n");
+        let b = store.nodes_by_kind("demo", NodeKind::Gotcha).unwrap().into_iter().find(|n| n.name.as_deref() == Some("B")).unwrap().id;
+        assert_eq!(ingest().written_ids, vec![b]);
     }
 
     #[test]
