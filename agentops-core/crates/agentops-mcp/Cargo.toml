@@ -34,4 +34,5 @@ docbrain-graph = { path = "../../../docbrain-core/crates/docbrain-graph" }
 docbrain-ingest = { path = "../../../docbrain-core/crates/docbrain-ingest" }
 
 [dev-dependencies]
+rusqlite.workspace = true
 tempfile = "3"

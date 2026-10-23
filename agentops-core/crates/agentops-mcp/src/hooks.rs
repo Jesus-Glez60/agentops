@@ -148,8 +148,15 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: 
     // A file read or edited inside the repo is a work cue (milestone 3b),
     // by its path; the content is never read for it or stored.
     let mut injected = None;
+    // Recall is best-effort: a failed cue is recorded and the capture below
+    // still runs (milestone 3c).
     if let (Some((FILE_READ | "file_modified", _)), Some(path)) = (&recorded, rel_path(raw)) {
-        injected = work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::File { path: path.to_string() }, embedder)?;
+        match work_cue(store, repo, raw, &agentops_retrieval::work_recall::WorkCue::File { path: path.to_string() }, embedder) {
+            Ok(context) => injected = context,
+            Err(e) => {
+                let _ = store.record_session_event_in(repo, session_id, &payload.tool_name, &format!("work recall failed: {e:#}"), None, WORK_RECALL_ERROR, agent_id(raw));
+            }
+        }
     }
     let output = injected.map(|context| hook_output("PostToolUse", Some(&context), None));
 
@@ -264,6 +271,9 @@ fn recorded_post_tool_event(payload: &Value, tool_name: &str, tool_input: &Value
 /// of a `Grep`/`Glob` search (description: the pattern).
 pub const FILE_READ: &str = "file_read";
 pub const SEARCH: &str = "search";
+/// `event_kind` of a work cue that failed (description: the error); the
+/// tool call is still recorded and captured.
+pub const WORK_RECALL_ERROR: &str = "work_recall_error";
 
 /// The payload field `agentops hook-capture` sets to the repo-relative path
 /// of the file a tool call touches. The server never sees the repo root
@@ -929,6 +939,21 @@ mod tests {
         assert!(events.iter().all(|e| e.event_kind != RECALL_INJECTED));
         let on = context(read("on", false));
         assert!(on.contains("Release tagging"), "{on}");
+    }
+
+    #[test]
+    fn a_failed_work_cue_is_recorded_and_the_output_is_still_captured() {
+        let (dir, store, repo) = store();
+        // The cue's own event insert fails; the capture's don't.
+        let conn = rusqlite::Connection::open(crate::graph_db_path(dir.path())).unwrap();
+        conn.execute_batch("CREATE TRIGGER cue_fails BEFORE INSERT ON session_events WHEN NEW.event_kind = 'work_cue' BEGIN SELECT RAISE(FAIL, 'cue store down'); END;").unwrap();
+        let out = handle(store.as_ref(), &repo, "posttooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/src/a.rs"}, "tool_response": {"type": "text", "text": "x".repeat(DEFAULT_CHAR_BUDGET + 1)}, "session_id": "s", REL_PATH_FIELD: "src/a.rs" })).unwrap();
+        assert!(out.is_none(), "nothing injected");
+        let events = store.session_events(&repo, "s").unwrap();
+        let failed = events.iter().find(|e| e.event_kind == WORK_RECALL_ERROR).expect("the failure is recorded");
+        assert!(failed.description.contains("cue store down"), "{}", failed.description);
+        assert!(events.iter().any(|e| e.event_kind == FILE_READ));
+        assert_eq!(store.nodes_by_kind(&repo, NodeKind::ToolOutput).unwrap().len(), 1, "the output is still captured");
     }
 
     #[test]
