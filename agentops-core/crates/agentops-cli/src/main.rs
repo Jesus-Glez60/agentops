@@ -148,7 +148,7 @@ enum Command {
         with_embeddings: bool,
     },
     /// Gives this repo's existing gotchas, decisions and notes a memory
-    /// class (durable, status, experimental, temporal; ADR 0054) on the
+    /// class (durable, progress, experimental, temporal; ADR 0054) on the
     /// server it's connected to. Dry run by default: saves the proposals to
     /// `.context/classify-memories.{json,md}`. `--apply` writes exactly the
     /// saved proposals.
@@ -158,7 +158,8 @@ enum Command {
         #[arg(long)]
         apply: bool,
         /// Judge at most N memories a minute, for a free-tier provider's
-        /// rate limit (e.g. 15 for Groq's free tier).
+        /// rate limit (at most 8 for Groq's free tier: 8,000 tokens a minute,
+        /// about 650-900 per judgment).
         #[arg(long)]
         per_minute: Option<usize>,
         /// Re-judge only the saved proposals whose judge call failed.
