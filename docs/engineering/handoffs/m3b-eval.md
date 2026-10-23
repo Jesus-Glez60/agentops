@@ -265,3 +265,24 @@ The author replaced the 3,000-character median with the noise and useful targets
 - Headers now make up about a third of the volume: one per injection, 453 injections.
 - Label mix by memory (a proxy, joining each pointer with its memory's existing label): 56% useful, 37% neutral, 7% noise, against 58/35/7 at 3 per cue. 53 of the 453 pointers reached unlabelled memories.
 
+
+## Milestone 3c: labels lead, cases guard (2026-10-23, `6ea8172`)
+
+From here on, **labels are the primary measure of recall during work.** The noise and useful shares come from a labelled sample of replayed pointers. The 20 cases in `.context/work-recall-eval.jsonl` and `.context/recall-eval.jsonl` are a regression guard: a drop means something changed, but a score alone doesn't say whether recall got better.
+
+**Redrawn cases.** Each case was checked against three rules for a recallable target: not `progress`, not `temporal` past its date, and not `needs_review`. Two failed, both because their target is classed `progress`. Each was replaced by a new case with the same cue type and a durable target. Every other case keeps its id.
+
+| Set | Old case | Target | New case | Cue | Targets |
+| --- | --- | --- | --- | --- | --- |
+| Prompt | c17 | 104436 (`progress`) | c21 | plan-mode question on the Postgres store's Tokio runtime panic | 54054, 54028 (same bug, either counts) |
+| Work | f05 | 190997 (`progress`) | f11 | file `docs/engineering/spikes/m1-hooks.md` | 62451 (mentions the path; no `Affects` link) |
+
+**Baselines.** Both sets ran at `6ea8172` against a snapshot of the production graph taken 2026-10-23. Each set ran 5 times, every run on a fresh restore and a fresh server process, with `--repeat 5` inside each run.
+
+| Set | Hits min / median / max | MRR min / median / max | p95 ms (range) |
+| --- | --- | --- | --- |
+| Prompt (`recall-eval`) | 13 / 13 / 13 | 0.445 / 0.445 / 0.445 | 81–99 |
+| Work (`work-recall-eval`) | 6 / 6 / 6 (file 4, error 2) | 0.300 / 0.300 / 0.300 | 83–107 |
+
+- **No run-to-run drift this time.** Every case's rank was identical across all 5 runs of each set. The ±1 seen before (gotcha 244815) didn't show up on this snapshot.
+- **The +1 in each set is the swap.** c21 and f11 both hit at rank 1. On the same snapshot, the old c17 and f05 both still miss. Without the swaps the sets would score 12/20 and 5/20, matching the `684e36a` and `785d282` numbers above.
