@@ -19,7 +19,7 @@
 | `hooks_never_load_the_model` covers every hook | `fb216a6`, derived from `STORE_EVENTS`, mutation-checked | Met |
 | Shorter header; replay median before and after | 57 → 42 characters; median 12,436 → 11,120 (§4) | Met |
 | Remote p95 < 300 ms; local p95 < 50 ms on ≥ 3,000 nodes | 72.8 ms; 12.6 ms on 3,666 nodes (§4) | Met |
-| F71 measured; a recall error no longer skips capture | 75% duplicates for one file read in parallel, 0% across files; `9698a46` | Met; the fix deploys with this report's push (§1) |
+| F71 measured; a recall error no longer skips capture | 75% duplicates for one file read in parallel, 0% across files; `9698a46` | Met; the fix is live since `8ec7f8b` (§1) |
 | Every item 7 count, with the agreement table | §5 | Met |
 | Workspace tests pass with Postgres; held-out noise ≤ 30% | Gate passes with `AGENTOPS_TEST_DATABASE_URL` set; noise not re-scored (§4) | Met |
 
@@ -37,7 +37,7 @@
 
 **Item 3 verified live.** The fix was deployed and the laptop CLI rebuilt. An `add_note` in a real session then recorded `memory_written` with its id, so the hook parses the real MCP `tool_response`. The exclusion itself is covered by a test, not live. In the live check the note tied with another candidate at 0.9, and neither was shown, so that check couldn't tell the difference.
 
-**Item 6 deploys with this report.** The gate for `9698a46` failed on `verify_triggers_indexing_and_the_job_reaches_succeeded_over_http`, a known flaky test (F48). It passed on rerun against the same tree. The autodeploy doesn't retry a failed commit, so `9698a46` reaches production with the next push.
+**Item 6 went live with `8ec7f8b`.** The gate for `9698a46` failed on `verify_triggers_indexing_and_the_job_reaches_succeeded_over_http`, a known flaky test (F48). It passed on rerun against the same tree. The autodeploy doesn't retry a failed commit, so the fix reached production with the next push, `8ec7f8b`, whose gate passed (rust 1,311, web 199, marketing 7).
 
 **Deviations:**
 - **Item 3 touched 4 files.** That's over the spec's 3-file line. The plan's five-member council served as its plan council; the author approved the plan.
