@@ -31,7 +31,7 @@ use crate::hooks::RECALL_INJECTED;
 /// per-context ceiling counts (prompt and subagent seeds don't).
 pub const WORK_RECALL_TOOL: &str = "work_recall";
 /// First line of every work-time injection, file or error.
-pub const WORK_RECALL_HEADER: &str = "AgentOps recall; `fetch_content` <id> for the full text:";
+pub const WORK_RECALL_HEADER: &str = "Recalled (`fetch_content <id>` for more):";
 
 /// A session's event log as work-time recall reads and writes it: the
 /// store for a live hook, memory for `work-recall-eval --replay`, so the
