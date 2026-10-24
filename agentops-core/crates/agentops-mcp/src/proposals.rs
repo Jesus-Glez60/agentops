@@ -253,10 +253,27 @@ fn write_proposal(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphS
         "decision" => agentops_notes::NoteType::Decision,
         _ => agentops_notes::NoteType::Knowledge,
     };
+    // A merge often reuses a source's title, and `add_note` upserts on
+    // (kind, file, title): written as is, it overwrote source 54087 and
+    // marked it needs-review (2026-10-24). So the title is made unique.
+    let kind = match note_type {
+        agentops_notes::NoteType::Gotcha => agentops_graph::NodeKind::Gotcha,
+        agentops_notes::NoteType::Decision => agentops_graph::NodeKind::Decision,
+        _ => agentops_graph::NodeKind::Note,
+    };
+    let taken: HashSet<String> = store.nodes_by_kind(repo, kind)?.into_iter().filter_map(|n| n.name.map(|t| t.to_lowercase())).collect();
+    let mut title = proposed.title.clone();
+    let mut n = 1;
+    while taken.contains(&title.to_lowercase()) {
+        title = if n == 1 { format!("{} (consolidated)", proposed.title) } else { format!("{} (consolidated {n})", proposed.title) };
+        n += 1;
+    }
     // `Write`, not `WriteUnlessDuplicate`: a merge is close to its own
     // sources by design.
-    let written = crate::notes::add_note_with(repo_path, &proposed.title, &proposed.body, Some(note_type), &[PROPOSED_TAG.to_string()], notes_dir, true, crate::notes::AddMode::Write)?;
+    let written = crate::notes::add_note_with(repo_path, &title, &proposed.body, Some(note_type), &[PROPOSED_TAG.to_string()], notes_dir, true, crate::notes::AddMode::Write)?;
+    anyhow::ensure!(!written.already_exists, "the proposal landed on existing node {:?}; nothing recorded", written.node_id);
     let id = written.node_id.context("the proposal was written but has no node id")?;
+    anyhow::ensure!(!sources.contains(&id), "the proposal landed on its own source {id}");
     let ids = sources.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
     store.set_curation(repo, id, NodeProminence::NeedsReview, Some(&format!("proposed by consolidation from {ids}")))?;
     store.set_memory_class(repo, id, MemoryClass::Durable, None)?;
@@ -291,6 +308,7 @@ fn waiting(store: &dyn GraphStore, repo: &str, proposal_id: i64) -> Result<agent
 /// today, as `add_note`'s `supersedes`), so recall stops showing them.
 pub fn accept(repo_path: &Path, store: &dyn GraphStore, repo: &str, proposal_id: i64) -> Result<()> {
     let row = waiting(store, repo, proposal_id)?;
+    anyhow::ensure!(!row.source_ids.contains(&proposal_id), "proposal {proposal_id} is one of its own sources (written over it); reject it to clear the row, then restore the memory");
     let node = store.get_node(repo, proposal_id)?.with_context(|| format!("proposal {proposal_id}'s memory is gone"))?;
     store.set_curation(repo, proposal_id, NodeProminence::Full, None)?;
     crate::notes::apply_memory_class(repo_path, proposal_id, node.name.as_deref().unwrap_or(""), Some((MemoryClass::Durable, None)), &row.source_ids)?;
@@ -300,7 +318,12 @@ pub fn accept(repo_path: &Path, store: &dyn GraphStore, repo: &str, proposal_id:
 /// Rejects a proposal: its memory and note file are deleted, and the
 /// rejection is kept with its sources' digest.
 pub fn reject(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphStore, repo: &str, proposal_id: i64) -> Result<()> {
-    waiting(store, repo, proposal_id)?;
+    let row = waiting(store, repo, proposal_id)?;
+    // A row naming one of its own sources was written over that memory
+    // (see `write_proposal`): the memory stays, only the row is closed.
+    if row.source_ids.contains(&proposal_id) {
+        return store.set_proposal_state(repo, proposal_id, "rejected");
+    }
     if let Some(node) = store.get_node(repo, proposal_id)? {
         // The file goes too, or the next ingest would bring the node back.
         if let Some(rel) = node.path.as_deref().and_then(|p| p.strip_prefix("vault:")) {
@@ -426,6 +449,31 @@ mod tests {
         assert_eq!(Candidate::from_id("m4"), None);
         assert_eq!(Candidate::from_id("x1-2"), None);
         assert_eq!(Candidate::from_id("dfoo"), None);
+    }
+
+    #[test]
+    fn a_proposal_titled_like_a_source_is_written_as_its_own_memory() {
+        let r = Repo::new();
+        let a = r.memory("The pool runs out under load", "The connection pool runs out at 50 clients.", at(1.0));
+        let b = r.memory("Connection pool runs out", "At 50 clients the pool is exhausted.", at(0.88));
+        let url = mock_llm(vec![(MERGED, 10, 10)]);
+        let id = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &[Candidate::merge(a, b, 0.88)], None, "s").unwrap().proposals[0];
+        assert!(id != a && id != b);
+        assert_eq!(r.node(id).unwrap().name.as_deref(), Some("The pool runs out under load (consolidated)"));
+        let source = r.node(a).unwrap();
+        assert_eq!((source.prominence, source.content.as_deref()), (NodeProminence::Full, Some("The connection pool runs out at 50 clients.")), "the source is untouched");
+    }
+
+    #[test]
+    fn a_row_naming_its_own_source_is_only_closed_by_reject_and_never_accepted() {
+        let r = Repo::new();
+        let a = r.memory("Pool exhaustion under load", "x", at(1.0));
+        let b = r.memory("Connection pool runs out", "y", at(0.88));
+        r.store.record_proposal(&r.repo, a, &[a, b], "d").unwrap();
+        assert!(accept(r.dir.path(), r.store.as_ref(), &r.repo, a).is_err());
+        reject(r.dir.path(), None, r.store.as_ref(), &r.repo, a).unwrap();
+        assert!(r.node(a).is_some(), "the memory stays");
+        assert_eq!(r.store.proposals(&r.repo).unwrap()[0].state, "rejected");
     }
 
     #[test]
