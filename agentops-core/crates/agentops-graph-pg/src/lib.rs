@@ -745,6 +745,28 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn search_lexical_ties(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
+        if query.trim().is_empty() {
+            return Ok(vec![]);
+        }
+        // WITH TIES can't tie on the unique id, so the id order is applied
+        // outside; the outer LIMIT is the cap.
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let (top_k, max) = (top_k as i64, (top_k * agentops_graph::LEXICAL_TIES_MAX_FACTOR) as i64);
+            let kind = kind.map(|k| k.as_db_str());
+            let rows = client
+                .query(
+                    "SELECT * FROM (SELECT *, ts_rank(search_vector, plainto_tsquery('english', $1)) AS rank FROM nodes \
+                     WHERE repo = $2 AND ($3::text IS NULL OR kind = $3) AND search_vector @@ plainto_tsquery('english', $1) \
+                     ORDER BY rank DESC FETCH FIRST $4 ROWS WITH TIES) t ORDER BY rank DESC, id LIMIT $5",
+                    &[&query, &repo, &kind, &top_k, &max],
+                )
+                .await?;
+            Ok(rows.iter().map(|row| (row_to_node(row), row.get::<_, f32>("rank"))).collect())
+        })
+    }
+
     fn search_exact(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
@@ -1547,6 +1569,26 @@ mod tests {
         let hits: Vec<i64> = store.search_lexical(&repo, "tied", 10, Some(NodeKind::Gotcha)).unwrap().into_iter().map(|(n, _)| n.id).collect();
         assert_eq!(hits, ids[..10].to_vec());
         store.delete_nodes(&repo, &ids).unwrap();
+    }
+
+    #[test]
+    fn search_lexical_ties_keeps_the_block_tied_at_the_cutoff_up_to_its_cap() {
+        let store = require_store!();
+        let repo = format!("pg-repo-ties-{}", std::process::id());
+        let add = |i: usize, body: &str| {
+            let mut n = node(&repo, NodeKind::Gotcha, Some(&format!("t{i}.md")), Some("tie"));
+            n.content = Some(body.to_string());
+            upsert_node(&store, n).unwrap()
+        };
+        let better: Vec<i64> = (0..2).map(|i| add(i, "tied tied word")).collect();
+        let tied: Vec<i64> = (2..7).map(|i| add(i, "tied plain word")).collect();
+        let hits: Vec<i64> = store.search_lexical_ties(&repo, "tied", 3, Some(NodeKind::Gotcha)).unwrap().into_iter().map(|(n, _)| n.id).collect();
+        let many: Vec<i64> = (7..20).map(|i| add(i, "tied plain word")).collect();
+        let capped: Vec<i64> = store.search_lexical_ties(&repo, "tied", 3, None).unwrap().into_iter().map(|(n, _)| n.id).collect();
+        let all: Vec<i64> = [better.clone(), tied.clone(), many].concat();
+        store.delete_nodes(&repo, &all).unwrap();
+        assert_eq!(hits, [better, tied].concat(), "the 3rd hit ties with four more: all five come");
+        assert_eq!(capped, all[..3 * agentops_graph::LEXICAL_TIES_MAX_FACTOR].to_vec(), "capped, rank then id");
     }
 
     #[test]

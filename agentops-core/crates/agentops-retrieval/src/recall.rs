@@ -48,7 +48,8 @@ pub const RECALL_KINDS: &[NodeKind] = &[NodeKind::Gotcha, NodeKind::Decision, No
 /// Keywords searched per prompt. Bounds the number of store queries a hook
 /// makes (`MAX_KEYWORDS * RECALL_KINDS.len()`).
 const MAX_KEYWORDS: usize = 8;
-/// Candidates fetched per keyword and kind before fusion.
+/// Candidates fetched per keyword and kind before fusion, plus any tied
+/// with the last (`search_lexical_ties`).
 const PER_QUERY: usize = 10;
 /// Lowest prompt-to-memory cosine that counts as close in meaning. A prompt
 /// is shorter than a note, so these run lower than note-to-note scores.
@@ -200,7 +201,9 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         weakest = weakest.min(weight);
         query_weight += weight;
         for &kind in RECALL_KINDS {
-            for (rank, (node, _)) in store.search_lexical(repo, keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
+            // The whole block tied at the cutoff, ordered by id (milestone 4):
+            // where a tie is cut decided which memories made the pool.
+            for (rank, (node, _)) in store.search_lexical_ties(repo, keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
                 add(&node, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""), weight);
             }
         }

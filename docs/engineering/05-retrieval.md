@@ -156,6 +156,10 @@ Edges and vectors are only read here, so the hook loads no embedding model ([ADR
 - **Hop neighbour:** weighs like one hit on the prompt's weakest word.
 - **Unchanged:** a note must still match at least two of three or more keywords.
 
+**Ties at the pool's cutoff (milestone 4).** Each keyword's pool per kind is `search_lexical_ties`: the `PER_QUERY` best hits, plus every hit tied with the last of them on rank, up to `LEXICAL_TIES_MAX_FACTOR` (3) × `PER_QUERY`, ordered by rank and then id. Postgres uses `FETCH FIRST n ROWS WITH TIES` inside and `ORDER BY rank DESC, id` outside, since a tie on the unique id is impossible; SQLite trims its over-fetch at the same point.
+
+A common word ties many memories at one rank. Cutting that block at `PER_QUERY` decided which memories made the pool: first by physical row order (case c09, gotcha 326954), then, with only an id tiebreak, by id, which lost c09 and one error cue for good (gotcha 349916). Keeping the block keeps the same graph ranking the same way without that choice.
+
 This was added after milestone 3a's eval ended at 15/20. Four of the five misses matched two common words and sank among dozens of equal two-word matches. The spec allowed IDF only if the target couldn't be met without it, and the author approved it.
 
 ## Meaning in the recall seed

@@ -744,6 +744,10 @@ pub struct TaskLink {
 /// what makes "knowledge was reused" queryable directly instead of parsed
 /// out of `description`'s free text. `event_kind` defaults to `"activity"`
 /// for every pre-existing row/caller.
+/// The most `search_lexical_ties` returns, as a multiple of `top_k`: a
+/// word so common that more memories tie can't flood a recall pool.
+pub const LEXICAL_TIES_MAX_FACTOR: usize = 3;
+
 /// One memory shown in one context of a session (`recall_shown`,
 /// milestone 4): `context` is a subagent's id or `main#<n>`, `source` how
 /// it was shown.
@@ -1189,6 +1193,12 @@ pub trait GraphStore {
     /// distance — the result `Vec` is already sorted best-first, which is
     /// the only thing `agentops-retrieval`'s fusion actually relies on.
     fn search_lexical(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>>;
+    /// `search_lexical`, plus every further hit tied with the `top_k`-th on
+    /// rank, up to `LEXICAL_TIES_MAX_FACTOR` × `top_k` in all; ordered by
+    /// rank, then id. Recall's per-keyword pools use it: cutting a tied
+    /// block at `top_k` decided membership by row order, then by id, and
+    /// cost recall cases either way (milestone 4, gotcha 349916).
+    fn search_lexical_ties(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>>;
     /// Cheap exact/substring name match, case-insensitive — an exact
     /// `name` match ranks first, then substring matches shortest-name
     /// first. Same "best-first, don't compare the score across sources"

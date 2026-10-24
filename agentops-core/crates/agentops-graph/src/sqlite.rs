@@ -947,6 +947,13 @@ impl GraphStore for SqliteGraphStore {
         Ok(hits)
     }
 
+    fn search_lexical_ties(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
+        let max = top_k * crate::LEXICAL_TIES_MAX_FACTOR;
+        let all = self.search_lexical(repo, query, max, kind)?;
+        let Some(cutoff) = all.get(top_k.saturating_sub(1)).map(|(_, score)| *score) else { return Ok(all) };
+        Ok(all.into_iter().enumerate().take_while(|(i, (_, score))| *i < top_k || *score == cutoff).map(|(_, hit)| hit).collect())
+    }
+
     fn count_lexical(&self, repo: &str, query: &str, kinds: &[NodeKind]) -> Result<usize> {
         let match_query = fts5_match_query(query);
         if match_query.is_empty() || kinds.is_empty() {
@@ -1581,6 +1588,21 @@ mod tests {
         }
         let hits: Vec<i64> = store.search_lexical("repo-a", "tied", 3, Some(NodeKind::Gotcha)).unwrap().into_iter().map(|(n, _)| n.id).collect();
         assert_eq!(hits, ids[..3].to_vec());
+    }
+
+    #[test]
+    fn search_lexical_ties_keeps_the_block_tied_at_the_cutoff_up_to_its_cap() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let add = |i: usize, body: &str| upsert_node(&store, NewNode { content: Some(body.into()), ..node("repo-a", NodeKind::Gotcha, Some(&format!("t{i}.md")), Some("tie")) }).unwrap();
+        let better: Vec<i64> = (0..2).map(|i| add(i, "tied tied word")).collect();
+        let tied: Vec<i64> = (2..7).map(|i| add(i, "tied plain word")).collect();
+        let hits: Vec<i64> = store.search_lexical_ties("repo-a", "tied", 3, Some(NodeKind::Gotcha)).unwrap().into_iter().map(|(n, _)| n.id).collect();
+        assert_eq!(hits, [better.clone(), tied.clone()].concat(), "the 3rd hit ties with four more: all five come");
+        let many: Vec<i64> = (7..20).map(|i| add(i, "tied plain word")).collect();
+        let capped = store.search_lexical_ties("repo-a", "tied", 3, Some(NodeKind::Gotcha)).unwrap();
+        assert_eq!(capped.len(), 3 * crate::LEXICAL_TIES_MAX_FACTOR, "capped");
+        assert_eq!(capped.iter().map(|(n, _)| n.id).collect::<Vec<_>>(), [better, tied, many].concat()[..9].to_vec(), "rank, then id");
+        assert_eq!(store.search_lexical_ties("repo-a", "absent", 3, None).unwrap().len(), 0);
     }
 
     #[test]
