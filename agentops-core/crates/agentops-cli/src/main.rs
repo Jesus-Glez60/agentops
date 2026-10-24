@@ -223,6 +223,11 @@ enum Command {
         /// Run against the server this repo is connected to.
         #[arg(long)]
         remote: bool,
+        /// Locally, recall by meaning too, loading the embedding model as
+        /// the server does (local hooks never do). For evaluating a
+        /// restored database through AGENTOPS_DATABASE_URL.
+        #[arg(long)]
+        embed: bool,
         /// JSONL cases `{id, prompt, mode, targets}`; defaults to
         /// `.context/recall-eval.jsonl`.
         #[arg(long)]
@@ -245,6 +250,10 @@ enum Command {
         /// Run against the server this repo is connected to.
         #[arg(long)]
         remote: bool,
+        /// Locally, resolve cues with the embedding model, as the server
+        /// does (local hooks never do).
+        #[arg(long)]
+        embed: bool,
         /// JSONL cases `{id, cue: {kind, path?, text?}, targets}`; defaults
         /// to `.context/work-recall-eval.jsonl`.
         #[arg(long)]
@@ -797,8 +806,8 @@ fn main() -> Result<()> {
         Command::Changelog { path, since, limit } => changelog(&path, since, limit),
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
         Command::LinkSimilar { path, prune } => link_similar(&path, prune),
-        Command::RecallEval { path, remote, cases, mode, repeat } => recall_eval::run(&path, remote, cases.as_deref(), mode, repeat),
-        Command::WorkRecallEval { path, remote, cases, baseline, repeat, sizing, replay, min_score, sources, sample } => work_recall_eval::run(&path, work_recall_eval::Options { remote, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample }),
+        Command::RecallEval { path, remote, embed, cases, mode, repeat } => recall_eval::run(&path, remote, embed, cases.as_deref(), mode, repeat),
+        Command::WorkRecallEval { path, remote, embed, cases, baseline, repeat, sizing, replay, min_score, sources, sample } => work_recall_eval::run(&path, work_recall_eval::Options { remote, embed, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample }),
         Command::ClassifyMemories { path, apply, per_minute, retry_failed, llm } => classify_memories::run(&path, apply, per_minute, retry_failed, llm),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {

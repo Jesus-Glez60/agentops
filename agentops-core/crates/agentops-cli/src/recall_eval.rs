@@ -121,17 +121,28 @@ pub(crate) struct DeepPointer {
 }
 
 /// Where the hook runs: this repo's local graph, or the server it's
-/// connected to.
+/// connected to. Locally, `embedder` adds recall by meaning exactly as
+/// the server's hook route does (`--embed`); a real local hook never
+/// loads the model (ADR 0052).
 pub(crate) enum Backend {
-    Local { store: Box<dyn GraphStore>, repo: String },
+    Local { store: Box<dyn GraphStore>, repo: String, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)> },
     Remote(RemoteMcpMarker),
+}
+
+/// `--embed`'s embedder: the model the server warms at startup.
+pub(crate) static EVAL_EMBEDDER: agentops_embeddings::LocalEmbedder = agentops_embeddings::LocalEmbedder;
+
+/// The local backend for `path`, with the model when `embed` is set.
+pub(crate) fn local_backend(path: &Path, embed: bool) -> Result<Backend> {
+    let embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)> = if embed { Some(&EVAL_EMBEDDER) } else { None };
+    Ok(Backend::Local { store: agentops_mcp::open_store(path)?, repo: agentops_mcp::repo_name(path), embedder })
 }
 
 impl Backend {
     /// The hook's output for `payload`, as `hooks::handle` returns it.
     fn prompt(&self, payload: &Value) -> Result<Option<Value>> {
         match self {
-            Backend::Local { store, repo } => agentops_mcp::hooks::handle(store.as_ref(), repo, "userpromptsubmit", payload),
+            Backend::Local { store, repo, embedder } => agentops_mcp::hooks::handle_with(store.as_ref(), repo, "userpromptsubmit", payload, *embedder),
             Backend::Remote(marker) => crate::hook_capture::call_remote(marker, "userpromptsubmit", payload),
         }
     }
@@ -140,7 +151,7 @@ impl Backend {
     /// without a vector are left out.
     fn cosines(&self, node: i64, to: &[i64]) -> Result<HashMap<i64, f32>> {
         match self {
-            Backend::Local { store, repo } => {
+            Backend::Local { store, repo, .. } => {
                 let mut out = HashMap::new();
                 let Some(source) = store.get_embedding(repo, node)? else { return Ok(out) };
                 for &other in to {
@@ -163,7 +174,7 @@ impl Backend {
     /// `DEEP_LIMIT` pointers, with nothing recorded.
     pub(crate) fn deep(&self, prompt: &str) -> Result<Vec<DeepPointer>> {
         match self {
-            Backend::Local { store, repo } => Ok(agentops_retrieval::recall_seed(store.as_ref(), repo, prompt, DEEP_LIMIT, &Default::default())?
+            Backend::Local { store, repo, embedder } => Ok(agentops_retrieval::recall_seed_with(store.as_ref(), repo, prompt, DEEP_LIMIT, &Default::default(), *embedder)?
                 .into_iter()
                 .map(|p| DeepPointer { node_id: p.node_id, kind: p.kind.as_db_str().to_string(), reason: p.reason })
                 .collect()),
@@ -177,7 +188,7 @@ impl Backend {
     /// A node's prominence, or `None` if it doesn't exist.
     pub(crate) fn prominence(&self, node: i64) -> Result<Option<NodeProminence>> {
         match self {
-            Backend::Local { store, repo } => Ok(store.get_node(repo, node)?.map(|n| n.prominence)),
+            Backend::Local { store, repo, .. } => Ok(store.get_node(repo, node)?.map(|n| n.prominence)),
             Backend::Remote(marker) => match remote_get(marker, &format!("nodes/{node}")) {
                 Ok(detail) => Ok(Some(serde_json::from_value(detail["prominence"].clone()).context("reading a node's prominence")?)),
                 Err(e) if e.to_string().contains("returned 404") => Ok(None),
@@ -214,13 +225,14 @@ pub(crate) fn remote_send_within(marker: &RemoteMcpMarker, rest: &str, body: Opt
     response.body_mut().read_json().with_context(|| format!("parsing {method} {url} response"))
 }
 
-pub(crate) fn run(path: &Path, remote: bool, cases_file: Option<&Path>, mode: Option<Mode>, repeat: usize) -> Result<()> {
+pub(crate) fn run(path: &Path, remote: bool, embed: bool, cases_file: Option<&Path>, mode: Option<Mode>, repeat: usize) -> Result<()> {
+    anyhow::ensure!(!(remote && embed), "--embed is for a local graph; the server already embeds");
     let cases_file = cases_file.map(Path::to_path_buf).unwrap_or_else(|| path.join(".context").join("recall-eval.jsonl"));
     let cases = read_cases(&cases_file)?;
     let backend = if remote {
         Backend::Remote(read_remote_marker(path).with_context(|| format!("--remote needs a server connection; {} has no .context/agentops-remote.json", path.display()))?)
     } else {
-        Backend::Local { store: agentops_mcp::open_store(path)?, repo: agentops_mcp::repo_name(path) }
+        local_backend(path, embed)?
     };
     let (results, summary) = evaluate(&backend, &cases, mode, repeat.max(1))?;
 
@@ -498,7 +510,7 @@ mod tests {
         store.set_embedding("r", twin, &vector(1.0, 0.0)).unwrap();
         store.set_embedding("r", original, &vector(0.95, 0.31)).unwrap(); // cosine ≈ 0.95
         store.set_embedding("r", digest, &vector(1.0, 0.0)).unwrap();
-        let backend = Backend::Local { store: Box::new(store), repo: "r".into() };
+        let backend = Backend::Local { store: Box::new(store), repo: "r".into(), embedder: None };
 
         let cases = vec![case("exact", "webhook signature", vec![exact]), case("twin", "rollback deploy box", vec![original]), case("miss", "rollback deploy box", vec![unembedded])];
         let (results, summary) = evaluate(&backend, &cases, None, 2).unwrap();
@@ -534,7 +546,7 @@ mod tests {
     fn deep_rank_finds_a_target_below_the_seed_cut() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let ids: Vec<i64> = (0..12).map(|n| note(&store, NodeKind::Gotcha, &format!("webhook signature {n}"), &format!("webhook signature {n}"))).collect();
-        let backend = Backend::Local { store: Box::new(store), repo: "r".into() };
+        let backend = Backend::Local { store: Box::new(store), repo: "r".into(), embedder: None };
         let deep = backend.deep("webhook signature").unwrap();
         assert!(deep.len() > SEED_SLOTS, "{deep:?}");
         let last = deep.last().unwrap().node_id;
@@ -550,7 +562,7 @@ mod tests {
         let unsettled = note(&store, NodeKind::Note, "unsettled", "x");
         store.set_curation("r", pinned, NodeProminence::Pinned, None).unwrap();
         store.set_curation("r", unsettled, NodeProminence::NeedsReview, Some("unclassified")).unwrap();
-        let backend = Backend::Local { store: Box::new(store), repo: "r".into() };
+        let backend = Backend::Local { store: Box::new(store), repo: "r".into(), embedder: None };
         for (id, target, says) in [("c-pin", pinned, "pinned"), ("c-review", unsettled, "needs_review"), ("c-gone", 999_999, "doesn't exist")] {
             let err = evaluate(&backend, &[case(id, "x", vec![target])], None, 1).unwrap_err().to_string();
             assert!(err.contains(id) && err.contains(says), "{err}");
@@ -571,7 +583,7 @@ mod tests {
         let cases = format!("{}\n{}\n", json!({ "id": "c1", "prompt": "webhook signature", "mode": "plan", "targets": [hit] }), json!({ "id": "c2", "prompt": "webhook signature", "mode": "default", "targets": [other] }));
         std::fs::write(repo_dir.join(".context").join("recall-eval.jsonl"), cases).unwrap();
 
-        run(&repo_dir, false, None, None, 2).unwrap();
+        run(&repo_dir, false, false, None, None, 2).unwrap();
 
         let out_dir = repo_dir.join(".context").join("recall-eval");
         let file = std::fs::read_dir(&out_dir).unwrap().next().unwrap().unwrap().path();

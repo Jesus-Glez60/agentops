@@ -295,7 +295,7 @@ fn cue_kind(cue: &WorkCue) -> &'static str {
 /// The candidate node ids `cue` reaches with `sources`, best first.
 fn resolve(backend: &Backend, cue: &WorkCue, sources: CueSources) -> Result<Vec<i64>> {
     match backend {
-        Backend::Local { store, repo } => Ok(agentops_retrieval::work_recall::resolve_cue(store.as_ref(), repo, cue, sources, None)?.into_iter().take(DEEP_LIMIT).map(|c| c.pointer.node_id).collect()),
+        Backend::Local { store, repo, embedder } => Ok(agentops_retrieval::work_recall::resolve_cue(store.as_ref(), repo, cue, sources, *embedder)?.into_iter().take(DEEP_LIMIT).map(|c| c.pointer.node_id).collect()),
         Backend::Remote(marker) => {
             let reply = remote_send(marker, "work-recall", Some(&json!({ "cue": cue, "sources": sources, "limit": DEEP_LIMIT })))?;
             Ok(reply["candidates"].as_array().context("reading the work-recall route's candidates")?.iter().filter_map(|c| c["node_id"].as_i64()).collect())
@@ -653,6 +653,8 @@ fn write_result(path: &Path, kind: &str, value: &Value) -> Result<()> {
 
 pub(crate) struct Options<'a> {
     pub(crate) remote: bool,
+    /// Locally, resolve with the embedding model, as the server does.
+    pub(crate) embed: bool,
     pub(crate) cases: Option<&'a Path>,
     pub(crate) baseline: Option<Baseline>,
     pub(crate) repeat: usize,
@@ -677,10 +679,11 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
     }
     let cases_file = options.cases.map(Path::to_path_buf).unwrap_or_else(|| path.join(".context").join("work-recall-eval.jsonl"));
     let cases = read_cases(&cases_file)?;
+    anyhow::ensure!(!(options.remote && options.embed), "--embed is for a local graph; the server already embeds");
     let backend = if options.remote {
         Backend::Remote(read_remote_marker(path).with_context(|| format!("--remote needs a server connection; {} has no .context/agentops-remote.json", path.display()))?)
     } else {
-        Backend::Local { store: agentops_mcp::open_store(path)?, repo: agentops_mcp::repo_name(path) }
+        crate::recall_eval::local_backend(path, options.embed)?
     };
     validate(&backend, &cases)?;
     let (results, summary) = evaluate(&backend, &cases, options.baseline, options.repeat.max(1), sources)?;
