@@ -1065,7 +1065,7 @@ mod tests {
             prominence: NodeProminence::Full,
             curation_reason: None,
             memory_class: agentops_graph::MemoryClass::Durable,
-            class_until: None,
+            class_until: None, applies_to: None,
             last_touched_at: None,
         };
         let prompt = build_prompt(&node, &["src/config.rs".to_string()], &[(NodeKind::Gotcha, "off-by-one".into(), "expiry bug".into(), NodeProminence::Full, None)], &[]);
@@ -1092,7 +1092,7 @@ mod tests {
             prominence: NodeProminence::Full,
             curation_reason: None,
             memory_class: agentops_graph::MemoryClass::Durable,
-            class_until: None,
+            class_until: None, applies_to: None,
             last_touched_at: None,
         };
         let prompt = build_prompt(&node, &[], &[(NodeKind::Gotcha, "niche issue".into(), "rare edge case".into(), NodeProminence::Reduced, Some("only affects old Linux envs".into()))], &[]);
@@ -1132,7 +1132,7 @@ mod tests {
             prominence: NodeProminence::Full,
             curation_reason: None,
             memory_class: agentops_graph::MemoryClass::Durable,
-            class_until: None,
+            class_until: None, applies_to: None,
             last_touched_at: None,
         };
         let prompt = build_prompt(&node, &[], &[], &[]);
@@ -1180,7 +1180,7 @@ mod tests {
             prominence: NodeProminence::Full,
             curation_reason: None,
             memory_class: agentops_graph::MemoryClass::Durable,
-            class_until: None,
+            class_until: None, applies_to: None,
             last_touched_at: None,
         };
         let prompt = build_prompt(&node, &[], &[], &[]);
@@ -1206,7 +1206,7 @@ mod tests {
             prominence: NodeProminence::Full,
             curation_reason: None,
             memory_class: agentops_graph::MemoryClass::Durable,
-            class_until: None,
+            class_until: None, applies_to: None,
             last_touched_at: None,
         };
 
@@ -1225,7 +1225,7 @@ mod tests {
                 prominence: NodeProminence::Full,
                 curation_reason: None,
                 memory_class: agentops_graph::MemoryClass::Durable,
-                class_until: None,
+                class_until: None, applies_to: None,
                 last_touched_at: None,
             },
             via: agentops_retrieval::PatternCompletionSource::Similar(0.9),
@@ -1257,7 +1257,7 @@ mod tests {
             prominence: NodeProminence::Full,
             curation_reason: None,
             memory_class: agentops_graph::MemoryClass::Durable,
-            class_until: None,
+            class_until: None, applies_to: None,
             last_touched_at: None,
         };
 

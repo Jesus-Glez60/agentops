@@ -73,6 +73,8 @@ pub struct RecallPointer {
     pub reason: String,
     /// Its class; an experimental one is labelled in the line.
     pub memory_class: MemoryClass,
+    /// The hosts it is tied to (milestone 4), labelled in the line.
+    pub applies_to: Option<Vec<String>>,
 }
 
 impl RecallPointer {
@@ -88,7 +90,9 @@ impl RecallPointer {
     }
 
     fn label(&self) -> String {
-        self.memory_class.label().map(|l| format!(" — {l}")).unwrap_or_default()
+        let class = self.memory_class.label().map(|l| format!(" — {l}")).unwrap_or_default();
+        let hosts = self.applies_to.as_ref().map(|h| format!(" — on {}", h.join(", "))).unwrap_or_default();
+        format!("{class}{hosts}")
     }
 }
 
@@ -159,6 +163,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         title: String,
         prominence: NodeProminence,
         memory_class: MemoryClass,
+        applies_to: Option<Vec<String>>,
         reasons: Vec<String>,
         /// Sum of the rarity weights of the distinct cues it matched.
         strength: f64,
@@ -172,7 +177,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         if !class_ok(node) {
             return;
         }
-        let c = candidates.entry(node.id).or_insert_with(|| Candidate { score: 0.0, kind: node.kind, title: node.name.as_deref().unwrap_or("(untitled)").to_string(), prominence: node.prominence, memory_class: node.memory_class, reasons: Vec::new(), strength: 0.0 });
+        let c = candidates.entry(node.id).or_insert_with(|| Candidate { score: 0.0, kind: node.kind, title: node.name.as_deref().unwrap_or("(untitled)").to_string(), prominence: node.prominence, memory_class: node.memory_class, applies_to: node.applies_to.clone(), reasons: Vec::new(), strength: 0.0 });
         c.score += score;
         if !c.reasons.contains(&reason) {
             c.reasons.push(reason);
@@ -259,7 +264,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
             let reduced = if c.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
             let keyword = if query_weight == 0.0 { 0.0 } else { (c.strength / query_weight).min(1.0) * single_keyword_cap };
             let confidence = affects_confidence.get(&id).copied().unwrap_or(0.0).max(keyword);
-            Ranked { id, strength: c.strength, score: c.score * reduced, confidence: confidence * reduced, hop: false, kind: c.kind, title: c.title, memory_class: c.memory_class, reasons: c.reasons }
+            Ranked { id, strength: c.strength, score: c.score * reduced, confidence: confidence * reduced, hop: false, kind: c.kind, title: c.title, memory_class: c.memory_class, applies_to: c.applies_to, reasons: c.reasons }
         })
         .collect();
     sort_ranked(&mut ranked);
@@ -278,7 +283,7 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         .map(|r| {
             let lexical = r.reasons.iter().any(|x| x.starts_with('"') || x.starts_with("affects"));
             let reason = if r.reasons.iter().all(|x| x.starts_with('"')) { format!("matched {}", r.reasons.join(", ")) } else { r.reasons.join("; ") };
-            Scored { pointer: RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason, memory_class: r.memory_class }, confidence: r.confidence, lexical }
+            Scored { pointer: RecallPointer { node_id: r.id, kind: r.kind, title: r.title, reason, memory_class: r.memory_class, applies_to: r.applies_to }, confidence: r.confidence, lexical }
         })
         .collect())
 }
@@ -322,7 +327,7 @@ fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
     for (i, (node, cosine)) in dense.into_iter().enumerate() {
         let reduced = if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
         let reason = format!("close in meaning ({cosine:.2})");
-        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, confidence: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), memory_class: node.memory_class, reasons: Vec::new() });
+        let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, confidence: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), memory_class: node.memory_class, applies_to: node.applies_to.clone(), reasons: Vec::new() });
         entry.score += dense_weight(i) * reduced;
         entry.confidence = entry.confidence.max(dense_confidence(cosine) * reduced);
         entry.reasons.push(reason);
@@ -390,6 +395,7 @@ struct Ranked {
     kind: NodeKind,
     title: String,
     memory_class: MemoryClass,
+    applies_to: Option<Vec<String>>,
     reasons: Vec<String>,
 }
 
@@ -445,7 +451,7 @@ fn hop(store: &dyn GraphStore, repo: &str, ranked: &mut Vec<Ranked>, shown: &dyn
             let reduced = if neighbour.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
             taken += 1;
             position.insert(target, ranked.len());
-            ranked.push(Ranked { id: target, strength: hop_strength, score: score * cosine * HOP_FACTOR * reduced, confidence: confidence * cosine * HOP_FACTOR * reduced, hop: true, kind: neighbour.kind, memory_class: neighbour.memory_class, title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
+            ranked.push(Ranked { id: target, strength: hop_strength, score: score * cosine * HOP_FACTOR * reduced, confidence: confidence * cosine * HOP_FACTOR * reduced, hop: true, kind: neighbour.kind, memory_class: neighbour.memory_class, applies_to: neighbour.applies_to.clone(), title: neighbour.name.unwrap_or_else(|| "(untitled)".to_string()), reasons: vec![reason] });
         }
     }
     sort_ranked(ranked);

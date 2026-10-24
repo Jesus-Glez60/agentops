@@ -298,6 +298,7 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/work-recall/replay", post(dashboard::work_recall_replay_json))
         .route("/repos/{id}/memories/classify", post(dashboard::classify_memories_json))
         .route("/repos/{id}/memories/class", post(dashboard::assign_memory_classes_json))
+        .route("/repos/{id}/memories/scope", post(dashboard::assign_memory_scopes_json))
         .route("/libraries", get(libraries_http::list_libraries_json))
         .route("/libraries/tools/{name}", post(libraries_http::call_library_tool_json))
         .route("/libraries/{slug}", get(libraries_http::get_library_json));

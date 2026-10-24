@@ -401,6 +401,11 @@ pub struct Node {
     /// rescan keeps it.
     pub memory_class: MemoryClass,
     pub class_until: Option<String>,
+    /// The hosts (client hostnames, `normalize_host`d) this memory is tied
+    /// to, or `None` for everywhere (milestone 4). An error cue on another
+    /// host skips it; other recall shows it, labelled. Set only through
+    /// `set_memory_scope`, never by `upsert_node`, like the class.
+    pub applies_to: Option<Vec<String>>,
 }
 
 /// A single Core Modules grouping for the Documentation Viewer -- either
@@ -727,6 +732,22 @@ pub struct TaskLink {
     pub relation: String,
 }
 
+/// The most `search_lexical_ties` returns, as a multiple of `top_k`: a
+/// word so common that more memories tie can't flood a recall pool.
+pub const LEXICAL_TIES_MAX_FACTOR: usize = 3;
+
+/// One memory shown in one context of a session (`recall_shown`,
+/// milestone 4): `context` is a subagent's id or `main#<n>`, `source` how
+/// it was shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallShown {
+    pub session_id: String,
+    pub context: String,
+    pub node_id: i64,
+    pub source: String,
+    pub shown_at: String,
+}
+
 /// One notable action tagged with a caller-supplied `session_id` —
 /// Module 6's cross-tool session correlation. Not scan-scoped (unlike
 /// `ScanHistoryEntry`, which only exists inside one `scan_repo` call): any
@@ -744,22 +765,6 @@ pub struct TaskLink {
 /// what makes "knowledge was reused" queryable directly instead of parsed
 /// out of `description`'s free text. `event_kind` defaults to `"activity"`
 /// for every pre-existing row/caller.
-/// The most `search_lexical_ties` returns, as a multiple of `top_k`: a
-/// word so common that more memories tie can't flood a recall pool.
-pub const LEXICAL_TIES_MAX_FACTOR: usize = 3;
-
-/// One memory shown in one context of a session (`recall_shown`,
-/// milestone 4): `context` is a subagent's id or `main#<n>`, `source` how
-/// it was shown.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecallShown {
-    pub session_id: String,
-    pub context: String,
-    pub node_id: i64,
-    pub source: String,
-    pub shown_at: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub id: i64,
@@ -978,6 +983,9 @@ pub trait GraphStore {
     /// rescan and note ingest goes through `upsert_node`, which must never
     /// reset it.
     fn set_memory_class(&self, repo: &str, node_id: i64, class: MemoryClass, until: Option<&str>) -> Result<()>;
+    /// Sets the hosts a memory is tied to; `None` (or an empty list) ties
+    /// it to none, so it shows everywhere. Kept across rescans, like the class.
+    fn set_memory_scope(&self, repo: &str, node_id: i64, hosts: Option<&[String]>) -> Result<()>;
     /// Changes a node's kind in place (id, edges, embedding and curation
     /// kept): the Gotchas workspace's "set kind" on a `NeedsReview` memory.
     /// A vault-backed note's file must be rewritten to the same kind by the
@@ -1817,4 +1825,15 @@ mod tests {
 
         format!("{y:04}-{m_:02}-{d:02} {h:02}:{m:02}:{s:02}")
     }
+}
+
+/// `applies_to` as stored: a JSON array, or NULL for none or an empty list.
+pub fn scope_to_db(hosts: Option<&[String]>) -> Option<String> {
+    hosts.filter(|h| !h.is_empty()).map(|h| serde_json::to_string(h).expect("a list of strings serializes"))
+}
+
+/// `applies_to` as read back; a value that isn't a JSON list of strings
+/// reads as none.
+pub fn scope_from_db(raw: Option<String>) -> Option<Vec<String>> {
+    raw.and_then(|r| serde_json::from_str::<Vec<String>>(&r).ok()).filter(|h| !h.is_empty())
 }

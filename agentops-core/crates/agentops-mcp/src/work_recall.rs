@@ -95,15 +95,18 @@ pub struct Injection {
 /// The threshold, the off switch and the cue sources, which the replay
 /// varies (the sources only for the ablation; the hook always runs all).
 #[derive(Debug, Clone, Copy)]
-pub struct Settings {
+pub struct Settings<'a> {
     pub min_score: f64,
     pub enabled: bool,
     pub sources: CueSources,
+    /// The machine the cue came from (`client_host`, normalized), when the
+    /// client sent one. An error cue skips memories scoped to other hosts.
+    pub client_host: Option<&'a str>,
 }
 
-impl Default for Settings {
+impl Default for Settings<'_> {
     fn default() -> Self {
-        Settings { min_score: INJECT_MIN_SCORE, enabled: true, sources: CueSources::All }
+        Settings { min_score: INJECT_MIN_SCORE, enabled: true, sources: CueSources::All, client_host: None }
     }
 }
 
@@ -138,7 +141,7 @@ fn work_injected(context: &[&SessionEvent]) -> usize {
 /// One work cue in `agent_id`'s context: resolve, record, activate, and
 /// maybe show (see the module docs). `None` when nothing is shown; with
 /// the off switch set, the cue is still resolved and recorded.
-pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_id: Option<&str>, cue: &WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>, settings: Settings) -> Result<Option<Injection>> {
+pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_id: Option<&str>, cue: &WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>, settings: Settings<'_>) -> Result<Option<Injection>> {
     let key = cue_key(cue);
     let events = log.events()?;
     let context = context_events(&events, agent_id);
@@ -154,7 +157,13 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
             return Ok(None);
         }
     }
-    let candidates = resolve_cue(store, repo, cue, settings.sources, embedder)?;
+    let mut candidates = resolve_cue(store, repo, cue, settings.sources, embedder)?;
+    // An error is about the machine it happened on: a memory tied to other
+    // hosts is noise there (milestone 4; 4 of milestone 3c's 6 non-progress
+    // noise rows). File and prompt cues still show it, labelled.
+    if let (WorkCue::Error { .. }, Some(host)) = (cue, settings.client_host) {
+        candidates.retain(|c| c.pointer.applies_to.as_ref().is_none_or(|hosts| hosts.iter().any(|h| h == host)));
+    }
     if candidates.is_empty() {
         // A file that reached nothing is still recorded, so a re-read of it
         // is skipped above rather than resolved again.
@@ -382,7 +391,7 @@ pub struct ReplayInjection {
 
 /// Runs `steps` in order against `log` with the hook's own code (`on_cue`,
 /// `on_prompt`), recording only into `log`.
-pub fn replay(store: &dyn GraphStore, repo: &str, log: &mut MemoryLog, steps: &[ReplayStep], embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>, settings: Settings) -> Result<Vec<ReplayInjection>> {
+pub fn replay(store: &dyn GraphStore, repo: &str, log: &mut MemoryLog, steps: &[ReplayStep], embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>, settings: Settings<'_>) -> Result<Vec<ReplayInjection>> {
     let mut out = Vec::new();
     for (i, step) in steps.iter().enumerate() {
         match step {
@@ -420,7 +429,7 @@ mod tests {
         WorkCue::File { path: "docs/release.md".into() }
     }
 
-    const LOW: Settings = Settings { min_score: 0.1, enabled: true, sources: CueSources::All };
+    const LOW: Settings = Settings { min_score: 0.1, enabled: true, sources: CueSources::All, client_host: None };
 
     #[test]
     fn a_memory_shown_once_is_never_shown_again_in_that_context_until_compaction() {
@@ -434,6 +443,23 @@ mod tests {
 
         log.record("SessionStart", "compact", CONTEXT_RESET, None).unwrap();
         assert!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().is_some(), "after compaction it can be");
+    }
+
+    /// Milestone 4: an error on another machine skips a memory scoped to
+    /// hosts; a file cue still shows it, labelled with them.
+    #[test]
+    fn an_error_cue_skips_a_memory_scoped_to_other_hosts_and_a_file_cue_labels_it() {
+        let store = agentops_graph::SqliteGraphStore::open_in_memory().unwrap();
+        let id = gotcha(&store, "r", "Deploy box restart fails", "docs/deploy.md: pm2 restart fails with EADDRINUSE on the deploy box.");
+        store.set_memory_scope("r", id, Some(&["deploy-box".to_string()])).unwrap();
+        let error = WorkCue::Error { text: "pm2 restart fails with EADDRINUSE".into() };
+        let on = |host: Option<&str>, cue: &WorkCue, session: &mut MemoryLog| on_cue(&store, "r", session, None, cue, None, Settings { client_host: host, ..LOW }).unwrap();
+        assert_eq!(on(Some("laptop"), &error, &mut MemoryLog::default()), None, "another host's error");
+        let here = on(Some("deploy-box"), &error, &mut MemoryLog::default()).expect("its own host's error");
+        assert_eq!(here.shown[0].0.node_id, id);
+        assert!(on(None, &error, &mut MemoryLog::default()).is_some(), "no host sent: nothing is skipped");
+        let file = on(Some("laptop"), &WorkCue::File { path: "docs/deploy.md".into() }, &mut MemoryLog::default()).expect("a file cue still shows it");
+        assert!(file.context.contains("— on deploy-box"), "{}", file.context);
     }
 
     /// Against the store, the claim decides: a memory shown once is never

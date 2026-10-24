@@ -186,6 +186,8 @@ Milestone 3b, `agentops-retrieval/src/work_recall.rs`. A work cue is a file the 
 | 2. A memory naming only the file name, when no other file has that name (`count_files_named`) | `MENTION_NAME_SCORE` 0.7 |
 | An error cue, cleaned (see below) | recall's confidence, for memories a keyword or a named symbol matched only; gotchas × `ERROR_GOTCHA_BOOST`, capped at 1.0 |
 
+**Scope (milestone 4).** An error cue skips a memory whose `applies_to` doesn't include the payload's `client_host` ([13-agent-integration.md](13-agent-integration.md), "Memory scope"). Every other cue keeps it, and its pointer line ends ` — on <hosts>`.
+
 **Recall's confidence** (`recall_scored_with`) is recall's comparable score: the share of the query's rarity weight that a memory matched, capped at 0.5 for a one-keyword query; `affects_confidence_for` for a named symbol's `Affects` edge; and the cosine rescaled so that `DENSE_MIN_SCORE` is 0 and 1.0 is 1, when that scores higher. A hop neighbour gets its source's confidence × cosine × `HOP_FACTOR`, and a reduced memory gets half. It doesn't change recall's order, so `recall_seed_with` returns the same pointers as before.
 
 **How sources combine.** Path mentions are a substring search, not a full-text query, because the two stores combine full-text words differently (SQLite ORs them, Postgres ANDs them). A memory reached several ways keeps its best score. Ties break on arrival order (sources in trust order, each in its own rank), never on node id.

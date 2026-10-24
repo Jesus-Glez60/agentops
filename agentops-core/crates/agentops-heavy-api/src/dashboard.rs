@@ -215,6 +215,7 @@ pub(crate) async fn node_detail_json(State(state): State<AppState>, user: Option
             curated: node.curated,
             prominence: node.prominence,
             curation_reason: node.curation_reason,
+            applies_to: node.applies_to,
             connected,
         }))
     })
@@ -820,6 +821,10 @@ pub(crate) struct WorkRecallReplayBody {
     /// Cue sources for the ablation (milestone 3b revision 1); all by default.
     #[serde(default)]
     sources: agentops_retrieval::work_recall::CueSources,
+    /// Replay as if the cues came from this host (milestone 4): an error
+    /// cue then skips memories scoped to others.
+    #[serde(default)]
+    client_host: Option<String>,
 }
 
 /// `POST /repos/{id}/work-recall/replay` -- runs a chunk of a past
@@ -847,6 +852,8 @@ pub(crate) async fn work_recall_replay_json(State(state): State<AppState>, user:
             settings.min_score = min;
         }
         settings.sources = body.sources;
+        let host = body.client_host.as_deref().and_then(agentops_mcp::hooks::normalize_host);
+        settings.client_host = host.as_deref();
         let injections = agentops_mcp::work_recall::replay(store.as_ref(), &repo, &mut log, &body.steps, Some(&SERVER_EMBEDDER), settings)?;
         Ok(Some(json!({ "events": log.to_logged(), "injections": injections })))
     })
@@ -934,6 +941,56 @@ pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: 
     match result {
         Ok(Ok(Some(reply))) => (StatusCode::OK, Json(reply)),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct MemoryScopeAssignment {
+    node_id: i64,
+    applies_to: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub(crate) struct AssignMemoryScopesBody {
+    assign: Vec<MemoryScopeAssignment>,
+}
+
+/// `POST /repos/{id}/memories/scope` -- ties memories to the hosts the
+/// author approved (milestone 4), exactly as listed, each host
+/// `normalize_host`d; an empty list clears a scope. An id that isn't a
+/// memory in this repo refuses the whole batch before any write. Replies
+/// `{assigned}`. `agentops classify-memories --scope --apply` sends it.
+pub(crate) async fn assign_memory_scopes_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<AssignMemoryScopesBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Result<usize, String>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(Err("no such repo connection".into())),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        for a in &body.assign {
+            match store.get_node(&repo, a.node_id)? {
+                Some(n) if agentops_graph::similarity::MEMORY_KINDS.contains(&n.kind) => {}
+                _ => return Ok(Err(format!("node {} isn't a memory in this repo", a.node_id))),
+            }
+        }
+        for a in &body.assign {
+            let mut hosts: Vec<String> = a.applies_to.iter().filter_map(|h| agentops_mcp::hooks::normalize_host(h)).collect();
+            hosts.dedup();
+            store.set_memory_scope(&repo, a.node_id, Some(&hosts))?;
+        }
+        Ok(Ok(body.assign.len()))
+    })
+    .await;
+    match result {
+        Ok(Ok(Ok(n))) => (StatusCode::OK, Json(json!({ "assigned": n }))),
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
     }

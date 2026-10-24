@@ -191,6 +191,8 @@ ALTER TABLE nodes ADD COLUMN IF NOT EXISTS curation_reason TEXT;
 -- row_to_node reads them with no ::text cast; set only by set_memory_class.
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS memory_class TEXT NOT NULL DEFAULT 'durable';
 ALTER TABLE nodes ADD COLUMN IF NOT EXISTS class_until TEXT;
+-- Milestone 4: the hosts a memory is tied to (a JSON list); NULL = everywhere.
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS applies_to TEXT;
 -- The class first shipped as "status"; it's "progress" now. Idempotent.
 UPDATE nodes SET memory_class = 'progress' WHERE memory_class = 'status';
 

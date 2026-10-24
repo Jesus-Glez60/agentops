@@ -538,7 +538,8 @@ fn sample_markdown(sample: &[&LabelLine]) -> String {
 /// The `cue` of a labelling line for an error cue.
 const ERROR_CUE: &str = "(error)";
 
-fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score: Option<f64>, sources: CueSources, sample_size: Option<usize>) -> Result<()> {
+fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score: Option<f64>, sources: CueSources, sample_size: Option<usize>, client_host: Option<&str>) -> Result<()> {
+    let client_host = client_host.and_then(agentops_mcp::hooks::normalize_host);
     let transcripts = read_transcripts(path, None, None, Some(sessions))?;
     for prefix in sessions {
         if !transcripts.iter().any(|t| t.session_id.starts_with(prefix.as_str())) {
@@ -568,7 +569,7 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
         for (chunk_no, chunk) in steps.chunks(REPLAY_CHUNK).enumerate() {
             let injections: Vec<ReplayInjection> = match (&marker, &local) {
                 (Some(marker), _) => {
-                    let reply = remote_send_within(marker, "work-recall/replay", Some(&json!({ "events": events, "steps": chunk, "min_score": min_score, "sources": sources })), REPLAY_TIMEOUT)?;
+                    let reply = remote_send_within(marker, "work-recall/replay", Some(&json!({ "events": events, "steps": chunk, "min_score": min_score, "sources": sources, "client_host": client_host })), REPLAY_TIMEOUT)?;
                     events = serde_json::from_value(reply["events"].clone()).context("reading the replay's events")?;
                     serde_json::from_value(reply["injections"].clone()).context("reading the replay's injections")?
                 }
@@ -579,6 +580,7 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
                         settings.min_score = min;
                     }
                     settings.sources = sources;
+                    settings.client_host = client_host.as_deref();
                     let out = agentops_mcp::work_recall::replay(store.as_ref(), repo, &mut log, chunk, None, settings)?;
                     events = log.to_logged();
                     out
@@ -663,6 +665,9 @@ pub(crate) struct Options<'a> {
     pub(crate) min_score: Option<f64>,
     pub(crate) sources: Option<&'a str>,
     pub(crate) sample: Option<usize>,
+    /// With replay: run as if from this host, so error cues skip memories
+    /// scoped to others (milestone 4).
+    pub(crate) client_host: Option<&'a str>,
 }
 
 pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
@@ -675,7 +680,7 @@ pub(crate) fn run(path: &Path, options: Options) -> Result<()> {
         None => CueSources::All,
     };
     if !options.replay.is_empty() {
-        return replay(path, &root, options.replay, options.remote, options.min_score, sources, options.sample);
+        return replay(path, &root, options.replay, options.remote, options.min_score, sources, options.sample, options.client_host);
     }
     let cases_file = options.cases.map(Path::to_path_buf).unwrap_or_else(|| path.join(".context").join("work-recall-eval.jsonl"));
     let cases = read_cases(&cases_file)?;

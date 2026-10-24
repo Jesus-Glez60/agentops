@@ -250,6 +250,7 @@ The 20 SQLite graph steps, oldest first:
 22. `nodes.memory_class`, `class_until` (ADR 0054)
 23. `memory_class` `status` renamed to `progress`
 24. `recall_shown` (milestone 4; Postgres: `CREATE TABLE IF NOT EXISTS` in `schema.sql`)
+25. `nodes.applies_to` (milestone 4: the hosts a memory is tied to, a JSON list; NULL for everywhere; Postgres: `ADD COLUMN IF NOT EXISTS`)
 
 The vector table is created separately (`vec_table_migration`).
 

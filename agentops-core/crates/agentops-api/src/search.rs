@@ -178,6 +178,8 @@ pub struct NodeDetail {
     pub curated: bool,
     pub prominence: NodeProminence,
     pub curation_reason: Option<String>,
+    /// The hosts a memory is tied to (milestone 4); `None` for everywhere.
+    pub applies_to: Option<Vec<String>>,
 }
 
 /// `pub(crate)` so `subgraph.rs` reuses this instead of re-deriving the
@@ -243,6 +245,7 @@ pub(crate) async fn node_detail_json(State(state): State<AppState>, AxumPath((re
             curated: node.curated,
             prominence: node.prominence,
             curation_reason: node.curation_reason,
+            applies_to: node.applies_to,
             connected,
         }))
     })

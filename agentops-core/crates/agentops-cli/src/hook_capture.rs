@@ -78,6 +78,12 @@ fn process(event: &str, compress: bool, input: &str) -> Result<Option<Value>> {
     }
 }
 
+/// This machine's hostname as `hostname` prints it, trimmed; `None` if the
+/// command fails or prints nothing.
+pub(crate) fn hostname() -> Option<String> {
+    std::process::Command::new("hostname").output().ok().filter(|o| o.status.success()).and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 /// Runs `event`'s store logic locally or on the server (see the module doc
 /// comment). Returns the hook's stdout JSON, if any.
 fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
@@ -101,6 +107,11 @@ fn dispatch(event: &str, payload: &Value) -> Result<Option<Value>> {
     // The `path` the agent should pass to agentops tools, echoed into the
     // context the hook injects: the connection id for a remote repo (the
     // hosted `/mcp` never resolves a local checkout path), else this repo.
+    // Which machine this is, so an error cue can skip memories tied to
+    // another one (milestone 4). Nothing else from the environment is sent.
+    if let Some(host) = hostname().as_deref().and_then(hooks::normalize_host) {
+        payload[hooks::CLIENT_HOST_FIELD] = Value::String(host);
+    }
     let marker = read_remote_marker(repo_path);
     payload["agentops_path"] = Value::String(marker.as_ref().map_or_else(|| repo_path.to_string_lossy().into_owned(), |m| m.connection_id.clone()));
     let payload = &payload;
@@ -482,6 +493,12 @@ mod tests {
         assert!(!request.contains("transcript_path") && !request.contains("\"cwd\""), "local paths must not be sent: {request}");
         let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body["agentops_path"], "conn-1", "the agent is told the connection id");
+        // What the client adds to Claude Code's payload: its own fields, and
+        // from the environment only the normalized hostname.
+        let sent: std::collections::BTreeSet<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = ["prompt", "session_id", "hook_event_name", "agentops_path", "client_host"].into_iter().collect();
+        assert_eq!(sent.difference(&expected).collect::<Vec<_>>(), Vec::<&&str>::new(), "{body}");
+        assert_eq!(body["client_host"], json!(hostname().as_deref().and_then(hooks::normalize_host)), "{body}");
         assert!(!dir.path().join(".context").join("graph.db").exists());
     }
 

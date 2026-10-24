@@ -120,6 +120,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "memory_class": { "type": "string", "enum": ["durable", "progress", "experimental", "temporal"], "description": "What kind of truth it holds; omit to classify from the title. progress: records where the work stands (shipped, a session or milestone summary, a plan or requirements); never recalled. experimental: provisional. temporal: true until class_until." },
                         "class_until": { "type": "string", "description": "For temporal: the UTC date (YYYY-MM-DD) it stops being recalled." },
                         "supersedes": { "type": "array", "items": { "type": "integer" }, "description": "Node ids this note replaces; they stop being recalled today." },
+                        "applies_to": { "type": "array", "items": { "type": "string" }, "description": "Hostnames of the machines this is tied to (one server's setup, one SSH alias); omit for everywhere. An error on another machine won't recall it." },
                     },
                     "required": ["path", "title", "body"],
                 })
@@ -135,6 +136,14 @@ fn tool_specs() -> Vec<ToolSpec> {
             annotations: WRITE_IDEMPOTENT,
             input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "id": { "type": "integer" }, "memory_class": { "type": "string", "enum": ["durable", "progress", "experimental", "temporal"] }, "class_until": { "type": "string" } }, "required": ["path", "id", "memory_class"] }),
             handler: tool_set_memory_class,
+        },
+        ToolSpec {
+            name: "set_memory_scope",
+            description: "Ties a gotcha/decision/note to the machines it is about (hostnames where Claude Code runs), or clears that with an empty list. An error on another machine won't recall it; prompts and files still do, labelled with its hosts.",
+            access: AccessMode::Advisor,
+            annotations: WRITE_IDEMPOTENT,
+            input_schema: || json!({ "type": "object", "properties": { "path": { "type": "string" }, "id": { "type": "integer" }, "applies_to": { "type": "array", "items": { "type": "string" } } }, "required": ["path", "id", "applies_to"] }),
+            handler: tool_set_memory_scope,
         },
         ToolSpec {
             name: "ingest_notes",
@@ -781,6 +790,35 @@ fn tool_set_memory_class(args: &Value) -> anyhow::Result<String> {
     Ok(format!("Node {id} is now {}{}.", class.as_db_str(), until.map(|u| format!(" until {u}")).unwrap_or_default()))
 }
 
+/// `applies_to` from a tool call, each host `normalize_host`d; `None` when
+/// absent. Errors on anything but a list of strings.
+fn parse_scope_args(args: &Value) -> anyhow::Result<Option<Vec<String>>> {
+    let Some(value) = args.get("applies_to") else { return Ok(None) };
+    let list = value.as_array().ok_or_else(|| anyhow::anyhow!("applies_to must be a list of hostnames"))?;
+    let mut hosts = Vec::new();
+    for item in list {
+        let raw = item.as_str().ok_or_else(|| anyhow::anyhow!("applies_to must be a list of hostnames"))?;
+        if let Some(host) = crate::hooks::normalize_host(raw) {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    Ok(Some(hosts))
+}
+
+fn tool_set_memory_scope(args: &Value) -> anyhow::Result<String> {
+    let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
+    let id = args.get("id").and_then(Value::as_i64).ok_or_else(|| anyhow::anyhow!("missing required 'id'"))?;
+    let hosts = parse_scope_args(args)?.ok_or_else(|| anyhow::anyhow!("missing required 'applies_to'"))?;
+    let store = crate::store::open_store(Path::new(path_str))?;
+    let repo = crate::scan::repo_name(Path::new(path_str));
+    let node = store.get_node(&repo, id)?.ok_or_else(|| anyhow::anyhow!("no node {id}"))?;
+    anyhow::ensure!(agentops_graph::similarity::MEMORY_KINDS.contains(&node.kind), "only gotchas, decisions and notes have a scope, not a {}", node.kind.as_db_str());
+    store.set_memory_scope(&repo, id, Some(&hosts))?;
+    Ok(if hosts.is_empty() { format!("Node {id} applies everywhere.") } else { format!("Node {id} applies to {}.", hosts.join(", ")) })
+}
+
 fn tool_add_note(args: &Value) -> anyhow::Result<String> {
     let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
     let title = get_str(args, "title").ok_or_else(|| anyhow::anyhow!("missing required 'title'"))?;
@@ -799,6 +837,7 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
 
     // Checked before anything is written, so a bad class writes nothing.
     let explicit_class = parse_memory_class_args(args)?;
+    let scope = parse_scope_args(args)?;
     let supersedes: Vec<i64> = args.get("supersedes").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(Value::as_i64).collect()).unwrap_or_default();
 
     let mode = if get_bool(args, "dry_run") {
@@ -821,6 +860,9 @@ fn tool_add_note(args: &Value) -> anyhow::Result<String> {
     let event_kind = if result.note_type == agentops_notes::NoteType::Decision { "decision" } else { "activity" };
     if let (true, Some(id)) = (result.written, result.node_id) {
         crate::notes::apply_memory_class(Path::new(path_str), id, title, explicit_class, &supersedes)?;
+        if let Some(hosts) = scope.as_deref() {
+            crate::store::open_store(Path::new(path_str))?.set_memory_scope(&crate::scan::repo_name(Path::new(path_str)), id, Some(hosts))?;
+        }
     }
     if result.written {
         maybe_record_session_event(Path::new(path_str), args, "add_note", &format!("added {type_str} note: {title}"), None, event_kind)?;
@@ -1400,6 +1442,21 @@ mod tests {
     /// ADR 0054: a note's class comes from the caller when given, else from
     /// its title; `supersedes` ends the old memory today; a wrong class is
     /// fixed with `set_memory_class`; a bad class writes nothing.
+    #[test]
+    fn add_note_scopes_a_memory_to_hosts_and_set_memory_scope_corrects_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let store = crate::store::open_store(dir.path()).unwrap();
+        let repo = crate::scan::repo_name(dir.path());
+        let r = call_tool(AccessMode::Full, "add_note", &json!({ "path": path, "title": "Deploy box keeps logs in PM2", "body": "x", "note_type": "gotcha", "applies_to": ["Deploy-Box.local", "deploy-box"] })).unwrap();
+        assert!(!r.is_error, "{:?}", r.content);
+        let id = store.nodes_by_kind(&repo, NodeKind::Gotcha).unwrap().into_iter().find(|n| n.name.as_deref() == Some("Deploy box keeps logs in PM2")).unwrap().id;
+        assert_eq!(store.get_node(&repo, id).unwrap().unwrap().applies_to, Some(vec!["deploy-box".to_string()]), "normalized and deduplicated");
+        assert!(!call_tool(AccessMode::Advisor, "set_memory_scope", &json!({ "path": path, "id": id, "applies_to": [] })).unwrap().is_error);
+        assert_eq!(store.get_node(&repo, id).unwrap().unwrap().applies_to, None, "an empty list is everywhere");
+        assert!(call_tool(AccessMode::Advisor, "set_memory_scope", &json!({ "path": path, "id": id, "applies_to": "deploy-box" })).unwrap().is_error, "not a list");
+    }
+
     #[test]
     fn add_note_sets_a_memory_class_and_set_memory_class_corrects_it() {
         use agentops_graph::MemoryClass;
@@ -2100,7 +2157,7 @@ mod tests {
                 prominence: agentops_graph::NodeProminence::Full,
                 curation_reason: None,
                 memory_class: agentops_graph::MemoryClass::Durable,
-                class_until: None,
+                class_until: None, applies_to: None,
                 last_touched_at: None,
             }
         }

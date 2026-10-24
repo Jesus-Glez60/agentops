@@ -409,6 +409,9 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
             PRIMARY KEY (repo, session_id, context, node_id)
         );",
     ),
+    // Milestone 4: the hosts a memory is tied to (a JSON list), NULL for
+    // everywhere. No default, so it adds cleanly to a non-empty table.
+    M::up("ALTER TABLE nodes ADD COLUMN applies_to TEXT;"),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -458,6 +461,7 @@ impl SqliteGraphStore {
             last_touched_at: row.get("last_touched_at")?,
             memory_class: MemoryClass::from_db_str(&row.get::<_, String>("memory_class")?),
             class_until: row.get("class_until")?,
+            applies_to: crate::scope_from_db(row.get("applies_to")?),
         })
     }
 
@@ -688,6 +692,11 @@ impl GraphStore for SqliteGraphStore {
             "UPDATE nodes SET memory_class = ?1, class_until = ?2 WHERE repo = ?3 AND id = ?4",
             rusqlite::params![class.as_db_str(), until, repo, node_id],
         )?;
+        Ok(())
+    }
+
+    fn set_memory_scope(&self, repo: &str, node_id: i64, hosts: Option<&[String]>) -> Result<()> {
+        self.conn.execute("UPDATE nodes SET applies_to = ?1 WHERE repo = ?2 AND id = ?3", rusqlite::params![crate::scope_to_db(hosts), repo, node_id])?;
         Ok(())
     }
 
@@ -1778,12 +1787,26 @@ mod tests {
         assert_eq!((after_rescan.memory_class, after_rescan.class_until.as_deref()), (MemoryClass::Temporal, Some("2026-11-01")));
     }
 
+    #[test]
+    fn set_memory_scope_survives_a_subsequent_rescan_and_empty_means_everywhere() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let n = node("repo-a", NodeKind::Gotcha, Some("vault:g.md"), Some("g"));
+        let id = upsert_node(&store, n.clone()).unwrap();
+        assert_eq!(store.get_node("repo-a", id).unwrap().unwrap().applies_to, None);
+        store.set_memory_scope("repo-a", id, Some(&["laptop".to_string(), "box".to_string()])).unwrap();
+        upsert_node(&store, n).unwrap();
+        assert_eq!(store.get_node("repo-a", id).unwrap().unwrap().applies_to, Some(vec!["laptop".to_string(), "box".to_string()]));
+        store.set_memory_scope("repo-a", id, Some(&[])).unwrap();
+        assert_eq!(store.get_node("repo-a", id).unwrap().unwrap().applies_to, None, "an empty list is everywhere, stored as NULL");
+    }
+
     /// A graph.db holding the class's first name reads it as progress.
     #[test]
     fn a_status_class_from_before_the_rename_becomes_progress() {
         let mut conn = Connection::open_in_memory().unwrap();
-        // Every migration up to the rename; milestone 4's recall_shown came after it.
-        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 2).unwrap();
+        // Every migration up to the rename; milestone 4's recall_shown and
+        // applies_to came after it.
+        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 3).unwrap();
         conn.execute("INSERT INTO nodes (kind, repo, name, memory_class) VALUES ('note', 'repo-a', 'old', 'status')", []).unwrap();
         migrations().to_latest(&mut conn).unwrap();
         let class: String = conn.query_row("SELECT memory_class FROM nodes", [], |r| r.get(0)).unwrap();

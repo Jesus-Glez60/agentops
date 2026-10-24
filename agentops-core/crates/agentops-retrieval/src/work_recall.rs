@@ -300,7 +300,7 @@ fn recallable(node: &agentops_graph::Node, today: &str) -> bool {
 
 fn candidate(node: agentops_graph::Node, score: f64, reason: String) -> WorkCandidate {
     let score = if node.prominence == NodeProminence::Reduced { score * 0.5 } else { score };
-    WorkCandidate { pointer: RecallPointer { node_id: node.id, kind: node.kind, title: node.name.unwrap_or_else(|| "(untitled)".to_string()), reason, memory_class: node.memory_class }, score }
+    WorkCandidate { pointer: RecallPointer { node_id: node.id, kind: node.kind, title: node.name.unwrap_or_else(|| "(untitled)".to_string()), reason, memory_class: node.memory_class, applies_to: node.applies_to }, score }
 }
 
 /// Source 1: memories with an `Affects` edge to one of `symbols` (the

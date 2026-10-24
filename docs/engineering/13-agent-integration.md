@@ -166,6 +166,18 @@ Milestone 3b (`agentops_mcp::work_recall`). The file the agent opens or edits, a
 - **Measuring it.** `agentops work-recall-eval --replay` runs past sessions through the same code via `POST /repos/{id}/work-recall/replay`, against an in-memory log. `--sources no_affects|no_mentions` turns one file-cue source off, for both cases and replay (the ablation, milestone 3b revision 1).
 - **Off switch.** `AGENTOPS_WORK_RECALL=off` turns injection off and leaves prompt-time recall alone. `agentops connect --no-work-recall` sets the variable in `.claude/settings.json`'s `env`, and connecting again without the flag removes it. `hook-capture` forwards the setting as `agentops_work_recall: false` in the payload, so a remote server honors it too. Reads and cues are still recorded. There is no separate repo config file: AgentOps has none.
 
+### Memory scope
+
+Milestone 4 item 3. Some memories hold only on one machine: one server's deploy setup, or one SSH alias. In milestone 3c, 4 of the 6 non-progress noise rows were these, and all came from error cues.
+- **`client_host`.** `hook-capture` adds this machine's hostname to every payload it forwards, normalized by `normalize_host`: trimmed, lowercased, cut at the first dot (macOS reports `name.local`). It's omitted when `hostname` fails. Nothing else from the environment is sent, neither the OS username nor environment variables (tested). The server normalizes it again.
+- **`applies_to`.** A memory's hosts: a JSON list in `nodes.applies_to`, NULL for everywhere. Set by `add_note`'s `applies_to` or the `set_memory_scope` tool (an empty list clears it). Kept across rescans like the class. The hosts are client hostnames, the machines Claude Code runs on. A memory scoped only to a server that never runs Claude Code is therefore never recalled by an error cue; the author chose that meaning, 2026-10-24.
+- **Recall.** An error cue drops a memory whose `applies_to` is set and doesn't contain the payload's `client_host`. Without a `client_host`, nothing is skipped. Prompt seeds, subagent seeds and file cues still show it, labelled ` — on <hosts>`, since you may be working on that machine's setup from another one.
+- **Backfill.** `agentops classify-memories --scope [--host NAME]...` lists every memory and proposes, for each one whose title or body names a candidate host as a whole word (case-insensitive), `applies_to` = the names found.
+  - The candidates are this hostname, the concrete `Host` aliases in `~/.ssh/config`, and `--host`. They are read and matched on this machine and never sent.
+  - The proposals go to `.context/classify-memories.scope.{json,md}`, with what each means for error cues from here.
+  - `--apply` sends exactly the saved file to `POST /repos/{id}/memories/scope`.
+- **Replay.** `work-recall-eval --replay ... --client-host NAME` replays as if the cues came from that host.
+
 ### Recording use: "followed"
 
 Milestone 4 item 2. A lookup of a memory the context was shown is the one use signal milestone 3c found that separates useful recall from noise (gotcha 340675). It is recorded; no weight changes from it.

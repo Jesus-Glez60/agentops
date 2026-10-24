@@ -181,6 +181,7 @@ fn row_to_node(row: &tokio_postgres::Row) -> Node {
         last_touched_at: None,
         memory_class: MemoryClass::from_db_str(row.get::<_, &str>("memory_class")),
         class_until: row.get("class_until"),
+        applies_to: agentops_graph::scope_from_db(row.get("applies_to")),
     }
 }
 
@@ -442,6 +443,14 @@ impl GraphStore for PostgresGraphStore {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
             client.execute("UPDATE nodes SET memory_class = $1, class_until = $2 WHERE repo = $3 AND id = $4", &[&class.as_db_str(), &until, &repo, &node_id]).await?;
+            Ok(())
+        })
+    }
+
+    fn set_memory_scope(&self, repo: &str, node_id: i64, hosts: Option<&[String]>) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("UPDATE nodes SET applies_to = $1 WHERE repo = $2 AND id = $3", &[&agentops_graph::scope_to_db(hosts), &repo, &node_id]).await?;
             Ok(())
         })
     }
@@ -1994,6 +2003,19 @@ mod tests {
         assert_eq!(after_rescan.prominence, NodeProminence::Reduced, "a rescan must not silently reset a curated gotcha's prominence back to Full");
 
         store.delete_nodes("pg-repo-review", &[id]).unwrap();
+    }
+
+    #[test]
+    fn set_memory_scope_survives_a_subsequent_rescan() {
+        let store = require_store!();
+        let repo = format!("pg-repo-scope-{}", std::process::id());
+        let n = node(&repo, NodeKind::Gotcha, Some("vault:g.md"), Some("g"));
+        let id = upsert_node(&store, n.clone()).unwrap();
+        store.set_memory_scope(&repo, id, Some(&["laptop".to_string()])).unwrap();
+        upsert_node(&store, n).unwrap();
+        let got = store.get_node(&repo, id).unwrap().unwrap().applies_to;
+        store.delete_nodes(&repo, &[id]).unwrap();
+        assert_eq!(got, Some(vec!["laptop".to_string()]), "read back, not only written");
     }
 
     #[test]

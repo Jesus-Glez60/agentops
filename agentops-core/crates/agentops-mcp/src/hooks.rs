@@ -296,8 +296,20 @@ pub const REL_PATH_FIELD: &str = "agentops_rel_path";
 pub const WORK_RECALL_ENV: &str = "AGENTOPS_WORK_RECALL";
 pub const WORK_RECALL_FIELD: &str = "agentops_work_recall";
 
-fn work_recall_settings(payload: &Value) -> crate::work_recall::Settings {
+fn work_recall_settings(payload: &Value) -> crate::work_recall::Settings<'static> {
     crate::work_recall::Settings { enabled: payload.get(WORK_RECALL_FIELD).and_then(|v| v.as_bool()) != Some(false), ..Default::default() }
+}
+
+/// The payload field `agentops hook-capture` sets to this machine's
+/// hostname, `normalize_host`d (milestone 4). Nothing else from the
+/// client's environment is sent.
+pub const CLIENT_HOST_FIELD: &str = "client_host";
+
+/// A hostname as memory scopes compare it: trimmed, lowercased, up to its
+/// first dot (macOS reports `name.local`). `None` when nothing is left.
+pub fn normalize_host(raw: &str) -> Option<String> {
+    let host = raw.trim().split('.').next().unwrap_or("").to_lowercase();
+    (!host.is_empty()).then_some(host)
 }
 
 fn rel_path(payload: &Value) -> Option<&str> {
@@ -323,7 +335,7 @@ const FLOW_SKILLS: &[&str] = &["plan", "library-docs", "audit-plan"];
 /// The agentops tools that write a memory, and the `event_kind` their
 /// PostToolUse records with the node ids written (description: `ids
 /// 1,2,3`, as `recall_injected`).
-const MEMORY_WRITE_TOOLS: &[&str] = &["mcp__agentops__add_note", "mcp__agentops__ingest_notes", "mcp__agentops__set_memory_class"];
+const MEMORY_WRITE_TOOLS: &[&str] = &["mcp__agentops__add_note", "mcp__agentops__ingest_notes", "mcp__agentops__set_memory_class", "mcp__agentops__set_memory_scope"];
 pub const MEMORY_WRITTEN: &str = "memory_written";
 
 /// Lookups that can follow a recalled pointer (milestone 4 item 2).
@@ -441,7 +453,10 @@ fn render_tool_response(value: &Value) -> String {
 /// context to inject, if any.
 fn work_cue(store: &dyn GraphStore, repo: &str, payload: &Value, cue: &agentops_retrieval::work_recall::WorkCue, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<String>> {
     let mut log = crate::work_recall::StoreLog { store, repo, session_id: session_id(payload) };
-    Ok(crate::work_recall::on_cue(store, repo, &mut log, agent_id(payload), cue, embedder, work_recall_settings(payload))?.map(|i| i.context))
+    // Normalized here too: the scopes it's compared with are.
+    let host = payload.get(CLIENT_HOST_FIELD).and_then(Value::as_str).and_then(normalize_host);
+    let settings = crate::work_recall::Settings { client_host: host.as_deref(), ..work_recall_settings(payload) };
+    Ok(crate::work_recall::on_cue(store, repo, &mut log, agent_id(payload), cue, embedder, settings)?.map(|i| i.context))
 }
 
 /// Claude Code's docs (as fetched) confirm `tool_name`/`tool_input` but

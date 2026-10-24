@@ -10,6 +10,7 @@
 
 mod hook_capture;
 mod classify_memories;
+mod classify_scope;
 mod compress_output;
 mod librarian;
 mod import_memory;
@@ -171,6 +172,15 @@ enum Command {
         path: PathBuf,
         #[arg(long)]
         apply: bool,
+        /// Propose which memories are tied to one machine instead
+        /// (milestone 4), from host names in their text: this hostname,
+        /// ~/.ssh/config aliases and --host. Saves
+        /// .context/classify-memories.scope.{json,md}; --apply sends them.
+        #[arg(long)]
+        scope: bool,
+        /// With --scope: another host name to look for (repeatable).
+        #[arg(long = "host")]
+        hosts: Vec<String>,
         /// Judge at most N memories a minute, for a free-tier provider's
         /// rate limit (at most 8 for Groq's free tier: 8,000 tokens a minute,
         /// about 650-900 per judgment).
@@ -296,6 +306,10 @@ enum Command {
         /// (.context/work-recall-eval/to-label.{jsonl,md}).
         #[arg(long)]
         sample: Option<usize>,
+        /// With --replay: run as if the cues came from this host, so error
+        /// cues skip memories scoped to other hosts (milestone 4).
+        #[arg(long)]
+        client_host: Option<String>,
     },
     /// Dense-vector search over embedded symbols/gotchas/decisions/notes —
     /// requires having scanned/added notes with --with-embeddings first.
@@ -821,9 +835,10 @@ fn main() -> Result<()> {
         Command::Note { path, kind, tags, with_embeddings, title, text } => note(&path, kind, &tags, with_embeddings, &title, &text),
         Command::LinkSimilar { path, prune } => link_similar(&path, prune),
         Command::RecallEval { path, remote, embed, cases, mode, repeat } => recall_eval::run(&path, remote, embed, cases.as_deref(), mode, repeat),
-        Command::WorkRecallEval { path, remote, embed, cases, baseline, repeat, sizing, replay, min_score, sources, sample } => work_recall_eval::run(&path, work_recall_eval::Options { remote, embed, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample }),
+        Command::WorkRecallEval { path, remote, embed, cases, baseline, repeat, sizing, replay, min_score, sources, sample, client_host } => work_recall_eval::run(&path, work_recall_eval::Options { remote, embed, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample, client_host: client_host.as_deref() }),
         Command::RecallStats { path, remote, since } => recall_eval::stats(&path, remote, since.as_deref()),
-        Command::ClassifyMemories { path, apply, per_minute, retry_failed, llm } => classify_memories::run(&path, apply, per_minute, retry_failed, llm),
+        Command::ClassifyMemories { path, apply, scope: true, hosts, .. } => classify_scope::run(&path, apply, &hosts),
+        Command::ClassifyMemories { path, apply, per_minute, retry_failed, llm, .. } => classify_memories::run(&path, apply, per_minute, retry_failed, llm),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
@@ -1681,7 +1696,7 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
 /// until it gets a real API key back. Field/status names match RFC 8628
 /// (OAuth 2.0 Device Authorization Grant) directly.
 fn device_flow_login(server_url: &str) -> Result<String> {
-    let device_name = std::process::Command::new("hostname").output().ok().filter(|o| o.status.success()).and_then(|o| String::from_utf8(o.stdout).ok()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "this device".to_string());
+    let device_name = hook_capture::hostname().unwrap_or_else(|| "this device".to_string());
 
     let mut response = ureq::post(format!("{server_url}/auth/cli/device")).config().http_status_as_error(false).build().send_json(serde_json::json!({ "device_name": device_name })).context("calling POST /auth/cli/device")?;
     if !response.status().is_success() {
