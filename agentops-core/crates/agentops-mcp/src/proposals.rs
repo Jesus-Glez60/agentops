@@ -86,6 +86,10 @@ pub struct RunLog {
     /// Estimated, from `agentops_llm::pricing`; `None` for an unpriced model.
     pub usd: Option<f64>,
     pub cap_reached: bool,
+    /// The LLM call that stopped the run early (a rate limit, a provider
+    /// error); what was written before it stays.
+    #[serde(default)]
+    pub error: Option<String>,
     pub provider: String,
     pub model: String,
 }
@@ -217,7 +221,13 @@ pub fn generate(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphSto
             continue; // a source is gone
         }
         let purpose = if c.purpose == "merge" { ConsolidationPurpose::Merge } else { ConsolidationPurpose::Distill };
-        let (proposed, call) = agentops_llm::propose_memory(config, purpose, &sources)?;
+        let (proposed, call) = match agentops_llm::propose_memory(config, purpose, &sources) {
+            Ok(done) => done,
+            Err(e) => {
+                log.error = Some(format!("{e:#}"));
+                break;
+            }
+        };
         log.input_tokens += call.input_tokens;
         log.output_tokens += call.output_tokens;
         match agentops_llm::pricing::cost_estimate_usd(&call.provider, &call.model, call.input_tokens as i64, call.output_tokens as i64, 0, 0) {
@@ -426,6 +436,20 @@ mod tests {
         let url = mock_llm(vec![(MERGED, 15_000, 5_000)]);
         let log = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &pairs, None, "batch").unwrap();
         assert_eq!((log.proposals.len(), log.cap_reached), (1, true));
+    }
+
+    #[test]
+    fn a_failed_call_stops_the_run_keeps_what_it_wrote_and_is_logged() {
+        let r = Repo::new();
+        let ids: Vec<i64> = (0..3).map(|i| r.memory(&format!("Twin {i}"), &format!("Twin fact {i}."), at(1.0))).collect();
+        let pairs = vec![Candidate::merge(ids[0], ids[1], 0.9), Candidate::merge(ids[1], ids[2], 0.9)];
+        // One good reply, then the stand-in is gone: the second call fails.
+        let url = mock_llm(vec![(MERGED, 10, 10)]);
+        let log = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &pairs, None, "batch").unwrap();
+        assert_eq!(log.proposals.len(), 1);
+        assert!(log.error.is_some(), "{log:?}");
+        let runs: Vec<_> = r.store.session_events(&r.repo, "batch").unwrap().into_iter().filter(|e| e.event_kind == CONSOLIDATION_RUN).collect();
+        assert_eq!(runs.len(), 1, "the failed run is still logged with its cost");
     }
 
     #[test]
