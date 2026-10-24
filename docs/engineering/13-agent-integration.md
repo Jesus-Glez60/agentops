@@ -166,6 +166,16 @@ Milestone 3b (`agentops_mcp::work_recall`). The file the agent opens or edits, a
 - **Measuring it.** `agentops work-recall-eval --replay` runs past sessions through the same code via `POST /repos/{id}/work-recall/replay`, against an in-memory log. `--sources no_affects|no_mentions` turns one file-cue source off, for both cases and replay (the ablation, milestone 3b revision 1).
 - **Off switch.** `AGENTOPS_WORK_RECALL=off` turns injection off and leaves prompt-time recall alone. `agentops connect --no-work-recall` sets the variable in `.claude/settings.json`'s `env`, and connecting again without the flag removes it. `hook-capture` forwards the setting as `agentops_work_recall: false` in the payload, so a remote server honors it too. Reads and cues are still recorded. There is no separate repo config file: AgentOps has none.
 
+### Recording use: "followed"
+
+Milestone 4 item 2. A lookup of a memory the context was shown is the one use signal milestone 3c found that separates useful recall from noise (gotcha 340675). It is recorded; no weight changes from it.
+- **What counts.** A `PostToolUse` for `fetch_content` (its `id`), `related_context` (its `symbol_id`) or `get_symbol`, where the memory is one this context was shown. `get_symbol` takes a name, so it counts when the name equals a shown memory's title exactly.
+- **Shown** means a row in `recall_shown` under the context's claim key (a subagent's id, or `main#<n>`), else a current pin.
+- **Recorded as** a `memory_followed` session event: `id N source S context C`, with `node_id` N. The source is the claim's: `prompt_seed`, `subagent_seed`, `file_cue`, `error_cue`, or `pin`.
+- **Subagents.** These three tools are forwarded from subagents too, unlike other agentops calls (`is_relevant`), so a follow of a subagent seed lands in the subagent's context. This needs the reinstalled CLI.
+- **Reading it.** `agentops recall-stats [--remote] [--since YYYY-MM-DD]` (route `GET /repos/{id}/recall/stats`) prints, per source and memory class, the memories shown, the ones followed and the rate. It counts distinct `(session, context, memory)` triples and leaves out `recall-eval-*` sessions. Pins have follows but no shown count.
+- **When to revisit reinforcement:** at 200 follows from at least 20 ordinary sessions (`handoffs/m3b-eval.md`).
+
 ### Importing MEMORY.md
 
 Claude Code's own auto-memory (MEMORY.md) is imported once with `agentops import-memory` ([06-notes-and-consolidation.md](06-notes-and-consolidation.md), "Importing Claude Code's MEMORY.md"), then turned off per project with `autoMemoryEnabled: false` in `.claude/settings.local.json` (verified in the milestone 2 spike: the session's system prompt loses its memory section). Milestone 1's redirect of memory writes to `add_note` stays on as a backstop.

@@ -286,3 +286,9 @@ From here on, **labels are the primary measure of recall during work.** The nois
 
 - **No run-to-run drift this time.** Every case's rank was identical across all 5 runs of each set. The ±1 seen before (gotcha 244815) didn't show up on this snapshot.
 - **The +1 in each set is the swap.** c21 and f11 both hit at rank 1. On the same snapshot, the old c17 and f05 both still miss. Without the swaps the sets would score 12/20 and 5/20, matching the `684e36a` and `785d282` numbers above.
+
+## Milestone 4: when to revisit reinforcement by use (2026-10-24)
+
+Weights don't change from use yet. The live signal is now recorded as `memory_followed` (`agentops recall-stats`).
+- **Revisit at:** at least 200 follows, from at least 20 ordinary sessions. Ordinary means not the labelling or analysis sessions, and not `recall-eval-*`.
+- **Why that much:** in milestone 3c, follows fired on 2.8% of 575 live pointers (16 follows). At that rate, 200 follows is about 7,000 shown pointers, enough to compare follow rates per source and class with a few dozen follows in each.

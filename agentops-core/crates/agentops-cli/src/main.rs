@@ -147,6 +147,20 @@ enum Command {
         #[arg(long)]
         with_embeddings: bool,
     },
+    /// Per source and memory class: memories recall showed, how many the
+    /// agent then looked up, and the rate (milestone 4). Leaves out
+    /// `recall-eval-*` sessions.
+    RecallStats {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        /// Read the server this repo is connected to.
+        #[arg(long)]
+        remote: bool,
+        /// Only count what was shown or followed on or after this date
+        /// (YYYY-MM-DD).
+        #[arg(long)]
+        since: Option<String>,
+    },
     /// Gives this repo's existing gotchas, decisions and notes a memory
     /// class (durable, progress, experimental, temporal; ADR 0054) on the
     /// server it's connected to. Dry run by default: saves the proposals to
@@ -808,6 +822,7 @@ fn main() -> Result<()> {
         Command::LinkSimilar { path, prune } => link_similar(&path, prune),
         Command::RecallEval { path, remote, embed, cases, mode, repeat } => recall_eval::run(&path, remote, embed, cases.as_deref(), mode, repeat),
         Command::WorkRecallEval { path, remote, embed, cases, baseline, repeat, sizing, replay, min_score, sources, sample } => work_recall_eval::run(&path, work_recall_eval::Options { remote, embed, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample }),
+        Command::RecallStats { path, remote, since } => recall_eval::stats(&path, remote, since.as_deref()),
         Command::ClassifyMemories { path, apply, per_minute, retry_failed, llm } => classify_memories::run(&path, apply, per_minute, retry_failed, llm),
         Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {

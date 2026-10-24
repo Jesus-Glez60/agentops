@@ -293,6 +293,7 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/usage/sync", post(dashboard::usage_sync_json))
         .route("/repos/{id}/hooks/{event}", post(dashboard::hook_event_json))
         .route("/repos/{id}/recall", post(dashboard::recall_json))
+        .route("/repos/{id}/recall/stats", get(dashboard::recall_stats_json))
         .route("/repos/{id}/work-recall", post(dashboard::work_recall_json))
         .route("/repos/{id}/work-recall/replay", post(dashboard::work_recall_replay_json))
         .route("/repos/{id}/memories/classify", post(dashboard::classify_memories_json))

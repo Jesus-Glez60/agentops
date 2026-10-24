@@ -18,7 +18,7 @@ use rusqlite_migration::{Migrations, M};
 
 use agentops_embeddings::EMBEDDING_DIM;
 
-use crate::{Edge, EdgeRelation, GraphStore, MemoryClass, Node, NodeKind, NodeProminence, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus};
+use crate::{Edge, EdgeRelation, GraphStore, MemoryClass, Node, NodeKind, NodeProminence, NewLlmUsage, NewNode, NewScanHistoryEntry, NewSessionReport, NewSessionUsage, NewTask, NodeVersion, RepoState, ScanChange, ScanHistory, ScanHistoryEntry, SessionEvent, SessionReport, SessionUsage, LlmUsage, Task, TaskLink, TaskStatus, RecallShown};
 
 static INIT_VEC_EXTENSION: Once = Once::new();
 
@@ -1067,6 +1067,14 @@ impl GraphStore for SqliteGraphStore {
         Ok(claimed)
     }
 
+    fn recall_shown_rows(&self, repo: &str, session_id: Option<&str>, since: Option<&str>) -> Result<Vec<RecallShown>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT session_id, context, node_id, source, shown_at FROM recall_shown WHERE repo = ?1 AND (?2 IS NULL OR session_id = ?2) AND (?3 IS NULL OR shown_at >= ?3) ORDER BY shown_at, rowid",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![repo, session_id, since], |r| Ok(RecallShown { session_id: r.get(0)?, context: r.get(1)?, node_id: r.get(2)?, source: r.get(3)?, shown_at: r.get(4)? }))?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>> {
         let mut stmt = self.conn.prepare("SELECT * FROM session_events WHERE repo = ?1 AND session_id = ?2 ORDER BY id ASC")?;
         let rows = stmt.query_map(rusqlite::params![repo, session_id], Self::row_to_session_event)?;
@@ -1557,6 +1565,10 @@ mod tests {
         assert_eq!(store.claim_shown("repo-a", "s", "agent-7", &[1], "subagent_seed").unwrap(), vec![1], "another context");
         assert_eq!(store.claim_shown("repo-a", "t", "main#0", &[1], "file_cue").unwrap(), vec![1], "another session");
         assert_eq!(store.claim_shown("repo-b", "s", "main#0", &[1], "file_cue").unwrap(), vec![1], "another repo");
+        let rows = store.recall_shown_rows("repo-a", Some("s"), None).unwrap();
+        assert_eq!(rows.iter().map(|r| (r.context.as_str(), r.node_id, r.source.as_str())).collect::<Vec<_>>(), vec![("main#0", 3, "file_cue"), ("main#0", 1, "file_cue"), ("main#0", 2, "file_cue"), ("main#0", 4, "error_cue"), ("main#1", 1, "file_cue"), ("agent-7", 1, "subagent_seed")], "the first claim keeps its source");
+        assert_eq!(store.recall_shown_rows("repo-a", None, None).unwrap().len(), 7, "every session");
+        assert!(store.recall_shown_rows("repo-a", None, Some("9999-01-01")).unwrap().is_empty());
     }
 
     #[test]

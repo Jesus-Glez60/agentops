@@ -940,6 +940,41 @@ pub(crate) async fn classify_memories_json(State(state): State<AppState>, user: 
 }
 
 #[derive(Deserialize)]
+pub(crate) struct RecallStatsQuery {
+    #[serde(default)]
+    tenant: Option<String>,
+    /// Only what was shown or followed at or after this date or timestamp.
+    #[serde(default)]
+    since: Option<String>,
+}
+
+/// `GET /repos/{id}/recall/stats?since=` -- per source and memory class,
+/// the memories recall showed and how many the agent looked up afterwards
+/// (milestone 4 item 2). `agentops recall-stats --remote` renders it.
+pub(crate) async fn recall_stats_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<RecallStatsQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Value>> {
+        let path = match resolve_connection_path(&state, &tenant, &id) {
+            Ok(p) => p,
+            Err(_) => return Ok(None),
+        };
+        let repo = agentops_mcp::repo_name(&path);
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        Ok(Some(serde_json::to_value(agentops_mcp::recall_stats::recall_stats(store.as_ref(), &repo, q.since.as_deref())?)?))
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(reply))) => (StatusCode::OK, Json(reply)),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+#[derive(Deserialize)]
 pub(crate) struct MemoryClassAssignment {
     node_id: i64,
     memory_class: String,

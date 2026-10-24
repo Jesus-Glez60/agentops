@@ -744,6 +744,18 @@ pub struct TaskLink {
 /// what makes "knowledge was reused" queryable directly instead of parsed
 /// out of `description`'s free text. `event_kind` defaults to `"activity"`
 /// for every pre-existing row/caller.
+/// One memory shown in one context of a session (`recall_shown`,
+/// milestone 4): `context` is a subagent's id or `main#<n>`, `source` how
+/// it was shown.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecallShown {
+    pub session_id: String,
+    pub context: String,
+    pub node_id: i64,
+    pub source: String,
+    pub shown_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionEvent {
     pub id: i64,
@@ -1109,6 +1121,10 @@ pub trait GraphStore {
     /// `source` is how it was shown: `prompt_seed`, `subagent_seed`,
     /// `file_cue` or `error_cue`.
     fn claim_shown(&self, repo: &str, session_id: &str, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>>;
+    /// The `claim_shown` rows of `repo`, oldest first: one session's, or
+    /// every session's when `session_id` is `None`; with `since` (a date or
+    /// timestamp, compared as text), only rows shown at or after it.
+    fn recall_shown_rows(&self, repo: &str, session_id: Option<&str>, since: Option<&str>) -> Result<Vec<RecallShown>>;
     /// Every event recorded for `repo` across *every* session_id, optionally
     /// filtered to one `event_kind` ("hit" or "activity") — unlike
     /// `session_events` above, not scoped to one caller-chosen session_id.

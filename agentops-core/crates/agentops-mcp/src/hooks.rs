@@ -78,7 +78,7 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     match event {
-        "posttooluse" => recorded_post_tool_event(payload, tool_name, &tool_input).is_some() || MEMORY_WRITE_TOOLS.contains(&tool_name) || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
+        "posttooluse" => recorded_post_tool_event(payload, tool_name, &tool_input).is_some() || MEMORY_WRITE_TOOLS.contains(&tool_name) || FOLLOW_TOOLS.contains(&tool_name) || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
         "pretooluse" => tool_name == "ExitPlanMode" || is_memory_write(tool_name, &tool_input) || detect_secret_exposure(tool_name, &tool_input).is_some(),
         "userpromptsubmit" => payload.get("prompt").and_then(|v| v.as_str()).is_some_and(|p| !p.trim().is_empty() && !is_task_notification(p)),
         "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
@@ -142,6 +142,15 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: 
         let ids = memory_write_ids(&payload.tool_input, &payload.tool_response);
         if !ids.is_empty() {
             store.record_session_event_in(repo, session_id, &payload.tool_name, &format!("ids {}", ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")), None, MEMORY_WRITTEN, agent_id(raw))?;
+        }
+    }
+
+    // Looking up a memory this context was shown is the one use signal that
+    // separates useful recall from noise (milestone 3c); bookkeeping, so a
+    // failure is only logged.
+    if FOLLOW_TOOLS.contains(&payload.tool_name.as_str()) {
+        if let Err(e) = record_follows(store, repo, session_id, agent_id(raw), &payload.tool_name, &payload.tool_input) {
+            eprintln!("agentops: recording a follow failed (non-fatal): {e:#}");
         }
     }
 
@@ -316,6 +325,60 @@ const FLOW_SKILLS: &[&str] = &["plan", "library-docs", "audit-plan"];
 /// 1,2,3`, as `recall_injected`).
 const MEMORY_WRITE_TOOLS: &[&str] = &["mcp__agentops__add_note", "mcp__agentops__ingest_notes", "mcp__agentops__set_memory_class"];
 pub const MEMORY_WRITTEN: &str = "memory_written";
+
+/// Lookups that can follow a recalled pointer (milestone 4 item 2).
+/// Forwarded from subagents too, unlike other agentops calls, so a follow
+/// of a subagent seed is recorded in the subagent's context.
+const FOLLOW_TOOLS: &[&str] = &["mcp__agentops__fetch_content", "mcp__agentops__get_symbol", "mcp__agentops__related_context"];
+/// `event_kind` of a lookup of a memory the context was shown (description
+/// `id N source S context C`, `node_id` N). `recall-stats` counts them.
+pub const MEMORY_FOLLOWED: &str = "memory_followed";
+
+/// The memory ids a follow tool's input names: `fetch_content`'s `id`,
+/// `related_context`'s `symbol_id`, or, for `get_symbol`, which takes a
+/// name, every shown memory titled exactly that.
+fn followed_ids(store: &dyn GraphStore, repo: &str, tool_name: &str, tool_input: &Value, shown: &[agentops_graph::RecallShown]) -> Result<Vec<i64>> {
+    Ok(match tool_name {
+        "mcp__agentops__fetch_content" => tool_input.get("id").and_then(Value::as_i64).into_iter().collect(),
+        "mcp__agentops__related_context" => tool_input.get("symbol_id").and_then(Value::as_i64).into_iter().collect(),
+        _ => {
+            let Some(name) = tool_input.get("name").and_then(Value::as_str) else { return Ok(Vec::new()) };
+            let mut ids = Vec::new();
+            for row in shown {
+                if !ids.contains(&row.node_id) && store.get_node(repo, row.node_id)?.and_then(|n| n.name).as_deref() == Some(name) {
+                    ids.push(row.node_id);
+                }
+            }
+            ids
+        }
+    })
+}
+
+/// Records a `memory_followed` event for each id the call names that this
+/// context was shown, with how: its `recall_shown` source, else `pin` for
+/// a pinned memory (pins ride on every prompt and aren't claimed).
+fn record_follows(store: &dyn GraphStore, repo: &str, session_id: &str, agent: Option<&str>, tool_name: &str, tool_input: &Value) -> Result<()> {
+    let context = crate::work_recall::claim_context(&store.session_events(repo, session_id)?, agent);
+    let shown: Vec<agentops_graph::RecallShown> = store.recall_shown_rows(repo, Some(session_id), None)?.into_iter().filter(|r| r.context == context).collect();
+    let mut pinned: Option<Vec<i64>> = None;
+    for id in followed_ids(store, repo, tool_name, tool_input, &shown)? {
+        let source = match shown.iter().find(|r| r.node_id == id) {
+            Some(row) => row.source.clone(),
+            None => {
+                let pins = match &pinned {
+                    Some(p) => p,
+                    None => pinned.insert(store.nodes_pinned(repo)?.into_iter().map(|n| n.id).collect()),
+                };
+                if !pins.contains(&id) {
+                    continue;
+                }
+                "pin".to_string()
+            }
+        };
+        store.record_session_event_in(repo, session_id, tool_name, &format!("id {id} source {source} context {context}"), Some(id), MEMORY_FOLLOWED, agent)?;
+    }
+    Ok(())
+}
 
 /// The node ids a memory-write tool call wrote: `set_memory_class`'s `id`
 /// argument, else the reply's final `result: {json}` line (`node_id` from
@@ -834,6 +897,7 @@ mod tests {
         assert!(is_relevant("posttooluse", &json!({ "tool_name": "Skill", "tool_input": {"skill": "audit-plan"} })));
         assert!(!is_relevant("posttooluse", &json!({ "tool_name": "Skill", "tool_input": {"skill": "session"} })));
         assert!(!is_relevant("posttooluse", &json!({ "tool_name": "mcp__agentops__list_gotchas", "tool_input": {}, "agent_id": "a1" })), "a subagent's recall is never sent");
+        assert!(is_relevant("posttooluse", &json!({ "tool_name": "mcp__agentops__fetch_content", "tool_input": {"id": 7}, "agent_id": "a1" })), "a subagent's follow is");
         assert!(is_relevant("userpromptsubmit", &json!({ "prompt": "hi" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<task-notification>x" })));
         assert!(!is_relevant("userpromptsubmit", &json!({ "prompt": "<agent-message from=\"a1\">\n[Subagent hand-back] report\n</agent-message>" })));
@@ -1112,6 +1176,46 @@ mod tests {
 
     fn prompt(store: &dyn GraphStore, repo: &str, text: &str, mode: &str) -> String {
         context(handle(store, repo, "userpromptsubmit", &json!({ "prompt": text, "session_id": "s", "permission_mode": mode })).unwrap())
+    }
+
+    fn follows(store: &dyn GraphStore, repo: &str) -> Vec<(String, Option<String>)> {
+        store.session_events(repo, "s").unwrap().into_iter().filter(|e| e.event_kind == MEMORY_FOLLOWED).map(|e| (e.description, e.agent_id)).collect()
+    }
+
+    fn lookup(store: &dyn GraphStore, repo: &str, tool: &str, input: Value, agent: Option<&str>) {
+        let mut payload = json!({ "session_id": "s", "tool_name": format!("mcp__agentops__{tool}"), "tool_input": input, "tool_response": "ok" });
+        if let Some(agent) = agent {
+            payload["agent_id"] = json!(agent);
+        }
+        handle(store, repo, "posttooluse", &payload).unwrap();
+    }
+
+    #[test]
+    fn a_lookup_of_a_shown_memory_records_a_follow_with_how_it_was_shown() {
+        let (_dir, store, repo) = store();
+        let seeded = gotcha(store.as_ref(), &repo, "Hooks ignore the remote server", "hook capture opens the local store");
+        let pin = gotcha(store.as_ref(), &repo, "Always check the remote marker", "a standing rule");
+        store.set_curation(&repo, pin, agentops_graph::NodeProminence::Pinned, None).unwrap();
+        let never = gotcha(store.as_ref(), &repo, "Unrelated", "nothing in common");
+        assert!(prompt(store.as_ref(), &repo, "make the hooks follow the remote server", "default").contains(&format!("(id {seeded})")));
+
+        lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": seeded }), None);
+        lookup(store.as_ref(), &repo, "get_symbol", json!({ "path": "r", "name": "Hooks ignore the remote server" }), None);
+        lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": pin }), None);
+        lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": never }), None);
+        lookup(store.as_ref(), &repo, "related_context", json!({ "path": "r", "symbol_id": never }), None);
+        assert_eq!(
+            follows(store.as_ref(), &repo),
+            vec![(format!("id {seeded} source prompt_seed context main#0"), None), (format!("id {seeded} source prompt_seed context main#0"), None), (format!("id {pin} source pin context main#0"), None)],
+            "never-shown ids record nothing"
+        );
+
+        // A subagent's seed is its own context's: the follow is attributed to it.
+        context(handle(store.as_ref(), &repo, "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a1" })).unwrap());
+        lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": seeded }), Some("a1"));
+        lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": seeded }), Some("a2"));
+        let all = follows(store.as_ref(), &repo);
+        assert_eq!(&all[3..], &[(format!("id {seeded} source subagent_seed context a1"), Some("a1".to_string()))], "a2 was never shown it");
     }
 
     #[test]

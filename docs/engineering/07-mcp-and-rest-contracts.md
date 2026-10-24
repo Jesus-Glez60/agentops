@@ -240,6 +240,8 @@ So a hosted user cannot record a note with `POST /tools/add_note` and a personal
 
 `POST /repos/{id}/hooks/{event}` is the hosted half of `agentops hook-capture` (milestone 1). A remote-connected repo forwards each Claude Code hook payload there. It runs `agentops_mcp::hooks::handle`, the same function the local hook path calls, against the connection's store, and replies `{"output": <hook stdout JSON or null>}`. `event` is one of `posttooluse`, `posttoolusefailure`, `userpromptsubmit`, `sessionstart`, `pretooluse`, `subagentstart`; anything else is a 404. Auth is the same personal API key as `/repos/{id}/usage/sync` ([13-agent-integration.md](13-agent-integration.md), "Claude Code hooks").
 
+`GET /repos/{id}/recall/stats[?since=YYYY-MM-DD]` returns `recall-stats`' counts as JSON: `rows` (`source`, `memory_class`, `shown` or null for pins, `followed`), `sessions_shown`, `sessions_followed` and `total_followed` (milestone 4; [13-agent-integration.md](13-agent-integration.md), "Recording use"). Same auth as the hook route.
+
 Dashboard REST routes such as `/gotchas`, `/local-search` and `/repos/{id}/nodes/{node_id}/curation` are separate handlers for the web UI, not tool wrappers. Their behavior can differ from the matching tool; `/local-search` is dense-only, for example ([05-retrieval.md](05-retrieval.md)).
 
 ### OpenAPI spec

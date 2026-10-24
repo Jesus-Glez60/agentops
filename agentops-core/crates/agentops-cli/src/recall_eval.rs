@@ -204,6 +204,20 @@ impl Backend {
     }
 }
 
+/// `agentops recall-stats`: the follow counts from the server, with
+/// `remote`, or from this repo's graph.
+pub(crate) fn stats(path: &Path, remote: bool, since: Option<&str>) -> Result<()> {
+    let stats: agentops_mcp::recall_stats::RecallStats = if remote {
+        let marker = read_remote_marker(path).with_context(|| format!("--remote needs a server connection; {} has no .context/agentops-remote.json", path.display()))?;
+        let query = since.map(|s| format!("?since={s}")).unwrap_or_default();
+        serde_json::from_value(remote_get(&marker, &format!("recall/stats{query}"))?).context("reading the recall/stats route")?
+    } else {
+        agentops_mcp::recall_stats::recall_stats(agentops_mcp::open_store(path)?.as_ref(), &agentops_mcp::repo_name(path), since)?
+    };
+    print!("{}", agentops_mcp::recall_stats::render(&stats));
+    Ok(())
+}
+
 /// `GET {server}/repos/{connection}/{rest}` with the marker's API key.
 fn remote_get(marker: &RemoteMcpMarker, rest: &str) -> Result<Value> {
     remote_send(marker, rest, None)

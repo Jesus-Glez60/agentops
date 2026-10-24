@@ -927,6 +927,19 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn recall_shown_rows(&self, repo: &str, session_id: Option<&str>, since: Option<&str>) -> Result<Vec<agentops_graph::RecallShown>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client
+                .query(
+                    "SELECT session_id, context, node_id, source, shown_at FROM recall_shown WHERE repo = $1 AND ($2::text IS NULL OR session_id = $2) AND ($3::text IS NULL OR shown_at >= $3) ORDER BY shown_at, ctid",
+                    &[&repo, &session_id, &since],
+                )
+                .await?;
+            Ok(rows.iter().map(|r| agentops_graph::RecallShown { session_id: r.get(0), context: r.get(1), node_id: r.get(2), source: r.get(3), shown_at: r.get(4) }).collect())
+        })
+    }
+
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
@@ -1507,6 +1520,8 @@ mod tests {
         assert_eq!(all, ids, "every id claimed exactly once across 8 parallel calls");
         assert_eq!(store.claim_shown(&repo, "s", "main#1", &[5, 3], "file_cue").unwrap(), vec![5, 3], "a new epoch re-arms, in the caller's order");
         assert!(store.claim_shown(&repo, "s", "main#0", &[], "file_cue").unwrap().is_empty());
+        assert_eq!(store.recall_shown_rows(&repo, Some("s"), None).unwrap().len(), 22, "20 in main#0, 2 in main#1");
+        assert!(store.recall_shown_rows(&repo, None, Some("9999-01-01")).unwrap().is_empty());
         store.wipe_repo(&repo).unwrap();
         assert_eq!(store.claim_shown(&repo, "s", "main#0", &[1], "file_cue").unwrap(), vec![1], "wipe_repo clears the claims");
         store.wipe_repo(&repo).unwrap();
