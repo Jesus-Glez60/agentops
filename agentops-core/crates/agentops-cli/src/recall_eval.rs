@@ -135,6 +135,12 @@ pub(crate) static EVAL_EMBEDDER: agentops_embeddings::LocalEmbedder = agentops_e
 /// The local backend for `path`, with the model when `embed` is set.
 pub(crate) fn local_backend(path: &Path, embed: bool) -> Result<Backend> {
     let embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)> = if embed { Some(&EVAL_EMBEDDER) } else { None };
+    // The model loads on first use, past the 250 ms dense budget; the
+    // server warms it at startup (`warm_embedder`), so this does too, or
+    // the first case runs on keywords alone.
+    if let Some(embedder) = embedder {
+        embedder.embed("warm up the recall embedder").context("warming the embedding model")?;
+    }
     Ok(Backend::Local { store: agentops_mcp::open_store(path)?, repo: agentops_mcp::repo_name(path), embedder })
 }
 
