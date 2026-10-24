@@ -242,6 +242,13 @@ So a hosted user cannot record a note with `POST /tools/add_note` and a personal
 
 `POST /repos/{id}/memories/scope` with `{assign: [{node_id, applies_to}]}` sets the hosts each memory is tied to, normalized. An empty list clears a scope, and an id that isn't a memory in the repo refuses the whole batch. It replies `{assigned}` (milestone 4; `classify-memories --scope --apply`). The MCP tool `set_memory_scope {path, id, applies_to}` does the same for one memory, and `add_note` takes `applies_to`. Hook payloads now carry `client_host`, the client's normalized hostname. `GET /repos/{id}/nodes/{node_id}` returns `applies_to`.
 
+Consolidation proposals (milestone 4, [ADR 0056](adr/0056-consolidation-proposals.md)), same auth as the hook route:
+- `POST /repos/{id}/memories/consolidate` with `{session_id}` runs the session-end pass, at most 3 proposals. With `{candidates: [ids]}` it proposes exactly those dry-run candidates. Without a tenant LLM key it replies `{ran: false, reason}`, status 200; otherwise `{ran: true, log}`, the run's `consolidation_run` record.
+- `POST /repos/{id}/memories/consolidate/candidates` lists the repo's unblocked merge pairs with titles and writes nothing.
+- `GET /repos/{id}/memories/proposals` lists waiting proposals with their sources.
+- `POST /repos/{id}/memories/proposals/{proposal_id}/accept|reject` is a person's decision. `POST .../nodes/{node_id}/curation` refuses a waiting proposal (409).
+- The CLI is `agentops consolidate --session <id> | --all --dry-run | --generate <id>...`.
+
 `GET /repos/{id}/recall/stats[?since=YYYY-MM-DD]` returns `recall-stats`' counts as JSON: `rows` (`source`, `memory_class`, `shown` or null for pins, `followed`), `sessions_shown`, `sessions_followed` and `total_followed` (milestone 4; [13-agent-integration.md](13-agent-integration.md), "Recording use"). Same auth as the hook route.
 
 Dashboard REST routes such as `/gotchas`, `/local-search` and `/repos/{id}/nodes/{node_id}/curation` are separate handlers for the web UI, not tool wrappers. Their behavior can differ from the matching tool; `/local-search` is dense-only, for example ([05-retrieval.md](05-retrieval.md)).

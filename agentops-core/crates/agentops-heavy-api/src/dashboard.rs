@@ -410,7 +410,10 @@ pub(crate) async fn set_curation_json(
     let audit_tenant = tenant.clone();
     let audit_target = format!("{id}/nodes/{node_id}");
     let audit_metadata = json!({ "prominence": prominence.as_db_str(), "reason": reason });
-    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<()>> {
+    // `Some(false)`: a consolidation proposal still waiting, which only
+    // accept/reject may decide (they supersede or delete; curation alone
+    // would make it recallable with its sources still shown).
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<bool>> {
         let path = match resolve_connection_path(&state, &tenant, &id) {
             Ok(p) => p,
             Err(_) => return Ok(None),
@@ -420,16 +423,20 @@ pub(crate) async fn set_curation_json(
         if store.get_node(&repo, node_id)?.is_none() {
             return Ok(None);
         }
+        if store.proposals(&repo)?.iter().any(|p| p.proposal_id == node_id && p.state == "proposed") {
+            return Ok(Some(false));
+        }
         store.set_curation(&repo, node_id, prominence, reason.as_deref())?;
-        Ok(Some(()))
+        Ok(Some(true))
     })
     .await;
 
-    if matches!(result, Ok(Ok(Some(())))) {
+    if matches!(result, Ok(Ok(Some(true)))) {
         audit_curation(&audit_state, &audit_tenant, &user, "node_curated", &audit_target, audit_metadata);
     }
     match result {
-        Ok(Ok(Some(()))) => (StatusCode::OK, Json(json!({ "id": node_id, "prominence": prominence }))),
+        Ok(Ok(Some(true))) => (StatusCode::OK, Json(json!({ "id": node_id, "prominence": prominence }))),
+        Ok(Ok(Some(false))) => (StatusCode::CONFLICT, Json(json!({ "error": "this is a consolidation proposal: accept or reject it" }))),
         Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such node" }))),
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
@@ -994,6 +1001,146 @@ pub(crate) async fn assign_memory_scopes_json(State(state): State<AppState>, use
         Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
     }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ConsolidateBody {
+    /// The session-end run: this session's candidates, at most
+    /// `MAX_PROPOSALS_PER_SESSION`.
+    #[serde(default)]
+    session_id: Option<String>,
+    /// Or exactly these candidate ids from a dry run, with no per-session
+    /// maximum (the token cap still applies).
+    #[serde(default)]
+    candidates: Vec<String>,
+}
+
+/// Runs `f` against the connection's store, path and notes folder, inside
+/// the shared Postgres pool so `add_note`'s own store opens reach the same
+/// database. `None` for an unknown connection.
+fn with_connection<T>(state: &AppState, tenant: &str, id: &str, f: impl FnOnce(&std::path::Path, &std::path::Path, &dyn agentops_graph::GraphStore, &str) -> anyhow::Result<T>) -> anyhow::Result<Option<T>> {
+    let Ok(path) = resolve_connection_path(state, tenant, id) else { return Ok(None) };
+    let notes_dir = crate::indexing::notes_dir_for_checkout(&path);
+    std::fs::create_dir_all(&notes_dir)?;
+    let repo = agentops_mcp::repo_name(&path);
+    agentops_mcp::with_shared_postgres_store(state.pg_store.as_ref(), || {
+        let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
+        f(&path, &notes_dir, store.as_ref(), &repo).map(Some)
+    })
+}
+
+fn reply(result: Result<anyhow::Result<Option<Value>>, tokio::task::JoinError>) -> (StatusCode, Json<Value>) {
+    match result {
+        Ok(Ok(Some(reply))) => (StatusCode::OK, Json(reply)),
+        Ok(Ok(None)) => (StatusCode::NOT_FOUND, Json(json!({ "error": "no such repo connection" }))),
+        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("{e:#}") }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
+/// `POST /repos/{id}/memories/consolidate` -- consolidation proposals
+/// (milestone 4, ADR 0056) with the tenant's Anthropic, else Groq, key;
+/// with neither, nothing runs and the reply says so (200). Proposals are
+/// needs-review memories, never applied here.
+pub(crate) async fn consolidate_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>, Json(body): Json<ConsolidateBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let config = {
+        let credentials = state.credentials.lock().unwrap();
+        crate::resolve_judge_config(&credentials, state.secrets.as_ref(), &tenant)
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        with_connection(&state, &tenant, &id, |path, notes, store, repo| {
+            use agentops_mcp::proposals;
+            if let Some(session) = body.session_id.as_deref() {
+                return proposals::run_for_session(path, Some(notes), store, repo, session, config.as_ref());
+            }
+            let picked: Vec<proposals::Candidate> = body.candidates.iter().map(|c| proposals::Candidate::from_id(c).ok_or_else(|| anyhow::anyhow!("not a candidate id: {c}"))).collect::<anyhow::Result<_>>()?;
+            let picked = proposals::unblocked(store, repo, picked)?;
+            let Some(config) = config.as_ref() else { return Ok(json!({ "ran": false, "reason": "no LLM key (Anthropic or Groq)", "candidates": picked.len() })) };
+            let log = proposals::generate(path, Some(notes), store, repo, config, &picked, None, "consolidate-batch")?;
+            Ok(json!({ "ran": true, "log": log }))
+        })
+    })
+    .await;
+    reply(result)
+}
+
+/// `POST /repos/{id}/memories/consolidate/candidates` -- the batch dry
+/// run: every near-duplicate pair in the repo not already proposed or
+/// rejected unchanged, with titles. Writes nothing; needs no key.
+pub(crate) async fn consolidate_candidates_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        with_connection(&state, &tenant, &id, |_, _, store, repo| {
+            let mut out = Vec::new();
+            for c in agentops_mcp::proposals::repo_candidates(store, repo)? {
+                let mut sources = Vec::new();
+                for &sid in &c.sources {
+                    let n = store.get_node(repo, sid)?;
+                    sources.push(json!({ "id": sid, "kind": n.as_ref().map(|n| n.kind.as_db_str()), "title": n.and_then(|n| n.name) }));
+                }
+                out.push(json!({ "id": c.id, "purpose": c.purpose, "cosine": c.cosine, "sources": sources }));
+            }
+            Ok(json!({ "candidates": out }))
+        })
+    })
+    .await;
+    reply(result)
+}
+
+/// `GET /repos/{id}/memories/proposals` -- every proposal still waiting,
+/// with its sources' ids and titles, for the Gotchas workspace.
+pub(crate) async fn proposals_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath(id): AxumPath<String>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        with_connection(&state, &tenant, &id, |_, _, store, repo| {
+            let mut out = Vec::new();
+            for p in store.proposals(repo)?.into_iter().filter(|p| p.state == "proposed") {
+                let mut sources = Vec::new();
+                for &sid in &p.source_ids {
+                    let n = store.get_node(repo, sid)?;
+                    sources.push(json!({ "id": sid, "kind": n.as_ref().map(|n| n.kind.as_db_str()), "title": n.and_then(|n| n.name) }));
+                }
+                out.push(json!({ "proposal_id": p.proposal_id, "created_at": p.created_at, "sources": sources }));
+            }
+            Ok(json!({ "proposals": out }))
+        })
+    })
+    .await;
+    reply(result)
+}
+
+/// `POST /repos/{id}/memories/proposals/{proposal_id}/{decision}` with
+/// `accept` or `reject` -- a person's decision on a proposal. Accepting
+/// supersedes its sources; rejecting deletes it and keeps the rejection.
+pub(crate) async fn decide_proposal_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, AxumPath((id, proposal_id, decision)): AxumPath<(String, i64, String)>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    if decision != "accept" && decision != "reject" {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "expected accept or reject" })));
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        with_connection(&state, &tenant, &id, |path, notes, store, repo| {
+            match decision.as_str() {
+                "accept" => agentops_mcp::proposals::accept(path, store, repo, proposal_id)?,
+                _ => agentops_mcp::proposals::reject(path, Some(notes), store, repo, proposal_id)?,
+            }
+            Ok(json!({ "proposal_id": proposal_id, "state": if decision == "accept" { "accepted" } else { "rejected" } }))
+        })
+    })
+    .await;
+    reply(result)
 }
 
 #[derive(Deserialize)]

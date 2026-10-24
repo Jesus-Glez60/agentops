@@ -5,8 +5,10 @@ import useSWR, { useSWRConfig } from "swr";
 import { toast } from "sonner";
 import { ArrowDown, CheckCircle2, FileCode, GitBranch, Pencil, Pin, RotateCcw, SearchIcon, TriangleAlert } from "lucide-react";
 import {
+  decideProposal,
   getCurationQueue,
   getNodeDetail,
+  getProposals,
   getRepos,
   GOTCHAS_SWR_KEY,
   REPOS_SWR_KEY,
@@ -124,9 +126,39 @@ export default function GotchasPage() {
   const detailKey = selected ? (["node", selected.repo, selected.id] as const) : null;
   const { data: detail, error: detailError } = useSWR(detailKey, () => getNodeDetail(selected!.repo, selected!.id));
   const branch = selected ? allRepos?.connections.find((r) => r.id === selected.repo)?.branch : undefined;
+  // A needs-review memory may be a consolidation proposal: it is decided
+  // with Accept/Reject (which supersede or delete), never plain curation.
+  const proposalsKey = detail?.prominence === "NeedsReview" ? (["proposals", detail.repo] as const) : null;
+  const { data: proposals } = useSWR(proposalsKey, () => getProposals(detail!.repo));
+  const proposal = detail ? proposals?.find((p) => p.proposal_id === detail.id) : undefined;
+
+  async function applyProposalDecision(decision: "accept" | "reject") {
+    if (!selected || !proposal) return;
+    try {
+      await decideProposal(selected.repo, proposal.proposal_id, decision);
+      if (decision === "reject") {
+        mutate(GOTCHAS_SWR_KEY, (current: GotchaSummary[] | undefined) => current?.filter((g) => !(g.repo === selected.repo && g.id === selected.id)), { revalidate: false });
+        setSelected(null);
+      } else {
+        mutate(GOTCHAS_SWR_KEY);
+        mutate(detailKey);
+        markReviewed(selected.repo, selected.id);
+      }
+      mutate(proposalsKey);
+      toast.success(decision === "accept" ? "Accepted: its sources are superseded." : "Rejected: it won't be proposed again unless its sources change.");
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Couldn't decide the proposal. Please try again.");
+    }
+  }
 
   async function applyCuration(prominence: NodeProminence, reason: string | null) {
     if (!selected) return;
+    // A proposal is decided only by Accept proposal / Reject (shortcuts
+    // included): plain curation would skip superseding its sources.
+    if (proposal) {
+      toast.error("This is a consolidation proposal: use Accept proposal or Reject.");
+      return;
+    }
     try {
       const updated = await setCuration(selected.repo, selected.id, prominence, reason);
       const patch = { curated: true, prominence: updated.prominence, curation_reason: prominence === "Reduced" ? reason : null };
@@ -382,6 +414,19 @@ export default function GotchasPage() {
                   <div className="flex shrink-0 items-center gap-2">
                     {/* No dismiss/delete action anywhere -- gotchas are
                         permanent knowledge, curation only reorders them. */}
+                    {proposal ? (
+                      <>
+                        <Button size="sm" className="gap-1.5 bg-curation-kept/15 text-curation-kept hover:bg-curation-kept/25" variant="ghost" onClick={() => applyProposalDecision("accept")}>
+                          <CheckCircle2 className="size-3.5" />
+                          Accept proposal
+                        </Button>
+                        <Button size="sm" variant="outline" className="gap-1.5" onClick={() => applyProposalDecision("reject")}>
+                          <TriangleAlert className="size-3.5" />
+                          Reject
+                        </Button>
+                      </>
+                    ) : (
+                      <>
                     {detail.prominence === "NeedsReview" && (
                       <div className="flex items-center gap-1" role="group" aria-label="Set kind">
                         {KIND_CHOICES.map((choice) => (
@@ -427,6 +472,8 @@ export default function GotchasPage() {
                         Reduce prominence
                       </Button>
                     ) : null}
+                      </>
+                    )}
                     <CopyButton value={`${detail.repo}:${detail.kind}:${detail.id}`} label="Copy ID" />
                     <Button size="sm" variant="ghost" className="ml-auto gap-1.5 text-ink-500" onClick={skipSelected}>
                       <ArrowDown className="size-3.5" />
@@ -435,6 +482,20 @@ export default function GotchasPage() {
                   </div>
                 </div>
 
+                {proposal && (
+                  <section aria-label="Proposed from" className="flex flex-col gap-2 rounded-md border border-curation-needs-review/40 bg-curation-needs-review/5 p-3">
+                    <p className="text-body-sm text-ink-300">Proposed by consolidation from these memories. Nothing changes until you accept: accepting supersedes them (recall stops showing them).</p>
+                    <ul className="flex flex-col gap-1">
+                      {proposal.sources.map((source) => (
+                        <li key={source.id}>
+                          <button type="button" className="text-left text-body-sm text-ink-100 underline-offset-2 hover:underline" onClick={() => setSelected({ repo: detail.repo, id: source.id })}>
+                            [{source.kind ?? "gone"}] {source.title ?? `Node ${source.id}`} <span className="text-mono-code text-ink-500">(id {source.id})</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </section>
+                )}
                 <NodeDetailSections detail={detail} branch={branch} onSelectConnected={(node) => setSelected({ repo: detail.repo, id: node.id })} />
               </>
             )}

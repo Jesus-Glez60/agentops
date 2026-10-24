@@ -5,6 +5,7 @@
 
 pub mod budget;
 pub mod hooks;
+pub mod proposals;
 pub mod recall_stats;
 mod consolidate;
 mod docgen;

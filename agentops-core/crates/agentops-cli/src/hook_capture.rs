@@ -321,6 +321,8 @@ fn detect_command_rewrite(tool_name: &str, tool_input: &serde_json::Value) -> Op
 
 #[derive(Debug, Deserialize)]
 struct SessionEndPayload {
+    #[serde(default)]
+    session_id: Option<String>,
     transcript_path: Option<String>,
     cwd: Option<String>,
     reason: Option<String>,
@@ -350,6 +352,20 @@ fn process_session_end(input: &str) -> Result<()> {
         .stderr(log)
         .spawn()
         .context("spawning detached usage sync")?;
+    // Consolidation proposals from what the session wrote (milestone 4),
+    // detached too: a few LLM calls on the server, or none without a key.
+    if let Some(session) = payload.session_id.as_deref().filter(|s| !s.is_empty()) {
+        let mut log = std::fs::OpenOptions::new().create(true).append(true).open(context_dir.join("consolidate.log"))?;
+        writeln!(log, "session end: {session}")?;
+        std::process::Command::new(std::env::current_exe()?)
+            .args(["consolidate", "--session", session, "--path"])
+            .arg(&cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()
+            .context("spawning detached consolidate")?;
+    }
     Ok(())
 }
 

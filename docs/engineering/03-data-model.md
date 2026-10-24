@@ -129,6 +129,7 @@ A `References` edge whose target disappeared is deleted (`delete_edge`). The aut
 | `node_versions` | Bi-temporal history: `valid_from`, `valid_until`. No FK, so history survives pruning. |
 | `session_events` | Per-session activity and knowledge-reuse "hits" (`event_kind`, `node_id`). `agent_id` names the subagent an event came from (`NULL` for the main session), so work-time recall can keep each context apart (milestone 3b). |
 | `recall_shown` | One row per memory shown in one context of a session, keyed `(repo, session_id, context, node_id)`, with how it was shown (`source`: `prompt_seed`, `subagent_seed`, `file_cue`, `error_cue`). `context` is a subagent's id, or `main#<n>` after the main context's n-th compaction. `GraphStore::claim_shown` inserts with `ON CONFLICT DO NOTHING` and returns only the new rows, so parallel hooks can't show one memory twice (milestone 4, F71). |
+| `consolidation_proposals` | One row per consolidation proposal ([ADR 0056](adr/0056-consolidation-proposals.md)): `proposal_id` (the proposal's node), `source_ids` (comma-separated), `sources_digest` (SHA-256 of the sorted sources' ids, titles and bodies), `state` (`proposed`, `accepted` or `rejected`, a CHECK), `created_at` TEXT. A rejected row outlives its deleted node, so unchanged sources aren't proposed again. |
 | `tasks`, `task_links` | Native tasks; partial unique index on `(external_source, external_id)` for synced issues. |
 | `nodes_fts` | FTS5 external-content index over `name`, `content`, kept in sync by triggers. |
 | `doc_pages` | One generated `DocPage` per repo, as opaque JSON. |
@@ -251,6 +252,7 @@ The 20 SQLite graph steps, oldest first:
 23. `memory_class` `status` renamed to `progress`
 24. `recall_shown` (milestone 4; Postgres: `CREATE TABLE IF NOT EXISTS` in `schema.sql`)
 25. `nodes.applies_to` (milestone 4: the hosts a memory is tied to, a JSON list; NULL for everywhere; Postgres: `ADD COLUMN IF NOT EXISTS`)
+26. `consolidation_proposals` (milestone 4, ADR 0056; Postgres: `CREATE TABLE IF NOT EXISTS`)
 
 The vector table is created separately (`vec_table_migration`).
 

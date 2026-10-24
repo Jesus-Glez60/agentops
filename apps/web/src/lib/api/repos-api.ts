@@ -404,6 +404,22 @@ export function setCuration(connectionId: string, id: number, prominence: NodePr
   });
 }
 
+/** A consolidation proposal still waiting for a person (milestone 4, ADR 0056): a needs-review memory an LLM wrote from `sources`, applied only when accepted. */
+export interface ConsolidationProposal {
+  proposal_id: number;
+  created_at: string;
+  sources: { id: number; kind: string | null; title: string | null }[];
+}
+
+export function getProposals(connectionId: string): Promise<ConsolidationProposal[]> {
+  return heavyFetch<{ proposals: ConsolidationProposal[] }>(`/repos/${encodeURIComponent(connectionId)}/memories/proposals`).then((r) => r.proposals);
+}
+
+/** Accepting makes the proposal full, durable knowledge and supersedes its sources; rejecting deletes it and remembers the rejection. */
+export function decideProposal(connectionId: string, proposalId: number, decision: "accept" | "reject"): Promise<{ proposal_id: number; state: string }> {
+  return heavyFetch(`/repos/${encodeURIComponent(connectionId)}/memories/proposals/${proposalId}/${decision}`, { method: "POST" });
+}
+
 /**
  * The Knowledge Graph screen's 4 tabs, mapped onto real `EdgeRelation`s
  * (there's no `Calls`/`Contains` edge in the graph) -- see

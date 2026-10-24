@@ -12,6 +12,7 @@ mod hook_capture;
 mod classify_memories;
 mod classify_scope;
 mod compress_output;
+mod consolidate_cmd;
 mod librarian;
 mod import_memory;
 mod mcp_client;
@@ -147,6 +148,24 @@ enum Command {
         /// Embed every ingested note so it's findable via `search`.
         #[arg(long)]
         with_embeddings: bool,
+    },
+    /// Consolidation proposals (milestone 4): an LLM proposes merges of
+    /// near-duplicate memories and durable lessons from progress ones, as
+    /// needs-review memories that only a person accepts. `--session` is
+    /// what the SessionEnd hook runs; `--all --dry-run` lists merge
+    /// candidates; `--generate` proposes the picked ones.
+    Consolidate {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        dry_run: bool,
+        /// Candidate ids from the dry run.
+        #[arg(long, num_args = 1..)]
+        generate: Vec<String>,
     },
     /// Per source and memory class: memories recall showed, how many the
     /// agent then looked up, and the rate (milestone 4). Leaves out
@@ -836,6 +855,7 @@ fn main() -> Result<()> {
         Command::LinkSimilar { path, prune } => link_similar(&path, prune),
         Command::RecallEval { path, remote, embed, cases, mode, repeat } => recall_eval::run(&path, remote, embed, cases.as_deref(), mode, repeat),
         Command::WorkRecallEval { path, remote, embed, cases, baseline, repeat, sizing, replay, min_score, sources, sample, client_host } => work_recall_eval::run(&path, work_recall_eval::Options { remote, embed, cases: cases.as_deref(), baseline, repeat, sizing, replay: &replay, min_score, sources: sources.as_deref(), sample, client_host: client_host.as_deref() }),
+        Command::Consolidate { path, session, all, dry_run, generate } => consolidate_cmd::run(&path, session.as_deref(), all, dry_run, &generate),
         Command::RecallStats { path, remote, since } => recall_eval::stats(&path, remote, since.as_deref()),
         Command::ClassifyMemories { path, apply, scope: true, hosts, .. } => classify_scope::run(&path, apply, &hosts),
         Command::ClassifyMemories { path, apply, per_minute, retry_failed, llm, .. } => classify_memories::run(&path, apply, per_minute, retry_failed, llm),

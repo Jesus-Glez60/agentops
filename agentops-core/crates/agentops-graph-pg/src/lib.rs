@@ -147,6 +147,7 @@ impl PostgresGraphStore {
             client.execute("DELETE FROM repo_state WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_events WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM recall_shown WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM consolidation_proposals WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_usage WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM llm_usage WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_report WHERE repo = $1", &[&repo]).await?;
@@ -955,6 +956,31 @@ impl GraphStore for PostgresGraphStore {
                 .await?;
             let won: std::collections::HashSet<i64> = rows.iter().map(|r| r.get(0)).collect();
             Ok(ids.iter().copied().filter(|id| won.contains(id)).collect())
+        })
+    }
+
+    fn record_proposal(&self, repo: &str, proposal_id: i64, source_ids: &[i64], sources_digest: &str) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client.execute("INSERT INTO consolidation_proposals (repo, proposal_id, source_ids, sources_digest, state) VALUES ($1, $2, $3, $4, 'proposed')", &[&repo, &proposal_id, &agentops_graph::ids_to_db(source_ids), &sources_digest]).await?;
+            Ok(())
+        })
+    }
+
+    fn proposals(&self, repo: &str) -> Result<Vec<agentops_graph::ConsolidationProposal>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT proposal_id, source_ids, sources_digest, state, created_at FROM consolidation_proposals WHERE repo = $1 ORDER BY created_at, proposal_id", &[&repo]).await?;
+            Ok(rows.iter().map(|r| agentops_graph::ConsolidationProposal { proposal_id: r.get(0), source_ids: agentops_graph::ids_from_db(r.get::<_, &str>(1)), sources_digest: r.get(2), state: r.get(3), created_at: r.get(4) }).collect())
+        })
+    }
+
+    fn set_proposal_state(&self, repo: &str, proposal_id: i64, state: &str) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let n = client.execute("UPDATE consolidation_proposals SET state = $1 WHERE repo = $2 AND proposal_id = $3", &[&state, &repo, &proposal_id]).await?;
+            anyhow::ensure!(n == 1, "no proposal {proposal_id}");
+            Ok(())
         })
     }
 
@@ -2003,6 +2029,19 @@ mod tests {
         assert_eq!(after_rescan.prominence, NodeProminence::Reduced, "a rescan must not silently reset a curated gotcha's prominence back to Full");
 
         store.delete_nodes("pg-repo-review", &[id]).unwrap();
+    }
+
+    #[test]
+    fn proposals_round_trip_on_postgres() {
+        let store = require_store!();
+        let repo = format!("pg-repo-proposals-{}", std::process::id());
+        store.record_proposal(&repo, 9, &[3, 4], "d1").unwrap();
+        store.set_proposal_state(&repo, 9, "accepted").unwrap();
+        let rows = store.proposals(&repo).unwrap();
+        assert!(store.set_proposal_state(&repo, 9, "maybe").is_err(), "the CHECK constraint");
+        store.wipe_repo(&repo).unwrap();
+        assert_eq!((rows.len(), rows[0].source_ids.clone(), rows[0].state.as_str()), (1, vec![3, 4], "accepted"));
+        assert!(store.proposals(&repo).unwrap().is_empty(), "wipe_repo clears them");
     }
 
     #[test]

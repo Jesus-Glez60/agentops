@@ -333,3 +333,26 @@ Each model must classify 5 notes cleanly before the full run (`SMOKE_GATE`). The
 ## Open questions
 
 None. Q6, Q7 and Q13 were answered (ADRs 0041, 0042).
+
+## Consolidation proposals
+
+Milestone 4, [ADR 0056](adr/0056-consolidation-proposals.md), `agentops-mcp/src/proposals.rs`. This is the requirement's "session ends → consolidation", at the level of memories.
+
+```mermaid
+flowchart LR
+  end[SessionEnd] --> spawn[detached agentops consolidate --session]
+  spawn --> gate{wrote a memory or touched progress? LLM key?}
+  gate -- no --> nothing[nothing runs]
+  gate -- yes --> cands[merge pairs 0.85-0.92, distill set]
+  cands --> llm[one propose_memory call each, max 3, 20k tokens]
+  llm --> proposal[NeedsReview note, proposed-by:consolidation, sources recorded]
+  proposal --> person{a person in the Gotchas workspace}
+  person -- accept --> full[Full, durable; sources superseded]
+  person -- reject --> gone[deleted; rejection kept with digest]
+```
+
+- **Unapplied until accepted.** A proposal's sources keep their class and prominence, and recall never shows the proposal (`NeedsReview`).
+- **Accepting** applies `supersedes`: each source becomes temporal, ending today.
+- **Rejecting** deletes the proposal's node and note file. Its `consolidation_proposals` row stays, with a digest of the sources' text, so the same unchanged sources aren't proposed again.
+- **Batch:** `agentops consolidate --all --dry-run` writes `.context/consolidate.dry-run.{json,md}`; `--generate <id>...` proposes the picked candidates.
+- **Cost:** every run is a `consolidation_run` session event with tokens and estimated USD.

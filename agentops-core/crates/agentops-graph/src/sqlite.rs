@@ -412,6 +412,19 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     // Milestone 4: the hosts a memory is tied to (a JSON list), NULL for
     // everywhere. No default, so it adds cleanly to a non-empty table.
     M::up("ALTER TABLE nodes ADD COLUMN applies_to TEXT;"),
+    // Milestone 4 (ADR 0056): consolidation proposals, unapplied until a
+    // person accepts; rejections stay, so unchanged sources aren't re-proposed.
+    M::up(
+        "CREATE TABLE consolidation_proposals (
+            repo           TEXT NOT NULL,
+            proposal_id    INTEGER NOT NULL,
+            source_ids     TEXT NOT NULL,
+            sources_digest TEXT NOT NULL,
+            state          TEXT NOT NULL CHECK (state IN ('proposed', 'accepted', 'rejected')),
+            created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (repo, proposal_id)
+        );",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -1081,6 +1094,23 @@ impl GraphStore for SqliteGraphStore {
             }
         }
         Ok(claimed)
+    }
+
+    fn record_proposal(&self, repo: &str, proposal_id: i64, source_ids: &[i64], sources_digest: &str) -> Result<()> {
+        self.conn.execute("INSERT INTO consolidation_proposals (repo, proposal_id, source_ids, sources_digest, state) VALUES (?1, ?2, ?3, ?4, 'proposed')", rusqlite::params![repo, proposal_id, crate::ids_to_db(source_ids), sources_digest])?;
+        Ok(())
+    }
+
+    fn proposals(&self, repo: &str) -> Result<Vec<crate::ConsolidationProposal>> {
+        let mut stmt = self.conn.prepare("SELECT proposal_id, source_ids, sources_digest, state, created_at FROM consolidation_proposals WHERE repo = ?1 ORDER BY created_at, rowid")?;
+        let rows = stmt.query_map(rusqlite::params![repo], |r| Ok(crate::ConsolidationProposal { proposal_id: r.get(0)?, source_ids: crate::ids_from_db(&r.get::<_, String>(1)?), sources_digest: r.get(2)?, state: r.get(3)?, created_at: r.get(4)? }))?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
+    }
+
+    fn set_proposal_state(&self, repo: &str, proposal_id: i64, state: &str) -> Result<()> {
+        let n = self.conn.execute("UPDATE consolidation_proposals SET state = ?1 WHERE repo = ?2 AND proposal_id = ?3", rusqlite::params![state, repo, proposal_id])?;
+        anyhow::ensure!(n == 1, "no proposal {proposal_id}");
+        Ok(())
     }
 
     fn recall_shown_rows(&self, repo: &str, session_id: Option<&str>, since: Option<&str>) -> Result<Vec<RecallShown>> {
@@ -1800,13 +1830,24 @@ mod tests {
         assert_eq!(store.get_node("repo-a", id).unwrap().unwrap().applies_to, None, "an empty list is everywhere, stored as NULL");
     }
 
+    #[test]
+    fn proposals_round_trip_and_a_state_change_needs_an_existing_proposal() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.record_proposal("repo-a", 9, &[3, 4], "d1").unwrap();
+        store.record_proposal("repo-b", 9, &[5], "d2").unwrap();
+        store.set_proposal_state("repo-a", 9, "rejected").unwrap();
+        let rows = store.proposals("repo-a").unwrap();
+        assert_eq!((rows.len(), rows[0].source_ids.clone(), rows[0].state.as_str(), rows[0].sources_digest.as_str()), (1, vec![3, 4], "rejected", "d1"));
+        assert!(store.set_proposal_state("repo-a", 10, "accepted").is_err());
+        assert!(store.set_proposal_state("repo-a", 9, "maybe").is_err(), "the CHECK constraint");
+    }
+
     /// A graph.db holding the class's first name reads it as progress.
     #[test]
     fn a_status_class_from_before_the_rename_becomes_progress() {
         let mut conn = Connection::open_in_memory().unwrap();
-        // Every migration up to the rename; milestone 4's recall_shown and
-        // applies_to came after it.
-        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 3).unwrap();
+        // Every migration up to the rename; milestone 4's three came after it.
+        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 4).unwrap();
         conn.execute("INSERT INTO nodes (kind, repo, name, memory_class) VALUES ('note', 'repo-a', 'old', 'status')", []).unwrap();
         migrations().to_latest(&mut conn).unwrap();
         let class: String = conn.query_row("SELECT memory_class FROM nodes", [], |r| r.get(0)).unwrap();

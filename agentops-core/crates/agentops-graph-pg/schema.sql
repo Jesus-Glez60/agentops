@@ -377,3 +377,16 @@ CREATE TABLE IF NOT EXISTS recall_shown (
     shown_at   TEXT NOT NULL DEFAULT (now()::text),
     PRIMARY KEY (repo, session_id, context, node_id)
 );
+
+-- Milestone 4 (ADR 0056): consolidation proposals, unapplied until a person
+-- accepts. Rejected rows stay, with a digest of their sources' text, so the
+-- same unchanged sources aren't proposed again.
+CREATE TABLE IF NOT EXISTS consolidation_proposals (
+    repo           TEXT NOT NULL,
+    proposal_id    BIGINT NOT NULL,
+    source_ids     TEXT NOT NULL,
+    sources_digest TEXT NOT NULL,
+    state          TEXT NOT NULL CHECK (state IN ('proposed', 'accepted', 'rejected')),
+    created_at     TEXT NOT NULL DEFAULT (now()::text),
+    PRIMARY KEY (repo, proposal_id)
+);

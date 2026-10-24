@@ -759,6 +759,71 @@ pub fn classify_memory_class(config: &LlmConfig, kind: agentops_graph::NodeKind,
     Ok(gotcha_never_progress(kind, parse_memory_class(&result.text)))
 }
 
+/// Characters of each source memory a consolidation prompt carries:
+/// enough for the substance, bounded so a run stays under its token cap.
+const CONSOLIDATE_BODY_MAX: usize = 2_000;
+
+/// What a consolidation call is for (milestone 4, ADR 0056).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsolidationPurpose {
+    /// Near-duplicates: one memory that says what both say.
+    Merge,
+    /// Progress memories: the decision, gotcha or fact that outlives them.
+    Distill,
+}
+
+/// A memory a consolidation call proposes. `kind` is `gotcha`, `decision`
+/// or `knowledge`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ProposedMemory {
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+}
+
+/// One consolidation judgment over `sources` (`(kind, title, body)`): the
+/// proposed memory, or `None` when the model finds nothing worth one (two
+/// pairs that only look alike; progress with no lasting lesson). The call
+/// result is returned either way, for the run's token and cost log. Only a
+/// proposal: nothing is applied until a person accepts it.
+pub fn propose_memory(config: &LlmConfig, purpose: ConsolidationPurpose, sources: &[(agentops_graph::NodeKind, String, String)]) -> Result<(Option<ProposedMemory>, LlmCallResult)> {
+    let listed = sources
+        .iter()
+        .enumerate()
+        .map(|(i, (kind, title, body))| format!("Memory {} ({}): {title}\n{}", i + 1, kind.as_db_str(), body.chars().take(CONSOLIDATE_BODY_MAX).collect::<String>()))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n");
+    let task = match purpose {
+        ConsolidationPurpose::Merge => "These project memories look like near-duplicates. If they record the same fact, write one memory that keeps everything true and useful from each, with nothing invented. If they are different facts, say it isn't worth merging.",
+        ConsolidationPurpose::Distill => "These project memories record where some work stood (progress). If they contain a lasting decision, gotcha or fact that an agent changing this code would need after the work is finished, write it as one memory: the rule or cause, not the history. If there is none, say so.",
+    };
+    let prompt = format!("{task}\n\n{listed}\n\nReply as JSON: worth (boolean); when worth is true, kind (gotcha, decision or knowledge), title (one line, under 120 characters) and body (Markdown, the reasoning included).");
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": { "worth": { "type": "boolean" }, "kind": { "type": "string", "enum": ["gotcha", "decision", "knowledge"] }, "title": { "type": "string" }, "body": { "type": "string" } },
+        "required": ["worth"],
+        "additionalProperties": false,
+    });
+    let operation = match purpose {
+        ConsolidationPurpose::Merge => "consolidate_merge",
+        ConsolidationPurpose::Distill => "consolidate_distill",
+    };
+    let result = call_json(config, operation, &prompt, schema)?;
+    Ok((parse_proposal(&result.text), result))
+}
+
+/// A consolidation reply: a proposal only when `worth` is true and kind,
+/// title and body are all there and sane.
+fn parse_proposal(reply: &str) -> Option<ProposedMemory> {
+    let v: serde_json::Value = serde_json::from_str(reply).ok()?;
+    if v.get("worth").and_then(serde_json::Value::as_bool) != Some(true) {
+        return None;
+    }
+    let proposal: ProposedMemory = serde_json::from_value(v).ok()?;
+    let ok = ["gotcha", "decision", "knowledge"].contains(&proposal.kind.as_str()) && !proposal.title.trim().is_empty() && !proposal.body.trim().is_empty();
+    ok.then(|| ProposedMemory { title: proposal.title.trim().chars().take(200).collect(), ..proposal })
+}
+
 /// A gotcha is permanent knowledge (decision 54003): a judge reading "X
 /// was fixed" as progress would hide it. The Groq pass did that to 16
 /// gotchas, among them every memory labelled useful that it would have
@@ -1319,6 +1384,15 @@ mod tests {
         assert_eq!(result.text, "This function verifies a token.");
         assert_eq!(result.input_tokens, 42);
         assert_eq!(result.output_tokens, 7);
+    }
+
+    #[test]
+    fn a_consolidation_reply_proposes_only_when_worth_it_and_complete() {
+        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "gotcha", "title": " T ", "body": "B"}"#), Some(ProposedMemory { kind: "gotcha".into(), title: "T".into(), body: "B".into() }));
+        assert_eq!(parse_proposal(r#"{"worth": false, "kind": "gotcha", "title": "T", "body": "B"}"#), None);
+        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "rumour", "title": "T", "body": "B"}"#), None);
+        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "gotcha", "title": "", "body": "B"}"#), None);
+        assert_eq!(parse_proposal("not json"), None);
     }
 
     #[test]

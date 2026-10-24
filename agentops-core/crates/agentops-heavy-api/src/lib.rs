@@ -299,6 +299,10 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/memories/classify", post(dashboard::classify_memories_json))
         .route("/repos/{id}/memories/class", post(dashboard::assign_memory_classes_json))
         .route("/repos/{id}/memories/scope", post(dashboard::assign_memory_scopes_json))
+        .route("/repos/{id}/memories/consolidate", post(dashboard::consolidate_json))
+        .route("/repos/{id}/memories/consolidate/candidates", post(dashboard::consolidate_candidates_json))
+        .route("/repos/{id}/memories/proposals", get(dashboard::proposals_json))
+        .route("/repos/{id}/memories/proposals/{proposal_id}/{decision}", post(dashboard::decide_proposal_json))
         .route("/libraries", get(libraries_http::list_libraries_json))
         .route("/libraries/tools/{name}", post(libraries_http::call_library_tool_json))
         .route("/libraries/{slug}", get(libraries_http::get_library_json));

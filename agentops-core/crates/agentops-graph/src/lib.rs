@@ -736,6 +736,20 @@ pub struct TaskLink {
 /// word so common that more memories tie can't flood a recall pool.
 pub const LEXICAL_TIES_MAX_FACTOR: usize = 3;
 
+/// A consolidation proposal (milestone 4, ADR 0056): a needs-review memory
+/// an LLM wrote from `source_ids`, applied only when a person accepts it.
+/// A rejected one keeps its row, with the digest of its sources' text, so
+/// the same unchanged sources aren't proposed again.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsolidationProposal {
+    pub proposal_id: i64,
+    pub source_ids: Vec<i64>,
+    pub sources_digest: String,
+    /// `proposed`, `accepted` or `rejected`.
+    pub state: String,
+    pub created_at: String,
+}
+
 /// One memory shown in one context of a session (`recall_shown`,
 /// milestone 4): `context` is a subagent's id or `main#<n>`, `source` how
 /// it was shown.
@@ -1137,6 +1151,11 @@ pub trait GraphStore {
     /// every session's when `session_id` is `None`; with `since` (a date or
     /// timestamp, compared as text), only rows shown at or after it.
     fn recall_shown_rows(&self, repo: &str, session_id: Option<&str>, since: Option<&str>) -> Result<Vec<RecallShown>>;
+    /// Records a new proposal, state `proposed`.
+    fn record_proposal(&self, repo: &str, proposal_id: i64, source_ids: &[i64], sources_digest: &str) -> Result<()>;
+    /// Every proposal of `repo`, oldest first, in any state.
+    fn proposals(&self, repo: &str) -> Result<Vec<ConsolidationProposal>>;
+    fn set_proposal_state(&self, repo: &str, proposal_id: i64, state: &str) -> Result<()>;
     /// Every event recorded for `repo` across *every* session_id, optionally
     /// filtered to one `event_kind` ("hit" or "activity") — unlike
     /// `session_events` above, not scoped to one caller-chosen session_id.
@@ -1836,4 +1855,13 @@ pub fn scope_to_db(hosts: Option<&[String]>) -> Option<String> {
 /// reads as none.
 pub fn scope_from_db(raw: Option<String>) -> Option<Vec<String>> {
     raw.and_then(|r| serde_json::from_str::<Vec<String>>(&r).ok()).filter(|h| !h.is_empty())
+}
+
+/// `consolidation_proposals.source_ids` as stored: ids joined by commas.
+pub fn ids_to_db(ids: &[i64]) -> String {
+    ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",")
+}
+
+pub fn ids_from_db(raw: &str) -> Vec<i64> {
+    raw.split(',').filter_map(|id| id.trim().parse().ok()).collect()
 }

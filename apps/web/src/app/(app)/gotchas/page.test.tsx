@@ -2,7 +2,10 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { SWRConfig } from "swr";
 
-const { getGotchas, getRepos, setCuration, setNodeKind, getNodeDetail, toastError } = vi.hoisted(() => ({
+const { getGotchas, getRepos, setCuration, setNodeKind, getNodeDetail, getProposals, decideProposal, toastError, toastSuccess } = vi.hoisted(() => ({
+  getProposals: vi.fn(),
+  decideProposal: vi.fn(),
+  toastSuccess: vi.fn(),
   getGotchas: vi.fn(),
   getRepos: vi.fn(),
   setCuration: vi.fn(),
@@ -14,11 +17,11 @@ const { getGotchas, getRepos, setCuration, setNodeKind, getNodeDetail, toastErro
 vi.mock("@/lib/api/repos-api", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api/repos-api")>("@/lib/api/repos-api");
   // The page loads `getCurationQueue`; here it is just the mocked list.
-  return { ...actual, getGotchas, getCurationQueue: () => getGotchas(), getRepos, setCuration, setNodeKind, getNodeDetail };
+  return { ...actual, getGotchas, getCurationQueue: () => getGotchas(), getRepos, setCuration, setNodeKind, getNodeDetail, getProposals, decideProposal };
 });
 
 vi.mock("sonner", () => ({
-  toast: { error: toastError },
+  toast: { error: toastError, success: toastSuccess },
 }));
 
 import GotchasPage from "./page";
@@ -93,6 +96,9 @@ describe("GotchasPage", () => {
     getNodeDetail.mockReset();
     toastError.mockClear();
     getRepos.mockResolvedValue({ connections: [], can_connect: true });
+    getProposals.mockReset();
+    getProposals.mockResolvedValue([]);
+    decideProposal.mockReset();
   });
 
   it("renders a card per gotcha with its curation bucket badge", async () => {
@@ -141,6 +147,42 @@ describe("GotchasPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /Accept/ }));
     await waitFor(() => expect(setCuration).toHaveBeenCalledWith("agentops", 3, "Full", null));
+  });
+
+  it("a consolidation proposal shows its sources and is decided only by Accept proposal or Reject", async () => {
+    const proposal = { ...needsReviewNote, id: 9, name: "The pool runs out under load", kind: "Gotcha" as const, curation_reason: "proposed by consolidation from 4, 5" };
+    getGotchas.mockResolvedValue([proposal]);
+    getNodeDetail.mockResolvedValue(nodeDetailFor(proposal));
+    getProposals.mockResolvedValue([{ proposal_id: 9, created_at: "2026-10-24", sources: [{ id: 4, kind: "gotcha", title: "Pool exhaustion under load" }, { id: 5, kind: "gotcha", title: "Connection pool runs out" }] }]);
+    decideProposal.mockResolvedValue({ proposal_id: 9, state: "accepted" });
+    renderPage();
+
+    fireEvent.click(await screen.findByText("The pool runs out under load"));
+    expect(await screen.findByText(/Pool exhaustion under load/)).toBeInTheDocument();
+    expect(screen.getByText(/Connection pool runs out/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Accept" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Pin" })).not.toBeInTheDocument();
+
+    fireEvent.keyDown(document, { key: "k" });
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+    expect(setCuration).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Accept proposal" }));
+    await waitFor(() => expect(decideProposal).toHaveBeenCalledWith("agentops", 9, "accept"));
+  });
+
+  it("rejecting a proposal removes it from the list", async () => {
+    const proposal = { ...needsReviewNote, id: 9, name: "The pool runs out under load", kind: "Gotcha" as const };
+    getGotchas.mockResolvedValue([proposal]);
+    getNodeDetail.mockResolvedValue(nodeDetailFor(proposal));
+    getProposals.mockResolvedValue([{ proposal_id: 9, created_at: "2026-10-24", sources: [{ id: 4, kind: "gotcha", title: "Pool exhaustion under load" }] }]);
+    decideProposal.mockResolvedValue({ proposal_id: 9, state: "rejected" });
+    renderPage();
+
+    fireEvent.click(await screen.findByText("The pool runs out under load"));
+    fireEvent.click(await screen.findByRole("button", { name: "Reject" }));
+    await waitFor(() => expect(decideProposal).toHaveBeenCalledWith("agentops", 9, "reject"));
+    await waitFor(() => expect(screen.queryByText("The pool runs out under load")).not.toBeInTheDocument());
   });
 
   it("shows an empty state when nothing matches", async () => {

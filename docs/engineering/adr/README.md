@@ -60,6 +60,7 @@ Decisions with a recorded reason, one file each. A record exists only when its "
 | [0052](0052-the-server-may-embed-the-prompt-in-a-hook.md) | The server may embed the prompt in a hook | Milestone 3a |
 | [0053](0053-session-activation-from-recorded-cues.md) | Session activation from recorded cues | Milestone 3b |
 | [0054](0054-memory-classes.md) | Memory classes | Milestone 3b |
+| [0056](0056-consolidation-proposals.md) | Consolidation proposals | Milestone 4 |
 
 ## Pending: rationale not recorded
 
