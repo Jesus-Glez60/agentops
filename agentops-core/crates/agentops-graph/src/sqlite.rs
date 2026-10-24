@@ -913,9 +913,10 @@ impl GraphStore for SqliteGraphStore {
         // Same over-fetch-then-filter-in-Rust technique as search_similar —
         // FTS5's MATCH can't be combined with an arbitrary repo/kind filter
         // inside the same virtual-table query efficiently, and node counts
-        // at self-hosted scale make this cheap.
+        // at self-hosted scale make this cheap. Ties on bm25 break on id, so
+        // the same graph always ranks the same (gotcha 326954).
         let fetch_k = (top_k * 8).max(50) as i64;
-        let mut stmt = self.conn.prepare("SELECT rowid, bm25(nodes_fts) FROM nodes_fts WHERE nodes_fts MATCH ?1 ORDER BY bm25(nodes_fts) LIMIT ?2")?;
+        let mut stmt = self.conn.prepare("SELECT rowid, bm25(nodes_fts) FROM nodes_fts WHERE nodes_fts MATCH ?1 ORDER BY bm25(nodes_fts), rowid LIMIT ?2")?;
         let rows = stmt.query_map(rusqlite::params![match_query, fetch_k], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
 
         let mut hits = Vec::new();
@@ -1521,6 +1522,18 @@ mod tests {
         let hits = store.search_lexical("repo-a", "signature expiry", 10, None).unwrap();
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].0.name.as_deref(), Some("verify_token"));
+    }
+
+    #[test]
+    fn search_lexical_breaks_rank_ties_by_id_whatever_the_index_order() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let ids: Vec<i64> = (0..5).map(|i| upsert_node(&store, NewNode { content: Some(if i < 2 { "placeholder" } else { "every tied word" }.into()), ..node("repo-a", NodeKind::Gotcha, Some(&format!("t{i}.md")), Some("tie")) }).unwrap()).collect();
+        // The two lowest ids are indexed for the word last.
+        for &id in &ids[..2] {
+            store.update_node("repo-a", id, None, None, Some("every tied word".into())).unwrap();
+        }
+        let hits: Vec<i64> = store.search_lexical("repo-a", "tied", 3, Some(NodeKind::Gotcha)).unwrap().into_iter().map(|(n, _)| n.id).collect();
+        assert_eq!(hits, ids[..3].to_vec());
     }
 
     #[test]

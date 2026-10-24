@@ -708,6 +708,9 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    // Ties on ts_rank break on id: without it, which tied rows make the
+    // LIMIT followed physical row order, and one new note moved recall
+    // cases (gotcha 326954, milestone 4).
     fn search_lexical(&self, repo: &str, query: &str, top_k: usize, kind: Option<NodeKind>) -> Result<Vec<(Node, f32)>> {
         if query.trim().is_empty() {
             return Ok(vec![]);
@@ -721,7 +724,7 @@ impl GraphStore for PostgresGraphStore {
                         .query(
                             "SELECT *, ts_rank(search_vector, plainto_tsquery('english', $1)) AS rank FROM nodes \
                              WHERE repo = $2 AND kind = $3 AND search_vector @@ plainto_tsquery('english', $1) \
-                             ORDER BY rank DESC LIMIT $4",
+                             ORDER BY rank DESC, id LIMIT $4",
                             &[&query, &repo, &k.as_db_str(), &top_k],
                         )
                         .await?
@@ -731,7 +734,7 @@ impl GraphStore for PostgresGraphStore {
                         .query(
                             "SELECT *, ts_rank(search_vector, plainto_tsquery('english', $1)) AS rank FROM nodes \
                              WHERE repo = $2 AND search_vector @@ plainto_tsquery('english', $1) \
-                             ORDER BY rank DESC LIMIT $3",
+                             ORDER BY rank DESC, id LIMIT $3",
                             &[&query, &repo, &top_k],
                         )
                         .await?
@@ -1467,6 +1470,28 @@ mod tests {
         assert_eq!(got.content.as_deref(), Some("fn foo() { changed }"));
 
         store.delete_nodes("pg-repo-a", &[id1]).unwrap();
+    }
+
+    #[test]
+    fn search_lexical_breaks_rank_ties_by_id_whatever_the_row_order() {
+        let store = require_store!();
+        let repo = format!("pg-repo-tie-{}", std::process::id());
+        // 40 rows tied on ts_rank, every third rewritten after the rest so the
+        // physical order isn't id order. Without the id tiebreak, the LIMIT
+        // kept 9 of the highest ids (measured, milestone 4).
+        let ids: Vec<i64> = (0..40)
+            .map(|i| {
+                let mut n = node(&repo, NodeKind::Gotcha, Some(&format!("t{i}.md")), Some("tie"));
+                n.content = Some(if i % 3 == 0 { "placeholder" } else { "every tied word" }.to_string());
+                upsert_node(&store, n).unwrap()
+            })
+            .collect();
+        for &id in ids.iter().step_by(3) {
+            store.update_node(&repo, id, None, None, Some("every tied word".to_string())).unwrap();
+        }
+        let hits: Vec<i64> = store.search_lexical(&repo, "tied", 10, Some(NodeKind::Gotcha)).unwrap().into_iter().map(|(n, _)| n.id).collect();
+        assert_eq!(hits, ids[..10].to_vec());
+        store.delete_nodes(&repo, &ids).unwrap();
     }
 
     #[test]
