@@ -40,6 +40,9 @@ pub trait EventLog {
     /// Every event of the session, oldest first.
     fn events(&self) -> Result<Vec<SessionEvent>>;
     fn record(&mut self, tool_name: &str, description: &str, event_kind: &str, agent_id: Option<&str>) -> Result<()>;
+    /// Claims `ids` as shown in `context` (`claim_context`) and returns the
+    /// ones this call won: only those may be shown (milestone 4, F71).
+    fn claim(&mut self, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>>;
 }
 
 /// The live hook's log: one session in the store.
@@ -56,6 +59,9 @@ impl EventLog for StoreLog<'_> {
     fn record(&mut self, tool_name: &str, description: &str, event_kind: &str, agent_id: Option<&str>) -> Result<()> {
         self.store.record_session_event_in(self.repo, self.session_id, tool_name, description, None, event_kind, agent_id).map(|_| ())
     }
+    fn claim(&mut self, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>> {
+        self.store.claim_shown(self.repo, self.session_id, context, ids, source)
+    }
 }
 
 /// An in-memory log, for the replay.
@@ -70,6 +76,11 @@ impl EventLog for MemoryLog {
         let id = self.0.len() as i64 + 1;
         self.0.push(SessionEvent { id, repo: String::new(), session_id: String::new(), tool_name: tool_name.into(), description: description.into(), node_id: None, event_kind: event_kind.into(), created_at: String::new(), agent_id: agent_id.map(String::from) });
         Ok(())
+    }
+    /// The replay runs one cue at a time, and `on_cue` already left out
+    /// what this context was shown, so nothing can have been claimed since.
+    fn claim(&mut self, _context: &str, ids: &[i64], _source: &str) -> Result<Vec<i64>> {
+        Ok(ids.to_vec())
     }
 }
 
@@ -178,22 +189,31 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     if picks.is_empty() {
         return Ok(None);
     }
-    // A parallel tool call may have shown one of these meanwhile
-    // (PostToolUse runs concurrently); this narrows that race, it can't
-    // close it (findings.md).
-    let now_shown = excluded_ids(&log.events()?, agent_id);
-    picks.retain(|(c, _)| !now_shown.contains(&c.pointer.node_id));
-
     // The header rides on the tool call that triggered it, so it needn't
     // name the file or the error again; the lines skip the match reasons.
     // Together that halves each injection (milestone 3b revision 2).
-    let mut text = WORK_RECALL_HEADER.to_string();
-    let mut shown_now = Vec::new();
+    let mut size = WORK_RECALL_HEADER.chars().count();
+    let mut fitting = Vec::new();
     for (candidate, activation) in picks {
         let line = candidate.pointer.render_short();
-        if text.chars().count() + 1 + line.chars().count() > WORK_RECALL_BUDGET {
+        size += 1 + line.chars().count();
+        if size > WORK_RECALL_BUDGET {
             break;
         }
+        fitting.push((candidate, activation, line));
+    }
+    // PostToolUse runs concurrently, so a parallel call may be showing the
+    // same memories right now. Each claims before it shows and keeps only
+    // what it won, so a memory reaches a context once (milestone 4, F71;
+    // re-reading the log here only narrowed the race).
+    let source = match cue {
+        WorkCue::File { .. } => "file_cue",
+        WorkCue::Error { .. } => "error_cue",
+    };
+    let won: HashSet<i64> = log.claim(&claim_context(&events, agent_id), &fitting.iter().map(|(c, _, _)| c.pointer.node_id).collect::<Vec<_>>(), source)?.into_iter().collect();
+    let mut text = WORK_RECALL_HEADER.to_string();
+    let mut shown_now = Vec::new();
+    for (candidate, activation, line) in fitting.into_iter().filter(|(c, _, _)| won.contains(&c.pointer.node_id)) {
         text.push('\n');
         text.push_str(&line);
         shown_now.push((candidate.pointer.clone(), activation));
@@ -220,6 +240,17 @@ pub const WORK_CUE_KEEP: usize = 10;
 /// The events of one context, oldest first: those carrying `agent_id`
 /// (`None` = the main session), and for the main session only those after
 /// its latest `context_reset`.
+/// The key a context's shown memories are claimed under (milestone 4): a
+/// subagent's id, or `main#<n>` for the main context after its n-th
+/// compaction. A new epoch re-arms the main context exactly where
+/// `context_events` starts over; a subagent's never does.
+pub fn claim_context(events: &[SessionEvent], agent_id: Option<&str>) -> String {
+    match agent_id {
+        Some(agent) => agent.to_string(),
+        None => format!("main#{}", events.iter().filter(|e| e.agent_id.is_none() && e.event_kind == CONTEXT_RESET).count()),
+    }
+}
+
 pub fn context_events<'a>(events: &'a [SessionEvent], agent_id: Option<&str>) -> Vec<&'a SessionEvent> {
     let mine: Vec<&SessionEvent> = events.iter().filter(|e| e.agent_id.as_deref() == agent_id).collect();
     match mine.iter().rposition(|e| e.event_kind == CONTEXT_RESET) {
@@ -403,6 +434,73 @@ mod tests {
 
         log.record("SessionStart", "compact", CONTEXT_RESET, None).unwrap();
         assert!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().is_some(), "after compaction it can be");
+    }
+
+    /// Against the store, the claim decides: a memory shown once is never
+    /// shown again in that context, until compaction starts a new epoch.
+    #[test]
+    fn the_store_log_claims_per_context_and_compaction_re_arms() {
+        let (store, id) = setup();
+        let mut log = StoreLog { store: &store, repo: "r", session_id: "s" };
+        assert!(on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().is_some());
+        assert_eq!(store.claim_shown("r", "s", "main#0", &[id], "file_cue").unwrap(), Vec::<i64>::new(), "claimed by the cue");
+        log.record("SessionStart", "compact", CONTEXT_RESET, None).unwrap();
+        let again = on_cue(&store, "r", &mut log, None, &release_cue(), None, LOW).unwrap().expect("a new epoch re-arms");
+        assert_eq!(again.shown.iter().map(|(p, _)| p.node_id).collect::<Vec<_>>(), [id]);
+        assert_eq!(claim_context(&log.events().unwrap(), None), "main#1");
+        assert_eq!(claim_context(&log.events().unwrap(), Some("a1")), "a1");
+    }
+
+    /// A `StoreLog` whose first read waits until every parallel caller has
+    /// read too: the widest race, where no call has recorded anything yet.
+    struct RacingLog<'a> {
+        inner: StoreLog<'a>,
+        barrier: std::sync::Arc<std::sync::Barrier>,
+        waited: bool,
+    }
+    impl EventLog for RacingLog<'_> {
+        fn events(&self) -> Result<Vec<SessionEvent>> {
+            let events = self.inner.events()?;
+            if !self.waited {
+                self.barrier.wait();
+            }
+            Ok(events)
+        }
+        fn record(&mut self, tool_name: &str, description: &str, event_kind: &str, agent_id: Option<&str>) -> Result<()> {
+            self.waited = true;
+            self.inner.record(tool_name, description, event_kind, agent_id)
+        }
+        fn claim(&mut self, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>> {
+            self.inner.claim(context, ids, source)
+        }
+    }
+
+    /// F71: parallel PostToolUse reads of one file injected one memory up to
+    /// 4 times per session (75% duplicates). Skips without Postgres; the
+    /// server's CI sets AGENTOPS_TEST_DATABASE_URL.
+    #[test]
+    fn parallel_reads_of_one_file_inject_each_memory_once() {
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
+        let Ok(pg) = agentops_graph_pg::PostgresGraphStore::connect(&url) else {
+            eprintln!("skipping parallel_reads_of_one_file_inject_each_memory_once: no Postgres reachable at {url}");
+            return;
+        };
+        let pg = std::sync::Arc::new(pg);
+        let repo = format!("f71-test-{}", std::process::id());
+        let id = gotcha(pg.as_ref(), &repo, "Release tagging needs the changelog bumped", "Tagging a release fails unless docs/release.md has the changelog entry.");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (pg, repo, barrier) = (pg.clone(), repo.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let mut log = RacingLog { inner: StoreLog { store: pg.as_ref(), repo: &repo, session_id: "s" }, barrier, waited: false };
+                    on_cue(pg.as_ref(), &repo, &mut log, None, &release_cue(), None, LOW).unwrap().map(|i| i.shown.len()).unwrap_or(0)
+                })
+            })
+            .collect();
+        let shown: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        pg.wipe_repo(&repo).unwrap();
+        assert_eq!(shown, 1, "memory {id} shown once across 8 parallel reads");
     }
 
     #[test]

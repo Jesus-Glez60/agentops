@@ -510,9 +510,13 @@ The 2026-10-14 pass followed the author's decisions in `questions.md` A-6 to A-1
 
 ### F71. Parallel tool calls can inject the same memory twice
 
-- Status: known race, milestone 3b. The author approved it as a deviation from "never twice", 2026-10-20.
+- Status: known race, milestone 3b. The author approved it as a deviation from "never twice", 2026-10-20. Closed in milestone 4.
 - `PostToolUse` fires concurrently for parallel tool calls (hooks reference). Two cues handled at once each read the shown set before either records its injection.
 - `work_recall::on_cue` reads the shown set again just before recording, which narrows the window. Only a lock across processes would close it. The manual session counts how often it happens.
+- **Fixed in milestone 4 (item 1c).** Measured first in milestone 3c: 75% of injections duplicated when one file was read 8 times in parallel (gotcha 336104).
+  - `on_cue` now claims the lines it would show through `GraphStore::claim_shown`, an insert-if-absent on `(session, context, node)` in `recall_shown`, and shows only what it won.
+  - The test forces the race: 8 threads, each held at a barrier after reading the log. Without claims it shows the memory more than once; with them, once.
+  - Live re-measure: see `handoffs/m4-report.md`.
 
 ### F72. Searches go through Bash, so the `search` event records almost nothing
 

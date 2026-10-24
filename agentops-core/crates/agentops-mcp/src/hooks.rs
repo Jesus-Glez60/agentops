@@ -462,8 +462,9 @@ pub fn parse_injected(description: &str) -> Vec<i64> {
 
 /// Appends a recall section to `parts` with as many pointers as fit in
 /// `budget` (counting everything already in `parts`), and records which
-/// ones went out. Returns nothing; an empty seed adds nothing.
-fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, parts: &mut Vec<String>, seed: &[agentops_retrieval::RecallPointer], budget: usize) -> Result<()> {
+/// ones went out, claiming them in the main context's `claim` key. Returns
+/// nothing; an empty seed adds nothing.
+fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, claim: &str, parts: &mut Vec<String>, seed: &[agentops_retrieval::RecallPointer], budget: usize) -> Result<()> {
     const HEADER: &str = "Recalled from AgentOps for this task (pointers; `fetch_content` with the id returns the full text):";
     let used: usize = parts.iter().map(|p| p.chars().count() + 2).sum::<usize>() + HEADER.chars().count();
     let mut lines = Vec::new();
@@ -481,6 +482,10 @@ fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, parts: &mut V
     }
     let ids = lines.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>().join(",");
     store.record_session_event(repo, session_id, "recall", &format!("ids {ids}"), None, RECALL_INJECTED)?;
+    // A prompt seed may re-show memories on purpose (plan mode shows the
+    // whole seed), so the claim only records them for work-time recall and
+    // `recall-stats`; what it wins doesn't limit the seed.
+    store.claim_shown(repo, session_id, claim, &lines.iter().map(|(id, _)| *id).collect::<Vec<_>>(), "prompt_seed")?;
     parts.push(format!("{HEADER}\n{}", lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")));
     Ok(())
 }
@@ -542,14 +547,14 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embed
         // Only memories the session wrote itself stay out.
         let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, PLAN_SEED_MAX_ITEMS, &crate::work_recall::written_ids(&events), embedder)?;
         record_prompt_cue(store, repo, session_id, &seed)?;
-        push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
+        push_seed(store, repo, session_id, &crate::work_recall::claim_context(&events, None), &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     } else {
         // What the main context has been shown; a subagent's injections
         // went to its own context (milestone 3b).
         let shown = crate::work_recall::excluded_ids(&events, None);
         let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &shown, embedder)?;
         record_prompt_cue(store, repo, session_id, &seed)?;
-        push_seed(store, repo, session_id, &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
+        push_seed(store, repo, session_id, &crate::work_recall::claim_context(&events, None), &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
     }
     if parts.is_empty() {
         return Ok(None);
@@ -727,6 +732,7 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder:
             if let Some(agent) = agent_id(payload) {
                 let ids = seed.iter().map(|p| p.node_id.to_string()).collect::<Vec<_>>().join(",");
                 store.record_session_event_in(repo, session_id(payload), "subagent_seed", &format!("ids {ids}"), None, RECALL_INJECTED, Some(agent))?;
+                store.claim_shown(repo, session_id(payload), agent, &seed.iter().map(|p| p.node_id).collect::<Vec<_>>(), "subagent_seed")?;
             }
             const HEADER: &str = "Recalled from AgentOps for the task you were spawned for (pointers; query `get_symbol`/`related_context`/`list_gotchas` or `fetch_content` with the id before grepping):";
             parts.push(format!("{HEADER}\n{}", seed.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n")));

@@ -128,6 +128,7 @@ A `References` edge whose target disappeared is deleted (`delete_edge`). The aut
 | `repo_state` | One upserted row per repo: last scan, top gotcha and decision ids (JSON). |
 | `node_versions` | Bi-temporal history: `valid_from`, `valid_until`. No FK, so history survives pruning. |
 | `session_events` | Per-session activity and knowledge-reuse "hits" (`event_kind`, `node_id`). `agent_id` names the subagent an event came from (`NULL` for the main session), so work-time recall can keep each context apart (milestone 3b). |
+| `recall_shown` | One row per memory shown in one context of a session, keyed `(repo, session_id, context, node_id)`, with how it was shown (`source`: `prompt_seed`, `subagent_seed`, `file_cue`, `error_cue`). `context` is a subagent's id, or `main#<n>` after the main context's n-th compaction. `GraphStore::claim_shown` inserts with `ON CONFLICT DO NOTHING` and returns only the new rows, so parallel hooks can't show one memory twice (milestone 4, F71). |
 | `tasks`, `task_links` | Native tasks; partial unique index on `(external_source, external_id)` for synced issues. |
 | `nodes_fts` | FTS5 external-content index over `name`, `content`, kept in sync by triggers. |
 | `doc_pages` | One generated `DocPage` per repo, as opaque JSON. |
@@ -246,6 +247,9 @@ The 20 SQLite graph steps, oldest first:
 19. `peak_context_tokens`
 20. `session_report`
 21. `session_events.agent_id` (nullable, no default; Postgres: `ADD COLUMN IF NOT EXISTS` in `schema.sql`)
+22. `nodes.memory_class`, `class_until` (ADR 0054)
+23. `memory_class` `status` renamed to `progress`
+24. `recall_shown` (milestone 4; Postgres: `CREATE TABLE IF NOT EXISTS` in `schema.sql`)
 
 The vector table is created separately (`vec_table_migration`).
 

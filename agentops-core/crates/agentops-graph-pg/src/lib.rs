@@ -146,6 +146,7 @@ impl PostgresGraphStore {
             client.execute("DELETE FROM doc_pages WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM repo_state WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_events WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM recall_shown WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_usage WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM llm_usage WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_report WHERE repo = $1", &[&repo]).await?;
@@ -908,6 +909,24 @@ impl GraphStore for PostgresGraphStore {
         })
     }
 
+    fn claim_shown(&self, repo: &str, session_id: &str, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client
+                .query(
+                    "INSERT INTO recall_shown (repo, session_id, context, node_id, source) SELECT $1, $2, $3, id, $5 FROM unnest($4::bigint[]) AS id \
+                     ON CONFLICT DO NOTHING RETURNING node_id",
+                    &[&repo, &session_id, &context, &ids, &source],
+                )
+                .await?;
+            let won: std::collections::HashSet<i64> = rows.iter().map(|r| r.get(0)).collect();
+            Ok(ids.iter().copied().filter(|id| won.contains(id)).collect())
+        })
+    }
+
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>> {
         self.rt.block_on(async {
             let client = self.pool.get().await?;
@@ -1470,6 +1489,27 @@ mod tests {
         assert_eq!(got.content.as_deref(), Some("fn foo() { changed }"));
 
         store.delete_nodes("pg-repo-a", &[id1]).unwrap();
+    }
+
+    #[test]
+    fn claim_shown_gives_parallel_callers_disjoint_shares() {
+        let store = std::sync::Arc::new(require_store!());
+        let repo = format!("pg-repo-claim-{}", std::process::id());
+        let ids: Vec<i64> = (1..=20).collect();
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let (store, repo, ids) = (store.clone(), repo.clone(), ids.clone());
+                std::thread::spawn(move || store.claim_shown(&repo, "s", "main#0", &ids, "file_cue").unwrap())
+            })
+            .collect();
+        let mut all: Vec<i64> = handles.into_iter().flat_map(|h| h.join().unwrap()).collect();
+        all.sort();
+        assert_eq!(all, ids, "every id claimed exactly once across 8 parallel calls");
+        assert_eq!(store.claim_shown(&repo, "s", "main#1", &[5, 3], "file_cue").unwrap(), vec![5, 3], "a new epoch re-arms, in the caller's order");
+        assert!(store.claim_shown(&repo, "s", "main#0", &[], "file_cue").unwrap().is_empty());
+        store.wipe_repo(&repo).unwrap();
+        assert_eq!(store.claim_shown(&repo, "s", "main#0", &[1], "file_cue").unwrap(), vec![1], "wipe_repo clears the claims");
+        store.wipe_repo(&repo).unwrap();
     }
 
     #[test]

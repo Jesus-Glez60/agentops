@@ -361,3 +361,17 @@ CREATE TABLE IF NOT EXISTS session_report (
     recorded_at           TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_session_report_unique ON session_report(repo, session_id);
+
+-- Milestone 4 (F71): which memories each context of a session has been
+-- shown, one row each, so parallel hooks claim with ON CONFLICT DO NOTHING
+-- instead of re-reading session_events. shown_at is TEXT, as Node's
+-- timestamps are (no TIMESTAMPTZ-to-String mapping needed).
+CREATE TABLE IF NOT EXISTS recall_shown (
+    repo       TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    context    TEXT NOT NULL,
+    node_id    BIGINT NOT NULL,
+    source     TEXT NOT NULL,
+    shown_at   TEXT NOT NULL DEFAULT (now()::text),
+    PRIMARY KEY (repo, session_id, context, node_id)
+);

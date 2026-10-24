@@ -396,6 +396,19 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
     ),
     // The class first shipped as "status"; it's "progress" now (ADR 0054).
     M::up("UPDATE nodes SET memory_class = 'progress' WHERE memory_class = 'status';"),
+    // Milestone 4 (F71): which memories each context of a session has been
+    // shown, one row each, so parallel hooks claim instead of re-reading.
+    M::up(
+        "CREATE TABLE recall_shown (
+            repo       TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            context    TEXT NOT NULL,
+            node_id    INTEGER NOT NULL,
+            source     TEXT NOT NULL,
+            shown_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (repo, session_id, context, node_id)
+        );",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -1043,6 +1056,17 @@ impl GraphStore for SqliteGraphStore {
         Ok(self.conn.last_insert_rowid())
     }
 
+    fn claim_shown(&self, repo: &str, session_id: &str, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("INSERT INTO recall_shown (repo, session_id, context, node_id, source) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING")?;
+        let mut claimed = Vec::new();
+        for &id in ids {
+            if stmt.execute(rusqlite::params![repo, session_id, context, id, source])? == 1 {
+                claimed.push(id);
+            }
+        }
+        Ok(claimed)
+    }
+
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>> {
         let mut stmt = self.conn.prepare("SELECT * FROM session_events WHERE repo = ?1 AND session_id = ?2 ORDER BY id ASC")?;
         let rows = stmt.query_map(rusqlite::params![repo, session_id], Self::row_to_session_event)?;
@@ -1525,6 +1549,17 @@ mod tests {
     }
 
     #[test]
+    fn claim_shown_records_each_memory_once_per_context() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        assert_eq!(store.claim_shown("repo-a", "s", "main#0", &[3, 1, 2], "file_cue").unwrap(), vec![3, 1, 2]);
+        assert_eq!(store.claim_shown("repo-a", "s", "main#0", &[2, 4, 1], "error_cue").unwrap(), vec![4], "only what wasn't claimed yet");
+        assert_eq!(store.claim_shown("repo-a", "s", "main#1", &[1], "file_cue").unwrap(), vec![1], "a new epoch re-arms");
+        assert_eq!(store.claim_shown("repo-a", "s", "agent-7", &[1], "subagent_seed").unwrap(), vec![1], "another context");
+        assert_eq!(store.claim_shown("repo-a", "t", "main#0", &[1], "file_cue").unwrap(), vec![1], "another session");
+        assert_eq!(store.claim_shown("repo-b", "s", "main#0", &[1], "file_cue").unwrap(), vec![1], "another repo");
+    }
+
+    #[test]
     fn search_lexical_breaks_rank_ties_by_id_whatever_the_index_order() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let ids: Vec<i64> = (0..5).map(|i| upsert_node(&store, NewNode { content: Some(if i < 2 { "placeholder" } else { "every tied word" }.into()), ..node("repo-a", NodeKind::Gotcha, Some(&format!("t{i}.md")), Some("tie")) }).unwrap()).collect();
@@ -1713,7 +1748,8 @@ mod tests {
     #[test]
     fn a_status_class_from_before_the_rename_becomes_progress() {
         let mut conn = Connection::open_in_memory().unwrap();
-        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 1).unwrap();
+        // Every migration up to the rename; milestone 4's recall_shown came after it.
+        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 2).unwrap();
         conn.execute("INSERT INTO nodes (kind, repo, name, memory_class) VALUES ('note', 'repo-a', 'old', 'status')", []).unwrap();
         migrations().to_latest(&mut conn).unwrap();
         let class: String = conn.query_row("SELECT memory_class FROM nodes", [], |r| r.get(0)).unwrap();

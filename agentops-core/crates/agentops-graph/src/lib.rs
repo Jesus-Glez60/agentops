@@ -1102,6 +1102,13 @@ pub trait GraphStore {
     /// Every event recorded under `session_id` in `repo`, oldest first —
     /// the correlated feed `get_session` renders.
     fn session_events(&self, repo: &str, session_id: &str) -> Result<Vec<SessionEvent>>;
+    /// Claims `ids` as shown in one `context` of a session (milestone 4,
+    /// F71): records each `(session_id, context, node_id)` not recorded yet
+    /// and returns just those, in `ids`' order. Parallel hook calls in one
+    /// context each get a disjoint share, so a memory is shown there once.
+    /// `source` is how it was shown: `prompt_seed`, `subagent_seed`,
+    /// `file_cue` or `error_cue`.
+    fn claim_shown(&self, repo: &str, session_id: &str, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>>;
     /// Every event recorded for `repo` across *every* session_id, optionally
     /// filtered to one `event_kind` ("hit" or "activity") — unlike
     /// `session_events` above, not scoped to one caller-chosen session_id.
