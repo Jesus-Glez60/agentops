@@ -759,6 +759,12 @@ pub fn classify_memory_class(config: &LlmConfig, kind: agentops_graph::NodeKind,
     Ok(gotcha_never_progress(kind, parse_memory_class(&result.text)))
 }
 
+/// Output tokens a consolidation call may use. A merged body is long, and a
+/// reasoning model (Groq's gpt-oss) spends part of its budget thinking:
+/// at `groq_config`'s 512, 3 of 4 calls ran out before the JSON closed
+/// (2026-10-24). The run's token cap still bounds the cost.
+const CONSOLIDATE_MAX_TOKENS: u32 = 4_096;
+
 /// Characters of each source memory a consolidation prompt carries:
 /// enough for the substance, bounded so a run stays under its token cap.
 const CONSOLIDATE_BODY_MAX: usize = 2_000;
@@ -810,7 +816,8 @@ pub fn propose_memory(config: &LlmConfig, purpose: ConsolidationPurpose, sources
         ConsolidationPurpose::Merge => "consolidate_merge",
         ConsolidationPurpose::Distill => "consolidate_distill",
     };
-    let result = call_json(config, operation, &prompt, schema)?;
+    let config = LlmConfig { max_tokens: config.max_tokens.max(CONSOLIDATE_MAX_TOKENS), ..config.clone() };
+    let result = call_json(&config, operation, &prompt, schema)?;
     Ok((parse_proposal(&result.text), result))
 }
 
