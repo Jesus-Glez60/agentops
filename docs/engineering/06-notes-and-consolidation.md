@@ -275,7 +275,7 @@ Hybrid search loads the active head with `load_active_projector(repo)` and passe
 
 ### When it runs
 
-Only the `end_session` MCP tool runs embedding consolidation. It is Full-only, so it is hidden in the default Advisor mode. Nothing in the repo calls it automatically: no hook, CLI command or generated agent instruction mentions `end_session`. It also refuses to run unless the given `session_id` has recorded events in this repo.
+**On this graph it is a no-op** (milestone 4, [ADR 0055](adr/0055-model-training-is-parked.md)): no pair has both embeddings and a hard negative, so it trains nothing (0.12 s on the 2026-10-23 snapshot). It is parked, not removed. Only the `end_session` MCP tool runs embedding consolidation. It is Full-only, so it is hidden in the default Advisor mode. Nothing in the repo calls it automatically: no hook, CLI command or generated agent instruction mentions `end_session`. It also refuses to run unless the given `session_id` has recorded events in this repo.
 
 ## Generative consolidation
 
