@@ -797,11 +797,13 @@ pub fn propose_memory(config: &LlmConfig, purpose: ConsolidationPurpose, sources
         ConsolidationPurpose::Merge => "These project memories look like near-duplicates. If they record the same fact, write one memory that keeps everything true and useful from each, with nothing invented. If they are different facts, say it isn't worth merging.",
         ConsolidationPurpose::Distill => "These project memories record where some work stood (progress). If they contain a lasting decision, gotcha or fact that an agent changing this code would need after the work is finished, write it as one memory: the rule or cause, not the history. If there is none, say so.",
     };
-    let prompt = format!("{task}\n\n{listed}\n\nReply as JSON: worth (boolean); when worth is true, kind (gotcha, decision or knowledge), title (one line, under 120 characters) and body (Markdown, the reasoning included).");
+    let prompt = format!("{task}\n\n{listed}\n\nReply as JSON: worth (boolean), kind (gotcha, decision or knowledge), title (one line, under 120 characters) and body (Markdown, the reasoning included). When worth is false, give empty title and body.");
     let schema = serde_json::json!({
         "type": "object",
         "properties": { "worth": { "type": "boolean" }, "kind": { "type": "string", "enum": ["gotcha", "decision", "knowledge"] }, "title": { "type": "string" }, "body": { "type": "string" } },
-        "required": ["worth"],
+        // Every key: Groq's strict structured output refuses a schema that
+        // leaves any property optional (seen 2026-10-24).
+        "required": ["worth", "kind", "title", "body"],
         "additionalProperties": false,
     });
     let operation = match purpose {
