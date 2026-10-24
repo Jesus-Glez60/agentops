@@ -62,19 +62,20 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f32 {
 /// The memories most similar to `embedding`, best first, with their cosine.
 /// `exclude` drops one node (the memory itself). Fetches a few candidates
 /// per kind through the store's own index and re-scores them by cosine.
+/// The vectors come back in one `get_embeddings` call: one query per
+/// candidate would make recall's wider dense window (milestone 4) cost
+/// three times the queries inside its 250 ms budget.
 pub fn similar_memories(store: &dyn GraphStore, repo: &str, embedding: &[f32], exclude: Option<i64>, k: usize) -> Result<Vec<(Node, f32)>> {
-    let mut scored = Vec::new();
+    let mut candidates = Vec::new();
     for &kind in MEMORY_KINDS {
-        for (node, _) in store.search_similar(repo, embedding, k + 1, Some(kind))? {
-            if Some(node.id) == exclude {
-                continue;
-            }
-            if let Some(vector) = store.get_embedding(repo, node.id)? {
-                let score = cosine(embedding, &vector);
-                scored.push((node, score));
-            }
-        }
+        candidates.extend(store.search_similar(repo, embedding, k + 1, Some(kind))?.into_iter().map(|(node, _)| node).filter(|node| Some(node.id) != exclude));
     }
+    let vectors = store.get_embeddings(repo, &candidates.iter().map(|n| n.id).collect::<Vec<_>>())?;
+    let mut scored: Vec<(Node, f32)> = candidates.into_iter().filter_map(|node| {
+        let score = cosine(embedding, vectors.get(&node.id)?);
+        Some((node, score))
+    })
+    .collect();
     scored.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.id.cmp(&b.0.id)));
     scored.truncate(k);
     Ok(scored)
@@ -341,6 +342,28 @@ mod tests {
         let mut ids: Vec<i64> = store.edges_from("r", id).unwrap().into_iter().filter(|e| e.relation == EdgeRelation::SimilarTo).map(|e| e.dst_id).collect();
         ids.sort();
         ids
+    }
+
+    #[test]
+    fn similar_memories_scores_exactly_as_one_lookup_per_candidate_did() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let kinds = [NodeKind::Gotcha, NodeKind::Decision, NodeKind::Note];
+        let ids: Vec<i64> = (0..30).map(|i| memory(&store, kinds[i % 3], &format!("m{i}"), &vector(0, 1 + i % 7, 0.05 * i as f32))).collect();
+        let query = vector(0, 1, 0.3);
+        // The pre-batch loop: each candidate's vector fetched on its own.
+        let mut expected = Vec::new();
+        for &kind in MEMORY_KINDS {
+            for (node, _) in store.search_similar("r", &query, 11, Some(kind)).unwrap() {
+                if Some(node.id) != Some(ids[0]) {
+                    let v = store.get_embedding("r", node.id).unwrap().unwrap();
+                    expected.push((node.id, cosine(&query, &v)));
+                }
+            }
+        }
+        expected.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+        expected.truncate(10);
+        let got: Vec<(i64, f32)> = similar_memories(&store, "r", &query, Some(ids[0]), 10).unwrap().into_iter().map(|(n, s)| (n.id, s)).collect();
+        assert_eq!(got, expected);
     }
 
     #[test]

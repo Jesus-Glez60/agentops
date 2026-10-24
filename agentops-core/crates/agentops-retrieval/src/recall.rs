@@ -53,8 +53,10 @@ const PER_QUERY: usize = 10;
 /// Lowest prompt-to-memory cosine that counts as close in meaning. A prompt
 /// is shorter than a note, so these run lower than note-to-note scores.
 pub const DENSE_MIN_SCORE: f32 = 0.55;
-/// Nearest memories taken by meaning before fusion.
-pub const DENSE_TOP_K: usize = 20;
+/// Nearest memories taken by meaning before fusion. Each one's share of
+/// the fused score tapers with its rank (`dense_weight`) to nothing at the
+/// window's edge, so no rank is a cliff.
+pub const DENSE_WINDOW: usize = 50;
 /// Budget for embedding the prompt plus the nearest-neighbour search;
 /// over it, the dense half is dropped. Keeps a remote hook's p95 well
 /// under its 1 s target.
@@ -295,7 +297,7 @@ fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Res
         }
     };
     let searching = Instant::now();
-    let nearest = agentops_graph::similarity::similar_memories(store, repo, &embedding, None, DENSE_TOP_K)?;
+    let nearest = agentops_graph::similarity::similar_memories(store, repo, &embedding, None, DENSE_WINDOW)?;
     let total = embed_time + searching.elapsed();
     if total > budget {
         eprintln!("agentops: dense recall timeout: embedding plus search took {} ms; keyword recall only", total.as_millis());
@@ -305,7 +307,8 @@ fn dense_candidates(store: &dyn GraphStore, repo: &str, rx: &mpsc::Receiver<(Res
 }
 
 /// Replaces `ranked`'s order with the reciprocal rank fusion of it and
-/// `dense` (`crate::rrf`, the same fusion as `search_hybrid`). Fused scores are comparable across both lists, so
+/// `dense` (`crate::rrf`, the same fusion as `search_hybrid`, with the dense
+/// share tapered by `dense_weight`). Fused scores are comparable across both lists, so
 /// cue counts no longer lead: every candidate gets one, the same as a hop
 /// neighbour, which then ranks after them on the tie and by its fused
 /// score among other neighbours. A reduced memory's dense share is
@@ -317,12 +320,25 @@ fn fuse(ranked: &mut Vec<Ranked>, dense: Vec<(Node, f32)>) {
         let reduced = if node.prominence == NodeProminence::Reduced { 0.5 } else { 1.0 };
         let reason = format!("close in meaning ({cosine:.2})");
         let entry = fused.entry(node.id).or_insert_with(|| Ranked { id: node.id, strength: FUSED_STRENGTH, score: 0.0, confidence: 0.0, hop: false, kind: node.kind, title: node.name.clone().unwrap_or_else(|| "(untitled)".to_string()), memory_class: node.memory_class, reasons: Vec::new() });
-        entry.score += rrf(i) * reduced;
+        entry.score += dense_weight(i) * reduced;
         entry.confidence = entry.confidence.max(dense_confidence(cosine) * reduced);
         entry.reasons.push(reason);
     }
     ranked.extend(fused.into_values());
     sort_ranked(ranked);
+}
+
+/// The dense list's share of the fused score at 0-based rank `rank`:
+/// `rrf(rank)` tapered linearly to 0 at `DENSE_WINDOW`. Decreasing and
+/// continuous, so one new close neighbour costs a memory one rank's worth,
+/// about 0.0003 near rank 20. Before, the share was `rrf(rank)` for the
+/// first 20 and 0 after: the 21st lost 0.0125 at once, and one new gotcha
+/// took a target from rank 1 to 32 (gotcha 326954; milestone 4 report).
+fn dense_weight(rank: usize) -> f64 {
+    if rank >= DENSE_WINDOW {
+        return 0.0;
+    }
+    crate::rrf(rank) * (1.0 - rank as f64 / DENSE_WINDOW as f64)
 }
 
 /// Memories one symbol (or file) must reach before an `Affects` link to it
@@ -723,6 +739,42 @@ mod tests {
         assert_eq!(seed[0].title, "Webhook signature deploy failure", "matched by words and by meaning: {seed:?}");
         assert!(seed[0].reason.contains("close in meaning"), "{seed:?}");
         assert_eq!(seed.len(), 3, "{seed:?}");
+    }
+
+    #[test]
+    fn the_dense_share_falls_with_rank_and_ends_at_the_window() {
+        assert_eq!(dense_weight(0), crate::rrf(0));
+        for rank in 1..DENSE_WINDOW {
+            assert!(dense_weight(rank) < dense_weight(rank - 1), "rank {rank}");
+        }
+        assert!(dense_weight(DENSE_WINDOW - 1) < 0.001);
+        assert_eq!(dense_weight(DENSE_WINDOW), 0.0);
+    }
+
+    /// The c20 shape (gotcha 326954): a target matched by one keyword and
+    /// 20th nearest by meaning. One new memory closer in meaning must cost
+    /// it a place or two, not drop it below every keyword-only match.
+    #[test]
+    fn one_new_close_neighbour_moves_a_target_by_at_most_two_places() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        for k in 0..19 {
+            let id = note(&store, NodeKind::Note, &format!("Nearby {k}"), "nothing shared");
+            store.set_embedding("r", id, &vector(0.01 * k as f32)).unwrap();
+        }
+        // Nine gotchas match the word better, so the target is last of its
+        // kind's ten keyword hits and leans on its dense share.
+        for k in 0..9 {
+            note(&store, NodeKind::Gotcha, &format!("Webhook other {k}"), "webhook webhook");
+        }
+        let target = note(&store, NodeKind::Gotcha, "Target", "a webhook among many other words in a long body");
+        store.set_embedding("r", target, &vector(0.2)).unwrap();
+        let place = |store: &SqliteGraphStore| recall_seed_with(store, "r", "webhook", 100, &HashSet::new(), Some(&FIXED)).unwrap().iter().position(|p| p.node_id == target).unwrap();
+        let before = place(&store);
+        let newcomer = note(&store, NodeKind::Note, "Newcomer", "nothing shared");
+        store.set_embedding("r", newcomer, &vector(0.15)).unwrap();
+        let after = place(&store);
+        assert!(after <= before + 2, "{before} -> {after}");
+        assert!(before < 3, "the fixture puts the target near the top first: {before}");
     }
 
     #[test]

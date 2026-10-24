@@ -37,7 +37,7 @@ The `kind` filter applies to `dense` and `hybrid`. `gist_then_detail` ignores it
 | Source | Store method | SQLite | Postgres |
 | --- | --- | --- | --- |
 | `DenseCandidateSource` | `search_similar` | sqlite-vec KNN on `node_vectors` | pgvector on `nodes.embedding` |
-| `LexicalCandidateSource` | `search_lexical` | FTS5 `MATCH`, ordered by `bm25` | `tsvector`, ordered by `ts_rank` |
+| `LexicalCandidateSource` | `search_lexical` | FTS5 `MATCH`, ordered by `bm25`, then id | `tsvector`, ordered by `ts_rank`, then id |
 | `ExactCandidateSource` | `search_exact` | case-insensitive name equality, then substring (`LOWER(name) LIKE`); exact matches first, then shorter names | equivalent query |
 
 Store-level details (`agentops-core/crates/agentops-graph/src/sqlite.rs`):
@@ -162,8 +162,11 @@ This was added after milestone 3a's eval ended at 15/20. Four of the five misses
 
 On the server, `recall_seed_with` (`agentops-retrieval/src/recall.rs`) also recalls by meaning ([ADR 0052](adr/0052-the-server-may-embed-the-prompt-in-a-hook.md)). A local hook process never does, because it passes no embedder.
 1. The prompt is embedded on a helper thread while the keyword queries run.
-2. `similarity::similar_memories` returns the `DENSE_TOP_K = 20` nearest gotchas, decisions and notes. Those with cosine ≥ `DENSE_MIN_SCORE = 0.55` are kept, in cosine order with id as the tiebreak. Excluded, pinned and `NeedsReview` memories are dropped as usual.
-3. That list and the keyword ranking (cues, then score) are fused by reciprocal rank with k = 60, the same constant as `search_hybrid`. A reduced memory's dense share is halved. Their reason reads `close in meaning (0.71)`.
+2. `similarity::similar_memories` returns the `DENSE_WINDOW = 50` nearest gotchas, decisions and notes. Their vectors come back in one `get_embeddings` call. Those with cosine ≥ `DENSE_MIN_SCORE = 0.55` are kept, in cosine order with id as the tiebreak. Excluded, pinned and `NeedsReview` memories are dropped as usual.
+3. That list and the keyword ranking (cues, then score) are fused by reciprocal rank with k = 60, the same constant as `search_hybrid`. Their reason reads `close in meaning (0.71)`.
+   - **The dense share tapers.** At rank j (0-based) it is `dense_weight(j) = rrf(j) · (1 − j / DENSE_WINDOW)`, falling to 0 at the window's edge.
+   - **No cliff.** Until milestone 4 the share was `rrf(j)` for the 20 nearest and nothing after. The 21st nearest lost 0.0125 at once, and one new gotcha moved a target from rank 1 to 32 (case c20, gotcha 326954). Now one new close neighbour costs about 0.0003 near rank 20.
+   - A reduced memory's dense share is halved.
 4. The similarity hop then runs from the fused order.
 
 If embedding plus the search exceed `DENSE_TIMEOUT_MS = 250`, the dense half is dropped, `dense recall timeout` is logged, and the keyword result stands. `agentops-server` warms the model at startup (`warm_embedder`).
