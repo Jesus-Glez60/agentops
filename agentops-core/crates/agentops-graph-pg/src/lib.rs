@@ -51,6 +51,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 const SCHEMA: &str = include_str!("../schema.sql");
+/// The advisory lock `connect` holds while it applies `SCHEMA`.
+const SCHEMA_LOCK_KEY: i64 = 0x6167_6f70_7373;
 
 #[derive(Clone)]
 pub struct PostgresGraphStore {
@@ -121,7 +123,13 @@ impl PostgresGraphStore {
             cfg.pool = Some(deadpool_postgres::PoolConfig::new(pg_pool_max_size()));
             let pool = cfg.create_pool(Some(deadpool_postgres::Runtime::Tokio1), tokio_postgres::NoTls)?;
             let client = pool.get().await?;
-            client.batch_execute(SCHEMA).await?;
+            // One connect at a time applies the schema: `ALTER TABLE ... IF NOT
+            // EXISTS` still takes an AccessExclusiveLock, and parallel test
+            // stores applying it deadlocked (CI 2026-10-17 and 2026-10-25).
+            client.batch_execute(&format!("SELECT pg_advisory_lock({SCHEMA_LOCK_KEY})")).await?;
+            let applied = client.batch_execute(SCHEMA).await;
+            client.batch_execute(&format!("SELECT pg_advisory_unlock({SCHEMA_LOCK_KEY})")).await?;
+            applied?;
             Ok::<deadpool_postgres::Pool, anyhow::Error>(pool)
         })?;
         Ok(Self { rt: Arc::new(RuntimeGuard(Some(rt))), pool })
