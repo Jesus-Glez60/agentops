@@ -47,6 +47,11 @@ const BUCKET_TABS: { label: string; value: GotchaBucket | "all" }[] = [
 // own arm ordering.
 // `NeedsReview` first of all: it's never `curated` (no person has looked at
 // it yet), so it would otherwise land in "needs curation".
+/** A consolidation proposal still waiting (ADR 0056): written with this curation reason. */
+function isProposal(gotcha: Pick<GotchaSummary, "prominence" | "curation_reason">): boolean {
+  return gotcha.prominence === "NeedsReview" && (gotcha.curation_reason ?? "").startsWith("proposed by consolidation from");
+}
+
 function bucketOf(gotcha: Pick<GotchaSummary, "curated" | "prominence">): GotchaBucket {
   if (gotcha.prominence === "NeedsReview") return "needs_review";
   if (gotcha.prominence === "Pinned") return "pinned";
@@ -202,7 +207,13 @@ export default function GotchasPage() {
   // "Keep all" / "Reduce all" -- applies to every currently-filtered
   // gotcha (bucket tab + repo scope + text filter), not the whole list, so
   // it does what's visible on screen, not a silent global action.
-  async function applyCurationToMany(targets: GotchaSummary[], prominence: NodeProminence, reason: string | null) {
+  async function applyCurationToMany(all: GotchaSummary[], prominence: NodeProminence, reason: string | null) {
+    // Consolidation proposals are decided one at a time (Accept proposal
+    // supersedes two memories); bulk curation skips them instead of
+    // failing on the server's 409 for each.
+    const targets = all.filter((g) => !isProposal(g));
+    const skipped = all.length - targets.length;
+    if (skipped > 0) toast.error(`Skipped ${skipped} consolidation proposal${skipped === 1 ? "" : "s"}: open each one and use Accept proposal or Reject.`);
     if (targets.length === 0) return;
     // Concurrency-limited, not a bare `Promise.allSettled(targets.map(...))`
     // -- the backend opens a fresh Postgres connection pool per request

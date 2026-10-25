@@ -171,6 +171,19 @@ describe("GotchasPage", () => {
     await waitFor(() => expect(decideProposal).toHaveBeenCalledWith("agentops", 9, "accept"));
   });
 
+  it("Keep all skips consolidation proposals and says so, curating the rest", async () => {
+    const proposal = { ...needsReviewNote, id: 9, name: "The pool runs out under load", curation_reason: "proposed by consolidation from 4, 5" };
+    getGotchas.mockResolvedValue([proposal, needsCurationGotcha]);
+    setCuration.mockResolvedValue({ id: 1, prominence: "Full" });
+    renderPage();
+
+    await screen.findByText("The pool runs out under load");
+    fireEvent.click(screen.getByRole("button", { name: /Keep all/ }));
+    await waitFor(() => expect(setCuration).toHaveBeenCalledTimes(1));
+    expect(setCuration).toHaveBeenCalledWith("agentops", 1, "Full", null);
+    expect(toastError).toHaveBeenCalledWith(expect.stringContaining("Skipped 1 consolidation proposal"));
+  });
+
   it("rejecting a proposal removes it from the list", async () => {
     const proposal = { ...needsReviewNote, id: 9, name: "The pool runs out under load", kind: "Gotcha" as const };
     getGotchas.mockResolvedValue([proposal]);
