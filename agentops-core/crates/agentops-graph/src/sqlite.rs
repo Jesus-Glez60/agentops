@@ -1086,13 +1086,19 @@ impl GraphStore for SqliteGraphStore {
     }
 
     fn claim_shown(&self, repo: &str, session_id: &str, context: &str, ids: &[i64], source: &str) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare("INSERT INTO recall_shown (repo, session_id, context, node_id, source) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING")?;
+        // One transaction, as Postgres's single statement is: a failure
+        // part-way must not leave rows claimed that the caller never shows.
+        let tx = self.conn.unchecked_transaction()?;
         let mut claimed = Vec::new();
-        for &id in ids {
-            if stmt.execute(rusqlite::params![repo, session_id, context, id, source])? == 1 {
-                claimed.push(id);
+        {
+            let mut stmt = tx.prepare("INSERT INTO recall_shown (repo, session_id, context, node_id, source) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING")?;
+            for &id in ids {
+                if stmt.execute(rusqlite::params![repo, session_id, context, id, source])? == 1 {
+                    claimed.push(id);
+                }
             }
         }
+        tx.commit()?;
         Ok(claimed)
     }
 
@@ -1600,6 +1606,15 @@ mod tests {
         let hits = store.search_lexical("repo-a", "signature expiry", 10, None).unwrap();
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].0.name.as_deref(), Some("verify_token"));
+    }
+
+    #[test]
+    fn a_claim_that_fails_part_way_claims_nothing() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.conn.execute_batch("CREATE TRIGGER no_three BEFORE INSERT ON recall_shown WHEN NEW.node_id = 3 BEGIN SELECT RAISE(FAIL, 'store down'); END;").unwrap();
+        assert!(store.claim_shown("repo-a", "s", "main#0", &[1, 2, 3], "file_cue").is_err());
+        store.conn.execute_batch("DROP TRIGGER no_three;").unwrap();
+        assert_eq!(store.claim_shown("repo-a", "s", "main#0", &[1, 2], "file_cue").unwrap(), vec![1, 2], "1 and 2 were rolled back, so they can still be claimed");
     }
 
     #[test]

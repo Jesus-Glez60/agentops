@@ -238,7 +238,13 @@ pub fn generate(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphSto
             log.not_worth += 1;
             continue;
         };
-        log.proposals.push(write_proposal(repo_path, notes_dir, store, repo, &proposed, &c.sources)?);
+        match write_proposal(repo_path, notes_dir, store, repo, &proposed, &c.sources) {
+            Ok(id) => log.proposals.push(id),
+            Err(e) => {
+                log.error = Some(format!("writing a proposal: {e:#}"));
+                break;
+            }
+        }
     }
     log.usd = priced.then_some(usd);
     store.record_session_event(repo, session_id, "consolidate", &serde_json::to_string(&log)?, None, CONSOLIDATION_RUN)?;
@@ -253,18 +259,24 @@ fn write_proposal(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphS
         "decision" => agentops_notes::NoteType::Decision,
         _ => agentops_notes::NoteType::Knowledge,
     };
-    // A merge often reuses a source's title, and `add_note` upserts on
-    // (kind, file, title): written as is, it overwrote source 54087 and
-    // marked it needs-review (2026-10-24). So the title is made unique.
-    let kind = match note_type {
-        agentops_notes::NoteType::Gotcha => agentops_graph::NodeKind::Gotcha,
-        agentops_notes::NoteType::Decision => agentops_graph::NodeKind::Decision,
-        _ => agentops_graph::NodeKind::Note,
+    // A merge often reuses a source's title. `add_note` writes the file
+    // `<slug>.md` and upserts on (kind, file, title): with the same title it
+    // overwrote source 54087 (2026-10-24), and a title differing only in
+    // punctuation shares the slug and overwrites the source's file (gotcha
+    // 387589). So the title must give a slug no memory, of any kind, and no
+    // note file already has, checked before anything is written.
+    let notes = agentops_notes::resolve_notes_path(repo_path, notes_dir);
+    let mut taken = HashSet::new();
+    for &kind in MEMORY_KINDS {
+        taken.extend(store.nodes_by_kind(repo, kind)?.into_iter().filter_map(|n| n.name.map(|t| crate::notes::slug(&t))));
+    }
+    let free = |title: &str| {
+        let slug = crate::notes::slug(title);
+        !taken.contains(&slug) && !notes.join(format!("{slug}.md")).exists()
     };
-    let taken: HashSet<String> = store.nodes_by_kind(repo, kind)?.into_iter().filter_map(|n| n.name.map(|t| t.to_lowercase())).collect();
     let mut title = proposed.title.clone();
     let mut n = 1;
-    while taken.contains(&title.to_lowercase()) {
+    while !free(&title) {
         title = if n == 1 { format!("{} (consolidated)", proposed.title) } else { format!("{} (consolidated {n})", proposed.title) };
         n += 1;
     }
@@ -305,13 +317,28 @@ fn waiting(store: &dyn GraphStore, repo: &str, proposal_id: i64) -> Result<agent
 
 /// Accepts a proposal (a person's decision, never automatic): it becomes a
 /// full, durable memory, and its sources are superseded (temporal, ending
-/// today, as `add_note`'s `supersedes`), so recall stops showing them.
+/// today, as `add_note`'s `supersedes`), so recall stops showing them. If a
+/// source was pinned, the pin moves to the proposal: pins ignore the class,
+/// so the source would otherwise stay injected on every prompt beside its
+/// replacement (gotcha 387532), and a rule that must always hold stays
+/// always present. Everything is checked before anything changes, so a
+/// refused accept can be retried.
 pub fn accept(repo_path: &Path, store: &dyn GraphStore, repo: &str, proposal_id: i64) -> Result<()> {
     let row = waiting(store, repo, proposal_id)?;
     anyhow::ensure!(!row.source_ids.contains(&proposal_id), "proposal {proposal_id} is one of its own sources (written over it); reject it to clear the row, then restore the memory");
     let node = store.get_node(repo, proposal_id)?.with_context(|| format!("proposal {proposal_id}'s memory is gone"))?;
-    store.set_curation(repo, proposal_id, NodeProminence::Full, None)?;
+    let mut pinned = Vec::new();
+    for &source in &row.source_ids {
+        let n = store.get_node(repo, source)?.with_context(|| format!("proposal {proposal_id}'s source {source} is gone; reject the proposal"))?;
+        if n.prominence == NodeProminence::Pinned {
+            pinned.push(source);
+        }
+    }
+    store.set_curation(repo, proposal_id, if pinned.is_empty() { NodeProminence::Full } else { NodeProminence::Pinned }, None)?;
     crate::notes::apply_memory_class(repo_path, proposal_id, node.name.as_deref().unwrap_or(""), Some((MemoryClass::Durable, None)), &row.source_ids)?;
+    for source in pinned {
+        store.set_curation(repo, source, NodeProminence::Full, None)?;
+    }
     store.set_proposal_state(repo, proposal_id, "accepted")
 }
 
@@ -462,6 +489,48 @@ mod tests {
         assert_eq!(r.node(id).unwrap().name.as_deref(), Some("The pool runs out under load (consolidated)"));
         let source = r.node(a).unwrap();
         assert_eq!((source.prominence, source.content.as_deref()), (NodeProminence::Full, Some("The connection pool runs out at 50 clients.")), "the source is untouched");
+    }
+
+    #[test]
+    fn a_title_differing_only_in_punctuation_never_writes_over_the_sources_file() {
+        let r = Repo::new();
+        let a = r.memory("The pool: runs out under load", "The connection pool runs out at 50 clients.", at(1.0));
+        let b = r.memory("Connection pool runs out", "At 50 clients the pool is exhausted.", at(0.88));
+        let file = agentops_notes::resolve_notes_path(r.dir.path(), None).join(r.node(a).unwrap().path.unwrap().strip_prefix("vault:").unwrap());
+        let before = std::fs::read_to_string(&file).unwrap();
+        // MERGED's title is "The pool runs out under load": same slug as a's.
+        let url = mock_llm(vec![(MERGED, 10, 10)]);
+        let id = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &[Candidate::merge(a, b, 0.88)], None, "s").unwrap().proposals[0];
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), before, "the source's file is untouched");
+        assert_eq!(r.node(id).unwrap().name.as_deref(), Some("The pool runs out under load (consolidated)"));
+    }
+
+    #[test]
+    fn accepting_moves_a_sources_pin_to_the_proposal() {
+        let r = Repo::new();
+        let a = r.memory("Pool exhaustion under load", "x", at(1.0));
+        let b = r.memory("Connection pool runs out", "y", at(0.88));
+        r.store.set_curation(&r.repo, b, NodeProminence::Pinned, None).unwrap();
+        let url = mock_llm(vec![(MERGED, 10, 10)]);
+        let id = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &[Candidate::merge(a, b, 0.88)], None, "s").unwrap().proposals[0];
+        accept(r.dir.path(), r.store.as_ref(), &r.repo, id).unwrap();
+        let pins: Vec<i64> = r.store.nodes_pinned(&r.repo).unwrap().into_iter().map(|n| n.id).collect();
+        assert_eq!(pins, vec![id], "the pin moved from the superseded source to its replacement");
+    }
+
+    #[test]
+    fn an_accept_refused_for_a_missing_source_changes_nothing() {
+        let r = Repo::new();
+        let a = r.memory("Pool exhaustion under load", "x", at(1.0));
+        let b = r.memory("Connection pool runs out", "y", at(0.88));
+        let url = mock_llm(vec![(MERGED, 10, 10)]);
+        let id = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &[Candidate::merge(a, b, 0.88)], None, "s").unwrap().proposals[0];
+        r.store.delete_nodes(&r.repo, &[b]).unwrap();
+        assert!(accept(r.dir.path(), r.store.as_ref(), &r.repo, id).is_err());
+        let p = r.node(id).unwrap();
+        assert_eq!(p.prominence, NodeProminence::NeedsReview, "not half-promoted");
+        assert_eq!(r.node(a).unwrap().memory_class, MemoryClass::Durable, "the surviving source isn't superseded");
+        assert_eq!(r.store.proposals(&r.repo).unwrap()[0].state, "proposed");
     }
 
     #[test]
