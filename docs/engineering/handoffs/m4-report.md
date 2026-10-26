@@ -10,13 +10,13 @@
 | Adding any one of the 26 memories moves no seed target by more than 3 ranks | Worst move: 1 rank (c15, memory 235645) | Met |
 | Same graph, identical ranks in 5 separate processes | Identical on both backups | Met |
 | Parallel reads of one file inject each memory once (F71: 0% duplicates) | Live: 5 injections over 5 trials, 0 duplicates | Met |
-| Redrawn sets ≥ 13/20 prompt and 6/20 work; held-out noise ≤ 30% | 15/20 and 6/20; noise 0 of 30 by per-memory proxy (§2) | Met, noise by proxy |
+| Redrawn sets ≥ 13/20 prompt and 6/20 work; held-out noise ≤ 30% | 15/20 and 6/20; noise 0 of 30 by per-memory proxy (§2) | Sets met; noise **not re-scored as specified** (proxy from the author's per-memory labels) |
 | A live session follow records `memory_followed` with the right source | Recorded: `file_cue`, durable (§3) | Met |
 | `recall-stats` reports follow rates per source and class | Route and CLI live (§3) | Met |
 | Payloads carry `client_host` and nothing else new | Tested on the forwarded body (`18d2699`) | Met |
 | Error cue on another host skips a scoped memory; a file cue labels it | Tests (`18d2699`) | Met |
 | The known situational memories scoped through a reviewed backfill; their error-cue rows gone in a replay as another host | 14 scoped after review; 2 rows → 0 (§4) | Met; see the note on "4 memories" |
-| A session that wrote memories produces ≤ 3 proposals at its end, as needs-review nodes, sources unapplied | Live session end ran (§5): 1 candidate, judged not worth, 0 proposals; proposal writing verified live through the batch path | Met, except a live session end that writes a proposal |
+| A session that wrote memories produces ≤ 3 proposals at its end, as needs-review nodes, sources unapplied | Live session end ran (§5): 1 candidate, judged not worth, 0 proposals; proposal writing verified live through the batch path | **Partly met:** no live session end has written a proposal yet |
 | Accept applies `supersedes`; reject is recorded and the sources aren't re-proposed | Verified live through recall (§5) and in tests | Met |
 | No LLM key: nothing runs, nothing fails | Tests | Met (not live: the tenant has a key) |
 | Batch dry run lists candidates; ≥ 10 proposals generated and reviewed, at least half worth accepting | 106 candidates; 10 proposals; 7 accepted | Met |
@@ -127,16 +127,16 @@ Ranks were identical in all 5 runs of every row. On the shipped code c20 is at r
 1 follows; 1 sessions shown memories, 1 followed one.
 ```
 
-- **0 ordinary sessions.** The only session since the deploy is this milestone's own (meta); its one follow was the live check (memory 53999, file cue).
+- **0 ordinary sessions.** The only session since the deploy is this milestone's own (meta); its one follow was the live check: `fetch_content` on memory 53999, recorded as `memory_followed` with source `file_cue`, context `main#0` (session `3875ecaf`, 2026-10-24 20:02:03 UTC). The event's row id isn't exposed by any route.
 - Counting started at the deploy (`b8e04a5`, 20:01, 2026-10-24); earlier sessions have no `recall_shown` rows.
 - The revisit threshold is 200 follows from at least 20 ordinary sessions (`m3b-eval.md`).
 
 ## 4. Scope
 
-- **Backfill** (`agentops classify-memories --scope`). Candidate names: this hostname and 6 `~/.ssh/config` aliases.
-  - 45 of 413 memories matched: 43 on `thedamnserver`, 2 on `github-personal`. The full set is in `.context/classify-memories.scope.full.json` (local).
+- **Backfill** (`agentops classify-memories --scope`). Candidate names: this hostname and the `~/.ssh/config` aliases.
+  - 45 of 413 memories matched: 43 on `thedamnserver`, 2 on an SSH host alias. The full set is in `.context/classify-memories.scope.full.json` (local).
   - About two thirds only mention the server in passing.
-  - The author applied a curated 14: 12 about the server's deploy mechanics, plus the 2 SSH-alias ones. Reply: "Scoped 14 of 14 reviewed memories".
+  - The author applied a curated 14: 12 about the server's deploy mechanics, plus the 2 that name the SSH alias. Reply: "Scoped 14 of 14 reviewed memories".
 - **The spec's "4 known situational memories" are 4 rows of 3 memories:** 53975, 54101, and 104450 twice (from `to-label.jsonl`, scores 1–2). All 3 are among the 14.
 - **Replay comparison** (5 held-out sessions, today's graph):
 
@@ -150,9 +150,15 @@ Error-cue totals don't fall, because each cue's slot goes to its next candidate.
 ## 5. Consolidation
 
 - **Batch dry run:** 106 merge candidates (cosine 0.85–0.92), written to `.context/consolidate.dry-run.md`. The author approved 16 of them.
+- **How the counts fit.** The 16 candidates ran in three passes, because each fix re-ran what the last pass hadn't finished:
+  - pass 1: 4 runs, each stopped at its first call (schema);
+  - pass 2, after `383ba6f`: 4 runs, 1 proposal and 4 "not worth" before the 512-token cap stopped each run;
+  - pass 3, after `6aea617`: the 15 still open, giving 9 writes and 6 "not worth";
+  - one regeneration (373426), after the bad write described below.
+  - That makes 13 runs, 11 writes and 10 "not worth" verdicts, some candidates judged twice. Final outcome per candidate: 10 proposals and 6 not worth, which is all 16.
 - **Runs:** 13 logged as `consolidation_run` events, 19,715 input and 11,098 output tokens in all. The first 7 failed before writing anything useful: 4 on Groq's schema rule (0 tokens) and 3 on the 512-token cap.
 - **Cost:** Groq, model openai/gpt-oss-120b. Logged USD is `null`, because `agentops_llm::pricing` has no rate for that model; the tenant's key was on Groq's free tier in milestone 3b (gotcha 299440; **not re-checked**). **Per-run cost in dollars: unverified.**
-- **Outcomes:** 10 valid proposals came out of 11 writes, and the model judged 10 candidates not worth a memory.
+- **Outcomes:** 10 valid proposals came out of 11 writes.
   - **The 11th write overwrote its own source.** The merge of 54087 and 54088 reused 54087's exact title, and `add_note` upserted onto it: the body was replaced and the node was set needs-review, with a proposal row naming itself.
   - **Fixed in `ff2e01a`:** proposal titles are made unique, and a self-sourced row can't be accepted, only closed.
   - **Repair** (approved; four separate changes): the row was closed; the body was restored via `add_note` from the 10-24 backup, and it matches the backup byte for byte (1,084 characters); curation was set back to Full. Gotcha 368727.
@@ -204,7 +210,19 @@ Error-cue totals don't fall, because each cue's slot goes to its next candidate.
 ## 7. Open issues, and what must not break
 
 **Open:**
-- **A superseded pin stays pinned.** Accepting 368718 superseded 104416, which is pinned. Pins ignore the memory class (`nodes_pinned` selects on prominence only), so 104416 is still injected on every prompt next to its merged replacement. Unpin it, or make supersedes unpin; neither was done.
+- **A superseded pin stays pinned: fixed after this report's first version.** Accepting 368718 superseded 104416, which is pinned, and pins ignore the memory class. Accepting now moves a source's pin to the proposal (the author's call, 2026-10-26; test `accepting_moves_a_sources_pin_to_the_proposal`). 104416 itself is still pinned, because it was accepted before the fix: unpinning it, and pinning 368718, is the author's decision.
+- **migrate-graph drops data.** `agentops migrate-graph` copies nodes through `NewNode` plus curation and vectors only. It loses `applies_to`, `memory_class` and `class_until` (the last two already before this milestone), and the `recall_shown` and `consolidation_proposals` tables. Not fixed.
+- **Privacy.** A consolidation run sends the titles and bodies of its candidate memories, unredacted, to the tenant's LLM provider (Groq here). Every hook payload carries this machine's hostname (`client_host`) to the server. Both are by design, but neither was stated before this correction.
+- **Follow-ups from the wrap review:**
+  - record "not worth" verdicts (gotcha 387533);
+  - make migrate-graph copy the new data;
+  - delete `recall_shown` rows when SQLite deletes nodes;
+  - commit a stability gate using `STABILITY_MAX_DROP` (the 26-addition result came from a one-off harness);
+  - route tests for recall-stats, scope and proposals;
+  - claim only after `recall_injected` is recorded;
+  - the f32 bm25 tie compare;
+  - over-counted `get_symbol` title follows;
+  - the Simplifier's and the ladder audit's cleanups (shared `reply()`, one candidate JSON builder, `wiremock` in tests, `classify_scope` reusing `classify_memories`' paging).
 - **The 80-row cutoff.** SQLite's `search_lexical` over-fetches 80 rows across all repos and kinds before filtering, which is still a cliff on a multi-repo local DB. Its tiebreak test can't fail without the fix, because FTS5 already returns rowid order (gotcha 349870).
 - **Scope can't yet tell machines apart.** With one client machine, it only suppresses error cues (gotcha 354625).
 - **Unpriced model.** `agentops_llm::pricing` has no rate for Groq's gpt-oss-120b, so consolidation runs log `usd: null`.

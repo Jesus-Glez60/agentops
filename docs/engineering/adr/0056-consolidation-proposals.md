@@ -24,14 +24,16 @@ Sessions leave near-duplicate memories (milestone 3a found same-fact pairs at co
 - **One call per candidate** (`agentops_llm::propose_memory`, structured JSON). The reply is `worth: false`, or a kind, title and body.
   - At most `MAX_PROPOSALS_PER_SESSION` (3) per session end.
   - A run stops before any call once it has spent `RUN_TOKEN_CAP` (20,000) input plus output tokens, and keeps what it wrote.
-  - Every run is logged as a `consolidation_run` session event: proposals, tokens, estimated USD, provider, model.
+  - Every run is logged as a `consolidation_run` session event: proposals, tokens, estimated USD (null for a model `agentops_llm::pricing` has no rate for, such as Groq's), provider, model, and the error that stopped it, if any.
+- **What leaves the server.** A run sends the titles and bodies of its candidate memories, unredacted, to the tenant's configured provider (Anthropic or Groq). Turning it off means removing the tenant's LLM credentials.
 - **A proposal** is a note written by `add_note`. It is:
   - `NeedsReview`, so recall never shows it, with the curation reason "proposed by consolidation from <ids>";
   - durable, and tagged `proposed-by:consolidation`;
   - recorded in `consolidation_proposals` with its sources and a SHA-256 digest of their ids, titles and bodies;
   - not applied: nothing about its sources changes.
+  - titled so its file slug differs from every existing memory's; a merge often reuses its source's title (gotchas 368727, 387589).
 - **Only a person decides**, in the Gotchas workspace (`POST .../memories/proposals/{id}/accept|reject`). The plain curation route refuses a waiting proposal (409).
-  - **Accept:** the proposal becomes `Full` and durable, and its sources are superseded the way `add_note`'s `supersedes` does it (temporal, ending today), so recall drops them. The spec said the sources become progress. The author chose to reuse `supersedes` instead, because a merged-away gotcha isn't a progress record (2026-10-24).
+  - **Accept:** the proposal becomes `Full` and durable, and its sources are superseded the way `add_note`'s `supersedes` does it (temporal, ending today), so recall drops them. The spec said the sources become progress. The author chose to reuse `supersedes` instead, because a merged-away gotcha isn't a progress record (2026-10-24). If a source is pinned, the pin moves to the proposal, and every source must still exist before anything changes.
   - **Reject:** the proposal's node and note file are deleted, and the rejection is kept with its digest. The same sources aren't proposed again until one of them changes.
 - **Batch.** `agentops consolidate --all --dry-run` lists every unblocked merge pair in the repo, writing nothing. `--generate <id>...` proposes exactly the picked ones: the token cap applies, the per-session maximum doesn't.
 
