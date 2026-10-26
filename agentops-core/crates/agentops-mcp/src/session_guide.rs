@@ -62,12 +62,20 @@ pub fn render_pin(kind: NodeKind, name: Option<&str>, content: Option<&str>, id:
     }
 }
 
+/// The pins recall may show today: pinned, and recallable by memory class.
+/// A progress pin, or a temporal one past its date (a superseded source),
+/// is still pinned in the store but never injected (gotcha 387532).
+pub fn active_pins(store: &dyn GraphStore, repo: &str) -> anyhow::Result<Vec<agentops_graph::Node>> {
+    let today = agentops_graph::utc_today();
+    Ok(store.nodes_pinned(repo)?.into_iter().filter(|n| n.memory_class.recallable_at(&today, n.class_until.as_deref())).collect())
+}
+
 /// The `## Pinned` block within `PIN_BUDGET`, whole lines only, plus the
 /// ids of pins that didn't fit. A pin is never dropped silently: the block
 /// ends with a line naming the ones cut, and the importer's report lists
 /// them. Stable id order, so the block doesn't reshuffle every turn.
 pub fn pinned_block(store: &dyn GraphStore, repo: &str) -> anyhow::Result<(String, Vec<i64>)> {
-    let mut pinned = store.nodes_pinned(repo)?;
+    let mut pinned = active_pins(store, repo)?;
     if pinned.is_empty() {
         return Ok((String::new(), Vec::new()));
     }
@@ -252,6 +260,27 @@ mod tests {
         assert!(ctx.contains("Always remember"), "{ctx}");
         assert!(ctx.contains("Never bypass the redaction gate."), "{ctx}");
         assert!(!ctx.contains("Unrelated"), "{ctx}");
+    }
+
+    #[test]
+    fn a_progress_pin_or_a_temporal_pin_past_its_date_is_never_injected() {
+        use agentops_graph::{MemoryClass, NewNode};
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let pin = |name: &str, class: MemoryClass, until: Option<&str>| {
+            let id = store.add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some(format!("{name} body")) }).unwrap();
+            store.set_curation("demo", id, NodeProminence::Pinned, None).unwrap();
+            store.set_memory_class("demo", id, class, until).unwrap();
+            id
+        };
+        pin("durable pin", MemoryClass::Durable, None);
+        pin("progress pin", MemoryClass::Progress, None);
+        pin("superseded pin", MemoryClass::Temporal, Some("2000-01-01"));
+        pin("current temporal pin", MemoryClass::Temporal, Some("2999-01-01"));
+        let (block, cut) = pinned_block(&store, "demo").unwrap();
+        assert!(block.contains("durable pin") && block.contains("current temporal pin"), "{block}");
+        assert!(!block.contains("progress pin") && !block.contains("superseded pin"), "{block}");
+        assert!(cut.is_empty());
+        assert_eq!(store.nodes_pinned("demo").unwrap().len(), 4, "the store still lists every pin");
     }
 
     #[test]

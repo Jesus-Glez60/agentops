@@ -379,7 +379,7 @@ fn record_follows(store: &dyn GraphStore, repo: &str, session_id: &str, agent: O
             None => {
                 let pins = match &pinned {
                     Some(p) => p,
-                    None => pinned.insert(store.nodes_pinned(repo)?.into_iter().map(|n| n.id).collect()),
+                    None => pinned.insert(crate::session_guide::active_pins(store, repo)?.into_iter().map(|n| n.id).collect()),
                 };
                 if !pins.contains(&id) {
                     continue;
@@ -1231,6 +1231,16 @@ mod tests {
         lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": seeded }), Some("a2"));
         let all = follows(store.as_ref(), &repo);
         assert_eq!(&all[3..], &[(format!("id {seeded} source subagent_seed context a1"), Some("a1".to_string()))], "a2 was never shown it");
+    }
+
+    #[test]
+    fn a_pin_past_its_class_date_is_not_shown_so_looking_it_up_is_no_follow() {
+        let (_dir, store, repo) = store();
+        let pin = gotcha(store.as_ref(), &repo, "A superseded rule", "replaced by a merged memory");
+        store.set_curation(&repo, pin, agentops_graph::NodeProminence::Pinned, None).unwrap();
+        store.set_memory_class(&repo, pin, agentops_graph::MemoryClass::Temporal, Some("2000-01-01")).unwrap();
+        lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": pin }), None);
+        assert!(follows(store.as_ref(), &repo).is_empty());
     }
 
     #[test]
