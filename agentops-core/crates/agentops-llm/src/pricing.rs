@@ -1,4 +1,5 @@
-//! Hand-maintained $/million-token rates for Anthropic models — the one
+//! Hand-maintained $/million-token rates for Anthropic models, plus the
+//! Groq models this project calls — the one
 //! shared source for both `agentops-cli usage sync`'s session-cost estimate
 //! and this crate's own per-call LLM spend ledger. Verified against
 //! Anthropic's pricing page (indexed as `anthropic-pricing@2026-10`);
@@ -51,14 +52,21 @@ const ANTHROPIC_RATES: &[(&str, ModelRates)] = &[
     ("claude-haiku-4-5", rates(1.0, 5.0, 0.10, 1.25)),
 ];
 
-/// Rates for `model` under `provider`, or `None` when unknown. Only the
-/// `"anthropic"` provider has a rate table; every other provider (free
-/// tiers, OpenAI-compatible endpoints) is `None` by design.
+/// Groq's list price for `openai/gpt-oss-120b` (console.groq.com model page,
+/// 2026-10-26: input $0.15, cached input $0.075, output $0.60). Groq lists
+/// no cache-write price, so that rate is 0. A free-tier key pays nothing:
+/// this is the list price, an estimate, not a bill.
+const GROQ_GPT_OSS_120B: ModelRates = rates(0.15, 0.60, 0.075, 0.0);
+
+/// Rates for `model` under `provider`, or `None` when unknown. Anthropic
+/// has a rate table; Groq has exact ids only (the model consolidation and
+/// the classify judge use). Every other provider and model is `None`.
 pub fn rates_for(provider: &str, model: &str) -> Option<ModelRates> {
-    if provider != "anthropic" {
-        return None;
+    match provider {
+        "anthropic" => ANTHROPIC_RATES.iter().find(|(prefix, _)| model == *prefix || model.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('-'))).map(|(_, r)| *r),
+        "groq" if model == "openai/gpt-oss-120b" => Some(GROQ_GPT_OSS_120B),
+        _ => None,
     }
-    ANTHROPIC_RATES.iter().find(|(prefix, _)| model == *prefix || model.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('-'))).map(|(_, r)| *r)
 }
 
 /// Estimated USD cost, or `None` when the model's rates are unknown.
@@ -97,5 +105,12 @@ mod tests {
         assert_eq!(rates_for("anthropic", "opus"), None, "bare substrings must not match");
         assert_eq!(rates_for("groq", "llama-3.3-70b-versatile"), None);
         assert_eq!(cost_estimate_usd("groq", "llama-3.3-70b-versatile", 100, 100, 0, 0), None);
+        assert_eq!(rates_for("openrouter", "openai/gpt-oss-120b"), None, "the Groq rate is Groq's only");
+    }
+
+    #[test]
+    fn groq_gpt_oss_120b_is_priced_at_groqs_list_rate() {
+        let cost = cost_estimate_usd("groq", "openai/gpt-oss-120b", 1_093, 204, 0, 0).unwrap();
+        assert!((cost - (1_093.0 * 0.15 + 204.0 * 0.60) / 1_000_000.0).abs() < 1e-12, "{cost}");
     }
 }
