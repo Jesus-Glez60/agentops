@@ -16,7 +16,7 @@
 | Payloads carry `client_host` and nothing else new | Tested on the forwarded body (`18d2699`) | Met |
 | Error cue on another host skips a scoped memory; a file cue labels it | Tests (`18d2699`) | Met |
 | The known situational memories scoped through a reviewed backfill; their error-cue rows gone in a replay as another host | 14 scoped after review; 2 rows → 0 (§4) | Met; see the note on "4 memories" |
-| A session that wrote memories produces ≤ 3 proposals at its end, as needs-review nodes, sources unapplied | Tests; the batch path verified live | Live session end **unverified** |
+| A session that wrote memories produces ≤ 3 proposals at its end, as needs-review nodes, sources unapplied | Live session end ran (§5): 1 candidate, judged not worth, 0 proposals; proposal writing verified live through the batch path | Met, except a live session end that writes a proposal |
 | Accept applies `supersedes`; reject is recorded and the sources aren't re-proposed | Verified live through recall (§5) and in tests | Met |
 | No LLM key: nothing runs, nothing fails | Tests | Met (not live: the tenant has a key) |
 | Batch dry run lists candidates; ≥ 10 proposals generated and reviewed, at least half worth accepting | 106 candidates; 10 proposals; 7 accepted | Met |
@@ -175,6 +175,9 @@ Error-cue totals don't fall, because each cue's slot goes to its next candidate.
 - **Rejections, categorised by me from the sources' kinds and titles:** the author gave no reasons, so these are **unverified**.
   - 364021 and 368725: two related but distinct facts. A merge would blur which decision says what.
   - 368722: a general rule paired with one specific case of it.
+- **Live session end.** When this milestone's session ended (`3875ecaf`, 2026-10-25), the SessionEnd hook spawned `agentops consolidate --session`, and the server ran it with the tenant's Groq key:
+  - `.context/consolidate.log` and the server's `consolidation_run` event (00:51:42 UTC) both read `candidates 1, not_worth 1, proposals [], 1,093 + 204 tokens, error null`.
+  - The session had written 8 memories. The likely only pair in the 0.85-0.92 band is 349870/349916 (0.887): two different findings, so "not worth" is the right call. **Which candidate it was is unverified**; the run logs counts, not ids.
 - **Verified live through `POST /recall`,** prompted with a source's own title:
   - For accepted 368719 and 368721, neither source is recalled any more and the proposal is.
   - For rejected 364021, both sources are still recalled and the proposal is gone.
@@ -190,7 +193,7 @@ Error-cue totals don't fall, because each cue's slot goes to its next candidate.
 | A memory surfaces on its cue and not otherwise; injection stays inside a fixed budget | **Partly met** | Noise 0.8% by proxy (§2); one pointer per cue, 800 characters (`WORK_RECALL_BUDGET`). The per-session volume target from milestone 3b (median ≤ 3,000 characters) was not met there (17,672) and not re-measured here |
 | Rules that must always hold are enforced or always present | **Met** | `m2-report.md`: 15 of 15 imported rules pinned, re-injected every prompt |
 | MEMORY.md imported once, every entry routed, nothing silently dropped | **Met** for this repo | `m2-report.md`: 49 entries in = 49 records out; 2 to the review queue. Other projects not imported (out of scope here) |
-| Session learnings become memories without asking: the agent writes during the session, and consolidation runs at session end | **Partly met** | Mid-session writes since milestone 1; consolidation proposals ship (§5), but a person accepts each one by design, and a live session-end run is **unverified** (the hook is installed with the new CLI; this session's own end will be its first) |
+| Session learnings become memories without asking: the agent writes during the session, and consolidation runs at session end | **Met**, with a person accepting | Mid-session writes since milestone 1; consolidation runs at session end, live (§5); a person accepts each proposal, by design (ADR 0056) |
 | A memory recalled and wrong gets flagged for review; one recalled and used gets stronger | **Open** | "Followed" is recorded (§3) but changes no weight; 1 follow so far. Nothing flags a memory as wrong |
 | Measured: on a replay of the evidence sessions, the missed memory now appears before the step that went wrong | **Open** | The evidence transcripts were never attached (`m1-report.md`, check 5) |
 
@@ -205,7 +208,7 @@ Error-cue totals don't fall, because each cue's slot goes to its next candidate.
 - **The 80-row cutoff.** SQLite's `search_lexical` over-fetches 80 rows across all repos and kinds before filtering, which is still a cliff on a multi-repo local DB. Its tiebreak test can't fail without the fix, because FTS5 already returns rowid order (gotcha 349870).
 - **Scope can't yet tell machines apart.** With one client machine, it only suppresses error cues (gotcha 354625).
 - **Unpriced model.** `agentops_llm::pricing` has no rate for Groq's gpt-oss-120b, so consolidation runs log `usd: null`.
-- **The live session-end consolidation run** is unverified.
+- **A live session end that writes a proposal** hasn't happened: the first live run proposed nothing (§5).
 - **CI deadlocks.** Parallel Postgres test stores could deadlock applying the schema (2 of 259 CI logs, including the gate for `e369bab`); fixed by an advisory lock in `91da126` (gotcha 382829). The flaky indexing test (F48) is unchanged.
 - **No deploy gate for the laptop CLI.** The CLI was reinstalled by hand for this milestone.
 
