@@ -151,7 +151,7 @@ Error-cue totals don't fall, because each cue's slot goes to its next candidate.
 
 - **Batch dry run:** 106 merge candidates (cosine 0.85–0.92), written to `.context/consolidate.dry-run.md`. The author approved 16 of them.
 - **Runs:** 13 logged as `consolidation_run` events, 19,715 input and 11,098 output tokens in all. The first 7 failed before writing anything useful: 4 on Groq's schema rule (0 tokens) and 3 on the 512-token cap.
-- **Cost:** Groq, model openai/gpt-oss-120b. Logged USD is `null`, because `agentops_llm::pricing` has no rate for that model; the tenant's key is on Groq's free tier. **Per-run cost in dollars: unverified.**
+- **Cost:** Groq, model openai/gpt-oss-120b. Logged USD is `null`, because `agentops_llm::pricing` has no rate for that model; the tenant's key was on Groq's free tier in milestone 3b (gotcha 299440; **not re-checked**). **Per-run cost in dollars: unverified.**
 - **Outcomes:** 10 valid proposals came out of 11 writes, and the model judged 10 candidates not worth a memory.
   - **The 11th write overwrote its own source.** The merge of 54087 and 54088 reused 54087's exact title, and `add_note` upserted onto it: the body was replaced and the node was set needs-review, with a proposal row naming itself.
   - **Fixed in `ff2e01a`:** proposal titles are made unique, and a self-sourced row can't be accepted, only closed.
@@ -209,6 +209,7 @@ Error-cue totals don't fall, because each cue's slot goes to its next candidate.
 - **Scope can't yet tell machines apart.** With one client machine, it only suppresses error cues (gotcha 354625).
 - **Unpriced model.** `agentops_llm::pricing` has no rate for Groq's gpt-oss-120b, so consolidation runs log `usd: null`.
 - **A live session end that writes a proposal** hasn't happened: the first live run proposed nothing (§5).
+- **"Not worth" leaves no record.** Unlike a rejection, a "not worth" verdict isn't stored, so a resumed session re-judges the same pair at every end, one LLM call each time. Recording it like a rejection, with the sources' digest, would stop that. Not done.
 - **CI deadlocks.** Parallel Postgres test stores could deadlock applying the schema (2 of 259 CI logs, including the gate for `e369bab`); fixed by an advisory lock in `91da126` (gotcha 382829). The flaky indexing test (F48) is unchanged.
 - **No deploy gate for the laptop CLI.** The CLI was reinstalled by hand for this milestone.
 
