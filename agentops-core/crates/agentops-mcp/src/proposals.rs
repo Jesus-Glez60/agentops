@@ -308,13 +308,13 @@ fn write_proposal(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphS
     Ok(id)
 }
 
-/// The session-end run: nothing when the session wrote no memory and
-/// touched no progress memory, or when there is no LLM key; else at most
+/// The session-end run: nothing when the session has no open candidate
+/// (see `unblocked`), or when there is no LLM key; else at most
 /// `MAX_PROPOSALS_PER_SESSION` proposals. Never an error for either.
 pub fn run_for_session(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphStore, repo: &str, session_id: &str, config: Option<&LlmConfig>) -> Result<serde_json::Value> {
     let candidates = session_candidates(store, repo, session_id)?;
     if candidates.is_empty() {
-        return Ok(serde_json::json!({ "ran": false, "reason": "the session wrote no memory and touched no progress memory" }));
+        return Ok(serde_json::json!({ "ran": false, "reason": "no open candidate: the session wrote no memory and touched no progress memory, or each candidate is waiting, rejected or judged not worth and unchanged" }));
     }
     let Some(config) = config else {
         return Ok(serde_json::json!({ "ran": false, "reason": "no LLM key (Anthropic or Groq)", "candidates": candidates.len() }));
