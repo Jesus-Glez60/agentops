@@ -787,12 +787,24 @@ pub struct ProposedMemory {
     pub body: String,
 }
 
+/// What a consolidation reply says. `NotWorth` only for an explicit
+/// `"worth": false`; a reply that can't be read (bad JSON, a missing or
+/// empty field, an unknown kind, a truncated answer) is `Unreadable`, so
+/// it is never stored as a verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConsolidationVerdict {
+    Worth(ProposedMemory),
+    NotWorth,
+    Unreadable,
+}
+
 /// One consolidation judgment over `sources` (`(kind, title, body)`): the
-/// proposed memory, or `None` when the model finds nothing worth one (two
-/// pairs that only look alike; progress with no lasting lesson). The call
-/// result is returned either way, for the run's token and cost log. Only a
-/// proposal: nothing is applied until a person accepts it.
-pub fn propose_memory(config: &LlmConfig, purpose: ConsolidationPurpose, sources: &[(agentops_graph::NodeKind, String, String)]) -> Result<(Option<ProposedMemory>, LlmCallResult)> {
+/// proposed memory, `NotWorth` when the model finds nothing worth one (two
+/// pairs that only look alike; progress with no lasting lesson), or
+/// `Unreadable`. The call result is returned either way, for the run's
+/// token and cost log. Only a proposal: nothing is applied until a person
+/// accepts it.
+pub fn propose_memory(config: &LlmConfig, purpose: ConsolidationPurpose, sources: &[(agentops_graph::NodeKind, String, String)]) -> Result<(ConsolidationVerdict, LlmCallResult)> {
     let listed = sources
         .iter()
         .enumerate()
@@ -822,15 +834,21 @@ pub fn propose_memory(config: &LlmConfig, purpose: ConsolidationPurpose, sources
 }
 
 /// A consolidation reply: a proposal only when `worth` is true and kind,
-/// title and body are all there and sane.
-fn parse_proposal(reply: &str) -> Option<ProposedMemory> {
-    let v: serde_json::Value = serde_json::from_str(reply).ok()?;
-    if v.get("worth").and_then(serde_json::Value::as_bool) != Some(true) {
-        return None;
+/// title and body are all there and sane; not worth only when `worth` is
+/// false.
+fn parse_proposal(reply: &str) -> ConsolidationVerdict {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(reply) else { return ConsolidationVerdict::Unreadable };
+    match v.get("worth").and_then(serde_json::Value::as_bool) {
+        Some(false) => return ConsolidationVerdict::NotWorth,
+        Some(true) => {}
+        None => return ConsolidationVerdict::Unreadable,
     }
-    let proposal: ProposedMemory = serde_json::from_value(v).ok()?;
+    let Ok(proposal) = serde_json::from_value::<ProposedMemory>(v) else { return ConsolidationVerdict::Unreadable };
     let ok = ["gotcha", "decision", "knowledge"].contains(&proposal.kind.as_str()) && !proposal.title.trim().is_empty() && !proposal.body.trim().is_empty();
-    ok.then(|| ProposedMemory { title: proposal.title.trim().chars().take(200).collect(), ..proposal })
+    if !ok {
+        return ConsolidationVerdict::Unreadable;
+    }
+    ConsolidationVerdict::Worth(ProposedMemory { title: proposal.title.trim().chars().take(200).collect(), ..proposal })
 }
 
 /// A gotcha is permanent knowledge (decision 54003): a judge reading "X
@@ -1397,11 +1415,13 @@ mod tests {
 
     #[test]
     fn a_consolidation_reply_proposes_only_when_worth_it_and_complete() {
-        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "gotcha", "title": " T ", "body": "B"}"#), Some(ProposedMemory { kind: "gotcha".into(), title: "T".into(), body: "B".into() }));
-        assert_eq!(parse_proposal(r#"{"worth": false, "kind": "gotcha", "title": "T", "body": "B"}"#), None);
-        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "rumour", "title": "T", "body": "B"}"#), None);
-        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "gotcha", "title": "", "body": "B"}"#), None);
-        assert_eq!(parse_proposal("not json"), None);
+        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "gotcha", "title": " T ", "body": "B"}"#), ConsolidationVerdict::Worth(ProposedMemory { kind: "gotcha".into(), title: "T".into(), body: "B".into() }));
+        assert_eq!(parse_proposal(r#"{"worth": false, "kind": "gotcha", "title": "", "body": ""}"#), ConsolidationVerdict::NotWorth);
+        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "rumour", "title": "T", "body": "B"}"#), ConsolidationVerdict::Unreadable);
+        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "gotcha", "title": "", "body": "B"}"#), ConsolidationVerdict::Unreadable);
+        assert_eq!(parse_proposal("not json"), ConsolidationVerdict::Unreadable);
+        assert_eq!(parse_proposal(r#"{"worth": true, "kind": "gotcha", "title": "T", "bo"#), ConsolidationVerdict::Unreadable, "a truncated reply is no verdict");
+        assert_eq!(parse_proposal(r#"{"kind": "gotcha"}"#), ConsolidationVerdict::Unreadable);
     }
 
     #[test]

@@ -390,3 +390,14 @@ CREATE TABLE IF NOT EXISTS consolidation_proposals (
     created_at     TEXT NOT NULL DEFAULT (now()::text),
     PRIMARY KEY (repo, proposal_id)
 );
+
+-- Milestone 5: "not worth" verdicts, keyed on the candidate (`m<a>-<b>`,
+-- `d<id>-...`) with the sources' digest, so an unchanged candidate isn't
+-- judged again (gotcha 387533).
+CREATE TABLE IF NOT EXISTS consolidation_not_worth (
+    repo           TEXT NOT NULL,
+    candidate_id   TEXT NOT NULL,
+    sources_digest TEXT NOT NULL,
+    created_at     TEXT NOT NULL DEFAULT (now()::text),
+    PRIMARY KEY (repo, candidate_id)
+);

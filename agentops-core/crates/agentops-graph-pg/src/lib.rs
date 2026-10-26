@@ -156,6 +156,7 @@ impl PostgresGraphStore {
             client.execute("DELETE FROM session_events WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM recall_shown WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM consolidation_proposals WHERE repo = $1", &[&repo]).await?;
+            client.execute("DELETE FROM consolidation_not_worth WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_usage WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM llm_usage WHERE repo = $1", &[&repo]).await?;
             client.execute("DELETE FROM session_report WHERE repo = $1", &[&repo]).await?;
@@ -989,6 +990,28 @@ impl GraphStore for PostgresGraphStore {
             let n = client.execute("UPDATE consolidation_proposals SET state = $1 WHERE repo = $2 AND proposal_id = $3", &[&state, &repo, &proposal_id]).await?;
             anyhow::ensure!(n == 1, "no proposal {proposal_id}");
             Ok(())
+        })
+    }
+
+    fn record_not_worth(&self, repo: &str, candidate_id: &str, sources_digest: &str) -> Result<()> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            client
+                .execute(
+                    "INSERT INTO consolidation_not_worth (repo, candidate_id, sources_digest) VALUES ($1, $2, $3) \
+                     ON CONFLICT (repo, candidate_id) DO UPDATE SET sources_digest = EXCLUDED.sources_digest, created_at = now()::text",
+                    &[&repo, &candidate_id, &sources_digest],
+                )
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn not_worth(&self, repo: &str) -> Result<Vec<(String, String)>> {
+        self.rt.block_on(async {
+            let client = self.pool.get().await?;
+            let rows = client.query("SELECT candidate_id, sources_digest FROM consolidation_not_worth WHERE repo = $1 ORDER BY candidate_id", &[&repo]).await?;
+            Ok(rows.iter().map(|r| (r.get(0), r.get(1))).collect())
         })
     }
 
@@ -2050,6 +2073,17 @@ mod tests {
         store.wipe_repo(&repo).unwrap();
         assert_eq!((rows.len(), rows[0].source_ids.clone(), rows[0].state.as_str()), (1, vec![3, 4], "accepted"));
         assert!(store.proposals(&repo).unwrap().is_empty(), "wipe_repo clears them");
+    }
+
+    #[test]
+    fn not_worth_verdicts_round_trip_on_postgres() {
+        let store = require_store!();
+        let repo = format!("pg-repo-not-worth-{}", std::process::id());
+        store.record_not_worth(&repo, "m3-4", "d1").unwrap();
+        store.record_not_worth(&repo, "m3-4", "d2").unwrap();
+        assert_eq!(store.not_worth(&repo).unwrap(), vec![("m3-4".to_string(), "d2".to_string())], "a re-judge replaces the digest");
+        store.wipe_repo(&repo).unwrap();
+        assert!(store.not_worth(&repo).unwrap().is_empty(), "wipe_repo clears them");
     }
 
     #[test]

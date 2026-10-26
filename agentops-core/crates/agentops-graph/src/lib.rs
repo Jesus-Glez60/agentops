@@ -1156,6 +1156,12 @@ pub trait GraphStore {
     /// Every proposal of `repo`, oldest first, in any state.
     fn proposals(&self, repo: &str) -> Result<Vec<ConsolidationProposal>>;
     fn set_proposal_state(&self, repo: &str, proposal_id: i64, state: &str) -> Result<()>;
+    /// Records that the model judged consolidation candidate `candidate_id`
+    /// not worth a memory while its sources read as `sources_digest`.
+    /// Replaces an earlier verdict on the same candidate.
+    fn record_not_worth(&self, repo: &str, candidate_id: &str, sources_digest: &str) -> Result<()>;
+    /// Every "not worth" verdict of `repo`: `(candidate_id, sources_digest)`.
+    fn not_worth(&self, repo: &str) -> Result<Vec<(String, String)>>;
     /// Every event recorded for `repo` across *every* session_id, optionally
     /// filtered to one `event_kind` ("hit" or "activity") — unlike
     /// `session_events` above, not scoped to one caller-chosen session_id.

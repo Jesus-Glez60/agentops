@@ -79,8 +79,13 @@ pub struct RunLog {
     pub candidates: usize,
     /// The proposal node ids written.
     pub proposals: Vec<i64>,
-    /// Candidates the model judged not worth a memory.
+    /// Candidates the model judged not worth a memory. Each is recorded
+    /// with its sources' digest and not judged again while they're unchanged.
     pub not_worth: usize,
+    /// Replies that couldn't be read (bad or truncated JSON). Nothing is
+    /// recorded for them, so the candidate stays open.
+    #[serde(default)]
+    pub unreadable: usize,
     pub input_tokens: u64,
     pub output_tokens: u64,
     /// Estimated, from `agentops_llm::pricing`; `None` for an unpriced model.
@@ -158,19 +163,21 @@ pub fn repo_candidates(store: &dyn GraphStore, repo: &str) -> Result<Vec<Candida
     unblocked(store, repo, pairs)
 }
 
-/// `candidates` without those already waiting as a proposal, or rejected
-/// while their sources read exactly as they do now.
+/// `candidates` without those already waiting as a proposal, or rejected or
+/// judged not worth while their sources read exactly as they do now.
 pub fn unblocked(store: &dyn GraphStore, repo: &str, candidates: Vec<Candidate>) -> Result<Vec<Candidate>> {
     let proposals = store.proposals(repo)?;
+    let not_worth = store.not_worth(repo)?;
     let mut out = Vec::new();
     for c in candidates {
         let same: Vec<_> = proposals.iter().filter(|p| sorted(&p.source_ids) == sorted(&c.sources)).collect();
         if same.iter().any(|p| p.state == "proposed") {
             continue;
         }
-        if !same.is_empty() {
+        let judged = not_worth.iter().find(|(id, _)| *id == c.id);
+        if !same.is_empty() || judged.is_some() {
             let digest = sources_digest(store, repo, &c.sources)?;
-            if same.iter().any(|p| p.state == "rejected" && p.sources_digest == digest) {
+            if same.iter().any(|p| p.state == "rejected" && p.sources_digest == digest) || judged.is_some_and(|(_, d)| *d == digest) {
                 continue;
             }
         }
@@ -234,9 +241,17 @@ pub fn generate(repo_path: &Path, notes_dir: Option<&Path>, store: &dyn GraphSto
             Some(cost) => usd += cost,
             None => priced = false,
         }
-        let Some(proposed) = proposed else {
-            log.not_worth += 1;
-            continue;
+        let proposed = match proposed {
+            agentops_llm::ConsolidationVerdict::Worth(p) => p,
+            agentops_llm::ConsolidationVerdict::NotWorth => {
+                log.not_worth += 1;
+                store.record_not_worth(repo, &c.id, &sources_digest(store, repo, &c.sources)?)?;
+                continue;
+            }
+            agentops_llm::ConsolidationVerdict::Unreadable => {
+                log.unreadable += 1;
+                continue;
+            }
         };
         match write_proposal(repo_path, notes_dir, store, repo, &proposed, &c.sources) {
             Ok(id) => log.proposals.push(id),
@@ -465,8 +480,37 @@ mod tests {
         assert_eq!(serde_json::from_str::<RunLog>(&runs[0].description).unwrap(), log);
         assert!(log.usd.is_some(), "priced");
 
+        // A waiting proposal's sources aren't proposed twice, and the
+        // not-worth set isn't judged again: the next end calls nothing.
         let again = session_candidates(r.store.as_ref(), &r.repo, "s").unwrap();
-        assert_eq!(again.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec![format!("d{progress}")], "a waiting proposal's sources aren't proposed twice");
+        assert!(again.is_empty(), "{again:?}");
+        let rerun = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&mock_llm(vec![])), &again, Some(MAX_PROPOSALS_PER_SESSION), "s").unwrap();
+        assert_eq!((rerun.input_tokens, rerun.error), (0, None));
+    }
+
+    #[test]
+    fn an_unreadable_reply_is_no_verdict_and_a_changed_source_is_judged_again() {
+        let r = Repo::new();
+        let progress = r.memory("Pool fix shipped", "Shipped the pool fix.", at(0.1));
+        r.store.set_memory_class(&r.repo, progress, MemoryClass::Progress, None).unwrap();
+        r.wrote("s", &[progress]);
+        let candidates = session_candidates(r.store.as_ref(), &r.repo, "s").unwrap();
+        assert_eq!(candidates.len(), 1);
+
+        // Valid JSON, but no usable memory (a truncated reply fails in
+        // `call_json` and stops the run before any verdict).
+        let url = mock_llm(vec![(r#"{"worth": true, "kind": "gotcha", "title": "", "body": ""}"#, 500, 40)]);
+        let log = generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &candidates, None, "s").unwrap();
+        assert_eq!((log.not_worth, log.unreadable, log.proposals.len(), log.error), (0, 1, 0, None));
+        assert_eq!(session_candidates(r.store.as_ref(), &r.repo, "s").unwrap(), candidates, "an unreadable reply leaves the candidate open");
+
+        let url = mock_llm(vec![(NOT_WORTH, 500, 10)]);
+        generate(r.dir.path(), None, r.store.as_ref(), &r.repo, &config(&url), &candidates, None, "s").unwrap();
+        assert!(session_candidates(r.store.as_ref(), &r.repo, "s").unwrap().is_empty());
+
+        let edited = crate::notes::add_note_with(r.dir.path(), "Pool fix shipped", "Shipped the pool fix; the cap is now 80.", Some(agentops_notes::NoteType::Gotcha), &[], None, false, crate::notes::AddMode::Write).unwrap().node_id.unwrap();
+        assert_eq!(edited, progress);
+        assert_eq!(session_candidates(r.store.as_ref(), &r.repo, "s").unwrap(), candidates, "its source changed, so it is judged again");
     }
 
     #[test]

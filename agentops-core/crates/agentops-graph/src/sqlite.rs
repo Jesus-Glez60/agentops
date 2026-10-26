@@ -425,6 +425,17 @@ const MIGRATIONS_SLICE: &[M<'_>] = &[
             PRIMARY KEY (repo, proposal_id)
         );",
     ),
+    // Milestone 5: "not worth" verdicts, so an unchanged candidate isn't
+    // sent to the LLM again at every session end (gotcha 387533).
+    M::up(
+        "CREATE TABLE consolidation_not_worth (
+            repo           TEXT NOT NULL,
+            candidate_id   TEXT NOT NULL,
+            sources_digest TEXT NOT NULL,
+            created_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (repo, candidate_id)
+        );",
+    ),
 ];
 
 fn migrations() -> Migrations<'static> {
@@ -1117,6 +1128,21 @@ impl GraphStore for SqliteGraphStore {
         let n = self.conn.execute("UPDATE consolidation_proposals SET state = ?1 WHERE repo = ?2 AND proposal_id = ?3", rusqlite::params![state, repo, proposal_id])?;
         anyhow::ensure!(n == 1, "no proposal {proposal_id}");
         Ok(())
+    }
+
+    fn record_not_worth(&self, repo: &str, candidate_id: &str, sources_digest: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO consolidation_not_worth (repo, candidate_id, sources_digest) VALUES (?1, ?2, ?3) \
+             ON CONFLICT (repo, candidate_id) DO UPDATE SET sources_digest = excluded.sources_digest, created_at = CURRENT_TIMESTAMP",
+            rusqlite::params![repo, candidate_id, sources_digest],
+        )?;
+        Ok(())
+    }
+
+    fn not_worth(&self, repo: &str) -> Result<Vec<(String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT candidate_id, sources_digest FROM consolidation_not_worth WHERE repo = ?1 ORDER BY candidate_id")?;
+        let rows = stmt.query_map(rusqlite::params![repo], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        rows.map(|r| r.map_err(anyhow::Error::from)).collect()
     }
 
     fn recall_shown_rows(&self, repo: &str, session_id: Option<&str>, since: Option<&str>) -> Result<Vec<RecallShown>> {
@@ -1857,12 +1883,23 @@ mod tests {
         assert!(store.set_proposal_state("repo-a", 9, "maybe").is_err(), "the CHECK constraint");
     }
 
+    #[test]
+    fn a_not_worth_verdict_is_kept_per_repo_and_a_rejudge_replaces_its_digest() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        store.record_not_worth("repo-a", "m3-4", "d1").unwrap();
+        store.record_not_worth("repo-b", "m3-4", "d9").unwrap();
+        store.record_not_worth("repo-a", "m3-4", "d2").unwrap();
+        assert_eq!(store.not_worth("repo-a").unwrap(), vec![("m3-4".to_string(), "d2".to_string())]);
+        assert_eq!(store.not_worth("repo-b").unwrap(), vec![("m3-4".to_string(), "d9".to_string())]);
+    }
+
     /// A graph.db holding the class's first name reads it as progress.
     #[test]
     fn a_status_class_from_before_the_rename_becomes_progress() {
         let mut conn = Connection::open_in_memory().unwrap();
-        // Every migration up to the rename; milestone 4's three came after it.
-        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 4).unwrap();
+        // Every migration up to the rename; milestone 4's three and
+        // milestone 5's one came after it.
+        migrations().to_version(&mut conn, MIGRATIONS_SLICE.len() - 5).unwrap();
         conn.execute("INSERT INTO nodes (kind, repo, name, memory_class) VALUES ('note', 'repo-a', 'old', 'status')", []).unwrap();
         migrations().to_latest(&mut conn).unwrap();
         let class: String = conn.query_row("SELECT memory_class FROM nodes", [], |r| r.get(0)).unwrap();
