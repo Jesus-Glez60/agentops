@@ -8,6 +8,7 @@
 //! `agentops-ruler-bridge` is still a stub, and `sync-docs` is a separate
 //! follow-up (see the plan).
 
+mod guest_connect;
 mod hook_capture;
 mod classify_memories;
 mod classify_scope;
@@ -524,6 +525,23 @@ enum Command {
         /// Claude Code only.
         #[arg(long, conflicts_with = "no_hooks")]
         no_work_recall: bool,
+        /// With --remote, connect this repo the full way even though it
+        /// isn't AgentOps' own: hooks in the tracked `.claude/settings.json`,
+        /// AGENTS.md written if missing, `.gitignore` edited, Ruler run.
+        /// Without it, every other repo gets a guest connect that changes
+        /// no tracked file (see `guest_connect`).
+        #[arg(long)]
+        full: bool,
+    },
+    /// Turns Claude Code's own auto-memory (MEMORY.md) off for this repo,
+    /// in its untracked `.claude/settings.local.json`, or with --user for
+    /// every repo in `~/.claude/settings.json`. Run it after
+    /// `import-memory --apply` has been checked.
+    MemoryOff {
+        #[arg(long, default_value = ".")]
+        path: PathBuf,
+        #[arg(long)]
+        user: bool,
     },
     /// Internal: invoked by a Claude Code hook (installed via
     /// `connect`), not meant to be run by hand. Reads the
@@ -921,12 +939,16 @@ fn main() -> Result<()> {
             }
         },
         Command::Init { yes, path } => init(yes, &path),
-        Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks: _, no_hooks, compress_commands, no_work_recall } => {
+        Command::Connect { path, agents, global, access_mode, yes, remote, api_key, device_login, with_hooks: _, no_hooks, compress_commands, no_work_recall, full } => {
             if global {
                 connect_global(agents, access_mode, yes, remote, api_key, device_login)
             } else {
-                connect(&path, agents, access_mode, yes, remote, api_key, device_login, !no_hooks, compress_commands, no_work_recall)
+                connect(&path, agents, access_mode, yes, remote, api_key, device_login, !no_hooks, compress_commands, no_work_recall, full)
             }
+        }
+        Command::MemoryOff { path, user } => {
+            let settings = if user { dirs::home_dir().context("no home directory")?.join(".claude").join("settings.json") } else { path.join(".claude").join("settings.local.json") };
+            guest_connect::memory_off(&settings)
         }
         Command::HookCapture { event, compress } => hook_capture::run(&event, compress),
         Command::CompressOutput { kind } => compress_output::run(kind),
@@ -1328,7 +1350,7 @@ fn select_agents(mut agents: Vec<String>, yes: bool) -> Result<Vec<String>> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool, with_hooks: bool, compress_commands: bool, no_work_recall: bool) -> Result<()> {
+fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bool, remote: Option<String>, api_key: Option<String>, device_login: bool, with_hooks: bool, compress_commands: bool, no_work_recall: bool, full: bool) -> Result<()> {
     // Whether to use local/stdio vs. remote/HTTP is not inferable from
     // anything about this invocation on its own (a solo dev can self-host
     // on their own separate personal server too) -- ask directly rather
@@ -1358,6 +1380,9 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
         if agents.is_empty() {
             println!("No agents selected — nothing to do.");
             return Ok(());
+        }
+        if !full && !guest_connect::is_agentops_checkout(path) {
+            return connect_guest_cmd(path, &server_url, api_key, &agents, yes, device_login, with_hooks, compress_commands, no_work_recall);
         }
         if with_hooks {
             maybe_install_claude_hooks(path, &agents, compress_commands, no_work_recall)?;
@@ -1426,10 +1451,16 @@ fn connect(path: &Path, agents: Vec<String>, access_mode: AccessModeArg, yes: bo
 /// `--event` per hook so `hook_capture::run` can dispatch without sniffing
 /// payload shape.
 fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands: bool, no_work_recall: bool) -> Result<()> {
+    install_claude_hooks_at(&path.join(".claude").join("settings.json"), agents, compress_commands, no_work_recall)
+}
+
+/// `maybe_install_claude_hooks` into `settings_path`: the project's
+/// `settings.json`, or for a guest connect its untracked
+/// `settings.local.json`.
+fn install_claude_hooks_at(settings_path: &Path, agents: &[String], compress_commands: bool, no_work_recall: bool) -> Result<()> {
     if !agents.iter().any(|a| a == "claude") {
         return Ok(());
     }
-    let settings_path = path.join(".claude").join("settings.json");
     // (event, --event flag, timeout in seconds). The prompt hook gets 10 s,
     // below Claude Code's 30 s default: recall must never make a prompt
     // feel stuck, and on timeout the prompt still goes through.
@@ -1448,9 +1479,9 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
         // that one command line is simplest and keeps every other event's
         // command exactly as before -- no shared flag/env var needed.
         let extra_flag = if compress_commands && *event_name == "PreToolUse" { " --compress" } else { "" };
-        write_claude_hook(&settings_path, event_name, &format!("agentops hook-capture --event {event_flag}{extra_flag}"), *timeout)?;
+        write_claude_hook(settings_path, event_name, &format!("agentops hook-capture --event {event_flag}{extra_flag}"), *timeout)?;
     }
-    set_claude_env(&settings_path, agentops_mcp::hooks::WORK_RECALL_ENV, no_work_recall.then_some("off"))?;
+    set_claude_env(settings_path, agentops_mcp::hooks::WORK_RECALL_ENV, no_work_recall.then_some("off"))?;
     let compress_note = match (compress_commands, no_work_recall) {
         (true, true) => ", command-output compression enabled, recall during work off",
         (true, false) => ", command-output compression enabled",
@@ -1464,40 +1495,55 @@ fn maybe_install_claude_hooks(path: &Path, agents: &[String], compress_commands:
     Ok(())
 }
 
+/// Read-modify-write of a Claude Code settings file (`settings.json`,
+/// `settings.local.json`, the user's `~/.claude/settings.json`): `update`
+/// changes the top-level object, every other key is kept. A file that
+/// isn't a JSON object is an error and is left as it is: these files are
+/// the person's own, and replacing one with `{}` would lose their settings.
+fn update_settings_json(settings_path: &Path, update: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>)) -> Result<()> {
+    let mut root: serde_json::Value = if settings_path.exists() {
+        let raw = std::fs::read_to_string(settings_path).with_context(|| format!("reading {}", settings_path.display()))?;
+        if raw.trim().is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::from_str(&raw).with_context(|| format!("{} isn't valid JSON; fix or remove it (nothing was changed)", settings_path.display()))?
+        }
+    } else {
+        serde_json::json!({})
+    };
+    let Some(obj) = root.as_object_mut() else { anyhow::bail!("{} isn't a JSON object; fix or remove it (nothing was changed)", settings_path.display()) };
+    update(obj);
+    if let Some(parent) = settings_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(settings_path, serde_json::to_string_pretty(&root)? + "\n").with_context(|| format!("writing {}", settings_path.display()))
+}
+
 /// Sets (or, with `None`, removes) one variable in a project-level
 /// `.claude/settings.json`'s `env`, which Claude Code passes to every hook
 /// it runs. Every other key is kept.
 fn set_claude_env(settings_path: &Path, key: &str, value: Option<&str>) -> Result<()> {
-    let mut root: serde_json::Value = if settings_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(settings_path).with_context(|| format!("reading {}", settings_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
-    } else if value.is_none() {
+    if !settings_path.exists() && value.is_none() {
         return Ok(());
-    } else {
-        serde_json::json!({})
-    };
-    if !root.is_object() {
-        root = serde_json::json!({});
     }
-    let env = root.as_object_mut().expect("just normalized to an object above").entry("env").or_insert_with(|| serde_json::json!({}));
-    if !env.is_object() {
-        *env = serde_json::json!({});
-    }
-    let env = env.as_object_mut().expect("just normalized to an object above");
-    match value {
-        Some(v) => {
-            env.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+    update_settings_json(settings_path, |root| {
+        let env = root.entry("env").or_insert_with(|| serde_json::json!({}));
+        if !env.is_object() {
+            *env = serde_json::json!({});
         }
-        None => {
-            env.remove(key);
+        let env = env.as_object_mut().expect("just normalized to an object above");
+        match value {
+            Some(v) => {
+                env.insert(key.to_string(), serde_json::Value::String(v.to_string()));
+            }
+            None => {
+                env.remove(key);
+            }
         }
-    }
-    if env.is_empty() {
-        root.as_object_mut().expect("object").remove("env");
-    }
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(settings_path, serde_json::to_string_pretty(&root)? + "\n").with_context(|| format!("writing {}", settings_path.display()))
+        if env.is_empty() {
+            root.remove("env");
+        }
+    })
 }
 
 /// Merges (never overwrites) one hook entry into a project-level
@@ -1511,15 +1557,10 @@ fn set_claude_env(settings_path: &Path, key: &str, value: Option<&str>) -> Resul
 /// its own `event_name` key, leaving every other hook (ours or a user's own)
 /// untouched.
 fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str, timeout_secs: Option<u64>) -> Result<()> {
-    let mut root: serde_json::Value = if settings_path.exists() {
-        serde_json::from_str(&std::fs::read_to_string(settings_path).with_context(|| format!("reading {}", settings_path.display()))?).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
-    let root_obj = root.as_object_mut().expect("just normalized to an object above");
+    update_settings_json(settings_path, |root_obj| add_claude_hook(root_obj, event_name, command, timeout_secs))
+}
+
+fn add_claude_hook(root_obj: &mut serde_json::Map<String, serde_json::Value>, event_name: &str, command: &str, timeout_secs: Option<u64>) {
     let hooks = root_obj.entry("hooks").or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() {
         *hooks = serde_json::json!({});
@@ -1548,11 +1589,6 @@ fn write_claude_hook(settings_path: &Path, event_name: &str, command: &str, time
     }
     groups.push(serde_json::json!({ "hooks": [handler] }));
     *event = serde_json::Value::Array(groups);
-
-    if let Some(parent) = settings_path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(settings_path, serde_json::to_string_pretty(&root)?).with_context(|| format!("writing {}", settings_path.display()))
 }
 
 fn write_remote_marker(path: &Path, server_url: &str, connection_id: &str, api_key: &str) -> Result<()> {
@@ -1621,7 +1657,8 @@ fn register_local_repo(path: &Path, server_url: &str, api_key: &str) -> Result<S
     Ok(local_id)
 }
 
-fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool) -> Result<String> {
+/// The caller's tenant's connections (`GET /repos`).
+fn fetch_connections(server_url: &str, api_key: &str) -> Result<Vec<RepoConnectionSummary>> {
     let mut response = ureq::get(format!("{server_url}/repos"))
         .header("Authorization", &format!("Bearer {api_key}"))
         .config()
@@ -1638,7 +1675,14 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
         anyhow::bail!("GET /repos returned {status}: {body}");
     }
     let body: serde_json::Value = response.body_mut().read_json().context("parsing GET /repos response")?;
-    let connections: Vec<RepoConnectionSummary> = body.get("connections").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default();
+    Ok(body.get("connections").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or_default())
+}
+
+/// `guest` (a repo other than AgentOps itself, see `guest_connect`): a
+/// remote that matches no connection registers a memory-only connection
+/// instead of asking or failing, since the server can't index it anyway.
+fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool, guest: bool) -> Result<String> {
+    let connections = fetch_connections(server_url, api_key)?;
     let git_remote = git_remote_url(path);
 
     // A remote-less checkout can always self-register as local-only (see
@@ -1646,7 +1690,7 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
     // connections -- only bail early here for the "has a remote, nothing
     // to match against yet" case, where sending the caller to the web app
     // is the only real recovery.
-    if connections.is_empty() && git_remote.is_some() {
+    if connections.is_empty() && git_remote.is_some() && !guest {
         anyhow::bail!("no repos are connected to your organization yet — connect one from the web app first (Repositories -> Connect a repository), then run this again");
     }
 
@@ -1676,6 +1720,11 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
     // yet) it's always safe to self-register: `register_repo`'s `local_id`
     // path (see its doc comment) exists exactly for this case, so there's
     // no need to send the caller to the web app or bail under --yes either.
+    if guest {
+        println!("No connection matches this checkout: registering it memory-only (no indexing; notes, similarity and keyword/meaning recall work, Affects links don't).");
+        return register_local_repo(path, server_url, api_key);
+    }
+
     if git_remote.is_none() {
         if yes || dialoguer::Confirm::new().with_prompt("This checkout has no git remote — register it as a local-only repo for your account? (it won't be cloned or indexed server-side; your own CLI's scans/notes will still attach to it)").default(true).interact()? {
             return register_local_repo(path, server_url, api_key);
@@ -1932,6 +1981,33 @@ fn resolve_api_key_for_remote(server_url: &str, api_key: Option<String>, yes: bo
     }
 }
 
+/// `connect --remote` in a repo other than AgentOps (see `guest_connect`).
+#[allow(clippy::too_many_arguments)]
+fn connect_guest_cmd(path: &Path, server_url: &str, api_key: Option<String>, agents: &[String], yes: bool, device_login: bool, with_hooks: bool, compress_commands: bool, no_work_recall: bool) -> Result<()> {
+    let api_key = resolve_api_key_for_remote(server_url, api_key, yes, device_login)?;
+    let home = dirs::home_dir().context("no home directory for the user-level MCP entry")?;
+    let opts = guest_connect::GuestOptions { agents, with_hooks, compress_commands, no_work_recall, home: &home };
+    let (connection_id, writes) = guest_connect::connect_guest(path, server_url, &api_key, &opts, || resolve_connection_id(path, server_url, &api_key, yes, true), |id| marker_connection_exists(server_url, &api_key, id))?;
+    println!("\nConnected to {server_url} (repo: {connection_id}) as a guest: no tracked file was changed.");
+    if !writes.excluded.is_empty() {
+        println!("  added to .git/info/exclude (local, never committed): {}", writes.excluded.join(", "));
+    }
+    for p in &writes.in_repo {
+        println!("  wrote {}", p.display());
+    }
+    for p in &writes.outside_repo {
+        println!("  wrote {} (user-level MCP entry) — restart the tool to pick it up", p.display());
+    }
+    Ok(())
+}
+
+/// Whether the marker's connection still exists: a local-only stub merged
+/// into a GitHub App connection leaves the marker on a dead id (gotcha
+/// 54243), and a reconnect must then resolve again rather than reuse it.
+fn marker_connection_exists(server_url: &str, api_key: &str, connection_id: &str) -> Result<bool> {
+    Ok(fetch_connections(server_url, api_key)?.iter().any(|c| c.id == connection_id))
+}
+
 fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents: &[String], yes: bool, device_login: bool) -> Result<()> {
     let api_key = resolve_api_key_for_remote(server_url, api_key, yes, device_login)?;
 
@@ -1943,8 +2019,8 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
     // this check a second `connect --remote` on the same local-only repo
     // would silently create a duplicate connection server-side each time.
     let connection_id = match read_remote_marker(path) {
-        Some(marker) if marker.server_url == server_url => marker.connection_id,
-        _ => resolve_connection_id(path, server_url, &api_key, yes)?,
+        Some(marker) if marker.server_url == server_url && marker_connection_exists(server_url, &api_key, &marker.connection_id)? => marker.connection_id,
+        _ => resolve_connection_id(path, server_url, &api_key, yes, false)?,
     };
 
     let agents_md_path = path.join("AGENTS.md");
@@ -2015,7 +2091,10 @@ fn connect_remote(path: &Path, server_url: &str, api_key: Option<String>, agents
 /// docs); Gemini CLI's `~/.gemini/settings.json` uses the identical
 /// `mcpServers` shape as its project-level file, just a different path.
 fn user_level_mcp_config_path(agent_id: &str) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+    user_level_mcp_config_path_in(&dirs::home_dir()?, agent_id)
+}
+
+fn user_level_mcp_config_path_in(home: &Path, agent_id: &str) -> Option<PathBuf> {
     match agent_id {
         "claude" => Some(home.join(".claude.json")),
         "cursor" => Some(home.join(".cursor").join("mcp.json")),
@@ -2066,8 +2145,16 @@ fn user_level_mcp_config_path(agent_id: &str) -> Option<PathBuf> {
 /// in these files (e.g. a user's existing Context7/Linear entries) is
 /// preserved untouched.
 fn write_user_level_mcp_entries(agent_ids: &[String], access_mode: Option<&str>, remote: Option<(&str, &str)>) {
+    match dirs::home_dir() {
+        Some(home) => write_user_level_mcp_entries_in(&home, agent_ids, access_mode, remote),
+        None => println!("WARNING: no home directory, so agentops's MCP entry wasn't registered"),
+    }
+}
+
+/// `write_user_level_mcp_entries` under `home` (a test passes a temp dir).
+fn write_user_level_mcp_entries_in(home: &Path, agent_ids: &[String], access_mode: Option<&str>, remote: Option<(&str, &str)>) {
     for agent_id in agent_ids {
-        let Some(config_path) = user_level_mcp_config_path(agent_id) else { continue };
+        let Some(config_path) = user_level_mcp_config_path_in(home, agent_id) else { continue };
         let result = if agent_id == "codex" {
             let entry = match remote {
                 Some((url, _api_key)) => codex_remote_entry(url),
@@ -2384,7 +2471,7 @@ fn usage_sync_command(path: &Path, claude_home: Option<&Path>, remote: Option<&s
     // later bare `usage sync` here needs no `--remote` again.
     if let Some(server_url) = remote {
         let api_key = device_flow_login(server_url)?;
-        let connection_id = resolve_connection_id(path, server_url, &api_key, false)?;
+        let connection_id = resolve_connection_id(path, server_url, &api_key, false, false)?;
         write_remote_marker(path, server_url, &connection_id, &api_key)?;
         let synced = usage::push_usage_remote(server_url, &connection_id, &api_key, &entries, &reports)?;
         println!("Scanned {files_scanned} session file(s), synced {synced} session/model usage row(s) to {server_url} (repo: {connection_id}).");
@@ -2720,6 +2807,55 @@ mod tests {
         assert_eq!(events.len(), 1, "session events must be copied, not skipped");
         assert!(dst.session_reports_for_repo(&without).unwrap().is_empty());
         dst.wipe_repo(&with).unwrap();
+    }
+
+    /// A server answering each request with the next of `bodies` (200,
+    /// JSON); returns its URL and the requests' first lines.
+    fn stub_server(bodies: Vec<serde_json::Value>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut lines = Vec::new();
+            for body in bodies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut got = String::new();
+                loop {
+                    let n = std::io::Read::read(&mut stream, &mut buf).unwrap();
+                    got.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    let Some((head, rest)) = got.split_once("\r\n\r\n") else { continue };
+                    let len = head.lines().find_map(|l| l.to_lowercase().strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap())).unwrap_or(0);
+                    if n == 0 || rest.len() >= len {
+                        break;
+                    }
+                }
+                lines.push(got.lines().next().unwrap_or_default().to_string());
+                let body = body.to_string();
+                std::io::Write::write_all(&mut stream, format!("HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+            }
+            lines
+        });
+        (url, handle)
+    }
+
+    #[test]
+    fn a_guest_checkout_whose_remote_matches_no_connection_registers_memory_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).status().unwrap().success());
+        git(&["init", "-q"]);
+        git(&["remote", "add", "origin", "git@github-client:SomeClient/app.git"]);
+        let other = serde_json::json!({ "connections": [{ "id": "Jesus-Glez60--agentops", "repo_url": "https://github.com/Jesus-Glez60/agentops.git" }] });
+        let registered = serde_json::json!({ "jsonrpc": "2.0", "id": 1, "result": { "content": [{ "type": "text", "text": "registered local-only repo" }] } });
+        let (url, server) = stub_server(vec![other.clone(), registered]);
+        let id = resolve_connection_id(dir.path(), &url, "k", true, true).unwrap();
+        assert!(!id.is_empty());
+        let lines = server.join().unwrap();
+        assert!(lines[0].starts_with("GET /repos") && lines[1].starts_with("POST /mcp"), "{lines:?}");
+
+        // Not a guest: the same unmatched remote under --yes still refuses.
+        let (url, _server) = stub_server(vec![other]);
+        assert!(resolve_connection_id(dir.path(), &url, "k", true, false).is_err());
+        assert!(!guest_connect::is_agentops_checkout(dir.path()));
     }
 
     fn last_hook_command(parsed: &serde_json::Value, event: &str) -> serde_json::Value {

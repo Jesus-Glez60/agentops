@@ -67,7 +67,20 @@ Other flags:
 5. Write `.context/agentops-remote.json` with `server_url`, `connection_id` and `api_key`.
 6. Run Ruler. When the marker exists, Ruler's stdio entry is skipped and the remote entries are written instead.
 
-The marker is how everything else knows the repo is remote: `docs/vault-protocol.md`, the local-notes hook, and `agentops usage sync` all check it. It holds a credential, so it must stay out of git. A checkout that uses an SSH config host alias once failed to match its connection (gotcha 53975). Merging a local-only stub into a GitHub connection leaves the marker pointing at a dead id (gotcha 54243).
+The steps above are the **full** connect, which only AgentOps' own checkout gets (its origin is `Jesus-Glez60/agentops`), or any repo with `--full`.
+
+The marker is how everything else knows the repo is remote: `docs/vault-protocol.md`, the local-notes hook, and `agentops usage sync` all check it. It holds a credential, so it must stay out of git. A checkout that uses an SSH config host alias once failed to match its connection (gotcha 53975). Merging a local-only stub into a GitHub connection leaves the marker pointing at a dead id (gotcha 54243). Since milestone 5, a reconnect checks the marker's id against `GET /repos` and resolves again if it is gone.
+
+### Guest connect (every other repo)
+
+Milestone 5 item 2 (`agentops-cli/src/guest_connect.rs`). In any other repo, a client's above all, `connect --remote` changes no tracked file, so `git status` stays clean:
+
+1. For `.context/` and `.claude/settings.local.json`, `git check-ignore` decides. A path that isn't ignored is appended to the repo's `info/exclude` (`git rev-parse --git-path`), which is local and never committed. A path git already tracks aborts the connect before anything is written. A plain folder, or one nested inside another repo, gets no exclude.
+2. The connection is resolved as above. A remote that matches no connection is registered **memory-only** (`register_repo` with a `local_id`): notes, similarity and keyword/meaning recall work, `Affects` links don't.
+3. The marker is written, then the hooks go to `.claude/settings.local.json`, the same entries the full connect puts in `settings.json`.
+4. The MCP entry is written user-level, the only write outside the repo.
+
+`AGENTS.md`/`CLAUDE.md`, `.gitignore` and Ruler are never touched. `agentops memory-off` sets `autoMemoryEnabled: false` in `settings.local.json`, or with `--user` in `~/.claude/settings.json`. Settings files that aren't valid JSON are left alone and the command fails, instead of being replaced.
 
 ### connect.sh
 
@@ -190,7 +203,7 @@ Milestone 4 item 2. A lookup of a memory the context was shown is the one use si
 
 ### Importing MEMORY.md
 
-Claude Code's own auto-memory (MEMORY.md) is imported once with `agentops import-memory` ([06-notes-and-consolidation.md](06-notes-and-consolidation.md), "Importing Claude Code's MEMORY.md"), then turned off per project with `autoMemoryEnabled: false` in `.claude/settings.local.json` (verified in the milestone 2 spike: the session's system prompt loses its memory section). Milestone 1's redirect of memory writes to `add_note` stays on as a backstop.
+Claude Code's own auto-memory (MEMORY.md) is imported once with `agentops import-memory` ([06-notes-and-consolidation.md](06-notes-and-consolidation.md), "Importing Claude Code's MEMORY.md"), then turned off per project with `agentops memory-off`, which writes `autoMemoryEnabled: false` to `.claude/settings.local.json` (verified in the milestone 2 spike: the session's system prompt loses its memory section). Milestone 1's redirect of memory writes to `add_note` stays on as a backstop.
 
 ### Plan enforcement
 
