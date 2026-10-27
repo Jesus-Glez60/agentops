@@ -736,6 +736,40 @@ impl agentops_notes::NoteClassifier for LlmAssistedClassifier<'_> {
 /// provider's tokens-per-minute budget (Groq: 12k) good for many calls.
 const CLASSIFY_BODY_MAX: usize = 1_500;
 
+/// Output tokens a memory-kind judgment may use: gpt-oss reasons before
+/// its JSON, and `groq_config`'s 512 runs out first (gotcha 387531).
+const CLASSIFY_KIND_MAX_TOKENS: u32 = 2_048;
+
+/// The kind of an imported auto-memory entry (milestone 2; milestone 5
+/// runs it on the server with the org's key): `semantic`, `episodic` or
+/// `procedural`, `None` for "none of these", and the model's confidence.
+/// The caller redacts `body` first.
+pub fn classify_memory_kind(config: &LlmConfig, title: &str, body: &str) -> Result<(Option<String>, f32)> {
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "memory_kind": { "type": "string", "enum": ["semantic", "episodic", "procedural", "unknown"] },
+            "confidence": { "type": "number" }
+        },
+        "required": ["memory_kind", "confidence"],
+        "additionalProperties": false
+    });
+    let body: String = body.chars().take(CLASSIFY_BODY_MAX).collect();
+    let prompt = format!(
+        "Classify this memory an AI coding assistant saved about a software project.\n\
+         - semantic: a fact and the reason behind it (how something works, where something is).\n\
+         - episodic: what happened, when, in what context (a session, a release, an incident).\n\
+         - procedural: a rule that must always hold (always/never do X).\n\
+         - unknown: none of these fits.\n\
+         confidence: 0 to 1. Respond with JSON only.\n\nTitle: {title}\n\nBody:\n{body}"
+    );
+    let config = LlmConfig { max_tokens: config.max_tokens.max(CLASSIFY_KIND_MAX_TOKENS), ..config.clone() };
+    let result = call_json(&config, "import_memory_classify", &prompt, schema)?;
+    let v: serde_json::Value = serde_json::from_str(&result.text).context("parsing the classifier's JSON")?;
+    let kind = v["memory_kind"].as_str().filter(|k| ["semantic", "episodic", "procedural"].contains(k)).map(str::to_string);
+    Ok((kind, v["confidence"].as_f64().unwrap_or(0.0) as f32))
+}
+
 /// A memory's class (ADR 0054), and for a temporal one the date it ends
 /// when the text names one. The title heuristic settles a progress title
 /// with no call; anything else costs one bounded call to `config`'s
@@ -1392,6 +1426,30 @@ mod tests {
 
         let result = find_symbol_by_name(&store, "demo", "run", None);
         assert!(result.is_err(), "a same-named symbol in a different repo must not match");
+    }
+
+    #[tokio::test]
+    async fn a_memory_kind_judgment_gets_room_to_reason_and_maps_unknown_to_none() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::body_partial_json(serde_json::json!({ "max_tokens": CLASSIFY_KIND_MAX_TOKENS })))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "{\"memory_kind\": \"procedural\", \"confidence\": 0.9}"}],
+                "usage": {"input_tokens": 300, "output_tokens": 40}
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "content": [{"type": "text", "text": "{\"memory_kind\": \"unknown\", \"confidence\": 0.8}"}],
+                "usage": {"input_tokens": 300, "output_tokens": 40}
+            })))
+            .mount(&server)
+            .await;
+        let config = LlmConfig { max_tokens: 512, ..mock_config(&server.uri()) };
+        assert_eq!(classify_memory_kind(&config, "Never push to main", "Always use the gate.").unwrap(), (Some("procedural".to_string()), 0.9));
+        assert_eq!(classify_memory_kind(&config, "Lunch", "Friday.").unwrap(), (None, 0.8));
     }
 
     #[tokio::test]

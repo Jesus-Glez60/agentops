@@ -741,40 +741,59 @@ pub(crate) fn default_memory_dir(project: &Path) -> Result<PathBuf> {
     Ok(home.join(".claude").join("projects").join(encoded).join("memory"))
 }
 
-/// Uses the Anthropic API (cheap tier) when `--llm-classify` is set.
+fn memory_kind(kind: Option<&str>) -> Option<MemoryKind> {
+    match kind {
+        Some("semantic") => Some(MemoryKind::Semantic),
+        Some("episodic") => Some(MemoryKind::Episodic),
+        Some("procedural") => Some(MemoryKind::Procedural),
+        _ => None,
+    }
+}
+
+/// `--llm-classify` with no server: this machine's Anthropic key (cheap tier).
 struct LlmKindClassifier {
     config: agentops_llm::LlmConfig,
 }
 
 impl KindClassifier for LlmKindClassifier {
     fn classify(&self, title: &str, body: &str) -> Result<(Option<MemoryKind>, f32)> {
-        let schema = json!({
-            "type": "object",
-            "properties": {
-                "memory_kind": { "type": "string", "enum": ["semantic", "episodic", "procedural", "unknown"] },
-                "confidence": { "type": "number" }
-            },
-            "required": ["memory_kind", "confidence"],
-            "additionalProperties": false
-        });
-        let redacted = agentops_security::redact(body).text;
-        let prompt = format!(
-            "Classify this memory an AI coding assistant saved about a software project.\n\
-             - semantic: a fact and the reason behind it (how something works, where something is).\n\
-             - episodic: what happened, when, in what context (a session, a release, an incident).\n\
-             - procedural: a rule that must always hold (always/never do X).\n\
-             - unknown: none of these fits.\n\
-             confidence: 0 to 1. Respond with JSON only.\n\nTitle: {title}\n\nBody:\n{redacted}"
-        );
-        let result = agentops_llm::call_json(&self.config, "import_memory_classify", &prompt, schema)?;
-        let v: Value = serde_json::from_str(&result.text).context("parsing the classifier's JSON")?;
-        let kind = match v["memory_kind"].as_str() {
-            Some("semantic") => Some(MemoryKind::Semantic),
-            Some("episodic") => Some(MemoryKind::Episodic),
-            Some("procedural") => Some(MemoryKind::Procedural),
-            _ => None,
-        };
-        Ok((kind, v["confidence"].as_f64().unwrap_or(0.0) as f32))
+        let (kind, confidence) = agentops_llm::classify_memory_kind(&self.config, title, &agentops_security::redact(body).text)?;
+        Ok((memory_kind(kind.as_deref()), confidence))
+    }
+}
+
+/// Least time between two server judgments: the org's Groq free tier
+/// allows 8,000 tokens a minute and a judgment costs ~650-900 (gotcha
+/// 299440), so at most 8 a minute.
+const REMOTE_CLASSIFY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(7_500);
+
+/// `--llm-classify` on a connected repo: the server judges with the org's
+/// own key (`POST /memories/classify-kind`), so no LLM key is needed here.
+/// The body is redacted before it leaves this machine.
+struct RemoteKindClassifier {
+    marker: RemoteMcpMarker,
+    last: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl KindClassifier for RemoteKindClassifier {
+    fn classify(&self, title: &str, body: &str) -> Result<(Option<MemoryKind>, f32)> {
+        if let Some(wait) = self.last.get().and_then(|t| REMOTE_CLASSIFY_INTERVAL.checked_sub(t.elapsed())) {
+            std::thread::sleep(wait);
+        }
+        self.last.set(Some(std::time::Instant::now()));
+        let url = format!("{}/memories/classify-kind", self.marker.server_url.trim_end_matches('/'));
+        let mut response = ureq::post(&url)
+            .header("Authorization", &format!("Bearer {}", self.marker.api_key))
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .send_json(json!({ "title": title, "body": agentops_security::redact(body).text }))
+            .with_context(|| format!("calling POST {url}"))?;
+        let reply: Value = response.body_mut().read_json().unwrap_or_default();
+        if !response.status().is_success() {
+            anyhow::bail!("POST {url} returned {}: {}", response.status(), reply["error"].as_str().unwrap_or_default());
+        }
+        Ok((memory_kind(reply["memory_kind"].as_str()), reply["confidence"].as_f64().unwrap_or(0.0) as f32))
     }
 }
 
@@ -785,7 +804,11 @@ pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report
         Some(d) => d.to_path_buf(),
         None => default_memory_dir(project)?,
     };
-    let llm = if llm_classify { Some(LlmKindClassifier { config: agentops_llm::LlmConfig::from_env_cheap()? }) } else { None };
+    let llm: Option<Box<dyn KindClassifier>> = match (llm_classify, read_remote_marker(project)) {
+        (false, _) => None,
+        (true, Some(marker)) => Some(Box::new(RemoteKindClassifier { marker, last: Default::default() })),
+        (true, None) => Some(Box::new(LlmKindClassifier { config: agentops_llm::LlmConfig::from_env_cheap()? })),
+    };
     let sink: Box<dyn Sink> = match read_remote_marker(project) {
         // User-level memories (milestone 5): the person's own connection on
         // the server this repo is connected to, created by the first write.
@@ -817,7 +840,7 @@ pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report
     }
 
     let (_, names) = crate::classify_scope::local_candidate_names(&[]);
-    let (records, counts) = import_counted(&memory_dir, sink.as_ref(), llm.as_ref().map(|l| l as &dyn KindClassifier), apply, retitle, &names)?;
+    let (records, counts) = import_counted(&memory_dir, sink.as_ref(), llm.as_deref(), apply, retitle, &names)?;
     let report_path = match report {
         Some(p) => p.to_path_buf(),
         None => project.join(".context").join("memory-import").join(&date).join("report.json"),

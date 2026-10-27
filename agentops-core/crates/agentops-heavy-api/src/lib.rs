@@ -298,6 +298,7 @@ fn build_router_with_tools_flag(
         .route("/repos/{id}/work-recall", post(dashboard::work_recall_json))
         .route("/repos/{id}/work-recall/replay", post(dashboard::work_recall_replay_json))
         .route("/repos/{id}/memories/classify", post(dashboard::classify_memories_json))
+        .route("/memories/classify-kind", post(dashboard::classify_memory_kind_json))
         .route("/repos/{id}/memories/class", post(dashboard::assign_memory_classes_json))
         .route("/repos/{id}/memories/scope", post(dashboard::assign_memory_scopes_json))
         .route("/repos/{id}/memories/consolidate", post(dashboard::consolidate_json))
@@ -2613,6 +2614,22 @@ mod tests {
             assert!(text(&body).contains("not a repo connection"), "{guess}: {body:?}");
         }
         assert!(!personal(mate.id).exists());
+    }
+
+    #[tokio::test]
+    async fn classify_kind_needs_the_orgs_own_llm_key() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&accounts, "dev@example.com");
+        let (_, token) = accounts.create_user_api_key(user.id, "Laptop").unwrap();
+        let teams = agentops_teams::TeamStore::open_in_memory().unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), Some(teams), test_indexing_store(), std::env::temp_dir(), None);
+        let req = Request::builder().method("POST").uri("/memories/classify-kind").header("authorization", format!("Bearer {token}")).header("content-type", "application/json").body(Body::from(json!({ "title": "t", "body": "b" }).to_string())).unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let body = body_json(resp).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("no LLM key"), "{body}");
     }
 
     #[test]

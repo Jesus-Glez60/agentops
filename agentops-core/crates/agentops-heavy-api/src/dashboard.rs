@@ -904,6 +904,38 @@ pub(crate) struct ClassifyMemoriesBody {
     limit: Option<usize>,
 }
 
+#[derive(serde::Deserialize)]
+pub(crate) struct ClassifyKindBody {
+    title: String,
+    body: String,
+}
+
+/// `POST /memories/classify-kind` -- one MEMORY.md entry's kind (semantic,
+/// episodic, procedural, or `null` for none) and the model's confidence,
+/// judged with the org's own Anthropic or Groq credential
+/// (`resolve_judge_config`), writing nothing. `import-memory --llm-classify`
+/// calls it for entries no type, prefix or heuristic settles, so the laptop
+/// needs no LLM key (milestone 5). 409 when the org has no key.
+pub(crate) async fn classify_memory_kind_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, Query(q): Query<TenantQuery>, Json(body): Json<ClassifyKindBody>) -> (StatusCode, Json<Value>) {
+    let tenant = match tenant_and_capability(&state, &user, q.tenant.as_deref()).await {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+    let config = {
+        let credentials = state.credentials.lock().unwrap();
+        crate::resolve_judge_config(&credentials, state.secrets.as_ref(), &tenant)
+    };
+    let Some(config) = config else {
+        return (StatusCode::CONFLICT, Json(json!({ "error": "this organization has no LLM key (Anthropic or Groq) to judge with" })));
+    };
+    let (provider, model) = (config.provider.name().to_string(), config.model.clone());
+    match tokio::task::spawn_blocking(move || agentops_llm::classify_memory_kind(&config, &body.title, &body.body)).await {
+        Ok(Ok((kind, confidence))) => (StatusCode::OK, Json(json!({ "memory_kind": kind, "confidence": confidence, "provider": provider, "model": model }))),
+        Ok(Err(e)) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": format!("{e:#}") }))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": format!("internal task error: {e}") }))),
+    }
+}
+
 /// Most memories one classify request judges: each may cost an LLM call,
 /// so the CLI pages through a repo instead of holding one request open.
 const CLASSIFY_PAGE_MAX: usize = 50;
