@@ -6,6 +6,13 @@
 //! context counts once. Eval sessions (`recall-eval-*`) are left out
 //! (gotcha 112998). Pins aren't claimed when shown, so their row has
 //! follows but no shown count.
+//!
+//! Sessions are also split into **meta** and **ordinary** (milestone 5
+//! item 7): a meta session read or edited AgentOps' own memory and recall
+//! code (`META_PATHS`), so what it followed says little about ordinary
+//! work. Paths come from `file_read`/`file_modified` events and work-time
+//! file cues, which only some sessions record (gotcha 195365), so meta is
+//! undercounted, never overcounted.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -17,6 +24,22 @@ use crate::hooks::MEMORY_FOLLOWED;
 
 /// Session ids `recall-eval` and `work-recall-eval` record under.
 const EVAL_SESSION_PREFIX: &str = "recall-eval-";
+
+/// Path fragments of AgentOps' memory and recall code. A session that read
+/// or edited any of them is meta. They only occur in the AgentOps repo.
+pub const META_PATHS: &[&str] = &[
+    "agentops-mcp/src/work_recall.rs",
+    "agentops-mcp/src/hooks.rs",
+    "agentops-mcp/src/proposals.rs",
+    "agentops-mcp/src/session_guide.rs",
+    "agentops-mcp/src/budget.rs",
+    "agentops-mcp/src/recall_stats.rs",
+    "agentops-retrieval/",
+    "agentops-graph/",
+    "agentops-cli/src/recall_eval.rs",
+    "agentops-cli/src/work_recall_eval.rs",
+    "agentops-cli/src/import_memory.rs",
+];
 
 /// One source × class row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -35,6 +58,33 @@ pub struct RecallStats {
     pub sessions_shown: usize,
     pub sessions_followed: usize,
     pub total_followed: usize,
+    /// Of the sessions that were shown or followed a memory, how many were
+    /// meta and how many ordinary.
+    #[serde(default)]
+    pub sessions_meta: usize,
+    #[serde(default)]
+    pub sessions_ordinary: usize,
+    /// Follows in ordinary sessions only, per source.
+    #[serde(default)]
+    pub ordinary_followed: BTreeMap<String, usize>,
+}
+
+/// The sessions of `repo` that touched `META_PATHS`.
+pub fn meta_sessions(store: &dyn GraphStore, repo: &str) -> Result<HashSet<String>> {
+    let mut meta = HashSet::new();
+    for kind in [crate::hooks::FILE_READ, "file_modified"] {
+        for e in store.session_events_for_repo(repo, Some(kind))? {
+            if META_PATHS.iter().any(|p| e.description.contains(p)) {
+                meta.insert(e.session_id);
+            }
+        }
+    }
+    for e in store.session_events_for_repo(repo, Some(crate::work_recall::WORK_CUE))? {
+        if META_PATHS.iter().any(|p| e.tool_name.contains(p)) {
+            meta.insert(e.session_id);
+        }
+    }
+    Ok(meta)
 }
 
 /// The stats for `repo`, counting only what was shown or followed at or
@@ -70,11 +120,24 @@ pub fn recall_stats(store: &dyn GraphStore, repo: &str, since: Option<&str>) -> 
         cells.entry((source, class_of(id)?)).or_default().1.insert((e.session_id.clone(), context, id));
         follow_sessions.insert(e.session_id.clone());
     }
+    let meta = meta_sessions(store, repo)?;
+    let mut ordinary_followed: BTreeMap<String, usize> = BTreeMap::new();
+    for ((source, _), (_, f)) in &cells {
+        let n = f.iter().filter(|(session, _, _)| !meta.contains(session)).count();
+        if n > 0 {
+            *ordinary_followed.entry(source.clone()).or_default() += n;
+        }
+    }
     let rows = cells.into_iter().map(|((source, memory_class), (s, f))| StatsRow { shown: (source != "pin").then_some(s.len()), followed: f.len(), source, memory_class }).collect::<Vec<_>>();
+    let sessions: HashSet<&String> = shown.iter().map(|r| &r.session_id).chain(&follow_sessions).collect();
+    let sessions_meta = sessions.iter().filter(|s| meta.contains(s.as_str())).count();
     Ok(RecallStats {
         sessions_shown: shown.iter().map(|r| &r.session_id).collect::<HashSet<_>>().len(),
         sessions_followed: follow_sessions.len(),
         total_followed: rows.iter().map(|r| r.followed).sum(),
+        sessions_meta,
+        sessions_ordinary: sessions.len() - sessions_meta,
+        ordinary_followed,
         rows,
     })
 }
@@ -90,6 +153,9 @@ pub fn render(stats: &RecallStats) -> String {
         out += &format!("| {} | {} | {shown} | {} | {rate} |\n", r.source, r.memory_class, r.followed);
     }
     out += &format!("\n{} follows; {} sessions shown memories, {} followed one.\n", stats.total_followed, stats.sessions_shown, stats.sessions_followed);
+    let ordinary: usize = stats.ordinary_followed.values().sum();
+    let by_source = stats.ordinary_followed.iter().map(|(s, n)| format!("{s} {n}")).collect::<Vec<_>>().join(", ");
+    out += &format!("Sessions: {} ordinary, {} meta (touched AgentOps' memory or recall code). Ordinary follows: {ordinary}{}.\n", stats.sessions_ordinary, stats.sessions_meta, if by_source.is_empty() { String::new() } else { format!(" ({by_source})") });
     out
 }
 
@@ -132,5 +198,25 @@ mod tests {
         assert_eq!((stats.total_followed, stats.sessions_shown, stats.sessions_followed), (4, 2, 2));
         assert!(render(&stats).contains("| prompt_seed | durable | 2 | 1 | 50.0% |"), "{}", render(&stats));
         assert!(recall_stats(&store, "r", Some("9999-01-01")).unwrap().rows.is_empty());
+        assert_eq!((stats.sessions_meta, stats.sessions_ordinary), (0, 2), "eval sessions are in neither");
+    }
+
+    #[test]
+    fn a_session_that_touched_recall_code_is_meta_and_its_follows_are_kept_out_of_the_ordinary_count() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let a = memory(&store, "a");
+        for s in ["edits-recall", "reads-retrieval", "cue-on-hooks", "other-code", "plain"] {
+            store.claim_shown("r", s, "main#0", &[a], "prompt_seed").unwrap();
+            follow(&store, s, a, "prompt_seed", None);
+        }
+        store.record_session_event("r", "edits-recall", "Edit", "/Users/x/agentops/agentops-core/crates/agentops-mcp/src/work_recall.rs", None, "file_modified").unwrap();
+        store.record_session_event("r", "reads-retrieval", "Read", "agentops-core/crates/agentops-retrieval/src/recall.rs", None, crate::hooks::FILE_READ).unwrap();
+        store.record_session_event("r", "cue-on-hooks", "file:agentops-core/crates/agentops-mcp/src/hooks.rs", "1:0.9", None, crate::work_recall::WORK_CUE).unwrap();
+        store.record_session_event("r", "other-code", "Edit", "/Users/x/agentops/apps/web/src/page.tsx", None, "file_modified").unwrap();
+        let stats = recall_stats(&store, "r", None).unwrap();
+        assert_eq!((stats.sessions_meta, stats.sessions_ordinary), (3, 2));
+        assert_eq!(stats.ordinary_followed.get("prompt_seed"), Some(&2));
+        assert_eq!(stats.total_followed, 5, "the per-source rows still count every session");
+        assert!(render(&stats).contains("Sessions: 2 ordinary, 3 meta") && render(&stats).contains("Ordinary follows: 2 (prompt_seed 2)"), "{}", render(&stats));
     }
 }

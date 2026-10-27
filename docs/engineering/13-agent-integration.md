@@ -198,7 +198,7 @@ Milestone 4 item 2. A lookup of a memory the context was shown is the one use si
 - **Shown** means a row in `recall_shown` under the context's claim key (a subagent's id, or `main#<n>`), else a current pin.
 - **Recorded as** a `memory_followed` session event: `id N source S context C`, with `node_id` N. The source is the claim's: `prompt_seed`, `subagent_seed`, `file_cue`, `error_cue`, or `pin`.
 - **Subagents.** These three tools are forwarded from subagents too, unlike other agentops calls (`is_relevant`), so a follow of a subagent seed lands in the subagent's context. This needs the reinstalled CLI.
-- **Reading it.** `agentops recall-stats [--remote] [--since YYYY-MM-DD]` (route `GET /repos/{id}/recall/stats`) prints, per source and memory class, the memories shown, the ones followed and the rate. It counts distinct `(session, context, memory)` triples and leaves out `recall-eval-*` sessions. Pins have follows but no shown count.
+- **Reading it.** `agentops recall-stats [--remote] [--since YYYY-MM-DD]` (route `GET /repos/{id}/recall/stats`) prints, per source and memory class, the memories shown, the ones followed and the rate. It counts distinct `(session, context, memory)` triples and leaves out `recall-eval-*` sessions. Pins have follows but no shown count. Since milestone 5 it also splits sessions into **meta** (one that read or edited AgentOps' own memory or recall code, `recall_stats::META_PATHS`) and **ordinary**, and gives ordinary sessions' follows per source; replays and work-evals write no sessions. Meta is undercounted, since only some sessions record their file events (gotcha 195365).
 - **When to revisit reinforcement:** at 200 follows from at least 20 ordinary sessions (`handoffs/m3b-eval.md`).
 
 ### Importing MEMORY.md
