@@ -52,6 +52,7 @@ mod indexing;
 mod libraries_http;
 mod linear_webhook;
 mod mcp_http;
+mod personal;
 mod rate_limit;
 mod team;
 mod tenant_repo;
@@ -2571,6 +2572,56 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["result"]["isError"], false, "{body:?}");
         assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("no scans recorded yet"), "{body:?}");
+    }
+
+    #[tokio::test]
+    async fn a_personal_note_lands_in_the_callers_own_personal_tenant_and_a_teammate_can_never_reach_it() {
+        let (store, secrets) = test_state();
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (owner, owner_token) = signup(&accounts, "owner@example.com");
+        let (mate, _) = signup(&accounts, "mate@example.com");
+        accounts.switch_tenant(mate.id, &owner.tenant).unwrap();
+        let (_, mate_key) = accounts.create_user_api_key(mate.id, "Laptop").unwrap();
+        let checkouts = tempfile::tempdir().unwrap();
+        let app = build_router(store, secrets, None, None, None, PathBuf::from("unused-docbrain-dir"), Some(accounts), None, test_indexing_store(), checkouts.path().to_path_buf(), None);
+        let call = |token: &str, name: &str, arguments: Value, n: i64| {
+            let mut req = mcp_request("tools/call", json!({ "name": name, "arguments": arguments }), n);
+            req.headers_mut().insert("authorization", format!("Bearer {token}").parse().unwrap());
+            let app = app.clone();
+            async move { body_json(app.oneshot(req).await.unwrap()).await }
+        };
+        let text = |body: &Value| body["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string();
+        let personal = |user_id: i64| crate::indexing::checkout_path(checkouts.path(), &crate::personal::personal_tenant(user_id), "personal");
+
+        // A read before any write creates nothing.
+        let body = call(&owner_token, "status", json!({ "path": "personal" }), 1).await;
+        assert!(text(&body).contains("no personal memories yet"), "{body:?}");
+        assert!(!personal(owner.id).exists());
+
+        let body = call(&owner_token, "add_note", json!({ "personal": true, "path": "some-repo", "title": "Prefers terse answers", "body": "The user wants short replies." }), 2).await;
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+        let notes = crate::indexing::notes_dir_for_checkout(&personal(owner.id));
+        assert!(text(&body).contains(&notes.display().to_string()), "written to the owner's personal notes folder: {body:?}");
+        assert_eq!(call(&owner_token, "status", json!({ "path": "personal" }), 3).await["result"]["isError"], false);
+
+        // The teammate shares the org, and still only ever reaches their own.
+        let body = call(&mate_key, "status", json!({ "path": "personal" }), 4).await;
+        assert!(text(&body).contains("no personal memories yet"), "{body:?}");
+        for guess in [format!("personal--u{}", owner.id), "personal".to_string() + "--" + &crate::personal::personal_tenant(owner.id), format!("u{}", owner.id)] {
+            let body = call(&mate_key, "status", json!({ "path": guess }), 5).await;
+            assert_eq!(body["result"]["isError"], true, "{guess}: {body:?}");
+            assert!(text(&body).contains("not a repo connection"), "{guess}: {body:?}");
+        }
+        assert!(!personal(mate.id).exists());
+    }
+
+    #[test]
+    fn a_personal_tenant_never_looks_like_an_org_tenant() {
+        let accounts = agentops_accounts::AccountStore::open_in_memory().unwrap();
+        let (user, _) = signup(&accounts, "dev@example.com");
+        assert!(user.tenant.chars().all(|c| c.is_ascii_hexdigit()), "{}", user.tenant);
+        assert!(!crate::personal::personal_tenant(7).chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(agentops_repo_access::store::is_local_only_url(&format!("{}personal", agentops_repo_access::store::LOCAL_ONLY_URL_PREFIX)));
     }
 
     #[tokio::test]

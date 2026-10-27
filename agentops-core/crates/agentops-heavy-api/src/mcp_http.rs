@@ -295,8 +295,28 @@ async fn handle_tools_call(state: &AppState, caller: &TenantCaller, id: Value, p
         return ok(id, json!({ "content": [{ "type": "text", "text": message }], "isError": true }));
     }
 
+    // `add_note personal: true` is a fact about the person, not the repo:
+    // it goes to the caller's personal connection (milestone 5 item 4).
+    if let Some(obj) = arguments.as_object_mut() {
+        if obj.remove("personal").and_then(|v| v.as_bool()) == Some(true) && name == "add_note" {
+            obj.insert("path".into(), json!(crate::personal::PERSONAL_ALIAS));
+        }
+    }
+
     if let Some(connection_ref) = arguments.get("path").and_then(|v| v.as_str()).map(str::to_string) {
-        match resolve_connection_path(state, &caller.tenant, &connection_ref) {
+        let resolved = if connection_ref == crate::personal::PERSONAL_ALIAS {
+            match caller.user_id {
+                Some(user_id) => match crate::personal::personal_path(state, user_id, NOTES_TOOLS.contains(&name)) {
+                    Ok(Some(path)) => Ok(path),
+                    Ok(None) => Err("you have no personal memories yet; add_note with personal: true records the first".to_string()),
+                    Err(message) => Err(message),
+                },
+                None => Err("personal memories need a signed-in user or a personal API key".to_string()),
+            }
+        } else {
+            resolve_connection_path(state, &caller.tenant, &connection_ref)
+        };
+        match resolved {
             Ok(resolved) => {
                 arguments["path"] = json!(resolved.display().to_string());
                 // Server-set, never caller-set (refused above): the

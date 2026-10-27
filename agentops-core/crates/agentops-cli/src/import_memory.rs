@@ -474,6 +474,7 @@ pub(crate) struct ImportCounts {
 /// Classifies and (with `apply`) writes every entry in `memory_dir`.
 /// Returns one record per entry: entry files sorted by name, then the
 /// bullets written in MEMORY.md in line order.
+#[cfg(test)]
 pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindClassifier>, apply: bool, retitle: bool) -> Result<Vec<Record>> {
     Ok(import_counted(memory_dir, sink, llm, apply, retitle, &[])?.0)
 }
@@ -658,6 +659,7 @@ fn description_title(description: &str) -> Option<String> {
 /// Counts and warnings, plus the pin block the imported rules add (their
 /// rule lines, which the spec asks to see with its size). No other entry
 /// text, so everything but the pin block can be quoted safely.
+#[cfg(test)]
 pub(crate) fn summary_markdown(records: &[Record], apply: bool) -> String {
     summary_markdown_counted(records, apply, None)
 }

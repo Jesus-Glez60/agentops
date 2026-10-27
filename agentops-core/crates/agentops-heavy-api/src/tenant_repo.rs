@@ -30,6 +30,9 @@ use crate::AppState;
 #[derive(Clone)]
 pub(crate) struct TenantCaller {
     pub(crate) tenant: String,
+    /// The account behind the session or key: the only way to reach its
+    /// personal connection (`personal`).
+    pub(crate) user_id: Option<i64>,
 }
 
 /// Session-first, then a per-user API key -- **not** the instance-wide
@@ -62,10 +65,10 @@ fn resolve_tenant_caller(state: &AppState, token: &str) -> Option<TenantCaller> 
     let accounts = state.accounts.as_ref()?;
     let accounts = accounts.lock().unwrap();
     if let Ok(user) = accounts.verify_session(token) {
-        return Some(TenantCaller { tenant: user.tenant });
+        return Some(TenantCaller { tenant: user.tenant, user_id: Some(user.id) });
     }
-    if let Ok(Some((_user_id, tenant))) = accounts.verify_user_api_key(token) {
-        return Some(TenantCaller { tenant });
+    if let Ok(Some((user_id, tenant))) = accounts.verify_user_api_key(token) {
+        return Some(TenantCaller { tenant, user_id: Some(user_id) });
     }
     None
 }
