@@ -242,6 +242,11 @@ enum Command {
         /// their description (kept id, edges and tags). With `--apply`.
         #[arg(long)]
         retitle: bool,
+        /// With --apply, back up the memory directory here instead of the
+        /// project's `.context/memory-backup/<date>/` (milestone 5: backups
+        /// of another repo's memories live outside every repo).
+        #[arg(long)]
+        backup_dir: Option<PathBuf>,
     },
     /// Links every gotcha, decision and note to the memories it reads most
     /// like (`SimilarTo` edges, ADR 0051), embedding any that has no vector
@@ -877,7 +882,7 @@ fn main() -> Result<()> {
         Command::RecallStats { path, remote, since } => recall_eval::stats(&path, remote, since.as_deref()),
         Command::ClassifyMemories { path, apply, scope: true, hosts, .. } => classify_scope::run(&path, apply, &hosts),
         Command::ClassifyMemories { path, apply, per_minute, retry_failed, llm, .. } => classify_memories::run(&path, apply, per_minute, retry_failed, llm),
-        Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle),
+        Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle, backup_dir } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle, backup_dir.as_deref()),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
         }

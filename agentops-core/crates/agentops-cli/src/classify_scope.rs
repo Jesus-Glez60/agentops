@@ -48,9 +48,7 @@ pub(crate) fn run(path: &Path, apply: bool, extra_hosts: &[String]) -> Result<()
         return Ok(());
     }
 
-    let this_host = crate::hook_capture::hostname().as_deref().and_then(agentops_mcp::hooks::normalize_host);
-    let ssh_config = dirs::home_dir().map(|h| h.join(".ssh").join("config")).and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
-    let names = candidate_names(this_host.as_deref(), &ssh_config, extra_hosts);
+    let (this_host, names) = local_candidate_names(extra_hosts);
     anyhow::ensure!(!names.is_empty(), "no candidate host names: no hostname, no ~/.ssh/config aliases and no --host");
 
     let mut proposals = Vec::new();
@@ -82,6 +80,15 @@ pub(crate) fn run(path: &Path, apply: bool, extra_hosts: &[String]) -> Result<()
     std::fs::write(&md, render(&proposals, &names, this_host.as_deref()))?;
     println!("{} of {offset} memories mention one of {} host names. Review {} (edit {} to change a proposal), then run with --apply.", proposals.len(), names.len(), md.display(), saved.display());
     Ok(())
+}
+
+/// This machine's normalized hostname, and `candidate_names` from it and
+/// the user's `~/.ssh/config`.
+pub(crate) fn local_candidate_names(extra_hosts: &[String]) -> (Option<String>, Vec<String>) {
+    let this_host = crate::hook_capture::hostname().as_deref().and_then(agentops_mcp::hooks::normalize_host);
+    let ssh_config = dirs::home_dir().map(|h| h.join(".ssh").join("config")).and_then(|p| std::fs::read_to_string(p).ok()).unwrap_or_default();
+    let names = candidate_names(this_host.as_deref(), &ssh_config, extra_hosts);
+    (this_host, names)
 }
 
 /// The names to look for, normalized and deduplicated: this machine's,

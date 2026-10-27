@@ -1,7 +1,8 @@
 //! `agentops import-memory`: imports a Claude Code auto-memory directory
 //! (MEMORY.md plus one file per entry) into AgentOps (milestone 2 of the
 //! cue-driven memory work). Without `--apply` it changes nothing and only
-//! writes the report.
+//! writes the report. Entries written directly in MEMORY.md, one top-level
+//! bullet each, are imported too (milestone 5), with the same records.
 //!
 //! Every entry is classified into a memory kind, first match wins:
 //! frontmatter `type` (top level or under `metadata`), then the file-name
@@ -129,6 +130,87 @@ fn index_lines(memory_md: &str) -> HashMap<String, (usize, String)> {
             Some((line[start..end].to_string(), (i + 1, line.to_string())))
         })
         .collect()
+}
+
+/// A `- [Title](file.md)` index line: a link to an entry file.
+fn is_index_link(line: &str) -> bool {
+    let Some(start) = line.find("](").map(|i| i + 2) else { return false };
+    line[start..].find(')').is_some_and(|end| {
+        let target = &line[start..start + end];
+        target.ends_with(".md") && !target.contains("://")
+    })
+}
+
+/// Entries written directly in MEMORY.md: each top-level bullet that isn't
+/// an index link, with its indented sub-bullets as part of the body and
+/// the nearest `##` heading as context. Index lines' own sub-bullets
+/// describe the linked file and are not entries. Returns the entries
+/// (with their line number) and the lines that are neither: prose a
+/// person should look at, counted rather than dropped silently.
+fn inline_entries(memory_md: &str) -> (Vec<(usize, Entry)>, usize) {
+    let mut entries: Vec<(usize, Entry)> = Vec::new();
+    let mut unparsed = 0;
+    let mut heading: Option<String> = None;
+    // The open bullet: its line and lines, or `None` under an index line.
+    let mut open: Option<(usize, Vec<String>)> = None;
+    let mut under_index = false;
+    let close = |open: &mut Option<(usize, Vec<String>)>, heading: &Option<String>, entries: &mut Vec<(usize, Entry)>| {
+        if let Some((n, lines)) = open.take() {
+            let mut body = lines.join("\n");
+            if let Some(h) = heading {
+                body.push_str(&format!("\n\nContext: {h}"));
+            }
+            let first = lines.first().cloned().unwrap_or_default();
+            entries.push((n, Entry { file: format!("MEMORY.md#L{n}"), index_line: Some(first), body, ..Default::default() }));
+        }
+    };
+    for (i, line) in memory_md.lines().enumerate() {
+        let n = i + 1;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(text) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+            close(&mut open, &heading, &mut entries);
+            under_index = is_index_link(line);
+            if !under_index {
+                open = Some((n, vec![text.trim().to_string()]));
+            }
+            continue;
+        }
+        if line.starts_with(' ') || line.starts_with('\t') {
+            match &mut open {
+                Some((_, lines)) => lines.push(line.trim().to_string()),
+                None if under_index => {}
+                None => unparsed += 1,
+            }
+            continue;
+        }
+        close(&mut open, &heading, &mut entries);
+        under_index = false;
+        if let Some(h) = line.strip_prefix("## ") {
+            heading = Some(h.trim().to_string());
+        } else if !line.starts_with('#') {
+            unparsed += 1;
+        }
+    }
+    close(&mut open, &heading, &mut entries);
+    (entries, unparsed)
+}
+
+/// Entries MEMORY.md and its directory should yield, counted by line type
+/// independently of the parsers: each entry file, and each top-level
+/// bullet that isn't an index link. Records out must equal this.
+fn expected_entries(memory_dir: &Path) -> Result<usize> {
+    let files = std::fs::read_dir(memory_dir)?.filter_map(|e| e.ok()).filter(|e| e.path().extension().is_some_and(|x| x == "md") && e.file_name() != "MEMORY.md").count();
+    let md = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap_or_default();
+    let bullets = md.lines().filter(|l| (l.starts_with("- ") || l.starts_with("* ")) && !is_index_link(l)).count();
+    Ok(files + bullets)
+}
+
+/// An inline entry's title: its first sentence.
+fn inline_title(first_line: &str) -> Option<String> {
+    let sentence = first_line.split_once(". ").map_or(first_line, |(s, _)| s);
+    description_title(sentence.trim_start_matches("**").replace("**", "").trim())
 }
 
 /// How an entry was classified, before any write.
@@ -331,6 +413,10 @@ pub(crate) struct Record {
     /// For a pinned rule: the line its pin shows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rule_line: Option<String>,
+    /// Host names (this machine, `~/.ssh/config` aliases) the entry
+    /// mentions: a scope proposal, never applied by the import.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) scope_hosts: Vec<String>,
 }
 
 /// The rule a procedural entry pins: its one-line description, else its
@@ -363,10 +449,40 @@ fn note_body(entry: &Entry, kind: Option<MemoryKind>, mtime_date: &str) -> Strin
     body.trim().to_string()
 }
 
+/// One entry to import: from an entry file or a MEMORY.md bullet.
+struct Pending {
+    entry: Entry,
+    source_file: String,
+    source_line: Option<usize>,
+    title: String,
+    /// The title when `title` is taken by an earlier entry.
+    fallback_title: String,
+    /// The title an earlier import may have used: an entry file's slug.
+    /// An inline entry has none, so it's only ever found under its title.
+    legacy_title: Option<String>,
+    mtime_date: String,
+}
+
+/// What an import found besides its records.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct ImportCounts {
+    pub(crate) expected: usize,
+    /// MEMORY.md lines that are neither an entry, an index line nor a heading.
+    pub(crate) unparsed_lines: usize,
+}
+
 /// Classifies and (with `apply`) writes every entry in `memory_dir`.
-/// Returns one record per entry file, sorted by file name.
+/// Returns one record per entry: entry files sorted by name, then the
+/// bullets written in MEMORY.md in line order.
 pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindClassifier>, apply: bool, retitle: bool) -> Result<Vec<Record>> {
-    let index = std::fs::read_to_string(memory_dir.join("MEMORY.md")).map(|s| index_lines(&s)).unwrap_or_default();
+    Ok(import_counted(memory_dir, sink, llm, apply, retitle, &[])?.0)
+}
+
+/// `import`, with the independent entry count and scope proposals for the
+/// host `names` given.
+pub(crate) fn import_counted(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindClassifier>, apply: bool, retitle: bool, names: &[String]) -> Result<(Vec<Record>, ImportCounts)> {
+    let memory_md = std::fs::read_to_string(memory_dir.join("MEMORY.md")).unwrap_or_default();
+    let index = index_lines(&memory_md);
     let mut files: Vec<PathBuf> = std::fs::read_dir(memory_dir)
         .with_context(|| format!("reading {}", memory_dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -375,7 +491,7 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
     files.sort();
 
     let mut records = Vec::new();
-    let mut titles_used = std::collections::HashSet::new();
+    let mut pending = Vec::new();
     for path in files {
         let file = path.file_name().unwrap().to_string_lossy().to_string();
         let source_line = index.get(&file).map(|(line, _)| *line);
@@ -395,20 +511,37 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
         // title, so that's the title (F55). Memories imported before carry
         // the slug, and are found under it below.
         let slug_title = entry.name.clone().unwrap_or_else(|| file.trim_end_matches(".md").to_string());
-        let mut title = entry.description.as_deref().and_then(description_title).unwrap_or_else(|| slug_title.clone());
-        // Two entries sharing a description would share a natural key, and
-        // the second would read as already imported instead of a duplicate.
-        if !titles_used.insert(title.clone()) {
-            entry.warnings.push("description shared with an earlier entry; titled by its name".into());
-            title = slug_title.clone();
+        let title = entry.description.as_deref().and_then(description_title).unwrap_or_else(|| slug_title.clone());
+        let mtime_date = std::fs::metadata(&path).and_then(|m| m.modified()).map(utc_date).unwrap_or_default();
+        pending.push(Pending { entry, source_file: file, source_line, title, fallback_title: slug_title.clone(), legacy_title: Some(slug_title), mtime_date });
+    }
+    let (inline, unparsed_lines) = inline_entries(&memory_md);
+    let md_mtime = std::fs::metadata(memory_dir.join("MEMORY.md")).and_then(|m| m.modified()).map(utc_date).unwrap_or_default();
+    for (n, entry) in inline {
+        let title = entry.index_line.as_deref().and_then(inline_title).unwrap_or_else(|| format!("MEMORY.md line {n}"));
+        pending.push(Pending { source_file: entry.file.clone(), source_line: Some(n), fallback_title: format!("{title} (MEMORY.md L{n})"), legacy_title: None, title, mtime_date: md_mtime.clone(), entry });
+    }
+
+    let mut titles_used = std::collections::HashSet::new();
+    let mut slugs_used = std::collections::HashSet::new();
+    for Pending { mut entry, source_file: file, source_line, mut title, fallback_title, legacy_title, mtime_date } in pending {
+        // Two entries sharing a title would share a natural key, and the
+        // second would read as already imported instead of a duplicate; two
+        // whose titles differ only in punctuation would share a note file
+        // (gotchas 195360, 387595).
+        if !titles_used.insert(title.clone()) | !slugs_used.insert(agentops_mcp::slug(&title)) {
+            entry.warnings.push(format!("title shared with an earlier entry; titled {fallback_title:?}"));
+            title = fallback_title;
+            titles_used.insert(title.clone());
+            slugs_used.insert(agentops_mcp::slug(&title));
         }
+        let slug_title = legacy_title.unwrap_or_else(|| title.clone());
         if entry.body.is_empty() && entry.description.is_none() {
             records.push(skipped(&file, source_line, &title, [entry.warnings, vec!["empty entry".into()]].concat()));
             continue;
         }
         let classified = classify(&entry, llm)?;
         let entry_for_rule = Entry { description: entry.description.clone(), body: entry.body.clone(), ..Default::default() };
-        let mtime_date = std::fs::metadata(&path).and_then(|m| m.modified()).map(utc_date).unwrap_or_default();
         let body = note_body(&entry, classified.memory_kind, &mtime_date);
         let note_type = match classified.memory_kind {
             Some(MemoryKind::Semantic) if classified.needs_review.is_none() => classified.note_type,
@@ -455,6 +588,7 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
             similar_to: preview.similar_to.clone(),
             warnings: entry.warnings,
             rule_line: None,
+            scope_hosts: crate::classify_scope::mentioned(&format!("{title}\n{body}"), names),
         };
         if preview.already_exists {
             record.action = "skip";
@@ -495,11 +629,11 @@ pub(crate) fn import(memory_dir: &Path, sink: &dyn Sink, llm: Option<&dyn KindCl
         record.rule_line = pin.then(|| rule_line(&entry_for_rule));
         records.push(record);
     }
-    Ok(records)
+    Ok((records, ImportCounts { expected: expected_entries(memory_dir)?, unparsed_lines }))
 }
 
 fn skipped(file: &str, source_line: Option<usize>, title: &str, warnings: Vec<String>) -> Record {
-    Record { source_file: file.into(), source_line, title: title.into(), signal: "none", memory_kind: None, node_kind: None, confidence: None, action: "skip", node_id: None, duplicate_of: None, pinned: false, similar_to: Vec::new(), warnings, rule_line: None }
+    Record { source_file: file.into(), source_line, title: title.into(), signal: "none", memory_kind: None, node_kind: None, confidence: None, action: "skip", node_id: None, duplicate_of: None, pinned: false, similar_to: Vec::new(), warnings, rule_line: None, scope_hosts: Vec::new() }
 }
 
 /// Longest title taken from a description. Longer ones are cut at the
@@ -525,6 +659,15 @@ fn description_title(description: &str) -> Option<String> {
 /// rule lines, which the spec asks to see with its size). No other entry
 /// text, so everything but the pin block can be quoted safely.
 pub(crate) fn summary_markdown(records: &[Record], apply: bool) -> String {
+    summary_markdown_counted(records, apply, None)
+}
+
+/// Most scope proposals a summary lists (gotcha 354625: name matching
+/// over-proposes); the rest are counted.
+const SCOPE_SHOWN_MAX: usize = 10;
+
+/// `summary_markdown`, with the import's independent entry count.
+pub(crate) fn summary_markdown_counted(records: &[Record], apply: bool, counts: Option<&ImportCounts>) -> String {
     let by = |f: &dyn Fn(&Record) -> String| -> BTreeMap<String, usize> {
         let mut m = BTreeMap::new();
         for r in records {
@@ -533,7 +676,14 @@ pub(crate) fn summary_markdown(records: &[Record], apply: bool) -> String {
         m
     };
     let table = |title: &str, m: BTreeMap<String, usize>| format!("## {title}\n\n{}\n", m.iter().map(|(k, v)| format!("- {k}: {v}")).collect::<Vec<_>>().join("\n"));
-    let mut out = format!("# MEMORY.md import ({})\n\n{} entries, {} records.\n\n", if apply { "applied" } else { "dry run" }, records.len(), records.len());
+    let entries = counts.map_or(records.len(), |c| c.expected);
+    let mut out = format!("# MEMORY.md import ({})\n\n{entries} entries, {} records.\n\n", if apply { "applied" } else { "dry run" }, records.len());
+    if entries != records.len() {
+        out.push_str(&format!("**Entries in ({entries}) and records out ({}) differ: an entry was lost or doubled.**\n\n", records.len()));
+    }
+    if let Some(c) = counts.filter(|c| c.unparsed_lines > 0) {
+        out.push_str(&format!("MEMORY.md has {} unparsed lines (prose that is neither an entry, an index line nor a heading); nothing was made of them.\n\n", c.unparsed_lines));
+    }
     out.push_str(&table("By action", by(&|r| r.action.to_string())));
     out.push_str(&table("By memory kind", by(&|r| r.memory_kind.map_or("unclassified".into(), |k| k.as_str().to_string()))));
     out.push_str(&table("By signal", by(&|r| r.signal.to_string())));
@@ -553,6 +703,12 @@ pub(crate) fn summary_markdown(records: &[Record], apply: bool) -> String {
     out.push_str(&format!("\n## Pinned rules ({} rules, {size} characters, budget {budget})\n\n```\n{block}```\n", pins.len()));
     if !cut.is_empty() {
         out.push_str(&format!("\n**Over the pin budget: these would be cut** (named in the pin block, never dropped silently): {}\n", cut.join(", ")));
+    }
+    let mut scoped: Vec<&Record> = records.iter().filter(|r| !r.scope_hosts.is_empty()).collect();
+    scoped.sort_by(|a, b| b.scope_hosts.len().cmp(&a.scope_hosts.len()).then(a.source_file.cmp(&b.source_file)));
+    out.push_str(&format!("\n## Scope proposals ({} of {}, never applied)\n\n", scoped.len().min(SCOPE_SHOWN_MAX), scoped.len()));
+    for r in scoped.iter().take(SCOPE_SHOWN_MAX) {
+        out.push_str(&format!("- `{}`: {}\n", r.source_file, r.scope_hosts.join(", ")));
     }
     let warnings: Vec<String> = records.iter().flat_map(|r| r.warnings.iter().map(move |w| format!("- `{}`: {w}", r.source_file))).collect();
     out.push_str(&format!("\n## Warnings ({})\n\n{}\n", warnings.len(), if warnings.is_empty() { "None.".to_string() } else { warnings.join("\n") }));
@@ -621,7 +777,7 @@ impl KindClassifier for LlmKindClassifier {
 }
 
 /// The `import-memory` command.
-pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report: Option<&Path>, llm_classify: bool, retitle: bool) -> Result<()> {
+pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report: Option<&Path>, llm_classify: bool, retitle: bool, backup_dir: Option<&Path>) -> Result<()> {
     let memory_dir = match memory_dir {
         Some(d) => d.to_path_buf(),
         None => default_memory_dir(project)?,
@@ -639,7 +795,7 @@ pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report
     };
     let date = utc_date(std::time::SystemTime::now());
     if apply {
-        let backup = unique_dir(&project.join(".context").join("memory-backup").join(&date));
+        let backup = unique_dir(&backup_dir.map(Path::to_path_buf).unwrap_or_else(|| project.join(".context").join("memory-backup").join(&date)));
         std::fs::create_dir_all(&backup)?;
         for entry in std::fs::read_dir(&memory_dir)? {
             let path = entry?.path();
@@ -650,7 +806,8 @@ pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report
         println!("backed up {} to {}", memory_dir.display(), backup.display());
     }
 
-    let records = import(&memory_dir, sink.as_ref(), llm.as_ref().map(|l| l as &dyn KindClassifier), apply, retitle)?;
+    let (_, names) = crate::classify_scope::local_candidate_names(&[]);
+    let (records, counts) = import_counted(&memory_dir, sink.as_ref(), llm.as_ref().map(|l| l as &dyn KindClassifier), apply, retitle, &names)?;
     let report_path = match report {
         Some(p) => p.to_path_buf(),
         None => project.join(".context").join("memory-import").join(&date).join("report.json"),
@@ -659,11 +816,12 @@ pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(&report_path, serde_json::to_string_pretty(&records)?)?;
-    let summary = summary_markdown(&records, apply);
+    let summary = summary_markdown_counted(&records, apply, Some(&counts));
     let summary_path = report_path.with_file_name("summary.md");
     std::fs::write(&summary_path, &summary)?;
     println!("{summary}");
     println!("report: {}\nsummary: {}", report_path.display(), summary_path.display());
+    anyhow::ensure!(counts.expected == records.len(), "{} entries but {} records: see {}", counts.expected, records.len(), summary_path.display());
     Ok(())
 }
 
@@ -810,6 +968,71 @@ mod tests {
     /// file. Entries in equals records out; the dry run writes nothing;
     /// `--apply` twice creates nodes once; the originals are untouched.
     #[test]
+    fn inline_bullets_are_entries_with_their_sub_bullets_and_heading_and_prose_is_counted() {
+        let md = "# Memory\n\nSome intro prose.\n\n## Deploys\n- Deploys go through push-to-main. The gate runs first.\n  - rollbacks are automatic\n- [Linked](linked_file.md)\n  - describes the linked file\n* Never force-push main\n\n## Data\n- The pool runs out at 50 clients\n";
+        let (entries, unparsed) = inline_entries(md);
+        assert_eq!(unparsed, 1, "the intro line");
+        let lines: Vec<usize> = entries.iter().map(|(n, _)| *n).collect();
+        assert_eq!(lines, vec![6, 10, 13]);
+        assert_eq!(entries[0].1.body, "Deploys go through push-to-main. The gate runs first.\n- rollbacks are automatic\n\nContext: Deploys");
+        assert_eq!(entries[0].1.file, "MEMORY.md#L6");
+        assert!(entries.iter().all(|(_, e)| !e.body.contains("describes the linked file")), "an index line's notes aren't an entry");
+        assert_eq!(inline_title("Deploys go through push-to-main. The gate runs first."), Some("Deploys go through push-to-main".into()));
+        assert_eq!(inline_title("**Bold** rule here"), Some("Bold rule here".into()));
+        let (none, _) = inline_entries("- a fact with no heading\n");
+        assert_eq!(none[0].1.body, "a fact with no heading");
+    }
+
+    #[test]
+    fn an_inline_memory_md_imports_entry_by_entry_once_with_shared_titles_kept_apart() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("app.py"), "def app():\n    pass\n").unwrap();
+        agentops_mcp::scan_and_persist(repo.path(), false).unwrap();
+        let memory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            memory.path().join("MEMORY.md"),
+            "# Memory\n\n## Rules\n- Never push to main without the gate\n- Never push to main without the gate. Second copy, other reason: releases.\n- Never push to main, without the gate!\n\n## Facts\n- The pool runs out at 50 clients under load.\nA stray paragraph.\n- [file](entry.md)\n",
+        )
+        .unwrap();
+        std::fs::write(memory.path().join("entry.md"), "---\nname: entry\ndescription: a linked entry file\ntype: project\n---\n\nIt happened.\n").unwrap();
+        let sink = LocalSink { repo: repo.path().to_path_buf() };
+        let (dry, counts) = import_counted(memory.path(), &sink, None, false, false, &["thedamnserver".to_string()]).unwrap();
+        assert_eq!((dry.len(), counts.expected, counts.unparsed_lines), (5, 5, 1), "{dry:#?}");
+        let titles: Vec<&str> = dry.iter().map(|r| r.title.as_str()).collect();
+        assert_eq!(titles.iter().collect::<std::collections::HashSet<_>>().len(), 5, "every title distinct: {titles:?}");
+        let slugs: std::collections::HashSet<String> = titles.iter().map(|t| agentops_mcp::slug(t)).collect();
+        assert_eq!(slugs.len(), 5, "no two share a note file: {titles:?}");
+        assert!(dry.iter().filter(|r| r.source_file.starts_with("MEMORY.md#L")).all(|r| r.signal != "frontmatter" && r.source_line.is_some()));
+
+        let store = agentops_mcp::open_store(repo.path()).unwrap();
+        let name = agentops_mcp::repo_name(repo.path());
+        let memories = || agentops_graph::similarity::MEMORY_KINDS.iter().map(|&k| store.nodes_by_kind(&name, k).unwrap().len()).sum::<usize>();
+        let (first, _) = import_counted(memory.path(), &sink, None, true, false, &[]).unwrap();
+        let created = memories();
+        assert_eq!(created, first.iter().filter(|r| r.action != "duplicate").count(), "{first:#?}");
+        let (second, _) = import_counted(memory.path(), &sink, None, true, false, &[]).unwrap();
+        assert_eq!(memories(), created, "a re-run creates nothing");
+        assert!(second.iter().all(|r| matches!(r.action, "skip" | "duplicate")), "{second:#?}");
+        let summary = summary_markdown_counted(&second, true, Some(&counts));
+        assert!(summary.contains("5 entries, 5 records") && summary.contains("1 unparsed lines") && !summary.contains("50 clients"), "{summary}");
+    }
+
+    #[test]
+    fn a_scope_proposal_names_the_hosts_an_entry_mentions_and_is_never_applied() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(repo.path().join("app.py"), "def app():\n    pass\n").unwrap();
+        agentops_mcp::scan_and_persist(repo.path(), false).unwrap();
+        let memory = tempfile::tempdir().unwrap();
+        std::fs::write(memory.path().join("MEMORY.md"), "- The CI runner on build-box needs docker\n- Unrelated fact about colors\n").unwrap();
+        let sink = LocalSink { repo: repo.path().to_path_buf() };
+        let (records, counts) = import_counted(memory.path(), &sink, None, false, false, &["build-box".to_string()]).unwrap();
+        assert_eq!(records[0].scope_hosts, vec!["build-box".to_string()]);
+        assert!(records[1].scope_hosts.is_empty());
+        let summary = summary_markdown_counted(&records, false, Some(&counts));
+        assert!(summary.contains("## Scope proposals (1 of 1, never applied)") && summary.contains("`MEMORY.md#L1`: build-box"), "{summary}");
+    }
+
+    #[test]
     fn a_fixture_memory_directory_imports_once_and_never_touches_the_originals() {
         let repo = tempfile::tempdir().unwrap();
         std::fs::write(repo.path().join("deploy.py"), "def deploy():\n    pass\n").unwrap();
@@ -879,7 +1102,7 @@ mod tests {
         }
 
         // The command itself: backup before writing, report and summary beside it.
-        run(repo.path(), Some(memory.path()), true, None, false, false).unwrap();
+        run(repo.path(), Some(memory.path()), true, None, false, false, None).unwrap();
         let date = utc_date(std::time::SystemTime::now());
         let backup = repo.path().join(".context").join("memory-backup").join(&date);
         assert_eq!(std::fs::read(backup.join("feedback_tests.md")).unwrap(), originals[0], "the backup exists");
