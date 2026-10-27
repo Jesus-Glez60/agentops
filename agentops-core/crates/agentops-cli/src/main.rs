@@ -247,6 +247,11 @@ enum Command {
         /// of another repo's memories live outside every repo).
         #[arg(long)]
         backup_dir: Option<PathBuf>,
+        /// Import into your personal memories (about you, recalled in every
+        /// repo) on the server --project is connected to, instead of into
+        /// --project. For the user-level memory directory; pass --memory-dir.
+        #[arg(long, requires = "memory_dir")]
+        personal: bool,
     },
     /// Links every gotcha, decision and note to the memories it reads most
     /// like (`SimilarTo` edges, ADR 0051), embedding any that has no vector
@@ -882,7 +887,7 @@ fn main() -> Result<()> {
         Command::RecallStats { path, remote, since } => recall_eval::stats(&path, remote, since.as_deref()),
         Command::ClassifyMemories { path, apply, scope: true, hosts, .. } => classify_scope::run(&path, apply, &hosts),
         Command::ClassifyMemories { path, apply, per_minute, retry_failed, llm, .. } => classify_memories::run(&path, apply, per_minute, retry_failed, llm),
-        Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle, backup_dir } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle, backup_dir.as_deref()),
+        Command::ImportMemory { project, memory_dir, apply, report, llm_classify, retitle, backup_dir, personal } => import_memory::run(&project, memory_dir.as_deref(), apply, report.as_deref(), llm_classify, retitle, backup_dir.as_deref(), personal),
         Command::IngestNotes { path, notes, dry_run, llm_classify, llm_match, min_name_len, with_embeddings } => {
             ingest_notes(&path, notes.as_deref(), dry_run, llm_classify, llm_match, min_name_len, with_embeddings)
         }

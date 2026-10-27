@@ -42,8 +42,8 @@ fn prominence_sort_rank(p: NodeProminence) -> u8 {
 /// mid-session, so this is called from both hook handlers
 /// (`agentops-cli::hook_capture`). Returns an empty string when there are
 /// no pins -- same "nothing to show is the normal case" contract as `build`.
-pub fn build_pinned_context(store: &dyn GraphStore, repo: &str) -> anyhow::Result<String> {
-    Ok(pinned_block(store, repo)?.0)
+pub fn build_pinned_context(store: &dyn GraphStore, repo: &str, personal: Option<&str>) -> anyhow::Result<String> {
+    Ok(pinned_block(store, repo, personal)?.0)
 }
 
 /// One pin's line. A procedural memory (a rule, tagged
@@ -73,20 +73,33 @@ pub fn active_pins(store: &dyn GraphStore, repo: &str) -> anyhow::Result<Vec<age
 /// The `## Pinned` block within `PIN_BUDGET`, whole lines only, plus the
 /// ids of pins that didn't fit. A pin is never dropped silently: the block
 /// ends with a line naming the ones cut, and the importer's report lists
-/// them. Stable id order, so the block doesn't reshuffle every turn.
-pub fn pinned_block(store: &dyn GraphStore, repo: &str) -> anyhow::Result<(String, Vec<i64>)> {
-    let mut pinned = active_pins(store, repo)?;
+/// them. The repo's pins come first, then those of the user's `personal`
+/// connection (milestone 5), each in stable id order, so the block doesn't
+/// reshuffle every turn and repo pins win when both don't fit.
+pub fn pinned_block(store: &dyn GraphStore, repo: &str, personal: Option<&str>) -> anyhow::Result<(String, Vec<i64>)> {
+    let mut pinned: Vec<(agentops_graph::Node, bool)> = active_pins(store, repo)?.into_iter().map(|n| (n, false)).collect();
+    pinned.sort_by_key(|(n, _)| n.id);
+    if let Some(personal) = personal {
+        let mut own: Vec<agentops_graph::Node> = active_pins(store, personal)?;
+        own.sort_by_key(|n| n.id);
+        pinned.extend(own.into_iter().map(|n| (n, true)));
+    }
     if pinned.is_empty() {
         return Ok((String::new(), Vec::new()));
     }
-    pinned.sort_by_key(|n| n.id);
     const HEADER: &str = "## Pinned\n";
     // Room kept for the closing "didn't fit" line.
     const CUT_NOTE_ROOM: usize = 160;
     let mut out = HEADER.to_string();
     let mut cut = Vec::new();
-    for n in &pinned {
-        let line = render_pin(n.kind, n.name.as_deref(), n.content.as_deref(), n.id);
+    for (n, is_personal) in &pinned {
+        let mut line = render_pin(n.kind, n.name.as_deref(), n.content.as_deref(), n.id);
+        if *is_personal {
+            let id = format!("(id {})", n.id);
+            if let Some(at) = line.rfind(&id) {
+                line.replace_range(at..at + id.len(), &format!("(personal, id {})", n.id));
+            }
+        }
         if cut.is_empty() && out.chars().count() + line.chars().count() + 1 + CUT_NOTE_ROOM <= crate::budget::PIN_BUDGET {
             out.push_str(&line);
             out.push('\n');
@@ -242,7 +255,7 @@ mod tests {
     #[test]
     fn pinned_context_is_empty_with_no_pins() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
-        let ctx = build_pinned_context(&store, "demo").unwrap();
+        let ctx = build_pinned_context(&store, "demo", None).unwrap();
         assert_eq!(ctx, "");
     }
 
@@ -255,11 +268,38 @@ mod tests {
         store.add_node(NewNode { kind: NodeKind::Gotcha, repo: "demo".into(), path: None, name: Some("Unrelated".into()), container: None, start_line: None, end_line: None, content: Some("Some other note.".into()) }).unwrap();
         store.set_curation("demo", pinned_id, NodeProminence::Pinned, None).unwrap();
 
-        let ctx = build_pinned_context(&store, "demo").unwrap();
+        let ctx = build_pinned_context(&store, "demo", None).unwrap();
         assert!(ctx.contains("## Pinned"), "{ctx}");
         assert!(ctx.contains("Always remember"), "{ctx}");
         assert!(ctx.contains("Never bypass the redaction gate."), "{ctx}");
         assert!(!ctx.contains("Unrelated"), "{ctx}");
+    }
+
+    #[test]
+    fn repo_pins_come_before_personal_ones_and_win_the_budget_whatever_their_ids() {
+        use agentops_graph::{MemoryClass, NewNode};
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let pin = |repo: &str, name: &str, len: usize| {
+            let id = store.add_node(NewNode { kind: NodeKind::Gotcha, repo: repo.into(), path: None, name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some("y".repeat(len)) }).unwrap();
+            store.set_curation(repo, id, NodeProminence::Pinned, None).unwrap();
+            id
+        };
+        // Personal pins written first get the lower ids.
+        let early_personal = pin("me", "early personal", 150);
+        let expired = pin("me", "expired personal", 10);
+        store.set_memory_class("me", expired, MemoryClass::Temporal, Some("2000-01-01")).unwrap();
+        for i in 0..30 {
+            pin("demo", &format!("repo {i}"), 150);
+        }
+        let (block, cut) = pinned_block(&store, "demo", Some("me")).unwrap();
+        assert!(block.contains("repo 0:") && !block.contains("early personal"), "{block}");
+        assert!(cut.contains(&early_personal), "the personal pin's lower id doesn't put it ahead of repo pins: {cut:?}");
+        assert!(!block.contains("expired personal") && !cut.contains(&expired));
+        assert!(block.find("repo 0").unwrap() < block.find("repo 1").unwrap());
+
+        let (small, cut) = pinned_block(&store, "other", Some("me")).unwrap();
+        assert!(cut.is_empty() && small.contains(&format!("(personal, id {early_personal})")), "{small}");
+        assert_eq!(pinned_block(&store, "other", None).unwrap().0, "", "no personal connection, no personal pins");
     }
 
     #[test]
@@ -276,7 +316,7 @@ mod tests {
         pin("progress pin", MemoryClass::Progress, None);
         pin("superseded pin", MemoryClass::Temporal, Some("2000-01-01"));
         pin("current temporal pin", MemoryClass::Temporal, Some("2999-01-01"));
-        let (block, cut) = pinned_block(&store, "demo").unwrap();
+        let (block, cut) = pinned_block(&store, "demo", None).unwrap();
         assert!(block.contains("durable pin") && block.contains("current temporal pin"), "{block}");
         assert!(!block.contains("progress pin") && !block.contains("superseded pin"), "{block}");
         assert!(cut.is_empty());
@@ -289,7 +329,7 @@ mod tests {
         let store = SqliteGraphStore::open_in_memory().unwrap();
         let rule = store.add_node(NewNode { kind: NodeKind::Note, repo: "demo".into(), path: None, name: Some("feedback_tests".into()), container: None, start_line: None, end_line: None, content: Some(agentops_notes::content_with_tags("Run the test suites on the server.\n\nThe laptop build takes 38 minutes.", &["memory-kind:procedural".into()])) }).unwrap();
         store.set_curation("demo", rule, NodeProminence::Pinned, None).unwrap();
-        let (block, cut) = pinned_block(&store, "demo").unwrap();
+        let (block, cut) = pinned_block(&store, "demo", None).unwrap();
         assert!(block.contains(&format!("- Run the test suites on the server. (id {rule})")) && !block.contains("feedback_tests") && !block.contains("38 minutes"), "{block}");
         assert!(cut.is_empty());
 
@@ -307,7 +347,7 @@ mod tests {
             store.set_curation("demo", id, NodeProminence::Pinned, None).unwrap();
             id
         }).collect();
-        let (block, cut) = pinned_block(&store, "demo").unwrap();
+        let (block, cut) = pinned_block(&store, "demo", None).unwrap();
         assert!(block.chars().count() <= crate::budget::PIN_BUDGET, "{}", block.chars().count());
         assert!(!cut.is_empty() && cut.iter().all(|id| many.contains(id)));
         assert!(block.contains(&format!("{} more pinned didn't fit", cut.len())) && block.contains(&cut[0].to_string()), "{block}");

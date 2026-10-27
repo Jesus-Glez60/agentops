@@ -58,13 +58,22 @@ pub fn handle(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value) 
 /// passes one, where the model stays loaded; a local hook process runs
 /// `handle` and never loads it (ADR 0052).
 pub fn handle_with(store: &dyn GraphStore, repo: &str, event: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
+    handle_with_personal(store, repo, None, event, payload, embedder)
+}
+
+/// `handle_with`, plus the store repo of the user's personal connection
+/// (milestone 5), which the server knows from the caller's account. Its
+/// pins join the pin block after the repo's, and prompt and subagent seeds
+/// add up to `PERSONAL_SEED_MAX` of its memories, labelled `personal`.
+/// Work-time cues never use it: files and errors belong to the repo.
+pub fn handle_with_personal(store: &dyn GraphStore, repo: &str, personal: Option<&str>, event: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     match event {
-        "posttooluse" => post_tool_use(store, repo, payload, embedder),
+        "posttooluse" => post_tool_use(store, repo, personal, payload, embedder),
         "posttoolusefailure" => post_tool_use_failure(store, repo, payload, embedder),
-        "userpromptsubmit" => user_prompt_submit(store, repo, payload, embedder),
-        "sessionstart" => session_start(store, repo, payload),
+        "userpromptsubmit" => user_prompt_submit(store, repo, personal, payload, embedder),
+        "sessionstart" => session_start(store, repo, personal, payload),
         "pretooluse" => pre_tool_use(store, repo, payload),
-        "subagentstart" => subagent_start(store, repo, payload, embedder),
+        "subagentstart" => subagent_start(store, repo, personal, payload, embedder),
         other => anyhow::bail!("unknown hook event '{other}'"),
     }
 }
@@ -122,7 +131,7 @@ struct PostToolUsePayload {
     tool_response: Value,
 }
 
-fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
+fn post_tool_use(store: &dyn GraphStore, repo: &str, personal: Option<&str>, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     let session_id = session_id(payload);
     let raw = payload;
     let payload: PostToolUsePayload = serde_json::from_value(payload.clone()).context("parsing PostToolUse payload")?;
@@ -149,7 +158,13 @@ fn post_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: 
     // separates useful recall from noise (milestone 3c); bookkeeping, so a
     // failure is only logged.
     if FOLLOW_TOOLS.contains(&payload.tool_name.as_str()) {
-        if let Err(e) = record_follows(store, repo, session_id, agent_id(raw), &payload.tool_name, &payload.tool_input) {
+        // A lookup with `path: "personal"` follows a personal pointer, whose
+        // claims and pins live in the personal repo.
+        let follow_repo = match (personal, payload.tool_input.get("path").and_then(Value::as_str)) {
+            (Some(personal), Some(PERSONAL_PATH)) => personal,
+            _ => repo,
+        };
+        if let Err(e) = record_follows(store, repo, follow_repo, session_id, agent_id(raw), &payload.tool_name, &payload.tool_input) {
             eprintln!("agentops: recording a follow failed (non-fatal): {e:#}");
         }
     }
@@ -368,9 +383,12 @@ fn followed_ids(store: &dyn GraphStore, repo: &str, tool_name: &str, tool_input:
 
 /// Records a `memory_followed` event for each id the call names that this
 /// context was shown, with how: its `recall_shown` source, else `pin` for
-/// a pinned memory (pins ride on every prompt and aren't claimed).
-fn record_follows(store: &dyn GraphStore, repo: &str, session_id: &str, agent: Option<&str>, tool_name: &str, tool_input: &Value) -> Result<()> {
+/// a pinned memory (pins ride on every prompt and aren't claimed). The
+/// context comes from `repo`'s events (compactions); the claims, pins and
+/// the follow itself are `follow_repo`'s: `repo`, or the personal repo.
+fn record_follows(store: &dyn GraphStore, repo: &str, follow_repo: &str, session_id: &str, agent: Option<&str>, tool_name: &str, tool_input: &Value) -> Result<()> {
     let context = crate::work_recall::claim_context(&store.session_events(repo, session_id)?, agent);
+    let repo = follow_repo;
     let shown: Vec<agentops_graph::RecallShown> = store.recall_shown_rows(repo, Some(session_id), None)?.into_iter().filter(|r| r.context == context).collect();
     let mut pinned: Option<Vec<i64>> = None;
     for id in followed_ids(store, repo, tool_name, tool_input, &shown)? {
@@ -568,6 +586,40 @@ fn push_seed(store: &dyn GraphStore, repo: &str, session_id: &str, claim: &str, 
     Ok(())
 }
 
+/// The `path` an agent passes to reach the personal connection.
+pub const PERSONAL_PATH: &str = "personal";
+
+/// Appends up to `PERSONAL_SEED_MAX` of the user's personal memories for
+/// `query` to `parts`, after the repo's own seed and within `budget`
+/// (counting everything already in `parts`), labelled `personal`. They are
+/// claimed in the personal repo under the work repo's `context`, so a
+/// context is shown each one once, `recall-stats` classes them from their
+/// own repo, and a follow of one is found there. `written` (memories this
+/// session wrote) is never shown back.
+#[allow(clippy::too_many_arguments)]
+fn push_personal_seed(store: &dyn GraphStore, personal: &str, session_id: &str, context: &str, query: &str, written: &std::collections::HashSet<i64>, source: &str, parts: &mut Vec<String>, budget: usize, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<()> {
+    const HEADER: &str = "Personal memories (about you, from every repo; `fetch_content` with `path: \"personal\"` and the id):";
+    let mut exclude: std::collections::HashSet<i64> = store.recall_shown_rows(personal, Some(session_id), None)?.into_iter().filter(|r| r.context == context).map(|r| r.node_id).collect();
+    exclude.extend(written);
+    let seed = agentops_retrieval::recall_seed_with(store, personal, query, crate::budget::PERSONAL_SEED_MAX, &exclude, embedder)?;
+    let mut size = parts.iter().map(|p| p.chars().count() + 2).sum::<usize>() + HEADER.chars().count();
+    let mut lines = Vec::new();
+    for pointer in &seed {
+        let line = pointer.render().replacen("- [", "- [personal] [", 1);
+        size += line.chars().count() + 1;
+        if size > budget {
+            break;
+        }
+        lines.push((pointer.node_id, line));
+    }
+    if lines.is_empty() {
+        return Ok(());
+    }
+    store.claim_shown(personal, session_id, context, &lines.iter().map(|(id, _)| *id).collect::<Vec<_>>(), source)?;
+    parts.push(format!("{HEADER}\n{}", lines.into_iter().map(|(_, l)| l).collect::<Vec<_>>().join("\n")));
+    Ok(())
+}
+
 /// A plan-mode or default-mode prompt is a work cue too (milestone 3b): its
 /// seed seeds the main context's activation, so recall during work carries
 /// on from what the prompt was about.
@@ -593,7 +645,7 @@ fn record_prompt_cue(store: &dyn GraphStore, repo: &str, session_id: &str, seed:
 ///
 /// Everything fits in `PLAN_FLOW_BUDGET` plus `PIN_BUDGET` for the pins;
 /// recall pointers are dropped first.
-fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
+fn user_prompt_submit(store: &dyn GraphStore, repo: &str, personal: Option<&str>, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     use crate::budget::{DEFAULT_SEED_MAX_ITEMS, PLAN_FLOW_BUDGET, PLAN_SEED_MAX_ITEMS};
 
     let Some(prompt) = payload.get("prompt").and_then(|v| v.as_str()) else {
@@ -612,7 +664,7 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embed
     store.record_session_event(repo, session_id, if plan_mode { PLAN_PROMPT_TOOL } else { PROMPT_TOOL }, &redacted.text, None, "user_intent")?;
 
     let mut parts = Vec::new();
-    let pinned = crate::session_guide::build_pinned_context(store, repo)?;
+    let pinned = crate::session_guide::build_pinned_context(store, repo, personal)?;
     if !pinned.is_empty() {
         parts.push(pinned);
     }
@@ -633,6 +685,10 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, payload: &Value, embed
         let seed = agentops_retrieval::recall_scored_with(store, repo, prompt, DEFAULT_SEED_MAX_ITEMS, &shown, embedder)?;
         record_prompt_cue(store, repo, session_id, &seed)?;
         push_seed(store, repo, session_id, &crate::work_recall::claim_context(&events, None), &mut parts, &seed.into_iter().map(|(p, _)| p).collect::<Vec<_>>(), PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET)?;
+    }
+    if let (Some(personal), false) = (personal, plan_mode && continuing_episode) {
+        let context = crate::work_recall::claim_context(&events, None);
+        push_personal_seed(store, personal, session_id, &context, prompt, &crate::work_recall::written_ids(&events), "prompt_seed", &mut parts, PLAN_FLOW_BUDGET + crate::budget::PIN_BUDGET, embedder)?;
     }
     if parts.is_empty() {
         return Ok(None);
@@ -672,7 +728,7 @@ fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<O
 /// `add_note` instead.
 pub const MEMORY_WRITE_REDIRECTED: &str = "memory_write_redirected";
 
-const MEMORY_REDIRECT_REASON: &str = "AgentOps is this repo's memory: Claude Code's local memory files (MEMORY.md and the files beside it) aren't written here. Record this with the add_note MCP tool instead (it reaches the remote server when the repo is connected to one). Set note_type to gotcha, decision or knowledge, and add one tag saying what kind of memory it is: memory-kind:semantic (a fact and the reason behind it), memory-kind:episodic (what happened in a session), or memory-kind:procedural (a rule that must always hold). If it updates something already recorded, say so in the body.";
+const MEMORY_REDIRECT_REASON: &str = "AgentOps is this repo's memory: Claude Code's local memory files (MEMORY.md and the files beside it) aren't written here. Record this with the add_note MCP tool instead (it reaches the remote server when the repo is connected to one). Set note_type to gotcha, decision or knowledge, and add one tag saying what kind of memory it is: memory-kind:semantic (a fact and the reason behind it), memory-kind:episodic (what happened in a session), or memory-kind:procedural (a rule that must always hold). If it updates something already recorded, say so in the body. If it is about the user rather than this repo (their preferences, how they like to work), pass personal: true: it then follows them into every repo.";
 
 /// A `Write`/`Edit`/`MultiEdit` into Claude Code's per-project memory
 /// directory (`~/.claude/projects/<project>/memory/`). Reads aren't
@@ -781,7 +837,7 @@ fn detect_secret_exposure(tool_name: &str, tool_input: &Value) -> Option<String>
 /// task of its own), within `SUBAGENT_SEED_BUDGET`. Nothing is recorded as
 /// injected: a subagent's context isn't the main session's, so the main
 /// session must still be able to see these pointers itself.
-fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
+fn subagent_start(store: &dyn GraphStore, repo: &str, personal: Option<&str>, payload: &Value, embedder: Option<&'static (dyn agentops_embeddings::Embedder + Sync)>) -> Result<Option<Value>> {
     use crate::budget::{PLAN_SEED_MAX_ITEMS, SUBAGENT_SEED_BUDGET};
 
     if !is_relevant("subagentstart", payload) {
@@ -797,7 +853,7 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder:
     } else {
         format!("Pass `path: \"{path}\"` to every agentops tool.")
     }];
-    let pinned = crate::session_guide::build_pinned_context(store, repo)?;
+    let pinned = crate::session_guide::build_pinned_context(store, repo, personal)?;
     if !pinned.is_empty() {
         parts.push(pinned);
     }
@@ -815,6 +871,10 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder:
             const HEADER: &str = "Recalled from AgentOps for the task you were spawned for (pointers; query `get_symbol`/`related_context`/`list_gotchas` or `fetch_content` with the id before grepping):";
             parts.push(format!("{HEADER}\n{}", seed.iter().map(|p| p.render()).collect::<Vec<_>>().join("\n")));
         }
+        if let (Some(personal), Some(agent)) = (personal, agent_id(payload)) {
+            let written = crate::work_recall::written_ids(&store.session_events(repo, session_id(payload))?);
+            push_personal_seed(store, personal, session_id(payload), agent, &prompt, &written, "subagent_seed", &mut parts, SUBAGENT_SEED_BUDGET + crate::budget::PIN_BUDGET, embedder)?;
+        }
     }
     let context = cap(&parts.join("\n\n"), SUBAGENT_SEED_BUDGET + crate::budget::PIN_BUDGET, 0).text;
     Ok(Some(hook_output("SubagentStart", Some(&context), None)))
@@ -824,7 +884,7 @@ fn subagent_start(store: &dyn GraphStore, repo: &str, payload: &Value, embedder:
 // SessionStart
 // ---------------------------------------------------------------------
 
-fn session_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
+fn session_start(store: &dyn GraphStore, repo: &str, personal: Option<&str>, payload: &Value) -> Result<Option<Value>> {
     // `source` is one of startup/resume/clear/compact/fork. AgentOps never
     // needs a `PreCompact` hook because `session_events` already persists
     // durably and incrementally throughout the session -- gating here is
@@ -850,7 +910,7 @@ fn session_start(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<
     // session-resume guide/briefing -- and checked for emptiness only after
     // this concatenation, so a session with pins but no other activity yet
     // still emits output.
-    let pinned = crate::session_guide::build_pinned_context(store, repo)?;
+    let pinned = crate::session_guide::build_pinned_context(store, repo, personal)?;
     let guide = if pinned.is_empty() { guide } else if guide.is_empty() { pinned } else { format!("{pinned}\n\n{guide}") };
     Ok((!guide.is_empty()).then(|| hook_output("SessionStart", Some(&guide), None)))
 }
@@ -1231,6 +1291,67 @@ mod tests {
         lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": seeded }), Some("a2"));
         let all = follows(store.as_ref(), &repo);
         assert_eq!(&all[3..], &[(format!("id {seeded} source subagent_seed context a1"), Some("a1".to_string()))], "a2 was never shown it");
+    }
+
+    const ME: &str = "personal--u1";
+
+    fn personal_prompt(store: &dyn GraphStore, repo: &str, text: &str, mode: &str) -> String {
+        context(handle_with_personal(store, repo, Some(ME), "userpromptsubmit", &json!({ "prompt": text, "session_id": "s", "permission_mode": mode }), None).unwrap())
+    }
+
+    #[test]
+    fn a_prompt_seed_adds_personal_memories_after_the_repos_own_once_per_context() {
+        let (_dir, store, repo) = store();
+        let ours = gotcha(store.as_ref(), &repo, "Deploys go through the release gate", "the release gate runs every suite");
+        let mine = gotcha(store.as_ref(), ME, "The user wants the release gate explained briefly", "short answers about the release gate");
+        let mine_pin = gotcha(store.as_ref(), ME, "Never deploy on Fridays", "a personal rule");
+        store.set_curation(ME, mine_pin, agentops_graph::NodeProminence::Pinned, None).unwrap();
+
+        let first = personal_prompt(store.as_ref(), &repo, "how does the release gate work", "default");
+        assert!(first.contains(&format!("(personal, id {mine_pin})")), "personal pins join the pin block: {first}");
+        let (repo_at, personal_at) = (first.find(&format!("(id {ours})")).unwrap(), first.find(&format!("- [personal] [gotcha] The user wants the release gate explained briefly (id {mine})")).unwrap());
+        assert!(repo_at < personal_at, "the repo's seed comes first, so a cap trims personal lines first: {first}");
+        assert!(first.contains("path: \"personal\""), "{first}");
+        let claims = store.recall_shown_rows(ME, Some("s"), None).unwrap();
+        assert_eq!(claims.iter().map(|r| (r.node_id, r.source.as_str(), r.context.as_str())).collect::<Vec<_>>(), vec![(mine, "prompt_seed", "main#0")], "claimed in the personal repo");
+        assert!(store.recall_shown_rows(&repo, Some("s"), None).unwrap().iter().all(|r| r.node_id != mine), "never in the work repo's claims");
+
+        let again = personal_prompt(store.as_ref(), &repo, "and the release gate again", "default");
+        assert!(!again.contains("[personal]"), "shown once per context: {again}");
+
+        // A follow names `path: "personal"` and is recorded in the personal repo.
+        handle_with_personal(store.as_ref(), &repo, Some(ME), "posttooluse", &json!({ "session_id": "s", "tool_name": "mcp__agentops__fetch_content", "tool_input": { "path": "personal", "id": mine }, "tool_response": "ok" }), None).unwrap();
+        let followed: Vec<_> = store.session_events(ME, "s").unwrap().into_iter().filter(|e| e.event_kind == MEMORY_FOLLOWED).map(|e| e.description).collect();
+        assert_eq!(followed, vec![format!("id {mine} source prompt_seed context main#0")]);
+        assert!(store.session_events(&repo, "s").unwrap().iter().all(|e| e.event_kind != MEMORY_FOLLOWED));
+    }
+
+    #[test]
+    fn without_a_personal_connection_the_hooks_are_unchanged() {
+        let (_dir, store, repo) = store();
+        gotcha(store.as_ref(), &repo, "Deploys go through the release gate", "the release gate runs every suite");
+        gotcha(store.as_ref(), ME, "The user wants the release gate explained briefly", "short answers about the release gate");
+        let payload = json!({ "prompt": "how does the release gate work", "session_id": "plain", "permission_mode": "default" });
+        let plain = handle_with(store.as_ref(), &repo, "userpromptsubmit", &payload, None).unwrap();
+        assert!(!context(plain).contains("[personal]"));
+    }
+
+    #[test]
+    fn a_seeded_subagent_gets_personal_memories_and_work_cues_never_do() {
+        let (_dir, store, repo) = store();
+        gotcha(store.as_ref(), &repo, "Deploys go through the release gate", "the release gate runs every suite");
+        let mine = gotcha(store.as_ref(), ME, "docs/release.md is where the user keeps their release notes", "the release checklist file");
+        personal_prompt(store.as_ref(), &repo, "plan the release checklist", "plan");
+        let sub = context(handle_with_personal(store.as_ref(), &repo, Some(ME), "subagentstart", &json!({ "session_id": "s", "agent_type": "Explore", "agent_id": "a1" }), None).unwrap());
+        assert!(sub.contains(&format!("- [personal] [gotcha] docs/release.md is where the user keeps their release notes (id {mine})")), "{sub}");
+        assert!(store.recall_shown_rows(ME, Some("s"), None).unwrap().iter().any(|r| r.node_id == mine && r.context == "a1" && r.source == "subagent_seed"));
+
+        // A read of that very file and an error naming it: repo cues only.
+        let read = handle_with_personal(store.as_ref(), &repo, Some(ME), "posttooluse", &json!({ "tool_name": "Read", "tool_input": {"file_path": "/r/docs/release.md"}, "tool_response": {"type": "text", "text": "# Release notes"}, "session_id": "cue", REL_PATH_FIELD: "docs/release.md" }), None).unwrap();
+        let failed = handle_with_personal(store.as_ref(), &repo, Some(ME), "posttoolusefailure", &json!({ "tool_name": "Bash", "error": "docs/release.md: release notes missing", "session_id": "cue" }), None).unwrap();
+        for out in [read, failed] {
+            assert!(!context(out).contains(&format!("(id {mine})")), "a work cue never recalls a personal memory");
+        }
     }
 
     #[test]

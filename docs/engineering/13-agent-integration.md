@@ -201,6 +201,16 @@ Milestone 4 item 2. A lookup of a memory the context was shown is the one use si
 - **Reading it.** `agentops recall-stats [--remote] [--since YYYY-MM-DD]` (route `GET /repos/{id}/recall/stats`) prints, per source and memory class, the memories shown, the ones followed and the rate. It counts distinct `(session, context, memory)` triples and leaves out `recall-eval-*` sessions. Pins have follows but no shown count. Since milestone 5 it also splits sessions into **meta** (one that read or edited AgentOps' own memory or recall code, `recall_stats::META_PATHS`) and **ordinary**, and gives ordinary sessions' follows per source; replays and work-evals write no sessions. Meta is undercounted, since only some sessions record their file events (gotcha 195365).
 - **When to revisit reinforcement:** at 200 follows from at least 20 ordinary sessions (`handoffs/m3b-eval.md`).
 
+### Personal memories
+
+Milestone 5 item 4 (`agentops-heavy-api/src/personal.rs`). Facts about the person rather than a repo (preferences, how they like to work) live in one **personal connection per user account**, recalled in every repo they work in.
+
+- **Where.** Its own tenant, `u<user_id>`, never the user's org tenant, with connection id `personal` (a `local:` connection, created by the first write). Org-scoped lookups, listings, dashboards and reindexing resolve against the org tenant, so none of them can reach it, even given its id, and it follows the user across org switches.
+- **Reaching it.** Only from the caller's own user id: `path: "personal"` on `/mcp` (session or personal API key), `add_note personal: true`, the curation and retitle routes with `personal` as the repo id, and the hook route's authenticated user. Reads never create it.
+- **Recall.** The server passes it to `hooks::handle_with_personal`. Its pins join the pin block after the repo's (`pinned_block`; repo pins win the shared `PIN_BUDGET`). Prompt and seeded-subagent seeds add up to `PERSONAL_SEED_MAX = 2` of its memories after the repo's own, labelled `[personal]`, so a cap trims them first. They are claimed in the personal repo, so `recall-stats` classes them there and a `fetch_content` with `path: "personal"` is recorded as a follow there. Work-time cues (files, errors) never use it.
+- **Import.** `agentops import-memory --personal --memory-dir <user-level dir> --project <a connected repo>` writes into it.
+- **Local mode** has no personal connection: `add_note personal: true` fails there, and nothing personal is recalled.
+
 ### Importing MEMORY.md
 
 Claude Code's own auto-memory (MEMORY.md) is imported once with `agentops import-memory` ([06-notes-and-consolidation.md](06-notes-and-consolidation.md), "Importing Claude Code's MEMORY.md"), then turned off per project with `agentops memory-off`, which writes `autoMemoryEnabled: false` to `.claude/settings.local.json` (verified in the milestone 2 spike: the session's system prompt loses its memory section). Milestone 1's redirect of memory writes to `add_note` stays on as a backstop.

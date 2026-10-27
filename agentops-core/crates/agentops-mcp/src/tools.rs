@@ -121,6 +121,7 @@ fn tool_specs() -> Vec<ToolSpec> {
                         "class_until": { "type": "string", "description": "For temporal: the UTC date (YYYY-MM-DD) it stops being recalled." },
                         "supersedes": { "type": "array", "items": { "type": "integer" }, "description": "Node ids this note replaces; they stop being recalled today." },
                         "applies_to": { "type": "array", "items": { "type": "string" }, "description": "Hostnames of the machines this is tied to (one server's setup, one SSH alias); omit for everywhere. An error on another machine won't recall it." },
+                        "personal": { "type": "boolean", "description": "A fact about the user rather than this repo (their preferences, how they like to work): it goes to their personal memories, recalled in every repo they work in. Hosted servers only." },
                     },
                     "required": ["path", "title", "body"],
                 })
@@ -820,6 +821,9 @@ fn tool_set_memory_scope(args: &Value) -> anyhow::Result<String> {
 }
 
 fn tool_add_note(args: &Value) -> anyhow::Result<String> {
+    // The hosted server routes `personal: true` to the user's personal
+    // connection before this runs; locally there is none.
+    anyhow::ensure!(!get_bool(args, "personal"), "personal memories need a hosted server (agentops connect --remote): in local mode every memory belongs to the repo");
     let path_str = get_str(args, "path").ok_or_else(|| anyhow::anyhow!("missing required 'path'"))?;
     let title = get_str(args, "title").ok_or_else(|| anyhow::anyhow!("missing required 'title'"))?;
     let body = get_str(args, "body").ok_or_else(|| anyhow::anyhow!("missing required 'body'"))?;

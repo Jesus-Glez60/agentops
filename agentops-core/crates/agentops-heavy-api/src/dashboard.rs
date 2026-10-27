@@ -69,6 +69,17 @@ async fn tenant_and_capability(state: &AppState, user: &Option<axum::Extension<U
     Ok(tenant)
 }
 
+/// A node route's repo `id`: one of `tenant`'s connections, or `personal`
+/// for the signed-in caller's own personal connection (milestone 5), which
+/// no other caller can name.
+fn resolve_repo_path(state: &AppState, user_id: Option<i64>, tenant: &str, id: &str) -> Result<std::path::PathBuf, String> {
+    if id == crate::personal::PERSONAL_ALIAS {
+        let user_id = user_id.ok_or("personal memories need a signed-in user or a personal API key")?;
+        return crate::personal::personal_path(state, user_id, false)?.ok_or_else(|| "no personal memories yet".to_string());
+    }
+    resolve_connection_path(state, tenant, id)
+}
+
 /// `GET /activity` -- tenant's connections' recent scan history, same shape
 /// as `agentops-api`'s `activity_json`.
 pub(crate) async fn activity_json(State(state): State<AppState>, user: Option<axum::Extension<User>>, Query(q): Query<TenantQuery>) -> (StatusCode, Json<Value>) {
@@ -413,8 +424,9 @@ pub(crate) async fn set_curation_json(
     // `Some(false)`: a consolidation proposal still waiting, which only
     // accept/reject may decide (they supersede or delete; curation alone
     // would make it recallable with its sources still shown).
+    let user_id = user.as_ref().map(|u| u.id);
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<bool>> {
-        let path = match resolve_connection_path(&state, &tenant, &id) {
+        let path = match resolve_repo_path(&state, user_id, &tenant, &id) {
             Ok(p) => p,
             Err(_) => return Ok(None),
         };
@@ -653,6 +665,7 @@ pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<
         Err(e) => return e,
     };
 
+    let user_id = user.as_ref().map(|u| u.id);
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Option<Value>>> {
         let path = match resolve_connection_path(&state, &tenant, &id) {
             Ok(p) => p,
@@ -660,7 +673,10 @@ pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<
         };
         let repo = agentops_mcp::repo_name(&path);
         let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
-        Ok(Some(agentops_mcp::hooks::handle_with(store.as_ref(), &repo, &event, &payload, Some(&SERVER_EMBEDDER))?))
+        // The caller's personal memories join recall here (milestone 5);
+        // never created by a hook, only found.
+        let personal = user_id.and_then(|uid| crate::personal::personal_path(&state, uid, false).ok().flatten()).map(|p| agentops_mcp::repo_name(&p));
+        Ok(Some(agentops_mcp::hooks::handle_with_personal(store.as_ref(), &repo, personal.as_deref(), &event, &payload, Some(&SERVER_EMBEDDER))?))
     })
     .await;
 
@@ -702,8 +718,9 @@ pub(crate) async fn set_node_title_json(
     let audit_tenant = tenant.clone();
     let audit_target = format!("{id}/nodes/{node_id}");
     let new_title = title.clone();
+    let user_id = user.as_ref().map(|u| u.id);
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Result<(Option<String>, bool), (StatusCode, String)>> {
-        let path = match resolve_connection_path(&state, &tenant, &id) {
+        let path = match resolve_repo_path(&state, user_id, &tenant, &id) {
             Ok(p) => p,
             Err(_) => return Ok(Err((StatusCode::NOT_FOUND, "no such node".into()))),
         };

@@ -19,6 +19,10 @@ pub const PLAN_FLOW_BUDGET: usize = 4000;
 pub const PLAN_SEED_MAX_ITEMS: usize = 8;
 /// New recall pointers on an ordinary (non-plan) prompt.
 pub const DEFAULT_SEED_MAX_ITEMS: usize = 5;
+/// Pointers from the user's personal connection a prompt or subagent seed
+/// adds after the repo's own (milestone 5): personal facts help, but the
+/// repo's memories come first.
+pub const PERSONAL_SEED_MAX: usize = 2;
 /// Most recall pointers one work cue (a file read or edited, an error)
 /// injects (milestone 3b): its best match only. The author's volume ceiling
 /// (revision 2), chosen over 3 knowing it loses cases ranked 2nd or 3rd.

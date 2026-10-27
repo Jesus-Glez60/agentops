@@ -779,13 +779,21 @@ impl KindClassifier for LlmKindClassifier {
 }
 
 /// The `import-memory` command.
-pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report: Option<&Path>, llm_classify: bool, retitle: bool, backup_dir: Option<&Path>) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run(project: &Path, memory_dir: Option<&Path>, apply: bool, report: Option<&Path>, llm_classify: bool, retitle: bool, backup_dir: Option<&Path>, personal: bool) -> Result<()> {
     let memory_dir = match memory_dir {
         Some(d) => d.to_path_buf(),
         None => default_memory_dir(project)?,
     };
     let llm = if llm_classify { Some(LlmKindClassifier { config: agentops_llm::LlmConfig::from_env_cheap()? }) } else { None };
     let sink: Box<dyn Sink> = match read_remote_marker(project) {
+        // User-level memories (milestone 5): the person's own connection on
+        // the server this repo is connected to, created by the first write.
+        Some(marker) if personal => {
+            println!("importing into your personal memories on {}", marker.server_url);
+            Box::new(RemoteSink { marker: RemoteMcpMarker { connection_id: agentops_mcp::hooks::PERSONAL_PATH.to_string(), ..marker } })
+        }
+        None if personal => anyhow::bail!("--personal needs a repo connected to a server (agentops connect --remote): personal memories live there"),
         Some(marker) => {
             println!("importing into the server connection {} ({})", marker.connection_id, marker.server_url);
             Box::new(RemoteSink { marker })
@@ -1089,7 +1097,7 @@ mod tests {
         let rule_node = store.get_node(&name, rule.node_id.unwrap()).unwrap().unwrap();
         assert_eq!(rule_node.prominence, agentops_graph::NodeProminence::Pinned);
         assert_eq!(rule_node.content.as_deref().unwrap().lines().next(), Some("always run the suites on the server"), "the rule is the first line");
-        let (block, cut) = agentops_mcp::session_guide::pinned_block(store.as_ref(), &name).unwrap();
+        let (block, cut) = agentops_mcp::session_guide::pinned_block(store.as_ref(), &name, None).unwrap();
         assert!(block.contains(&format!("- always run the suites on the server (id {})", rule_node.id)) && cut.is_empty(), "{block}");
         assert!(!by_file(&first, "project_deploy.md").pinned, "only rules are pinned");
         let review = store.get_node(&name, by_file(&first, "notes_misc.md").node_id.unwrap()).unwrap().unwrap();
@@ -1104,7 +1112,7 @@ mod tests {
         }
 
         // The command itself: backup before writing, report and summary beside it.
-        run(repo.path(), Some(memory.path()), true, None, false, false, None).unwrap();
+        run(repo.path(), Some(memory.path()), true, None, false, false, None, false).unwrap();
         let date = utc_date(std::time::SystemTime::now());
         let backup = repo.path().join(".context").join("memory-backup").join(&date);
         assert_eq!(std::fs::read(backup.join("feedback_tests.md")).unwrap(), originals[0], "the backup exists");
