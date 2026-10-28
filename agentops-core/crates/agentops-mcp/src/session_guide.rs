@@ -92,6 +92,7 @@ pub fn pinned_block(store: &dyn GraphStore, repo: &str, personal: Option<&str>) 
     const CUT_NOTE_ROOM: usize = 160;
     let mut out = HEADER.to_string();
     let mut cut = Vec::new();
+    let mut cut_personal = Vec::new();
     for (n, is_personal) in &pinned {
         let mut line = render_pin(n.kind, n.name.as_deref(), n.content.as_deref(), n.id);
         if *is_personal {
@@ -105,11 +106,24 @@ pub fn pinned_block(store: &dyn GraphStore, repo: &str, personal: Option<&str>) 
             out.push('\n');
         } else {
             cut.push(n.id);
+            if *is_personal {
+                cut_personal.push(n.id);
+            }
         }
     }
     if !cut.is_empty() {
-        let ids = cut.iter().map(i64::to_string).collect::<Vec<_>>().join(", ");
-        let note = format!("- ({} more pinned didn't fit; fetch_content ids {ids})", cut.len());
+        // A personal pin is fetched with `path: "personal"`, not the repo's.
+        let list = |ids: &mut dyn Iterator<Item = &i64>| ids.map(i64::to_string).collect::<Vec<_>>().join(", ");
+        let repo_ids = list(&mut cut.iter().filter(|id| !cut_personal.contains(id)));
+        let personal_ids = list(&mut cut_personal.iter());
+        let ids = match (repo_ids.is_empty(), personal_ids.is_empty()) {
+            (false, true) => format!("fetch_content ids {repo_ids}"),
+            (true, false) => format!("fetch_content path \"personal\" ids {personal_ids}"),
+            // Personal first: the note is cut to `CUT_NOTE_ROOM`, and a long
+            // list of repo ids would otherwise push them off its end.
+            _ => format!("fetch_content path \"personal\" ids {personal_ids}; repo ids {repo_ids}"),
+        };
+        let note = format!("- ({} more pinned didn't fit; {ids})", cut.len());
         out.push_str(&note.chars().take(CUT_NOTE_ROOM - 1).collect::<String>());
         out.push('\n');
     }
@@ -294,6 +308,7 @@ mod tests {
         let (block, cut) = pinned_block(&store, "demo", Some("me")).unwrap();
         assert!(block.contains("repo 0:") && !block.contains("early personal"), "{block}");
         assert!(cut.contains(&early_personal), "the personal pin's lower id doesn't put it ahead of repo pins: {cut:?}");
+        assert!(block.contains(&format!("path \"personal\" ids {early_personal}")), "a cut personal pin says where to fetch it: {block}");
         assert!(!block.contains("expired personal") && !cut.contains(&expired));
         assert!(block.find("repo 0").unwrap() < block.find("repo 1").unwrap());
 
