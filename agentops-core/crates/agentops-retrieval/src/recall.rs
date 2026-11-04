@@ -283,15 +283,18 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
     // fusion runs per kind, so every kind's top hit scores alike, and a
     // gotcha matching three keywords must beat a decision matching two
     // (seen live on the server graph). Then the fused score.
-    // True keyword matches (gotcha 416490): a memory already in one keyword
-    // pool is credited with every other query keyword it contains, even if
-    // it fell past that keyword's pool cutoff. Otherwise a common word's
-    // cutoff decided whether it met the two-keyword minimum below, and one
-    // new note using that word moved a target 17 ranks. A word found this
-    // way scores like the last place in its pool, never above a real hit.
-    // Nothing enters on words alone: only pool members are checked.
+    // True keyword matches (gotcha 416490): a memory in some keyword pool
+    // that falls short of the two-keyword minimum only because it fell past
+    // another keyword's pool cutoff is credited with the query keywords it
+    // really contains. Otherwise a common word's cutoff decided the minimum,
+    // and one new note using that word moved a target 17 ranks. It only
+    // rescues: a memory that already meets the minimum is never re-ranked,
+    // which on long error queries let common words reorder the top (work
+    // eval 6/20 -> 4/20). A word found this way scores like the last place
+    // in its pool. Nothing enters on words alone: only pool members count.
     for c in candidates.values_mut() {
-        if !c.reasons.iter().any(|r| r.starts_with('"')) {
+        let pooled = c.reasons.iter().filter(|r| r.starts_with('"')).count();
+        if pooled == 0 || pooled >= min_keyword_matches {
             continue;
         }
         for &(keyword, weight) in &keyword_weights {
@@ -839,6 +842,18 @@ mod tests {
         let hit = seed.iter().find(|(p, _)| p.node_id == target).unwrap_or_else(|| panic!("target missing: {seed:?}"));
         assert!(hit.0.reason.contains("\"every\"") && hit.0.reason.contains("\"anthropic\""), "{}", hit.0.reason);
         assert_eq!(seed[0].0.node_id, target, "two true matches beat one: {seed:?}");
+    }
+
+    #[test]
+    fn a_memory_that_already_meets_the_minimum_is_never_re_ranked_by_the_word_check() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let qualified = note(&store, NodeKind::Gotcha, "Alpha beta", "alpha beta and a long tail that also says common common in passing among other words");
+        for k in 0..40 {
+            note(&store, NodeKind::Gotcha, &format!("Common {k}"), "common common common");
+        }
+        let seed = recall_seed_with(&store, "r", "alpha beta common", 10, &HashSet::new(), None).unwrap();
+        let hit = seed.iter().find(|p| p.node_id == qualified).unwrap();
+        assert!(!hit.reason.contains("\"common\""), "two pool hits already qualify it: {}", hit.reason);
     }
 
     #[test]
