@@ -21,8 +21,9 @@
 use std::collections::HashMap;
 
 pub mod recall;
+pub mod words;
 pub mod work_recall;
-pub use recall::{recall_scored_with, recall_seed, recall_seed_with, RecallPointer, DENSE_MIN_SCORE, DENSE_TIMEOUT_MS, DENSE_WINDOW, HOP_FACTOR, RECALL_KINDS};
+pub use recall::{recall_lexical_with, recall_scored_with, recall_seed, recall_seed_with, RecallPointer, DENSE_MIN_SCORE, DENSE_TIMEOUT_MS, DENSE_WINDOW, HOP_FACTOR, RECALL_KINDS};
 
 use agentops_embeddings::Embedder;
 use agentops_graph::{age_days, bounded_neighborhood, effective_edge_weight, effective_weight, EdgeRelation, GraphStore, Node, NodeKind, NeighborhoodQuery, TraversalDirection};

@@ -131,6 +131,15 @@ pub fn recall_scored_with(store: &dyn GraphStore, repo: &str, query: &str, limit
     Ok(recall_ranked_with(store, repo, query, limit, exclude, embedder)?.into_iter().map(|s| (s.pointer, s.confidence)).collect())
 }
 
+/// `recall_scored_with`, keeping only what a keyword or a named symbol
+/// reached: meaning may re-rank those but never adds one. The rule error
+/// cues follow (milestone 3b revision 1), shared with command cues and the
+/// personal seed (milestone 5 follow-up), where a match by meaning alone
+/// was mostly noise.
+pub fn recall_lexical_with(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<(RecallPointer, f64)>> {
+    Ok(recall_ranked_with(store, repo, query, limit, exclude, embedder)?.into_iter().filter(|s| s.lexical).map(|s| (s.pointer, s.confidence)).collect())
+}
+
 /// One `recall_ranked_with` result.
 pub(crate) struct Scored {
     pub pointer: RecallPointer,
@@ -167,6 +176,8 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         reasons: Vec<String>,
         /// Sum of the rarity weights of the distinct cues it matched.
         strength: f64,
+        /// Title and body, lowercased, for the true keyword matches below.
+        text: String,
     }
     let mut candidates: HashMap<i64, Candidate> = HashMap::new();
     // A memory's class is checked where it enters: a progress note never
@@ -177,7 +188,17 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
         if !class_ok(node) {
             return;
         }
-        let c = candidates.entry(node.id).or_insert_with(|| Candidate { score: 0.0, kind: node.kind, title: node.name.as_deref().unwrap_or("(untitled)").to_string(), prominence: node.prominence, memory_class: node.memory_class, applies_to: node.applies_to.clone(), reasons: Vec::new(), strength: 0.0 });
+        let c = candidates.entry(node.id).or_insert_with(|| Candidate {
+            score: 0.0,
+            kind: node.kind,
+            title: node.name.as_deref().unwrap_or("(untitled)").to_string(),
+            prominence: node.prominence,
+            memory_class: node.memory_class,
+            applies_to: node.applies_to.clone(),
+            reasons: Vec::new(),
+            strength: 0.0,
+            text: format!("{}\n{}", node.name.as_deref().unwrap_or(""), node.content.as_deref().unwrap_or("")).to_lowercase(),
+        });
         c.score += score;
         if !c.reasons.contains(&reason) {
             c.reasons.push(reason);
@@ -200,15 +221,20 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
     let memories = store.count_nodes(repo, RECALL_KINDS)?.max(1) as f64;
     let mut weakest = f64::INFINITY;
     let mut query_weight = 0.0;
+    let mut keyword_weights: Vec<(&String, f64)> = Vec::new();
+    let mut pool_len: HashMap<(&String, NodeKind), usize> = HashMap::new();
     for keyword in &keywords {
         let df = store.count_lexical(repo, keyword, RECALL_KINDS)?.max(1) as f64;
         let weight = (1.0 + memories / df).ln();
         weakest = weakest.min(weight);
         query_weight += weight;
+        keyword_weights.push((keyword, weight));
         for &kind in RECALL_KINDS {
             // The whole block tied at the cutoff, ordered by id (milestone 4):
             // where a tie is cut decided which memories made the pool.
-            for (rank, (node, _)) in store.search_lexical_ties(repo, keyword, PER_QUERY, Some(kind))?.into_iter().enumerate() {
+            let pool = store.search_lexical_ties(repo, keyword, PER_QUERY, Some(kind))?;
+            pool_len.insert((keyword, kind), pool.len());
+            for (rank, (node, _)) in pool.into_iter().enumerate() {
                 add(&node, 1.0 / (rank as f64 + 1.0), format!("\"{keyword}\""), weight);
             }
         }
@@ -257,6 +283,29 @@ pub(crate) fn recall_ranked_with(store: &dyn GraphStore, repo: &str, query: &str
     // fusion runs per kind, so every kind's top hit scores alike, and a
     // gotcha matching three keywords must beat a decision matching two
     // (seen live on the server graph). Then the fused score.
+    // True keyword matches (gotcha 416490): a memory already in one keyword
+    // pool is credited with every other query keyword it contains, even if
+    // it fell past that keyword's pool cutoff. Otherwise a common word's
+    // cutoff decided whether it met the two-keyword minimum below, and one
+    // new note using that word moved a target 17 ranks. A word found this
+    // way scores like the last place in its pool, never above a real hit.
+    // Nothing enters on words alone: only pool members are checked.
+    for c in candidates.values_mut() {
+        if !c.reasons.iter().any(|r| r.starts_with('"')) {
+            continue;
+        }
+        for &(keyword, weight) in &keyword_weights {
+            let reason = format!("\"{keyword}\"");
+            if c.reasons.contains(&reason) || !crate::words::contains_keyword(&c.text, keyword) {
+                continue;
+            }
+            let len = pool_len.get(&(keyword, c.kind)).copied().unwrap_or(PER_QUERY);
+            c.score += 1.0 / (len as f64 + 1.0);
+            c.reasons.push(reason);
+            c.strength += weight;
+        }
+    }
+
     let mut ranked: Vec<Ranked> = candidates
         .into_iter()
         .filter(|(id, c)| shown(id, c.prominence) && enough(c))
@@ -763,6 +812,60 @@ mod tests {
     /// The c20 shape (gotcha 326954): a target matched by one keyword and
     /// 20th nearest by meaning. One new memory closer in meaning must cost
     /// it a place or two, not drop it below every keyword-only match.
+    /// Most ranks one new memory may move a recall target (milestone 4's
+    /// stability criterion, committed here for keyword fillers).
+    const STABILITY_MAX_DROP: usize = 3;
+
+    /// Eval case c09's shape (gotcha 416490): a four-keyword query, a
+    /// target that contains two of the words, and `n` gotchas that use the
+    /// common one more densely, enough to push the target past that
+    /// word's pool cutoff.
+    fn c09_graph(n: usize) -> (SqliteGraphStore, i64) {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let target = note(&store, NodeKind::Gotcha, "Every scan makes a paid LLM call", "persist ends with a summary call whenever an Anthropic key is configured: every watch batch and every push-triggered reindex pays for one.");
+        note(&store, NodeKind::Gotcha, "Anthropic rates are hand-kept", "the rate table for anthropic models is maintained by hand");
+        for k in 0..n {
+            note(&store, NodeKind::Gotcha, &format!("Filler {k}"), "every every every time");
+        }
+        (store, target)
+    }
+
+    const C09: &str = "why does every rescan cost me money on the Anthropic bill?";
+
+    #[test]
+    fn a_memory_past_a_common_words_pool_cutoff_still_meets_the_two_keyword_minimum() {
+        let (store, target) = c09_graph(40);
+        let seed = recall_scored_with(&store, "r", C09, 8, &HashSet::new(), None).unwrap();
+        let hit = seed.iter().find(|(p, _)| p.node_id == target).unwrap_or_else(|| panic!("target missing: {seed:?}"));
+        assert!(hit.0.reason.contains("\"every\"") && hit.0.reason.contains("\"anthropic\""), "{}", hit.0.reason);
+        assert_eq!(seed[0].0.node_id, target, "two true matches beat one: {seed:?}");
+    }
+
+    #[test]
+    fn words_alone_never_bring_in_a_memory_outside_every_pool() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let outside = note(&store, NodeKind::Gotcha, "Outside", "a long body that mentions alpha once and beta once among many other ordinary words here");
+        for k in 0..40 {
+            note(&store, NodeKind::Gotcha, &format!("Alpha {k}"), "alpha alpha alpha");
+            note(&store, NodeKind::Gotcha, &format!("Beta {k}"), "beta beta beta");
+        }
+        let seed = recall_seed_with(&store, "r", "alpha beta gamma", 100, &HashSet::new(), None).unwrap();
+        assert!(seed.iter().all(|p| p.node_id != outside), "in neither pool, so never checked: {seed:?}");
+    }
+
+    #[test]
+    fn adding_any_one_common_word_filler_moves_the_target_by_at_most_the_stability_limit() {
+        let place = |store: &SqliteGraphStore, target: i64| recall_seed_with(store, "r", C09, 100, &HashSet::new(), None).unwrap().iter().position(|p| p.node_id == target);
+        let (store, target) = c09_graph(0);
+        let mut before = place(&store, target).expect("recalled with no fillers");
+        for k in 0..40 {
+            note(&store, NodeKind::Gotcha, &format!("Filler {k}"), "every every every time");
+            let after = place(&store, target).unwrap_or_else(|| panic!("lost after filler {k}"));
+            assert!(after <= before + STABILITY_MAX_DROP, "filler {k}: {before} -> {after}");
+            before = after;
+        }
+    }
+
     #[test]
     fn one_new_close_neighbour_moves_a_target_by_at_most_two_places() {
         let store = SqliteGraphStore::open_in_memory().unwrap();

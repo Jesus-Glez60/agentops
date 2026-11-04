@@ -115,17 +115,7 @@ pub(crate) fn candidate_names(this_host: Option<&str>, ssh_config: &str, extra: 
 /// matches in "on deploy-box:" but `box` doesn't match "inbox".
 pub(crate) fn mentioned(text: &str, names: &[String]) -> Vec<String> {
     let text = text.to_lowercase();
-    let mut found: Vec<String> = names
-        .iter()
-        .filter(|name| {
-            text.match_indices(name.as_str()).any(|(i, _)| {
-                let before = text[..i].chars().next_back();
-                let after = text[i + name.len()..].chars().next();
-                !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
-            })
-        })
-        .cloned()
-        .collect();
+    let mut found: Vec<String> = names.iter().filter(|name| agentops_retrieval::words::contains_word(&text, name)).cloned().collect();
     found.sort();
     found
 }
