@@ -966,6 +966,57 @@ fn main() -> Result<()> {
     }
 }
 
+/// A consolidation candidate id (`m<a>-<b>`, `d<id>-...`) with its node ids
+/// mapped into the destination store, or `None` if one isn't mapped.
+fn remap_candidate_id(id: &str, map: &std::collections::HashMap<i64, i64>) -> Option<String> {
+    let candidate = agentops_mcp::proposals::Candidate::from_id(id)?;
+    let mut ids = candidate.sources.iter().map(|old| map.get(old).copied()).collect::<Option<Vec<i64>>>()?;
+    ids.sort();
+    let joined = ids.iter().map(i64::to_string).collect::<Vec<_>>().join("-");
+    Some(format!("{}{joined}", if candidate.purpose == "merge" { "m" } else { "d" }))
+}
+
+/// `migrate_graph`'s copy of the recall claims, consolidation proposals and
+/// "not worth" verdicts. Returns (copied, skipped) row counts.
+fn migrate_recall_and_consolidation(src: &dyn agentops_graph::GraphStore, dst: &dyn agentops_graph::GraphStore, repo: &str, map: &std::collections::HashMap<i64, i64>) -> Result<(usize, usize)> {
+    let (mut copied, mut skipped) = (0, 0);
+    let mut claims: std::collections::BTreeMap<(String, String, String), Vec<i64>> = std::collections::BTreeMap::new();
+    for row in src.recall_shown_rows(repo, None, None)? {
+        match map.get(&row.node_id) {
+            Some(&id) => claims.entry((row.session_id, row.context, row.source)).or_default().push(id),
+            None => skipped += 1,
+        }
+    }
+    for ((session, context, source), ids) in &claims {
+        copied += dst.claim_shown(repo, session, context, ids, source)?.len();
+    }
+    for p in src.proposals(repo)? {
+        let sources: Option<Vec<i64>> = p.source_ids.iter().map(|id| map.get(id).copied()).collect();
+        let (Some(&proposal), Some(sources)) = (map.get(&p.proposal_id), sources) else {
+            skipped += 1;
+            continue;
+        };
+        if dst.proposals(repo)?.iter().any(|q| q.proposal_id == proposal) {
+            continue;
+        }
+        dst.record_proposal(repo, proposal, &sources, &p.sources_digest)?;
+        if p.state != "proposed" {
+            dst.set_proposal_state(repo, proposal, &p.state)?;
+        }
+        copied += 1;
+    }
+    for (candidate, digest) in src.not_worth(repo)? {
+        match remap_candidate_id(&candidate, map) {
+            Some(id) => {
+                dst.record_not_worth(repo, &id, &digest)?;
+                copied += 1;
+            }
+            None => skipped += 1,
+        }
+    }
+    Ok((copied, skipped))
+}
+
 fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result<()> {
     use agentops_graph::{NewNode, NewScanHistoryEntry, NewTask};
     use std::collections::HashMap;
@@ -999,8 +1050,17 @@ fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result
         if let Some(embedding) = src.get_embedding(repo, n.id)? {
             dst.set_embedding(repo, new_id, &embedding)?;
         }
+        // Class (ADR 0054) and scope (milestone 4) decide whether recall
+        // shows a memory at all; a copy without them would resurrect
+        // superseded memories and unscope scoped ones.
+        if n.memory_class != agentops_graph::MemoryClass::Durable || n.class_until.is_some() {
+            dst.set_memory_class(repo, new_id, n.memory_class, n.class_until.as_deref())?;
+        }
+        if n.applies_to.is_some() {
+            dst.set_memory_scope(repo, new_id, n.applies_to.as_deref())?;
+        }
     }
-    println!("nodes: {} copied", src_nodes.len());
+    println!("nodes: {} copied (with class and scope)", src_nodes.len());
 
     // --- edges ---
     let src_edges = src.all_edges(repo)?;
@@ -1055,6 +1115,14 @@ fn migrate_graph(from: &Path, to: &str, repo: &str, wipe_target: bool) -> Result
         dst.record_session_event(repo, &e.session_id, &e.tool_name, &e.description, node_id, &e.event_kind)?;
     }
     println!("session_events: {} copied (timestamps reset to the migration time)", events.len());
+
+    // --- recall_shown, consolidation proposals and verdicts (milestones 4-5) ---
+    // Every node id is mapped, and a row naming one this migration didn't
+    // copy is skipped, never carried through: in the new store an old id
+    // can belong to an unrelated node. Claims get the migration time as
+    // `shown_at`, like session events.
+    let (copied, skipped) = migrate_recall_and_consolidation(&src, &dst, repo, &node_id_map)?;
+    println!("recall_shown + proposals + not-worth verdicts: {copied} copied, {skipped} skipped (a node not in this migration)");
 
     // --- session_usage + llm_usage + session_report (no node references -- straight copies) ---
     // Must be copied, not skipped: `wipe_repo` deletes both on the
@@ -2792,13 +2860,64 @@ mod tests {
     /// Live Postgres only (`AGENTOPS_TEST_DATABASE_URL`, same default as
     /// agentops-graph-pg's tests); says so loudly when it can't run.
     #[test]
+    fn a_candidate_id_is_rewritten_through_the_id_map_or_dropped() {
+        let map: std::collections::HashMap<i64, i64> = [(3, 30), (7, 5), (9, 90)].into_iter().collect();
+        assert_eq!(remap_candidate_id("m3-7", &map).as_deref(), Some("m5-30"), "a merge pair stays sorted");
+        assert_eq!(remap_candidate_id("d3-7-9", &map).as_deref(), Some("d5-30-90"));
+        assert_eq!(remap_candidate_id("m3-4", &map), None, "an unmapped source drops the verdict");
+    }
+
+    /// The test Postgres, or `None` to skip: only when no URL is configured
+    /// at all (a laptop run). With `AGENTOPS_TEST_DATABASE_URL` set, as on
+    /// the CI server, a failed connection fails the test instead of
+    /// skipping it silently (gotchas 54237, 54247).
+    fn test_postgres() -> Option<(String, agentops_graph_pg::PostgresGraphStore)> {
+        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").ok()?;
+        let store = agentops_graph_pg::PostgresGraphStore::connect(&url).unwrap_or_else(|e| panic!("AGENTOPS_TEST_DATABASE_URL is set but Postgres is unreachable: {e:#}"));
+        Some((url, store))
+    }
+
+    #[test]
+    fn migrate_graph_copies_class_scope_claims_proposals_and_verdicts_and_skips_unmapped_ids() {
+        use agentops_graph::{GraphStore, MemoryClass, NewNode, NodeKind};
+        let Some((url, dst)) = test_postgres() else { return };
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("graph.db");
+        let src = agentops_graph::SqliteGraphStore::open(&db).unwrap();
+        let repo = format!("mig-m5-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let node = |name: &str| src.add_node(NewNode { kind: NodeKind::Gotcha, repo: repo.clone(), path: Some(format!("vault:{name}")), name: Some(name.into()), container: None, start_line: None, end_line: None, content: Some(name.into()) }).unwrap();
+        let (a, b, c) = (node("a"), node("b"), node("c"));
+        src.set_memory_class(&repo, a, MemoryClass::Temporal, Some("2026-12-31")).unwrap();
+        src.set_memory_scope(&repo, b, Some(&["build-box".to_string()])).unwrap();
+        src.claim_shown(&repo, "s1", "main#0", &[a, b], "prompt_seed").unwrap();
+        src.claim_shown(&repo, "s1", "main#0", &[999_999], "file_cue").unwrap();
+        src.record_proposal(&repo, c, &[a, b], "digest").unwrap();
+        src.set_proposal_state(&repo, c, "rejected").unwrap();
+        src.record_not_worth(&repo, &format!("m{}-{}", a.min(b), a.max(b)), "d1").unwrap();
+        src.record_not_worth(&repo, &format!("m{a}-999999"), "d2").unwrap();
+        drop(src);
+
+        for _ in 0..2 {
+            migrate_graph(&db, &url, &repo, true).unwrap();
+        }
+        let by_name = |name: &str| dst.all_nodes(&repo).unwrap().into_iter().find(|n| n.name.as_deref() == Some(name)).unwrap();
+        let (na, nb, nc) = (by_name("a"), by_name("b"), by_name("c"));
+        assert_eq!(dst.all_nodes(&repo).unwrap().len(), 3, "wipe then copy twice: no duplicates");
+        assert_eq!((na.memory_class, na.class_until.as_deref()), (MemoryClass::Temporal, Some("2026-12-31")));
+        assert_eq!(nb.applies_to, Some(vec!["build-box".to_string()]));
+        let shown: Vec<i64> = dst.recall_shown_rows(&repo, None, None).unwrap().into_iter().map(|r| r.node_id).collect();
+        assert_eq!(shown.len(), 2, "the unmapped claim is skipped: {shown:?}");
+        assert!(shown.contains(&na.id) && shown.contains(&nb.id));
+        let proposals = dst.proposals(&repo).unwrap();
+        assert_eq!((proposals.len(), proposals[0].proposal_id, proposals[0].state.as_str()), (1, nc.id, "rejected"));
+        assert_eq!(dst.not_worth(&repo).unwrap(), vec![(format!("m{}-{}", na.id.min(nb.id), na.id.max(nb.id)), "d1".to_string())], "rewritten ids; the unmapped verdict skipped");
+        dst.wipe_repo(&repo).unwrap();
+    }
+
+    #[test]
     fn migrate_graph_copies_session_reports_and_is_fine_with_none() {
         use agentops_graph::GraphStore;
-        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").unwrap_or_else(|_| "postgres://postgres:test@localhost:5433/agentops_test".to_string());
-        let Ok(dst) = agentops_graph_pg::PostgresGraphStore::connect(&url) else {
-            eprintln!("SKIPPING migrate_graph_copies_session_reports_and_is_fine_with_none: no Postgres at {url}");
-            return;
-        };
+        let Some((url, dst)) = test_postgres() else { return };
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("graph.db");
         let src = agentops_graph::SqliteGraphStore::open(&db).unwrap();
