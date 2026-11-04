@@ -151,7 +151,7 @@ pub(crate) fn register_repo(state: &AppState, tenant: &str, repo_url: Option<&st
         let derived_name = name.map(str::to_string).or_else(|| derive_name_from_local_id(local_id));
         return match store.create_discovered_connection(tenant, local_id, &synthetic_url, derived_name.as_deref()) {
             Ok(created) => format!(
-                "Registered local-only repo (id: {}). It has no git remote, so it can never be cloned or indexed server-side -- scans and notes from this machine's own CLI will attach to this connection directly.",
+                "Registered memory-only repo (id: {}): not cloned or indexed server-side. Notes, similarity and keyword/meaning recall work; Affects links don't. Scans and notes from this machine's own CLI attach to this connection directly.",
                 created.id
             ),
             Err(e) => format!("failed to register local repo '{local_id}': {e}"),

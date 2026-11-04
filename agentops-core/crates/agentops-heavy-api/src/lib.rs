@@ -2757,7 +2757,7 @@ mod tests {
         let resp = app.clone().oneshot(req).await.unwrap();
         let body = body_json(resp).await;
         assert_eq!(body["result"]["isError"], false, "{body:?}");
-        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("Registered local-only repo"), "{body:?}");
+        assert!(body["result"]["content"][0]["text"].as_str().unwrap().contains("Registered memory-only repo"), "{body:?}");
 
         // A follow-up call against the id it just registered must resolve,
         // exactly like the repo_url-based path already does above.

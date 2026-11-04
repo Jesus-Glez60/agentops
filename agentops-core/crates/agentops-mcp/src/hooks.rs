@@ -620,7 +620,9 @@ fn push_personal_seed(store: &dyn GraphStore, personal: &str, session_id: &str, 
     const HEADER: &str = "Personal memories (about you, from every repo; `fetch_content` with `path: \"personal\"` and the id):";
     let mut exclude: std::collections::HashSet<i64> = store.recall_shown_rows(personal, Some(session_id), None)?.into_iter().filter(|r| r.context == context).map(|r| r.node_id).collect();
     exclude.extend(written);
-    let seed = agentops_retrieval::recall_seed_with(store, personal, query, crate::budget::PERSONAL_SEED_MAX, &exclude, embedder)?;
+    // Keyword matches only: a personal memory reached by meaning alone was
+    // mostly noise on short prompts (two editor notes on "Proceed").
+    let seed: Vec<agentops_retrieval::RecallPointer> = agentops_retrieval::recall_lexical_with(store, personal, query, crate::budget::PERSONAL_SEED_MAX, &exclude, embedder)?.into_iter().map(|(p, _)| p).collect();
     let mut size = parts.iter().map(|p| p.chars().count() + 2).sum::<usize>() + HEADER.chars().count();
     let mut lines = Vec::new();
     for pointer in &seed {
@@ -1409,6 +1411,19 @@ mod tests {
         let followed: Vec<_> = store.session_events(ME, "s").unwrap().into_iter().filter(|e| e.event_kind == MEMORY_FOLLOWED).map(|e| e.description).collect();
         assert_eq!(followed, vec![format!("id {mine} source prompt_seed context main#0")]);
         assert!(store.session_events(&repo, "s").unwrap().iter().all(|e| e.event_kind != MEMORY_FOLLOWED));
+    }
+
+    #[test]
+    fn a_personal_memory_reached_only_through_similarity_is_never_seeded() {
+        let (_dir, store, repo) = store();
+        let worded = gotcha(store.as_ref(), ME, "The user wants release notes kept terse", "terse release notes");
+        let neighbour = gotcha(store.as_ref(), ME, "Catppuccin theme everywhere", "editor colours");
+        for (a, b) in [(worded, neighbour), (neighbour, worded)] {
+            store.add_edge(ME, a, b, agentops_graph::EdgeRelation::SimilarTo).unwrap();
+        }
+        let out = personal_prompt(store.as_ref(), &repo, "write the release notes", "default");
+        assert!(out.contains(&format!("(id {worded})")), "{out}");
+        assert!(!out.contains(&format!("(id {neighbour})")), "a similarity hop is not a keyword match: {out}");
     }
 
     #[test]
