@@ -13,7 +13,7 @@ pub mod hooks;
 /// remote hook; at session start the server warns a CLI that is behind
 /// (`hooks::with_protocol_warning`), since a stale CLI otherwise filters
 /// new cues out before the server sees them (gotchas 235644, 331536).
-pub const CLI_PROTOCOL: u32 = 1;
+pub const CLI_PROTOCOL: u32 = 2; // 2: Bash PreToolUse forwards command cues
 pub mod proposals;
 pub mod recall_stats;
 mod consolidate;

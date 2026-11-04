@@ -57,7 +57,10 @@ const PER_SOURCE: usize = 20;
 pub const ERROR_KEYWORDS: [&str; 5] = ["error", "fail", "exception", "panic", "fatal"];
 
 /// What a work cue is: a file the agent read or edited (its repo-relative
-/// path), or the text of a failed tool call.
+/// path), the text of a failed tool call, or a shell command about to run
+/// that starts or calls a local server, deploys, or runs on another host
+/// (milestone 5 follow-up: the rule "this runs on the server, not locally"
+/// had no cue at the step that broke it).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum WorkCue {
@@ -67,6 +70,150 @@ pub enum WorkCue {
     Error {
         text: String,
     },
+    Command {
+        class: CommandClass,
+        text: String,
+    },
+}
+
+/// The kind of action a command cue is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandClass {
+    /// Starts a server or app on this machine, or calls one there.
+    LocalServer,
+    /// Pushes code or artifacts somewhere else.
+    Deploy,
+    /// Runs a command on another host.
+    Remote,
+}
+
+impl CommandClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CommandClass::LocalServer => "local_server",
+            CommandClass::Deploy => "deploy",
+            CommandClass::Remote => "remote",
+        }
+    }
+
+    /// Words added to the command's own when it is a recall query: what
+    /// a memory about this kind of action would say.
+    fn vocabulary(self) -> &'static str {
+        match self {
+            CommandClass::LocalServer => "local localhost server run serve",
+            CommandClass::Deploy => "deploy push production server",
+            CommandClass::Remote => "remote server ssh",
+        }
+    }
+}
+
+const LOCALHOST: [&str; 3] = ["localhost", "127.0.0.1", "0.0.0.0"];
+
+/// A command's words, quoted spans kept whole. Unlike `shell_words`, a
+/// `$VAR` or glob doesn't refuse the command: classifying only reads words.
+fn command_words(segment: &str) -> Vec<String> {
+    shell_words(segment).unwrap_or_else(|| segment.split_whitespace().map(String::from).collect())
+}
+
+/// The class of `command` and, for its recall query, the program and its
+/// subcommand, if any part of it starts or calls a local server, deploys,
+/// or runs on another host. Every `&&`, `||`, `;` or `|` segment counts,
+/// unlike command compression, which refuses a chain because it rewrites
+/// the command; a cue only reads it. Leading `VAR=value`, `sudo`, `env`,
+/// `nice` and `timeout N` are skipped; `cd`, `echo` and `printf` never
+/// classify, so a command quoted in an echo doesn't either.
+pub fn command_class(command: &str) -> Option<(CommandClass, Vec<String>)> {
+    for segment in command.split("&&").flat_map(|s| s.split("||")).flat_map(|s| s.split(';')).flat_map(|s| s.split('|')) {
+        let mut words = command_words(segment.trim());
+        loop {
+            match words.first().map(String::as_str) {
+                Some(w) if w.contains('=') && !w.starts_with('-') => {
+                    words.remove(0);
+                }
+                Some("sudo" | "env" | "nice" | "command" | "exec") => {
+                    words.remove(0);
+                }
+                Some("timeout") => {
+                    words.drain(..words.len().min(2));
+                }
+                _ => break,
+            }
+        }
+        let lower: Vec<String> = words.iter().map(|w| w.to_lowercase()).collect();
+        if let Some(class) = classify_words(&lower) {
+            let program = lower.first().map(|p| p.rsplit('/').next().unwrap_or(p).to_string());
+            let sub = lower.iter().skip(1).find(|w| !w.starts_with('-')).cloned();
+            return Some((class, program.into_iter().chain(sub).collect()));
+        }
+    }
+    None
+}
+
+fn classify_words(w: &[String]) -> Option<CommandClass> {
+    let program = w.first()?.rsplit('/').next().unwrap_or_default().to_string();
+    let args: Vec<&str> = w.iter().skip(1).map(String::as_str).collect();
+    let positional: Vec<&str> = args.iter().copied().filter(|a| !a.starts_with('-')).collect();
+    let local = |a: &str| LOCALHOST.iter().any(|h| a.contains(h));
+    let p = program.as_str();
+    if matches!(p, "cd" | "echo" | "printf" | "cat" | "grep" | "rg" | "ls") {
+        return None;
+    }
+    // Calling a server on this machine, or binding one to it.
+    if matches!(p, "curl" | "wget" | "http" | "https" | "xh") && args.iter().any(|a| local(a)) {
+        return Some(CommandClass::LocalServer);
+    }
+    if args.windows(2).any(|pair| matches!(pair[0], "--addr" | "--host" | "--bind" | "-b") && local(pair[1])) || args.iter().any(|a| ["--addr=", "--host=", "--bind="].iter().any(|f| a.starts_with(f)) && local(a)) {
+        return Some(CommandClass::LocalServer);
+    }
+    let first = positional.first().copied().unwrap_or("");
+    let second = positional.get(1).copied().unwrap_or("");
+    let serve_word = |s: &str| s == "serve" || s.starts_with("serve-") || s == "server" || s == "runserver";
+    let local_server = match p {
+        "cargo" | "go" => first == "run",
+        "npm" | "pnpm" | "yarn" | "bun" => matches!(first, "dev" | "start" | "serve" | "preview") || (first == "run" && matches!(second, "dev" | "start" | "serve" | "preview")),
+        "docker" => first == "compose" && second == "up",
+        "docker-compose" => first == "up",
+        "uvicorn" | "gunicorn" | "hypercorn" | "vite" => true,
+        "flask" => first == "run",
+        "rails" => matches!(first, "s" | "server"),
+        "next" | "nuxt" | "astro" => first == "dev",
+        "python" | "python3" => serve_word(second) || positional.iter().any(|a| matches!(*a, "http.server" | "uvicorn" | "gunicorn")),
+        _ => serve_word(first),
+    };
+    if local_server {
+        return Some(CommandClass::LocalServer);
+    }
+    let deploy = match p {
+        "git" => first == "push" && !args.iter().any(|a| matches!(*a, "--dry-run" | "-n")),
+        "rsync" | "scp" => positional.iter().skip(1).any(|a| a.split_once(':').is_some_and(|(host, _)| !host.is_empty() && !host.contains('/'))),
+        "kubectl" => matches!(first, "apply" | "rollout" | "set"),
+        "helm" => matches!(first, "upgrade" | "install"),
+        "docker" => first == "push",
+        "fly" | "flyctl" => first == "deploy",
+        "vercel" => first == "deploy" || args.contains(&"--prod"),
+        _ => false,
+    };
+    if deploy {
+        return Some(CommandClass::Deploy);
+    }
+    if p == "ssh" {
+        // `ssh [options] host command...`: options that take a value
+        // consume the next word.
+        let mut rest = args.iter().copied();
+        let mut words = Vec::new();
+        while let Some(a) = rest.next() {
+            if matches!(a, "-i" | "-p" | "-o" | "-l" | "-F" | "-J" | "-L" | "-R" | "-D" | "-E" | "-c" | "-m" | "-b" | "-e" | "-S" | "-W" | "-w") {
+                rest.next();
+            } else if !a.starts_with('-') {
+                words.push(a);
+            }
+        }
+        if words.len() >= 2 {
+            return Some(CommandClass::Remote);
+        }
+    }
+    None
 }
 
 /// Which cue sources run. `AffectsOnly` is the baseline; each `No*` turns
@@ -221,7 +368,16 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
                 merged.extend(mention_candidates(store, repo, path)?);
             }
         }
-        WorkCue::Error { .. } if sources == CueSources::AffectsOnly => {}
+        WorkCue::Error { .. } | WorkCue::Command { .. } if sources == CueSources::AffectsOnly => {}
+        WorkCue::Command { class, text } => {
+            // The action's own words plus what a memory about this kind of
+            // action would say, keyword matches only (like an error), and
+            // no recall by meaning: only keyword hits would survive it, so
+            // the hook doesn't wait on an embedding (up to 250 ms).
+            let words = command_class(text).map(|(_, words)| words).unwrap_or_default();
+            let query = format!("{} {}", words.join(" "), class.vocabulary());
+            merged.extend(recall_ranked_with(store, repo, &query, PER_SOURCE, &HashSet::new(), None)?.into_iter().filter(|s| s.lexical).map(|s| WorkCandidate { pointer: s.pointer, score: s.confidence }));
+        }
         WorkCue::Error { text } => {
             let query = clean_error(text);
             if query.trim().is_empty() {
@@ -394,6 +550,24 @@ pub fn clean_error(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_classes_read_real_command_shapes() {
+        let class = |c: &str| command_class(c).map(|(class, _)| class);
+        for local in ["cargo run -p agentops-server", "cd agentops && cargo run", "RUST_LOG=info cargo run", "timeout 30 cargo run", "agentops serve-api --addr 127.0.0.1:8979", "curl -s http://127.0.0.1:8979/repos", "npm run dev", "pnpm dev", "docker compose up -d", "python manage.py runserver", "python3 -m http.server 8000", "uvicorn app:main --host 0.0.0.0", "sleep 2; curl localhost:3000/health"] {
+            assert_eq!(class(local), Some(CommandClass::LocalServer), "{local}");
+        }
+        for deploy in ["git push origin main", "rsync -az ./ thedamnserver:agentops-ci/scratch/", "scp file.sh thedamnserver:/tmp/x", "kubectl apply -f k8s/", "docker push repo/image:tag", "fly deploy"] {
+            assert_eq!(class(deploy), Some(CommandClass::Deploy), "{deploy}");
+        }
+        for remote in ["ssh thedamnserver 'docker ps'", "ssh -i key -p 2222 host uptime"] {
+            assert_eq!(class(remote), Some(CommandClass::Remote), "{remote}");
+        }
+        for other in ["echo \"cargo run\"", "git push --dry-run", "cargo test", "npm test", "git status", "ssh-keygen -t ed25519", "ssh thedamnserver", "curl https://example.com", "rsync -a ./a ./b", "grep -r 'cargo run' docs"] {
+            assert_eq!(class(other), None, "{other}");
+        }
+        assert_eq!(command_class("agentops serve-api --addr 127.0.0.1:8979").unwrap().1, vec!["agentops".to_string(), "serve-api".to_string()], "program and subcommand join the query");
+    }
     use agentops_graph::{upsert_node, MemoryClass, NewNode, SqliteGraphStore};
 
     fn node(store: &SqliteGraphStore, kind: NodeKind, path: &str, name: &str) -> i64 {

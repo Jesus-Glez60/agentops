@@ -41,7 +41,7 @@ fn every_store_hook_runs_without_loading_the_embedding_model() {
         ]),
         ("posttoolusefailure", vec![json!({ "session_id": "w", "tool_name": "Bash", "error": "Exit code 1\nremote hook server timeout after 5s" })]),
         ("sessionstart", vec![json!({ "session_id": "s", "source": "compact" }), json!({ "session_id": "u", "source": "startup" })]),
-        ("pretooluse", vec![json!({ "session_id": "s", "tool_name": "ExitPlanMode", "tool_input": {"plan": "# Plan\nmake the hooks follow the remote server"} })]),
+        ("pretooluse", vec![json!({ "session_id": "s", "tool_name": "ExitPlanMode", "tool_input": {"plan": "# Plan\nmake the hooks follow the remote server"} }), json!({ "session_id": "s", "tool_name": "Bash", "tool_input": {"command": "cargo run -p agentops-server"} })]),
     ];
     for event in STORE_EVENTS {
         let (_, payloads) = cases.iter().find(|(e, _)| e == event).unwrap_or_else(|| panic!("no payload drives the {event} hook"));

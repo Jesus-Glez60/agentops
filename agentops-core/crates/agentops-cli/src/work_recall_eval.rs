@@ -179,6 +179,7 @@ struct Counts {
     glob: usize,
     failed: usize,
     error_cues: usize,
+    command_cues: usize,
     file_cues: usize,
     distinct_files: usize,
     calls: usize,
@@ -198,13 +199,17 @@ fn count(transcript: &Transcript, root: &Path) -> Counts {
             _ => {}
         }
         c.failed += usize::from(call.failed);
+        if call.tool == "Bash" && call.input.get("command").and_then(Value::as_str).and_then(agentops_retrieval::work_recall::command_class).is_some() {
+            c.command_cues += 1;
+        }
         match cue_of(call, root) {
             Some(WorkCue::Error { .. }) => c.error_cues += 1,
             Some(WorkCue::File { path, .. }) => {
                 c.file_cues += 1;
                 files.insert(path);
             }
-            None => {}
+            // A command cue comes from the call, not its result (see `read_steps`).
+            Some(WorkCue::Command { .. }) | None => {}
         }
     }
     c.distinct_files = files.len();
@@ -223,7 +228,7 @@ fn sizing(path: &Path, root: &Path) -> Result<()> {
     for (label, main) in [("main", true), ("subagent", false)] {
         let counts: Vec<Counts> = transcripts.iter().filter(|t| t.agent_id.is_none() == main).map(|t| count(t, root)).filter(|c| c.calls > 0).collect();
         let column = |f: fn(&Counts) -> usize| counts.iter().map(|c| f(c) as f64).collect::<Vec<_>>();
-        let fields: [(&str, fn(&Counts) -> usize); 11] = [
+        let fields: [(&str, fn(&Counts) -> usize); 12] = [
             ("read", |c| c.read),
             ("bash_read", |c| c.bash_read),
             ("edit", |c| c.edit),
@@ -232,6 +237,7 @@ fn sizing(path: &Path, root: &Path) -> Result<()> {
             ("glob", |c| c.glob),
             ("failed", |c| c.failed),
             ("error_cues", |c| c.error_cues),
+            ("command_cues", |c| c.command_cues),
             ("file_cues", |c| c.file_cues),
             ("distinct_files", |c| c.distinct_files),
             ("calls", |c| c.calls),
@@ -289,6 +295,7 @@ fn cue_kind(cue: &WorkCue) -> &'static str {
     match cue {
         WorkCue::File { .. } => "file",
         WorkCue::Error { .. } => "error",
+        WorkCue::Command { .. } => "command",
     }
 }
 
@@ -307,7 +314,7 @@ fn resolve(backend: &Backend, cue: &WorkCue, sources: CueSources) -> Result<Vec<
 fn cue_text(cue: &WorkCue) -> &str {
     match cue {
         WorkCue::File { path, .. } => path,
-        WorkCue::Error { text } => text,
+        WorkCue::Error { text } | WorkCue::Command { text, .. } => text,
     }
 }
 
@@ -430,6 +437,12 @@ pub(crate) fn read_steps(path: &Path, root: &Path, agent_id: Option<&str>) -> Re
             match block.get("type").and_then(Value::as_str) {
                 Some("tool_use") => {
                     if let Some(id) = block.get("id").and_then(Value::as_str) {
+                        // A command cue fires before the command runs
+                        // (`PreToolUse`), so it replays at the call.
+                        let command = (block.get("name").and_then(Value::as_str) == Some("Bash")).then(|| block.pointer("/input/command").and_then(Value::as_str)).flatten();
+                        if let (false, Some((class, _))) = (calls.contains_key(id), command.and_then(agentops_retrieval::work_recall::command_class)) {
+                            steps.push(ReplayStep::Cue { agent_id: agent_id.map(String::from), cue: WorkCue::Command { class, text: agentops_security::redact(command.unwrap_or_default()).text } });
+                        }
                         calls.entry(id.to_string()).or_insert_with(|| (block.get("name").and_then(Value::as_str).unwrap_or_default().to_string(), block.get("input").cloned().unwrap_or(Value::Null)));
                     }
                 }
@@ -443,7 +456,7 @@ pub(crate) fn read_steps(path: &Path, root: &Path, agent_id: Option<&str>) -> Re
                     let cue = match cue_of(&call, root) {
                         Some(cue @ WorkCue::File { .. }) => cue,
                         Some(WorkCue::Error { text }) => WorkCue::Error { text: agentops_security::redact(&text).text },
-                        None => continue,
+                        Some(WorkCue::Command { .. }) | None => continue,
                     };
                     steps.push(ReplayStep::Cue { agent_id: agent_id.map(String::from), cue });
                 }
@@ -594,6 +607,7 @@ fn replay(path: &Path, root: &Path, sessions: &[String], remote: bool, min_score
                 let cue = match &injection.cue {
                     WorkCue::File { path, .. } => path.clone(),
                     WorkCue::Error { .. } => ERROR_CUE.to_string(),
+                    WorkCue::Command { class, .. } => format!("command:{}", class.as_str()),
                 };
                 for (node_id, kind, title, _reason, activation) in injection.shown {
                     labels.push(LabelLine { session: t.session_id.clone(), context: t.agent_id.clone().unwrap_or_else(|| "main".into()), step: chunk_no * REPLAY_CHUNK + injection.step, cue: cue.clone(), node_id, kind, title, activation, label: String::new() });
@@ -795,6 +809,7 @@ mod tests {
                 json!({"type": "system", "subtype": "compact_boundary"}),
                 json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "b", "name": "Bash", "input": {"command": "cargo test"}}]}}),
                 json!({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "b", "is_error": true, "content": "Exit code 101\npanicked"}]}}),
+                json!({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "c", "name": "Bash", "input": {"command": "agentops serve-api --addr 127.0.0.1:8979"}}]}}),
             ],
         );
         let steps = read_steps(&path, root, None).unwrap();
@@ -803,8 +818,9 @@ mod tests {
             ReplayStep::Compact => "compact".into(),
             ReplayStep::Cue { cue: WorkCue::File { path }, .. } => format!("file:{path}"),
             ReplayStep::Cue { cue: WorkCue::Error { text }, .. } => format!("error:{}", text.lines().count()),
+            ReplayStep::Cue { cue: WorkCue::Command { class, .. }, .. } => format!("command:{}", class.as_str()),
         }).collect();
-        assert_eq!(shape, ["prompt:tag the release:true", "file:docs/release.md", "compact", "error:2"]);
+        assert_eq!(shape, ["prompt:tag the release:true", "file:docs/release.md", "compact", "error:2", "command:local_server"], "the command cue comes at the call, before its result");
         let sub = read_steps(&path, root, Some("agent-a")).unwrap();
         assert!(sub.iter().all(|s| matches!(s, ReplayStep::Cue { agent_id: Some(_), .. })), "a subagent has no prompts or compactions of its own");
     }

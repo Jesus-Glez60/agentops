@@ -150,7 +150,9 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     // newest position for activation and shows nothing, without resolving
     // again. Before this, each re-read of a hub file drained its mention
     // list three pointers at a time (gotcha 235636).
-    if let WorkCue::File { .. } = cue {
+    // A command cue likewise speaks once per kind of action per context,
+    // and again after a compaction (the context's events start there).
+    if let WorkCue::File { .. } | WorkCue::Command { .. } = cue {
         if let Some(earlier) = context.iter().rev().find(|e| e.event_kind == WORK_CUE && e.tool_name == key) {
             let description = earlier.description.clone();
             log.record(&key, &description, WORK_CUE, agent_id)?;
@@ -167,7 +169,7 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     if candidates.is_empty() {
         // A file that reached nothing is still recorded, so a re-read of it
         // is skipped above rather than resolved again.
-        if let WorkCue::File { .. } = cue {
+        if let WorkCue::File { .. } | WorkCue::Command { .. } = cue {
             log.record(&key, "", WORK_CUE, agent_id)?;
         }
         return Ok(None);
@@ -185,7 +187,7 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     let injected = work_injected(&whole);
     let room = match agent_id {
         Some(_) => SUBAGENT_MAX_INJECTED.saturating_sub(injected),
-        None if matches!(cue, WorkCue::File { .. }) && injected >= MAX_INJECTED_PER_CONTEXT => 0,
+        None if matches!(cue, WorkCue::File { .. } | WorkCue::Command { .. }) && injected >= MAX_INJECTED_PER_CONTEXT => 0,
         None => WORK_RECALL_MAX_ITEMS,
     };
     if room == 0 {
@@ -218,6 +220,7 @@ pub fn on_cue(store: &dyn GraphStore, repo: &str, log: &mut dyn EventLog, agent_
     let source = match cue {
         WorkCue::File { .. } => "file_cue",
         WorkCue::Error { .. } => "error_cue",
+        WorkCue::Command { .. } => "command_cue",
     };
     let won: HashSet<i64> = log.claim(&claim_context(&events, agent_id), &fitting.iter().map(|(c, _, _)| c.pointer.node_id).collect::<Vec<_>>(), source)?.into_iter().collect();
     let mut text = WORK_RECALL_HEADER.to_string();
@@ -294,6 +297,7 @@ pub fn cue_key(cue: &WorkCue) -> String {
     match cue {
         WorkCue::File { path, .. } => format!("file:{path}"),
         WorkCue::Error { .. } => "error".to_string(),
+        WorkCue::Command { class, .. } => format!("command:{}", class.as_str()),
     }
 }
 

@@ -183,6 +183,15 @@ Milestone 3b (`agentops_mcp::work_recall`). The file the agent opens or edits, a
 - **Measuring it.** `agentops work-recall-eval --replay` runs past sessions through the same code via `POST /repos/{id}/work-recall/replay`, against an in-memory log. `--sources no_affects|no_mentions` turns one file-cue source off, for both cases and replay (the ablation, milestone 3b revision 1).
 - **Off switch.** `AGENTOPS_WORK_RECALL=off` turns injection off and leaves prompt-time recall alone. `agentops connect --no-work-recall` sets the variable in `.claude/settings.json`'s `env`, and connecting again without the flag removes it. `hook-capture` forwards the setting as `agentops_work_recall: false` in the payload, so a remote server honors it too. Reads and cues are still recorded. There is no separate repo config file: AgentOps has none.
 
+### Command cues
+
+Milestone 5 follow-up (`agentops_retrieval::work_recall::command_class`). A `Bash` call that starts or calls a local server (`cargo run`, `npm run dev`, a `serve*` subcommand, a request or bind to `localhost`/`127.0.0.1`), deploys (`git push`, `rsync`/`scp` to `host:`, `kubectl apply`, `docker push`) or runs on another host (`ssh host command`) is a work cue on `PreToolUse`, so a rule about where things run arrives before the command does. `additionalContext` from `PreToolUse` reaches the model (verified live, note 421339). Every `&&`/`;`/`|` segment counts; `echo`, `cd`, `grep` never classify.
+
+- The query is the program and subcommand plus a fixed vocabulary per class. Keyword matches only, like an error cue, and no recall by meaning, so the hook never waits on an embedding.
+- One pointer, the first cue per class per context (re-armed after a compaction), claimed as `command_cue`; the main session's ceiling applies as for files.
+- The command is never denied or rewritten; a secret warning in the same command is joined with it. Personal memories never ride on it.
+- Replays (`work-recall-eval --replay`) emit it at the tool call, before its result; `--sizing` counts `command_cues`.
+
 ### Memory scope
 
 Milestone 4 item 3. Some memories hold only on one machine: one server's deploy setup, or one SSH alias. In milestone 3c, 4 of the 6 non-progress noise rows were these, and all came from error cues.

@@ -88,7 +88,7 @@ pub fn is_relevant(event: &str, payload: &Value) -> bool {
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     match event {
         "posttooluse" => recorded_post_tool_event(payload, tool_name, &tool_input).is_some() || MEMORY_WRITE_TOOLS.contains(&tool_name) || FOLLOW_TOOLS.contains(&tool_name) || render_tool_response(payload.get("tool_response").unwrap_or(&Value::Null)).chars().count() > DEFAULT_CHAR_BUDGET,
-        "pretooluse" => tool_name == "ExitPlanMode" || is_memory_write(tool_name, &tool_input) || detect_secret_exposure(tool_name, &tool_input).is_some(),
+        "pretooluse" => tool_name == "ExitPlanMode" || is_memory_write(tool_name, &tool_input) || detect_secret_exposure(tool_name, &tool_input).is_some() || command_cue(tool_name, &tool_input).is_some(),
         "userpromptsubmit" => payload.get("prompt").and_then(|v| v.as_str()).is_some_and(|p| !p.trim().is_empty() && !is_task_notification(p)),
         "subagentstart" => payload.get("agent_type").and_then(|v| v.as_str()).is_some_and(|t| SEEDED_AGENTS.contains(&t)),
         _ => true,
@@ -736,11 +736,36 @@ fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<O
         let _ = store.record_session_event(repo, session_id(payload), tool_name, path, None, MEMORY_WRITE_REDIRECTED);
         return Ok(Some(serde_json::json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": MEMORY_REDIRECT_REASON } })));
     }
-    let Some(warning) = detect_secret_exposure(tool_name, &tool_input) else {
-        return Ok(None);
+    let warning = detect_secret_exposure(tool_name, &tool_input);
+    if let Some(warning) = &warning {
+        let _ = store.record_session_event(repo, session_id(payload), tool_name, warning, None, "secret_exposure_warning");
+    }
+    // A command that starts or calls a local server, deploys, or runs on
+    // another host recalls before it runs (milestone 5 follow-up), so a
+    // rule about where things run arrives in time. Context only: the
+    // command is never denied or rewritten. Repo memories only.
+    let recalled = match command_cue(tool_name, &tool_input) {
+        Some(cue) => work_cue(store, repo, payload, &cue, None).unwrap_or_else(|e| {
+            eprintln!("agentops: command cue failed (non-fatal): {e:#}");
+            None
+        }),
+        None => None,
     };
-    let _ = store.record_session_event(repo, session_id(payload), tool_name, &warning, None, "secret_exposure_warning");
-    Ok(Some(hook_output("PreToolUse", Some(&warning), Some(&format!("agentops: {warning}")))))
+    if warning.is_none() && recalled.is_none() {
+        return Ok(None);
+    }
+    let context = [warning.clone(), recalled].into_iter().flatten().collect::<Vec<_>>().join("\n\n");
+    Ok(Some(hook_output("PreToolUse", Some(&context), warning.map(|w| format!("agentops: {w}")).as_deref())))
+}
+
+/// A `Bash` call whose command is a command cue (`command_class`).
+fn command_cue(tool_name: &str, tool_input: &Value) -> Option<agentops_retrieval::work_recall::WorkCue> {
+    if tool_name != "Bash" {
+        return None;
+    }
+    let command = tool_input.get("command").and_then(Value::as_str)?;
+    let (class, _) = agentops_retrieval::work_recall::command_class(command)?;
+    Some(agentops_retrieval::work_recall::WorkCue::Command { class, text: agentops_security::redact(command).text })
 }
 
 /// `event_kind` of a write to Claude Code's local memory that was sent to
@@ -1230,6 +1255,33 @@ mod tests {
         let events = store.session_events(&repo, "sess-9").unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_kind, "secret_exposure_warning");
+    }
+
+    fn pre(store: &dyn GraphStore, repo: &str, command: &str, session: &str) -> Option<Value> {
+        handle_with_personal(store, repo, Some("personal--u1"), "pretooluse", &json!({ "tool_name": "Bash", "tool_input": {"command": command}, "session_id": session }), None).unwrap()
+    }
+
+    #[test]
+    fn a_command_that_starts_a_local_server_recalls_the_rule_before_it_runs_once_per_kind() {
+        let (_dir, store, repo) = store();
+        let rule = gotcha(store.as_ref(), &repo, "Never run a local server: serve-api runs on the remote server", "The live app is the server on thedamnserver; a local serve or localhost run is the wrong one.");
+        gotcha(store.as_ref(), "personal--u1", "The user likes a local server for serve-api runs", "local server serve run localhost");
+        let out = pre(store.as_ref(), &repo, "agentops serve-api --addr 127.0.0.1:8979", "c1").expect("a cue");
+        assert!(out["hookSpecificOutput"].get("permissionDecision").is_none(), "never blocks: {out}");
+        let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(context.contains(&format!("(id {rule})")), "{context}");
+        assert!(!context.contains("The user likes"), "personal memories never ride on a command cue: {context}");
+        assert!(out.get("systemMessage").is_none(), "no warning, no message");
+        assert!(store.recall_shown_rows(&repo, Some("c1"), None).unwrap().iter().any(|r| r.node_id == rule && r.source == "command_cue"));
+
+        assert!(pre(store.as_ref(), &repo, "curl -s http://127.0.0.1:8979/health", "c1").is_none(), "the same kind of action speaks once per context");
+        assert!(pre(store.as_ref(), &repo, "cargo test", "c1").is_none(), "not an action cue");
+
+        // A credential in the same command: the warning and the cue together.
+        let both = pre(store.as_ref(), &repo, r#"API_KEY="sk_live_abcdef1234567890ABCDEF" agentops serve-api --addr 127.0.0.1:8979"#, "c2").unwrap();
+        let context = both["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert!(context.contains("credential") && context.contains(&format!("(id {rule})")), "{context}");
+        assert!(both["systemMessage"].as_str().unwrap().contains("agentops:"), "{both}");
     }
 
     #[test]
