@@ -111,6 +111,25 @@ pub fn hook_output(event_name: &str, additional_context: Option<&str>, system_me
     output
 }
 
+/// The payload field a remote CLI puts its `CLI_PROTOCOL` in.
+pub const CLI_PROTOCOL_FIELD: &str = "cli_protocol";
+
+/// On `sessionstart` from a CLI behind the server (`cli_protocol` below
+/// `CLI_PROTOCOL`; a CLI from before the field existed sends none and
+/// counts as 0), adds a reinstall warning as the output's top-level
+/// `systemMessage` (gotcha 79051), creating the output if the hook had
+/// nothing else to say. Any other event or an up-to-date CLI: unchanged.
+pub fn with_protocol_warning(event: &str, payload: &Value, output: Option<Value>) -> Option<Value> {
+    let cli = payload.get(CLI_PROTOCOL_FIELD).and_then(Value::as_u64).unwrap_or(0);
+    if event != "sessionstart" || cli >= u64::from(crate::CLI_PROTOCOL) {
+        return output;
+    }
+    let message = format!("agentops CLI is behind the server (protocol {cli} < {}): reinstall it with `cargo install --path agentops-core/crates/agentops-cli` (or `npx agentops-cli`) and restart Claude Code.", crate::CLI_PROTOCOL);
+    let mut output = output.unwrap_or_else(|| hook_output("SessionStart", None, None));
+    output["systemMessage"] = Value::String(message);
+    Some(output)
+}
+
 fn session_id(payload: &Value) -> &str {
     payload.get("session_id").and_then(|v| v.as_str()).unwrap_or("unknown-session")
 }
@@ -1291,6 +1310,20 @@ mod tests {
         lookup(store.as_ref(), &repo, "fetch_content", json!({ "path": "r", "id": seeded }), Some("a2"));
         let all = follows(store.as_ref(), &repo);
         assert_eq!(&all[3..], &[(format!("id {seeded} source subagent_seed context a1"), Some("a1".to_string()))], "a2 was never shown it");
+    }
+
+    #[test]
+    fn a_cli_behind_the_server_is_warned_at_session_start_only() {
+        let warn = |event: &str, payload: Value, output: Option<Value>| with_protocol_warning(event, &payload, output);
+        let old = warn("sessionstart", json!({ "session_id": "s" }), None).expect("a CLI sending no protocol is protocol 0");
+        assert!(old["systemMessage"].as_str().unwrap().contains("reinstall"), "{old}");
+        assert_eq!(old["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        let guide = hook_output("SessionStart", Some("## Pinned"), None);
+        let kept = warn("sessionstart", json!({}), Some(guide.clone())).unwrap();
+        assert_eq!(kept["hookSpecificOutput"]["additionalContext"], "## Pinned", "the guide is kept");
+        assert!(kept["systemMessage"].is_string());
+        assert_eq!(warn("sessionstart", json!({ CLI_PROTOCOL_FIELD: crate::CLI_PROTOCOL }), Some(guide.clone())), Some(guide.clone()), "up to date: unchanged");
+        assert_eq!(warn("userpromptsubmit", json!({}), None), None, "only session start warns");
     }
 
     const ME: &str = "personal--u1";

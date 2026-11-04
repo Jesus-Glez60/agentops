@@ -71,6 +71,10 @@ The steps above are the **full** connect, which only AgentOps' own checkout gets
 
 The marker is how everything else knows the repo is remote: `docs/vault-protocol.md`, the local-notes hook, and `agentops usage sync` all check it. It holds a credential, so it must stay out of git. A checkout that uses an SSH config host alias once failed to match its connection (gotcha 53975). Merging a local-only stub into a GitHub connection leaves the marker pointing at a dead id (gotcha 54243). Since milestone 5, a reconnect checks the marker's id against `GET /repos` and resolves again if it is gone.
 
+### CLI protocol
+
+`agentops_mcp::CLI_PROTOCOL` is the contract between the laptop CLI and the server. Every remote hook carries it (`cli_protocol`). At session start, a CLI that sends a lower number, or none (counted as 0), gets a top-level `systemMessage` telling the person to reinstall (`hooks::with_protocol_warning`). **Bump it whenever the CLI must change for a server feature to work**: a new hook relevance rule, a payload field the server reads, a command a server feature depends on. Without it a stale CLI silently filters new cues out before the server sees them (gotchas 235644, 331536).
+
 ### Guest connect (every other repo)
 
 Milestone 5 item 2 (`agentops-cli/src/guest_connect.rs`). In any other repo, a client's above all, `connect --remote` changes no tracked file, so `git status` stays clean:

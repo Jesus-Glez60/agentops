@@ -5,6 +5,15 @@
 
 pub mod budget;
 pub mod hooks;
+
+/// The contract between `agentops hook-capture` (the laptop CLI) and the
+/// server. Bump it whenever the CLI must change for a server feature to
+/// work: a new hook relevance rule, a new payload field the server reads,
+/// a command the server's features depend on. A CLI sends it with every
+/// remote hook; at session start the server warns a CLI that is behind
+/// (`hooks::with_protocol_warning`), since a stale CLI otherwise filters
+/// new cues out before the server sees them (gotchas 235644, 331536).
+pub const CLI_PROTOCOL: u32 = 1;
 pub mod proposals;
 pub mod recall_stats;
 mod consolidate;

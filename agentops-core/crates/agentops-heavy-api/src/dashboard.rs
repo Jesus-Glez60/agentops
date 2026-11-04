@@ -676,7 +676,8 @@ pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<
         // The caller's personal memories join recall here (milestone 5);
         // never created by a hook, only found.
         let personal = user_id.and_then(|uid| crate::personal::personal_path(&state, uid, false).ok().flatten()).map(|p| agentops_mcp::repo_name(&p));
-        Ok(Some(agentops_mcp::hooks::handle_with_personal(store.as_ref(), &repo, personal.as_deref(), &event, &payload, Some(&SERVER_EMBEDDER))?))
+        let output = agentops_mcp::hooks::handle_with_personal(store.as_ref(), &repo, personal.as_deref(), &event, &payload, Some(&SERVER_EMBEDDER))?;
+        Ok(Some(agentops_mcp::hooks::with_protocol_warning(&event, &payload, output)))
     })
     .await;
 

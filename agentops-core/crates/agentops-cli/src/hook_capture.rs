@@ -173,6 +173,8 @@ pub(crate) fn call_remote(marker: &RemoteMcpMarker, event: &str, payload: &Value
     if let Some(map) = body.as_object_mut() {
         map.remove("cwd");
         map.remove("transcript_path");
+        // So the server can tell this CLI is behind it (`CLI_PROTOCOL`).
+        map.insert(hooks::CLI_PROTOCOL_FIELD.into(), serde_json::json!(agentops_mcp::CLI_PROTOCOL));
     }
     let mut response = ureq::post(&url)
         .header("Authorization", &format!("Bearer {}", marker.api_key))
@@ -512,7 +514,7 @@ mod tests {
         // What the client adds to Claude Code's payload: its own fields, and
         // from the environment only the normalized hostname.
         let sent: std::collections::BTreeSet<&str> = body.as_object().unwrap().keys().map(String::as_str).collect();
-        let expected: std::collections::BTreeSet<&str> = ["prompt", "session_id", "hook_event_name", "agentops_path", "client_host"].into_iter().collect();
+        let expected: std::collections::BTreeSet<&str> = ["prompt", "session_id", "hook_event_name", "agentops_path", "client_host", hooks::CLI_PROTOCOL_FIELD].into_iter().collect();
         assert_eq!(sent.difference(&expected).collect::<Vec<_>>(), Vec::<&&str>::new(), "{body}");
         assert_eq!(body["client_host"], json!(hostname().as_deref().and_then(hooks::normalize_host)), "{body}");
         assert!(!dir.path().join(".context").join("graph.db").exists());
