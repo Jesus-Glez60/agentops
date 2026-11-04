@@ -956,25 +956,23 @@ impl GraphStore for SqliteGraphStore {
         if match_query.is_empty() {
             return Ok(vec![]);
         }
-        // Same over-fetch-then-filter-in-Rust technique as search_similar —
-        // FTS5's MATCH can't be combined with an arbitrary repo/kind filter
-        // inside the same virtual-table query efficiently, and node counts
-        // at self-hosted scale make this cheap. Ties on bm25 break on id, so
-        // the same graph always ranks the same (gotcha 326954).
-        let fetch_k = (top_k * 8).max(50) as i64;
-        let mut stmt = self.conn.prepare("SELECT rowid, bm25(nodes_fts) FROM nodes_fts WHERE nodes_fts MATCH ?1 ORDER BY bm25(nodes_fts), rowid LIMIT ?2")?;
-        let rows = stmt.query_map(rusqlite::params![match_query, fetch_k], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
+        // Repo and kind are filtered in the same query (the join
+        // `count_lexical` uses): an over-fetch of the top rows across every
+        // repo, filtered afterwards, missed a small repo's hits on a
+        // multi-repo graph. Ties on bm25 break on id, so the same graph
+        // always ranks the same (gotcha 326954).
+        let mut stmt = self.conn.prepare(
+            "SELECT nodes_fts.rowid, bm25(nodes_fts) FROM nodes_fts JOIN nodes ON nodes.id = nodes_fts.rowid \
+             WHERE nodes_fts MATCH ?1 AND nodes.repo = ?2 AND (?3 IS NULL OR nodes.kind = ?3) \
+             ORDER BY bm25(nodes_fts), nodes_fts.rowid LIMIT ?4",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![match_query, repo, kind.map(|k| k.as_db_str()), top_k as i64], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?)))?;
 
         let mut hits = Vec::new();
         for row in rows {
             let (node_id, bm25_score) = row?;
-            let Some(node) = self.get_node(repo, node_id)? else { continue };
-            if kind.is_some_and(|k| node.kind != k) {
-                continue;
-            }
-            hits.push((node, bm25_score as f32));
-            if hits.len() >= top_k {
-                break;
+            if let Some(node) = self.get_node(repo, node_id)? {
+                hits.push((node, bm25_score as f32));
             }
         }
         Ok(hits)
@@ -1697,6 +1695,19 @@ mod tests {
         store.delete_nodes("repo-a", &[id]).unwrap();
         let hits_after_delete = store.search_lexical("repo-a", "unique_marker_xyz", 10, None).unwrap();
         assert!(hits_after_delete.is_empty(), "a deleted node must not remain searchable: {hits_after_delete:?}");
+    }
+
+    #[test]
+    fn a_small_repo_finds_its_hits_on_a_graph_where_another_repo_has_many_more() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        let note = |repo: &str, i: usize| store.add_node(NewNode { kind: NodeKind::Gotcha, repo: repo.into(), path: Some(format!("vault:{repo}-{i}")), name: Some(format!("{repo} {i}")), container: None, start_line: None, end_line: None, content: Some("the reindex queue stalls".into()) }).unwrap();
+        for i in 0..100 {
+            note("big", i);
+        }
+        let small: Vec<i64> = (0..3).map(|i| note("small", i)).collect();
+        let found: Vec<i64> = store.search_lexical("small", "reindex", 10, Some(NodeKind::Gotcha)).unwrap().into_iter().map(|(n, _)| n.id).collect();
+        assert_eq!(found, small, "the other repo's rows never crowd out this repo's");
+        assert!(store.search_lexical("small", "reindex", 10, Some(NodeKind::Decision)).unwrap().is_empty());
     }
 
     #[test]
