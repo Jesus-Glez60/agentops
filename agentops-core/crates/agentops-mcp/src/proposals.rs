@@ -49,12 +49,12 @@ pub struct Candidate {
 }
 
 impl Candidate {
-    fn merge(a: i64, b: i64, cosine: f32) -> Self {
+    pub fn merge(a: i64, b: i64, cosine: f32) -> Self {
         let (a, b) = (a.min(b), a.max(b));
         Candidate { id: format!("m{a}-{b}"), purpose: "merge".into(), sources: vec![a, b], cosine: Some(cosine) }
     }
 
-    fn distill(mut ids: Vec<i64>) -> Self {
+    pub fn distill(mut ids: Vec<i64>) -> Self {
         ids.sort();
         Candidate { id: format!("d{}", ids.iter().map(i64::to_string).collect::<Vec<_>>().join("-")), purpose: "distill".into(), sources: ids, cosine: None }
     }

@@ -1,12 +1,12 @@
 # Milestone 5 handoff: second import pass and evidence
 
-**Final, 2026-11-04.** Covers the milestone 5 spec. Facts only, each tied to a commit, a script or a command's output; anything not verified is marked **unverified**. **No client names, memory text, prompts or paths from other projects:** projects appear as aliases (p01–p21, `user-level`), whose real names live only in the git-ignored `.context/m5/projects.local.md`. AgentOps' own memories appear as node ids.
+**Final, 2026-11-04; corrected 2026-11-05 after the wrap review** (`m5b-report.md` §6). Covers the milestone 5 spec. Facts only, each tied to a commit, a script or a command's output; anything not verified is marked **unverified**. **No client names, memory text, prompts or paths from other projects:** projects appear as aliases (p01–p21, `user-level`), whose real names live only in the git-ignored `.context/m5/projects.local.md`. AgentOps' own memories appear as node ids.
 
 **Result: every personal project and the user-level memories are in AgentOps, personal memories recall in other repos, and the evidence replays measured the requirement: 3 of 4 corrected memories now reach the context before the step that went wrong. The "no regressions" gate is not met: the prompt eval is 14/20 (target 15/20), because one new memory pushed a fragile hit out of a keyword pool. A DNS outage took production offline from outside for 7 days 20 hours mid-milestone.**
 
 | Done when | Result | |
 | --- | --- | --- |
-| Accepting a proposal unpins its sources; 104416 no longer injected on production; a progress or expired temporal pin is never injected (tests) | Live probe: 104416 out of the pin block; tests in `9723db5` | Met |
+| Accepting a proposal unpins its sources; 104416 no longer injected on production; a progress or expired temporal pin is never injected (tests) | Live probe: 104416 out of the pin block. The unpin on accept is milestone 4's (`a59d1f2`, `proposals.rs`); the class filter that keeps progress and expired pins out is `9723db5` | Met |
 | An unchanged pair judged "not worth" isn't sent to the LLM again (test, one live session end) | Session `3875ecaf` ended twice: 2 judged, then no call (§1) | Met |
 | Consolidation runs log a dollar cost | `usd: 0.0007014` on the live run (§1) | Met |
 | Every approved project: entries in = records out, backup identical, auto-memory off, `git status` unchanged | 7 of 7 imports (§2) | Met |
@@ -48,6 +48,7 @@ All on `main`, deployed by the push-to-main autodeploy. The last deploy is `d9f0
 - **Only one client project imported** (p08), the others left untouched because the author has left those companies (2026-10-27). **All personal projects and user-level imported** (2026-10-27).
 - **Four evidence sessions, not three** (the author picked all four, 2026-11-04), one marked weak.
 - **p10's `archive/` (2 entries) not imported**, as archived by the author; kept in the backup.
+- **Eval sessions are counted in neither split** (not in the spec): `recall-stats` leaves `recall-eval-*` sessions out of both meta and ordinary (gotcha 112998), where the spec counts eval and replay sessions as meta. Found by the wrap review, not approved at the time.
 - **Pushes:** each approved by the author (`80957b4` batch, the Phase B batch, `82398b8`, `d9f0980`).
 
 ## 2. Import
@@ -101,7 +102,7 @@ Each replay ran on today's graph, on copies of the transcript and its subagents 
 | E3 | `84aa616d` (2026-09-25) | 104449 (same) | Yes, from prompt 6 of 24 | prompt seed | 5 |
 | E4 (weak) | `f8e90857` (2026-09-28) | 104410, notes reach the DB through MCP (2026-09-29, after the session) | Yes, all 3 prompts | pin | – |
 
-**What it says.** Of the three valid cases, two are recalled before the step that went wrong (E1 by pin, E3 by prompt seed at the last slot a default seed shows) and one is not (E2). E2's prompts never mention servers or running locally. The step that went wrong was an action: running the app locally. A Bash command is a cue only when it reads a file or fails, so no path in today's design would surface that memory then. E1 and E4 hold only because the memories are pinned: a pin is present on every prompt, which says nothing about cue recall. **Leakage:** none. Every target is an imported MEMORY.md entry, not something the replayed session wrote.
+**What it says.** Of the three valid cases, two are recalled before the step that went wrong (E1 by pin, E3 by prompt seed at the last slot a default seed shows) and one is not (E2). E2's prompts never mention servers or running locally. The step that went wrong was an action: running the app locally. A Bash command is a cue only when it reads a file or fails, so no path in today's design would surface that memory then. E1 and E4 hold only because the memories are pinned: a pin is present on every prompt, which says nothing about cue recall. **Leakage:** none written by the replayed sessions: every target is an imported MEMORY.md entry. But E4's memory was written the day after its session, so E4 measures recall of the lesson that session taught, not a lesson known before it; that is why it is weak.
 
 ## 5. Ordinary sessions so far
 
@@ -115,9 +116,9 @@ The counting runs, but there is almost nothing to count. **Production was unreac
 
 | Outcome | State | Evidence |
 | --- | --- | --- |
-| A relevant memory reaches the context without a tool call, in normal and plan mode and in subagents | **Met** | Milestones 1, 3b; personal memories now too (§3) |
+| A relevant memory reaches the context without a tool call, in normal and plan mode and in subagents | **Mechanism met; not shown on the evidence by cues** | Milestones 1, 3b; personal memories now too (§3). Of the evidence cases, E1 and E4 arrive by pin and E3 by prompt seed; no case was recalled by a work cue, and E2, the one cue case, was missed (§4) |
 | A memory surfaces on its cue and not otherwise; injection stays inside a fixed budget | **Met** against the 3b targets (decided: noise and useful share, 1 pointer per cue) | Spec decision; work cues stay at 1 pointer, 800 characters |
-| Rules that must always hold are enforced or always present | **Met** | Pins, including personal pins; 11 new rules pinned (§2) |
+| Rules that must always hold are enforced or always present | **Partly met** | Pins, including personal pins. The 11 rules pinned on the LLM's judgment (§2) are unreviewed |
 | MEMORY.md imported once, every entry routed, nothing silently dropped | **Met** for AgentOps and the 6 personal and 1 client projects imported; 15 client projects deliberately not imported | §2; entries = records everywhere; unparsed lines and archives counted |
 | Session learnings become memories without asking, consolidated at session end | **Met**, with a person accepting | Milestone 4; "not worth" no longer re-judged (§1) |
 | A memory recalled and wrong gets flagged; one recalled and used gets stronger | **Open** | No "wrong" signal; 2 follows, 0 in ordinary sessions |

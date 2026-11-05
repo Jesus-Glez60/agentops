@@ -1772,9 +1772,12 @@ mod tests {
 
         for repo in [&a, &b] {
             store.upsert_session_report(NewSessionReport { repo: repo.to_string(), session_id: "sess".into(), source: "transcript".into(), agent: "claude-code".into(), ..Default::default() }).unwrap();
+            store.record_not_worth(repo, "m1-2", "digest").unwrap();
         }
 
         store.wipe_repo(&a).unwrap();
+        assert!(store.not_worth(&a).unwrap().is_empty());
+        assert_eq!(store.not_worth(&b).unwrap().len(), 1, "another repo's not-worth verdicts survive (gotcha 54241)");
         assert!(store.session_reports_for_repo(&a).unwrap().is_empty());
         assert_eq!(store.session_reports_for_repo(&b).unwrap().len(), 1);
         assert!(store.llm_usage_for_repo(&a).unwrap().is_empty());

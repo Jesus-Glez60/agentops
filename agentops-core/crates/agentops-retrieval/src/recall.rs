@@ -135,9 +135,10 @@ pub fn recall_scored_with(store: &dyn GraphStore, repo: &str, query: &str, limit
 /// reached: meaning may re-rank those but never adds one. The rule error
 /// cues follow (milestone 3b revision 1), shared with command cues and the
 /// personal seed (milestone 5 follow-up), where a match by meaning alone
-/// was mostly noise.
+/// was mostly noise. The filter runs before the limit, so a memory reached
+/// by meaning alone never takes a place a keyword match would have had.
 pub fn recall_lexical_with(store: &dyn GraphStore, repo: &str, query: &str, limit: usize, exclude: &HashSet<i64>, embedder: Option<&'static (dyn Embedder + Sync)>) -> Result<Vec<(RecallPointer, f64)>> {
-    Ok(recall_ranked_with(store, repo, query, limit, exclude, embedder)?.into_iter().filter(|s| s.lexical).map(|s| (s.pointer, s.confidence)).collect())
+    Ok(recall_ranked_with(store, repo, query, usize::MAX, exclude, embedder)?.into_iter().filter(|s| s.lexical).take(limit).map(|s| (s.pointer, s.confidence)).collect())
 }
 
 /// One `recall_ranked_with` result.
@@ -778,9 +779,6 @@ mod tests {
         assert_eq!(dense_weight(DENSE_WINDOW), 0.0);
     }
 
-    /// The c20 shape (gotcha 326954): a target matched by one keyword and
-    /// 20th nearest by meaning. One new memory closer in meaning must cost
-    /// it a place or two, not drop it below every keyword-only match.
     /// Most ranks one new memory may move a recall target (milestone 4's
     /// stability criterion, committed here for keyword fillers).
     const STABILITY_MAX_DROP: usize = 3;
@@ -837,6 +835,9 @@ mod tests {
         }
     }
 
+    /// The c20 shape (gotcha 326954): a target matched by one keyword and
+    /// 20th nearest by meaning. One new memory closer in meaning must cost
+    /// it a place or two, not drop it below every keyword-only match.
     #[test]
     fn one_new_close_neighbour_moves_a_target_by_at_most_two_places() {
         let store = SqliteGraphStore::open_in_memory().unwrap();
@@ -877,6 +878,21 @@ mod tests {
         assert_eq!(lexical(worded), Some(true), "keywords, and close in meaning too");
         assert_eq!(lexical(named), Some(true), "affects the named symbol");
         assert_eq!(lexical(meaning), Some(false), "reached by meaning and a hop only");
+    }
+
+    #[test]
+    fn a_lexical_limit_counts_keyword_matches_only_even_when_meaning_ranks_others_first() {
+        let store = SqliteGraphStore::open_in_memory().unwrap();
+        // Closest in meaning and older, so they'd fill the first places.
+        for k in 0..3 {
+            let near = note(&store, NodeKind::Note, &format!("Near {k}"), "nothing in common");
+            store.set_embedding("r", near, &vector(0.0)).unwrap();
+        }
+        let worded: Vec<i64> = (0..2).map(|k| note(&store, NodeKind::Gotcha, &format!("Webhook signature {k}"), "webhook signature")).collect();
+        let kept = recall_lexical_with(&store, "r", "webhook signature", 2, &HashSet::new(), Some(&FIXED)).unwrap();
+        let mut ids: Vec<i64> = kept.iter().map(|(p, _)| p.node_id).collect();
+        ids.sort();
+        assert_eq!(ids, worded, "{kept:?}");
     }
 
     #[test]

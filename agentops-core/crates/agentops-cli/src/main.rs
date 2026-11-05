@@ -530,7 +530,9 @@ enum Command {
         /// Turn off recall during work (milestone 3b): file reads, edits
         /// and errors no longer inject memories, though reads are still
         /// recorded and prompt-time recall is untouched. Sets
-        /// `AGENTOPS_WORK_RECALL=off` in `.claude/settings.json`'s `env`;
+        /// `AGENTOPS_WORK_RECALL=off` in the repo's Claude settings `env`
+        /// (`.claude/settings.json`, or `settings.local.json` for a guest
+        /// connect);
         /// connecting again without it turns work-time recall back on.
         /// Claude Code only.
         #[arg(long, conflicts_with = "no_hooks")]
@@ -968,12 +970,20 @@ fn main() -> Result<()> {
 
 /// A consolidation candidate id (`m<a>-<b>`, `d<id>-...`) with its node ids
 /// mapped into the destination store, or `None` if one isn't mapped.
-fn remap_candidate_id(id: &str, map: &std::collections::HashMap<i64, i64>) -> Option<String> {
-    let candidate = agentops_mcp::proposals::Candidate::from_id(id)?;
-    let mut ids = candidate.sources.iter().map(|old| map.get(old).copied()).collect::<Option<Vec<i64>>>()?;
-    ids.sort();
-    let joined = ids.iter().map(i64::to_string).collect::<Vec<_>>().join("-");
-    Some(format!("{}{joined}", if candidate.purpose == "merge" { "m" } else { "d" }))
+fn remap_candidate(id: &str, map: &std::collections::HashMap<i64, i64>) -> Option<agentops_mcp::proposals::Candidate> {
+    use agentops_mcp::proposals::Candidate;
+    let candidate = Candidate::from_id(id)?;
+    let ids = candidate.sources.iter().map(|old| map.get(old).copied()).collect::<Option<Vec<i64>>>()?;
+    Some(if candidate.purpose == "merge" { Candidate::merge(ids[0], ids[1], 0.0) } else { Candidate::distill(ids) })
+}
+
+/// A rejection's or verdict's sources digest for the destination store.
+/// The digest hashes the source ids, which migration renumbers, so one
+/// that still matches its sources is recomputed there; a stale one is
+/// copied as it is, and the candidate stays reopened.
+fn migrated_digest(src: &dyn agentops_graph::GraphStore, dst: &dyn agentops_graph::GraphStore, repo: &str, old: &[i64], new: &[i64], stored: &str) -> Result<String> {
+    use agentops_mcp::proposals::sources_digest;
+    Ok(if sources_digest(src, repo, old)? == stored { sources_digest(dst, repo, new)? } else { stored.to_string() })
 }
 
 /// `migrate_graph`'s copy of the recall claims, consolidation proposals and
@@ -999,16 +1009,17 @@ fn migrate_recall_and_consolidation(src: &dyn agentops_graph::GraphStore, dst: &
         if dst.proposals(repo)?.iter().any(|q| q.proposal_id == proposal) {
             continue;
         }
-        dst.record_proposal(repo, proposal, &sources, &p.sources_digest)?;
+        dst.record_proposal(repo, proposal, &sources, &migrated_digest(src, dst, repo, &p.source_ids, &sources, &p.sources_digest)?)?;
         if p.state != "proposed" {
             dst.set_proposal_state(repo, proposal, &p.state)?;
         }
         copied += 1;
     }
     for (candidate, digest) in src.not_worth(repo)? {
-        match remap_candidate_id(&candidate, map) {
-            Some(id) => {
-                dst.record_not_worth(repo, &id, &digest)?;
+        match remap_candidate(&candidate, map) {
+            Some(mapped) => {
+                let old = agentops_mcp::proposals::Candidate::from_id(&candidate).map(|c| c.sources).unwrap_or_default();
+                dst.record_not_worth(repo, &mapped.id, &migrated_digest(src, dst, repo, &old, &mapped.sources, &digest)?)?;
                 copied += 1;
             }
             None => skipped += 1,
@@ -1567,7 +1578,7 @@ fn install_claude_hooks_at(settings_path: &Path, agents: &[String], compress_com
         (false, false) => "",
     };
     println!(
-        "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse/SessionEnd/SubagentStart{compress_note} — see the get_session_guide/fetch_content/semantic_search MCP tools).",
+        "  claude: installed the agentops hook suite at {} (PostToolUse/PostToolUseFailure/UserPromptSubmit/SessionStart/PreToolUse/SessionEnd/SubagentStart{compress_note} — see the get_session_guide/fetch_content/local_semantic_search MCP tools).",
         settings_path.display()
     );
     Ok(())
@@ -1799,7 +1810,7 @@ fn resolve_connection_id(path: &Path, server_url: &str, api_key: &str, yes: bool
     // path (see its doc comment) exists exactly for this case, so there's
     // no need to send the caller to the web app or bail under --yes either.
     if guest {
-        println!("No connection matches this checkout: registering it memory-only (no indexing; notes, similarity and keyword/meaning recall work, Affects links don't).");
+        println!("No connection matches this checkout: registering it memory-only (no indexing; notes, similarity and keyword/meaning recall work; no code is indexed, so memories aren't linked to code symbols).");
         return register_local_repo(path, server_url, api_key);
     }
 
@@ -2857,14 +2868,12 @@ mod tests {
         assert_eq!(parsed["mcpServers"]["agentops"]["env"]["AGENTOPS_ACCESS_MODE"], "advisor");
     }
 
-    /// Live Postgres only (`AGENTOPS_TEST_DATABASE_URL`, same default as
-    /// agentops-graph-pg's tests); says so loudly when it can't run.
     #[test]
     fn a_candidate_id_is_rewritten_through_the_id_map_or_dropped() {
         let map: std::collections::HashMap<i64, i64> = [(3, 30), (7, 5), (9, 90)].into_iter().collect();
-        assert_eq!(remap_candidate_id("m3-7", &map).as_deref(), Some("m5-30"), "a merge pair stays sorted");
-        assert_eq!(remap_candidate_id("d3-7-9", &map).as_deref(), Some("d5-30-90"));
-        assert_eq!(remap_candidate_id("m3-4", &map), None, "an unmapped source drops the verdict");
+        assert_eq!(remap_candidate("m3-7", &map).map(|c| c.id).as_deref(), Some("m5-30"), "a merge pair stays sorted");
+        assert_eq!(remap_candidate("d3-7-9", &map).map(|c| c.id).as_deref(), Some("d5-30-90"));
+        assert_eq!(remap_candidate("m3-4", &map), None, "an unmapped source drops the verdict");
     }
 
     /// The test Postgres, or `None` to skip: only when no URL is configured
@@ -2872,7 +2881,10 @@ mod tests {
     /// the CI server, a failed connection fails the test instead of
     /// skipping it silently (gotchas 54237, 54247).
     fn test_postgres() -> Option<(String, agentops_graph_pg::PostgresGraphStore)> {
-        let url = std::env::var("AGENTOPS_TEST_DATABASE_URL").ok()?;
+        let Ok(url) = std::env::var("AGENTOPS_TEST_DATABASE_URL") else {
+            eprintln!("SKIPPING: AGENTOPS_TEST_DATABASE_URL is unset");
+            return None;
+        };
         let store = agentops_graph_pg::PostgresGraphStore::connect(&url).unwrap_or_else(|e| panic!("AGENTOPS_TEST_DATABASE_URL is set but Postgres is unreachable: {e:#}"));
         Some((url, store))
     }
@@ -2891,9 +2903,11 @@ mod tests {
         src.set_memory_scope(&repo, b, Some(&["build-box".to_string()])).unwrap();
         src.claim_shown(&repo, "s1", "main#0", &[a, b], "prompt_seed").unwrap();
         src.claim_shown(&repo, "s1", "main#0", &[999_999], "file_cue").unwrap();
-        src.record_proposal(&repo, c, &[a, b], "digest").unwrap();
+        let digest = agentops_mcp::proposals::sources_digest(&src, &repo, &[a, b]).unwrap();
+        src.record_proposal(&repo, c, &[a, b], &digest).unwrap();
         src.set_proposal_state(&repo, c, "rejected").unwrap();
-        src.record_not_worth(&repo, &format!("m{}-{}", a.min(b), a.max(b)), "d1").unwrap();
+        src.record_not_worth(&repo, &format!("m{}-{}", a.min(b), a.max(b)), &digest).unwrap();
+        src.record_not_worth(&repo, &format!("d{a}-{c}"), "stale").unwrap();
         src.record_not_worth(&repo, &format!("m{a}-999999"), "d2").unwrap();
         drop(src);
 
@@ -2910,7 +2924,20 @@ mod tests {
         assert!(shown.contains(&na.id) && shown.contains(&nb.id));
         let proposals = dst.proposals(&repo).unwrap();
         assert_eq!((proposals.len(), proposals[0].proposal_id, proposals[0].state.as_str()), (1, nc.id, "rejected"));
-        assert_eq!(dst.not_worth(&repo).unwrap(), vec![(format!("m{}-{}", na.id.min(nb.id), na.id.max(nb.id)), "d1".to_string())], "rewritten ids; the unmapped verdict skipped");
+        let verdicts = dst.not_worth(&repo).unwrap();
+        let pair = format!("m{}-{}", na.id.min(nb.id), na.id.max(nb.id));
+        let mut ids: Vec<&str> = verdicts.iter().map(|(id, _)| id.as_str()).collect();
+        ids.sort();
+        let distill = format!("d{}-{}", na.id.min(nc.id), na.id.max(nc.id));
+        let mut want = vec![pair.as_str(), distill.as_str()];
+        want.sort();
+        assert_eq!(ids, want, "rewritten ids; the unmapped verdict skipped");
+        assert!(verdicts.iter().any(|(id, d)| *id == distill && d == "stale"), "a stale digest is copied as it is");
+        // What the verdicts and the rejection are for: the same sources,
+        // unchanged, aren't offered again after the migration.
+        use agentops_mcp::proposals::{unblocked, Candidate};
+        let offered = unblocked(&dst, &repo, vec![Candidate::merge(na.id, nb.id, 0.9), Candidate::distill(vec![na.id, nc.id])]).unwrap();
+        assert_eq!(offered.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec![distill.as_str()], "the matching pair stays blocked, the stale one is reopened");
         dst.wipe_repo(&repo).unwrap();
     }
 

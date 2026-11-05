@@ -674,8 +674,10 @@ pub(crate) async fn hook_event_json(State(state): State<AppState>, user: Option<
         let repo = agentops_mcp::repo_name(&path);
         let store = agentops_mcp::resolve_store(state.pg_store.as_ref(), &path)?;
         // The caller's personal memories join recall here (milestone 5);
-        // never created by a hook, only found.
-        let personal = user_id.and_then(|uid| crate::personal::personal_path(&state, uid, false).ok().flatten()).map(|p| agentops_mcp::repo_name(&p));
+        // never created by a hook, only found. Only on the shared Postgres
+        // store: on SQLite they live in their own checkout's graph.db, and
+        // this one store would read and write the work repo's file instead.
+        let personal = user_id.filter(|_| state.pg_store.is_some()).and_then(|uid| crate::personal::personal_path(&state, uid, false).ok().flatten()).map(|p| agentops_mcp::repo_name(&p));
         let output = agentops_mcp::hooks::handle_with_personal(store.as_ref(), &repo, personal.as_deref(), &event, &payload, Some(&SERVER_EMBEDDER))?;
         Ok(Some(agentops_mcp::hooks::with_protocol_warning(&event, &payload, output)))
     })

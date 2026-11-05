@@ -121,24 +121,21 @@ fn parse_entry(file: &str, content: &str) -> Entry {
 
 /// `MEMORY.md`'s `- [Title](file.md)` lines: file name → (line number, line).
 fn index_lines(memory_md: &str) -> HashMap<String, (usize, String)> {
-    memory_md
-        .lines()
-        .enumerate()
-        .filter_map(|(i, line)| {
-            let start = line.find("](")? + 2;
-            let end = line[start..].find(')')? + start;
-            Some((line[start..end].to_string(), (i + 1, line.to_string())))
-        })
-        .collect()
+    memory_md.lines().enumerate().filter_map(|(i, line)| Some((index_target(line)?.to_string(), (i + 1, line.to_string())))).collect()
 }
 
-/// A `- [Title](file.md)` index line: a link to an entry file.
+/// The entry file a `- [Title](file.md)` index line links to. Only a
+/// bullet that opens with the link counts: a bullet that merely mentions
+/// a file (`- Deploy gate: see [runbook](runbook.md)`) is an entry itself.
+fn index_target(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("- [").or_else(|| line.strip_prefix("* ["))?;
+    let start = rest.find("](")? + 2;
+    let end = rest[start..].find(')')? + start;
+    Some(&rest[start..end]).filter(|target| target.ends_with(".md") && !target.contains("://"))
+}
+
 fn is_index_link(line: &str) -> bool {
-    let Some(start) = line.find("](").map(|i| i + 2) else { return false };
-    line[start..].find(')').is_some_and(|end| {
-        let target = &line[start..start + end];
-        target.ends_with(".md") && !target.contains("://")
-    })
+    index_target(line).is_some()
 }
 
 /// Entries written directly in MEMORY.md: each top-level bullet that isn't
@@ -1014,6 +1011,15 @@ mod tests {
         assert_eq!(inline_title("**Bold** rule here"), Some("Bold rule here".into()));
         let (none, _) = inline_entries("- a fact with no heading\n");
         assert_eq!(none[0].1.body, "a fact with no heading");
+    }
+
+    #[test]
+    fn a_bullet_that_only_mentions_a_file_is_an_entry_not_an_index_line() {
+        let md = "- [Linked](linked_file.md) — the file\n- Deploy gate: see [runbook](runbook.md)\n  - the gate runs first\n";
+        let (entries, _) = inline_entries(md);
+        assert_eq!(entries.iter().map(|(n, _)| *n).collect::<Vec<_>>(), vec![2]);
+        assert!(entries[0].1.body.contains("the gate runs first"), "its sub-bullets stay with it");
+        assert_eq!(index_lines(md).keys().collect::<Vec<_>>(), vec!["linked_file.md"], "only the bullet that opens with the link indexes a file");
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 **2026-11-05.** Covers the one-pass plan made from `m5-report.md` §7 (the author chose all four groups: recall robustness, an action cue, small fixes, milestone 4 carryovers). Facts only, each tied to a commit or a command's output; anything not verified is marked **unverified**. Client projects by alias only.
 
-**Result: four of the six groups shipped and hold live. The two that were meant to close milestone 5's failed gates did not:**
+**Result: of the four groups the author chose, two shipped as intended (small fixes, milestone 4 carryovers); by step, four of the six hold live. The two groups meant to close milestone 5's failed gates did not:**
 - **c09:** both versions of the recall fix traded one eval for another, so the change was reverted;
 - **E2:** the command cue missed E2's memory and injected only noise, so it is off by default.
 
@@ -80,3 +80,44 @@ Unchanged from milestone 5 (`m5-report.md` §4).
 - migrate-graph never carries an unmapped id;
 - command cues stay off unless the switch is set;
 - personal seeds are keyword-only.
+
+## 6. Wrap review (2026-11-05)
+
+The whole milestone (`b27428a..fa2b399`, 34 files, already deployed) was reviewed after the fact by the five-persona council, a chair and a reuse audit. **Verdict: clear with changes; no rollback.** The review ran after deploy, which is the order gotcha 53914 warns against. Summary in note 450305.
+
+**Fixed** (one commit, `agentops-test-remote` OVERALL PASS, 1,382 Rust tests):
+
+| Finding | Fix | Test |
+| --- | --- | --- |
+| Personal seeds could lose a keyword match, **live**: `recall_lexical_with` filtered after its limit, so a memory reached by meaning alone took one of the 2 places and was then dropped (gotcha 450303) | Filter, then take the limit; command cues use it too | `a_lexical_limit_counts_keyword_matches_only_even_when_meaning_ranks_others_first`, which fails on the old line |
+| migrate-graph copied sources digests that hash the old node ids, so after a migration rejected proposals reopened and not-worth pairs were judged again (gotcha 450304) | A digest that still matches its sources is recomputed on the target; a stale one is copied as it is. Candidate ids come from `Candidate::merge`/`distill` | The migrate test runs `unblocked` after migrating (Postgres; it ran, no SKIPPING) |
+| import-memory treated any bullet with a `](x.md)` link as an index line, dropping it and its sub-bullets, and the count check used the same rule | One predicate, `index_target`: only a bullet that opens with the link | `a_bullet_that_only_mentions_a_file_is_an_entry_not_an_index_line`. **No real import was affected:** none of the 22 MEMORY.md files or 18 backups has such a bullet |
+| On SQLite, personal recall would read and write the work repo's `graph.db` (latent: production is Postgres) | Personal memories join only on the shared Postgres store | none (no SQLite hook-route test exists) |
+| Text | The reinstall message works outside an AgentOps checkout; `--no-work-recall` names `settings.local.json` for guest connects; `local_semantic_search`; "Affects links" explained; misplaced doc comments; the PreToolUse module doc lists its denial; `AGENTOPS_COMMAND_CUES` documented as a server-side switch; dead `contains_keyword` removed | — |
+| The Postgres wipe test didn't check that another repo's not-worth rows survive (gotcha 54241) | Asserted | `wipe_repo_removes_only_its_own_llm_and_session_usage` |
+
+**Reports corrected** in `m5-report.md`:
+- requirement rows "reaches the context" and "rules always present" downgraded;
+- the eval-session deviation disclosed;
+- E4's timing explained;
+- the unpin commit cited correctly;
+- this report's summary line.
+
+**Not fixed, deliberately:**
+- **Error cues** filter after their limit, the same defect as the personal seed. Moving it changes the work eval, so it waits for the offline harness.
+
+**Deferred:**
+- dedupe the command-cue redaction (`hooks.rs`/`work_recall_eval.rs`) and `push_personal_seed`/`push_seed`;
+- tests for `personal.rs`, `import-memory --personal` and the command arm of `resolve_cue`;
+- reserve `personal` as a connection id;
+- a size bound on `POST /memories/classify-kind`;
+- the "no git remote" wording in `indexing.rs`;
+- a `--min-hits` exit code on the evals.
+
+**The author's to decide:**
+- personal memories reach client repos with no per-repo opt-out;
+- employment, personal-memory and home-network details in these public reports;
+- inline import entries are keyed by line number, so a re-import after edits duplicates them;
+- `memory-off --user` has no undo.
+
+**Unexplained:** a reviewer saw a "create a Claude Docs document" instruction inside a graph search hit. [Guessing] It is a session's connector instructions captured in a stored tool output; not yet checked.

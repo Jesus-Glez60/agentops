@@ -36,7 +36,7 @@ use agentops_graph::{EdgeRelation, GraphStore, NodeKind, NodeProminence};
 use anyhow::Result;
 
 use crate::recall::affects_confidence_for;
-use crate::recall::recall_ranked_with;
+use crate::recall::{recall_lexical_with, recall_ranked_with};
 use crate::{RecallPointer, RECALL_KINDS};
 
 /// Score of a memory whose text names the file's repo-relative path.
@@ -376,7 +376,7 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
             // the hook doesn't wait on an embedding (up to 250 ms).
             let words = command_class(text).map(|(_, words)| words).unwrap_or_default();
             let query = format!("{} {}", words.join(" "), class.vocabulary());
-            merged.extend(recall_ranked_with(store, repo, &query, PER_SOURCE, &HashSet::new(), None)?.into_iter().filter(|s| s.lexical).map(|s| WorkCandidate { pointer: s.pointer, score: s.confidence }));
+            merged.extend(recall_lexical_with(store, repo, &query, PER_SOURCE, &HashSet::new(), None)?.into_iter().map(|(pointer, score)| WorkCandidate { pointer, score }));
         }
         WorkCue::Error { text } => {
             let query = clean_error(text);
@@ -386,7 +386,10 @@ pub fn resolve_cue(store: &dyn GraphStore, repo: &str, cue: &WorkCue, sources: C
             // Only what a keyword (or a named symbol) matched: meaning may
             // re-rank those but never adds one, since a self-explanatory
             // error otherwise pulled in unrelated memories by meaning alone
-            // (gotcha 235643, milestone 3b revision 1).
+            // (gotcha 235643, milestone 3b revision 1). The filter runs
+            // after the limit here, unlike `recall_lexical_with`: moving it
+            // changes the work eval, so it waits for the offline harness
+            // (gotcha 450303).
             merged.extend(recall_ranked_with(store, repo, &query, PER_SOURCE, &HashSet::new(), embedder)?.into_iter().filter(|s| s.lexical).map(|s| {
                 let score = if s.pointer.kind == NodeKind::Gotcha { (s.confidence * ERROR_GOTCHA_BOOST).min(1.0).max(s.confidence) } else { s.confidence };
                 WorkCandidate { pointer: s.pointer, score }

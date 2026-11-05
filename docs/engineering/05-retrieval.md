@@ -175,6 +175,12 @@ On the server, `recall_seed_with` (`agentops-retrieval/src/recall.rs`) also reca
 
 If embedding plus the search exceed `DENSE_TIMEOUT_MS = 250`, the dense half is dropped, `dense recall timeout` is logged, and the keyword result stands. `agentops-server` warms the model at startup (`warm_embedder`).
 
+**Keyword-only callers.** `recall_lexical_with` keeps only what a keyword or a named symbol reached: meaning may re-rank those but never adds one. It drops the rest before taking its limit, so a memory reached by meaning alone never takes a keyword match's place. Two callers use it:
+- the personal seed (milestone 5 follow-up), where meaning alone pulled in unrelated personal memories;
+- command cues.
+
+Error cues filter the same way but after their limit; moving that changes the work eval, so it waits for the offline harness (gotcha 450303).
+
 ## Recall during work: cue resolution
 
 Milestone 3b, `agentops-retrieval/src/work_recall.rs`. A work cue is a file the agent read or edited, or the text of a failed tool call. `resolve_cue` turns it into ranked candidates. Each candidate carries a score of about 0 to 1, which session activation sums and `INJECT_MIN_SCORE` thresholds. `agentops work-recall-eval` and the `PostToolUse` hook call the same function. The server's `POST /repos/{id}/work-recall` exposes it and records nothing.

@@ -20,7 +20,10 @@
 //!   `get_session_guide`.
 //! - `posttoolusefailure`, `userpromptsubmit`: record narrower categories
 //!   (`"error"`, `"user_intent"`) the same way.
-//! - `pretooluse`: a proactive secret-exposure warning. It never blocks.
+//! - `pretooluse`: a secret-exposure warning and, when switched on, a
+//!   command cue's recall (context only, never blocking); a plan check on
+//!   `ExitPlanMode`; and the one denial, a write to Claude Code's own
+//!   memory files, redirected to `add_note`.
 //! - `sessionstart`: renders the session-resume guide on compact/resume/
 //!   startup, via `session_guide::build`.
 //!
@@ -124,7 +127,7 @@ pub fn with_protocol_warning(event: &str, payload: &Value, output: Option<Value>
     if event != "sessionstart" || cli >= u64::from(crate::CLI_PROTOCOL) {
         return output;
     }
-    let message = format!("agentops CLI is behind the server (protocol {cli} < {}): reinstall it with `cargo install --path agentops-core/crates/agentops-cli` (or `npx agentops-cli`) and restart Claude Code.", crate::CLI_PROTOCOL);
+    let message = format!("agentops CLI is behind the server (protocol {cli} < {}): reinstall the `agentops` on your PATH (the one hooks run): `cargo install --git https://github.com/Jesus-Glez60/agentops agentops-cli`, or `cargo install --path agentops-core/crates/agentops-cli` inside an AgentOps checkout; then restart Claude Code.", crate::CLI_PROTOCOL);
     let mut output = output.unwrap_or_else(|| hook_output("SessionStart", None, None));
     output["systemMessage"] = Value::String(message);
     Some(output)
@@ -722,22 +725,26 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, personal: Option<&str>
 // PreToolUse
 // ---------------------------------------------------------------------
 
-/// A proactive secret-exposure warning that reuses the existing
-/// redaction/filename-classification code directly. **Never sets
-/// `permissionDecision`**: the tool call always proceeds through Claude
-/// Code's normal permission flow untouched. Recording the warning is
-/// best-effort; the warning itself is the point.
 /// The server-side switch for command cues (`AGENTOPS_COMMAND_CUES=on`).
 /// Off by default: in milestone 5's evidence replays every pointer they
 /// injected was noise and they missed the one case they were built for
 /// (E2; docs/engineering/handoffs/m5b-report.md), and a pointer that's usually
-/// noise teaches agents to skip pointers. Replays still evaluate them.
+/// noise teaches agents to skip pointers. Replays still evaluate them. Read
+/// on the server, from its own environment: setting it in a repo's Claude
+/// settings does nothing.
 pub const COMMAND_CUES_ENV: &str = "AGENTOPS_COMMAND_CUES";
 
 fn command_cues_enabled() -> bool {
     std::env::var(COMMAND_CUES_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("on"))
 }
 
+/// A proactive secret-exposure warning that reuses the existing
+/// redaction/filename-classification code directly, joined with a command
+/// cue's recall when `command_cues`. Neither sets `permissionDecision`:
+/// the tool call proceeds through Claude Code's normal permission flow
+/// untouched. Only a write to Claude Code's memory files is denied, and
+/// `ExitPlanMode` gets the plan check. Recording the warning is
+/// best-effort; the warning itself is the point.
 fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, command_cues: bool) -> Result<Option<Value>> {
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
