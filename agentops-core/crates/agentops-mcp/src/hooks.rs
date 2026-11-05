@@ -72,7 +72,7 @@ pub fn handle_with_personal(store: &dyn GraphStore, repo: &str, personal: Option
         "posttoolusefailure" => post_tool_use_failure(store, repo, payload, embedder),
         "userpromptsubmit" => user_prompt_submit(store, repo, personal, payload, embedder),
         "sessionstart" => session_start(store, repo, personal, payload),
-        "pretooluse" => pre_tool_use(store, repo, payload),
+        "pretooluse" => pre_tool_use(store, repo, payload, command_cues_enabled()),
         "subagentstart" => subagent_start(store, repo, personal, payload, embedder),
         other => anyhow::bail!("unknown hook event '{other}'"),
     }
@@ -727,7 +727,18 @@ fn user_prompt_submit(store: &dyn GraphStore, repo: &str, personal: Option<&str>
 /// `permissionDecision`**: the tool call always proceeds through Claude
 /// Code's normal permission flow untouched. Recording the warning is
 /// best-effort; the warning itself is the point.
-fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<Option<Value>> {
+/// The server-side switch for command cues (`AGENTOPS_COMMAND_CUES=on`).
+/// Off by default: in milestone 5's evidence replays every pointer they
+/// injected was noise and they missed the one case they were built for
+/// (E2; docs/engineering/handoffs/m5b-report.md), and a pointer that's usually
+/// noise teaches agents to skip pointers. Replays still evaluate them.
+pub const COMMAND_CUES_ENV: &str = "AGENTOPS_COMMAND_CUES";
+
+fn command_cues_enabled() -> bool {
+    std::env::var(COMMAND_CUES_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("on"))
+}
+
+fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value, command_cues: bool) -> Result<Option<Value>> {
     let tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     if tool_name == "ExitPlanMode" {
@@ -746,7 +757,7 @@ fn pre_tool_use(store: &dyn GraphStore, repo: &str, payload: &Value) -> Result<O
     // another host recalls before it runs (milestone 5 follow-up), so a
     // rule about where things run arrives in time. Context only: the
     // command is never denied or rewritten. Repo memories only.
-    let recalled = match command_cue(tool_name, &tool_input) {
+    let recalled = match command_cue(tool_name, &tool_input).filter(|_| command_cues) {
         Some(cue) => work_cue(store, repo, payload, &cue, None).unwrap_or_else(|e| {
             eprintln!("agentops: command cue failed (non-fatal): {e:#}");
             None
@@ -1260,7 +1271,16 @@ mod tests {
     }
 
     fn pre(store: &dyn GraphStore, repo: &str, command: &str, session: &str) -> Option<Value> {
-        handle_with_personal(store, repo, Some("personal--u1"), "pretooluse", &json!({ "tool_name": "Bash", "tool_input": {"command": command}, "session_id": session }), None).unwrap()
+        pre_tool_use(store, repo, &json!({ "tool_name": "Bash", "tool_input": {"command": command}, "session_id": session }), true).unwrap()
+    }
+
+    #[test]
+    fn command_cues_are_off_unless_switched_on() {
+        let (_dir, store, repo) = store();
+        gotcha(store.as_ref(), &repo, "Never run a local server: serve-api runs on the remote server", "The live app is the server; a local serve or localhost run is the wrong one.");
+        let payload = json!({ "tool_name": "Bash", "tool_input": {"command": "agentops serve-api --addr 127.0.0.1:8979"}, "session_id": "off" });
+        assert!(pre_tool_use(store.as_ref(), &repo, &payload, false).unwrap().is_none(), "off: nothing injected");
+        assert!(pre_tool_use(store.as_ref(), &repo, &payload, true).unwrap().is_some(), "on: the cue speaks");
     }
 
     #[test]
