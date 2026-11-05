@@ -13,7 +13,7 @@
 | Adding note 411710 moves c09 ≤ 3 ranks (Postgres) | c09 at 20; the two fixes reached 6 but were reverted | **Not met** |
 | Prompt-eval noise no higher than before | Unchanged from the baseline (136 non-target pointers in 150) | Met |
 | E2 surfaces 104449 before the corrected step via a command cue | Rank 16 for E2's command query; a cue shows 1 | **Not met** |
-| Each item shipped with tests, verified live where possible | §1 | Met, except the DNS alert (waiting on the author) |
+| Each item shipped with tests, verified live where possible | §1 | Met; the DNS alert's down path is unverified (§5) |
 | Prompt-hook p95 < 300 ms remote | 202 ms (p50 158 ms, n = 200, `ac5f535`); PreToolUse with a classed command: p95 123 ms (n = 50) | Met |
 
 ## 1. What shipped
@@ -70,7 +70,7 @@ Unchanged from milestone 5 (`m5-report.md` §4).
 
 - **c09 and the stability limit:** open, with a method chosen (§2).
 - **Command cues:** off. A redesign must improve the query (for example, weighting the class vocabulary over the program name) and be measured on the replays before it's switched on.
-- **DNS alert:** waiting on the author to create a Kuma push monitor and supply its URL. The script change is staged as in milestone 5 (gotcha 411710).
+- **DNS alert:** live since 2026-11-05 (note 445396). Each updater run pushes to the Kuma monitor `desec-dyndns`: up on `good`/`nochg`, down on anything else, and down after 20 minutes without a push (two missed runs). Kuma recorded `up | good` at the install run. **Unverified:** the down path and notification delivery (test: stop `desec-dyndns.timer` for 25 minutes).
 - **Personal pins in AgentOps** don't all fit the 3,000-character budget (406925 is cut and named, by design).
 - **From milestone 5, still the author's:** the needs-review queue (2), the 11 LLM-pinned rules, the old deSEC token, client ports, and the "wrong" signal milestone.
 
